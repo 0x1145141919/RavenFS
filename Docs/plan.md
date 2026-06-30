@@ -60,56 +60,91 @@ mkfs.ravenfs /dev/nvme0n1pX
 
 ---
 
-## Phase 1 — 上帝类 + 测试集
+## Phase 1 — 上帝类（静态库）+ 外部测试程序
 
-**目标**：在 Phase 0 格式化的分区上，实现完整的文件操作，通过测试集验证。
+**目标**：交付 `libravenfs.a`（静态链接的上帝类库），外部测试程序链接后即可挂载、操作文件系统。
+
+### 交付物
+
+| 产物 | 说明 |
+|------|------|
+| `libravenfs.a` | 上帝类静态库，内嵌极简 VFS + 多线程安全 |
+| 外部测试程序 | 任何外部 `main()` cpp 链接 `libravenfs.a`，`mount()` 后即可操作 |
 
 ### 策略
 
-- 所有算法内聚在 `RavenFS` 一个类中
-- 不拆分任何层，不做通用抽象
-- `io_backend.h` 仅用于区分 I/O 后端（host = pread, sparrowos = NVMe 驱动），不是算法抽象
+- **所有算法内聚**在 `RavenFS` 一个类中，不拆分任何抽象层
+- **极简 VFS 内嵌**在 god class 中：`open`/`close`/`read`/`write`/`create`/`delete` 是类的方法，不是外部层
+- **多线程安全**从一开始就设计：
+  - 文件句柄表（`FileID` → 上下文）必须支持并发访问
+  - B+tree 操作需要明确的锁粒度决策（inode 级锁？btree node 级锁？）
+  - 缓存一致性：私有 buffer cache 的并发读写
+- `io_backend.h` 仅用于切换 I/O 后端（host = pread, sparrowos = NVMe 驱动），不是算法抽象
+- 研究目标不只是文件系统，更是 **VFS 的并发设计**（句柄管理、路径解析的锁、并发 open/close 的语义）
 
-### 测试集（init_fs_t 模式）
+### 测试集
 
-继承 initfs 的历史经验——面向测试的上帝类，CLI 驱动测试：
+外部测试程序（任意 `main()`，链接 `libravenfs.a`）：
 
+```cpp
+#include "ravenfs/ravenfs.h"
+
+int main() {
+    PosixIOBackend io("/dev/nvme0n1pX");
+    RavenFS fs;
+    fs.mount(&io);
+
+    // 基础操作
+    fs.create_file({0,0}, "/hello.txt");
+    FileID f = fs.open({0,0}, "/hello.txt");
+    fs.write(f, "hello world", 11, 0);
+    char buf[32];
+    fs.read(f, buf, 11, 0);
+    fs.close(f);
+
+    // 目录
+    fs.mkdir({0,0}, "/subdir");
+    fs.create_file({0,0}, "/subdir/a.txt");
+    RavenFS::DirEntry entries[16];
+    int n = fs.readdir("/subdir", entries, 16);
+
+    // 随机读写
+    FileID f2 = fs.open({0,0}, "/bigfile.bin");
+    fs.read(f2, buf, 512, 1048576);  // offset 1MB
+    fs.write(f2, buf, 512, 2097152); // offset 2MB
+    fs.close(f2);
+}
 ```
-ravenfs_cli /dev/nvme0n1pX mkfs
-ravenfs_cli /dev/nvme0n1pX mkdir /mydir
-ravenfs_cli /dev/nvme0n1pX create /mydir/hello.txt
-ravenfs_cli /dev/nvme0n1pX write /mydir/hello.txt "world"
-ravenfs_cli /dev/nvme0n1pX read /mydir/hello.txt
-ravenfs_cli /dev/nvme0n1pX ls /mydir
-ravenfs_cli /dev/nvme0n1pX stat /mydir/hello.txt
-ravenfs_cli /dev/nvme0n1pX rm /mydir/hello.txt
-```
 
-测试步骤：
+覆盖场景：
 
-| # | 操作 | 验证点 |
+| # | 场景 | 验证点 |
 |---|------|--------|
-| 1 | mkfs | 布局正确 |
-| 2 | 创建单文件 | inode 分配、dentry 写入 |
-| 3 | 读写小文件 | inline data 路径 |
-| 4 | 读写跨 extent 大文件 | B+tree 多节点遍历 |
-| 5 | 创建/删除目录 | dentry B+tree 增删 |
-| 6 | 重命名 | dentry 更新 |
+| 1 | mkfs + 挂载 | 布局正确，superblock 校验 |
+| 2 | 创建单文件，写 inline data | inode 分配、dentry、inline 路径 |
+| 3 | 跨 extent 大文件读/写 | B+tree 多节点遍历 |
+| 4 | 创建/删除目录 | dentry B+tree 增删 |
+| 5 | 目录枚举 | readdir 正确性 |
+| 6 | 随机偏移读写 | extent 查找 + 部分块 I/O |
 | 7 | 空洞文件 | 未分配 extent 返回零 |
 | 8 | 碎片化写入 | B+tree 分裂/合并 |
+| 9 | 重命名 | dentry 更新 |
+| 10 | **多线程并发** | 多线程同时 open/read/write/close |
+| 11 | **压力测试** | 大量小文件创建/删除，句柄表耗尽/回收 |
 
 ### 测试战场
 
 - **主战场**：`/dev/nvme0n1pX`（01:00.0 实验盘）
-- 双用途：既是 RavenFS 测试盘，也是 SparrowOS NVMe 驱动的压力测试场
-- 备选：`/tmp/test.img` loop 文件（快速迭代时用）
+  - 双用途：既是 RavenFS 的测试盘，也是 SparrowOS NVMe 驱动的压力测试场
+- **备选**：`/tmp/test.img` loop 文件（快速迭代算法时用）
 
 ### 里程碑
 
 ```
-RavenFS 上帝类通过全部 8 步测试
-→ 文件系统操作完备
-→ 布局与 Phase 0 mkfs 一致
+libravenfs.a 编译通过
+外部测试程序链接成功
+单线程全部操作正确
+多线程并发无数据损坏
 → 可进入 Phase 2
 ```
 
