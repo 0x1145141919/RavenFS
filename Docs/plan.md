@@ -217,7 +217,6 @@ ravendsrv 启动 → 接收 SQ 请求 → io_uring 读写 → CQ 完成通知
 
 ### 原则
 
-- **不要提前设计通用算法抽象**
 - 各端开发者参考 Phase 1 上帝类中**验证过的算法**（B+tree 分裂/合并、inode 分配、bitmap 管理），按自己端的 API 翻译
 - Phase 2 弑神后的拆分架构（VFS vs FS impl）也是各端的参考方向
 - 差异在三端体现为：
@@ -248,14 +247,31 @@ SparrowOS kernel 加载 ravenfs.kmod → 挂载读写
 
 ---
 
+## 必须遵守的契约
+
+拒绝过早抽象 ≠ 没有共享契约。**磁盘布局**是所有端的最大公约数：
+
+- `Docs/disk_layout_v1.md` — 布局文档
+- `core/include/ravenfs/disk_struct.h` — 数据结构（C 结构体定义）
+
+mkfs 写的盘面，上帝类要能挂载，ravendsrv 要能读写，ravenfs.ko 要能识别。
+一切关于 superblock 偏移、inode 大小 256B、B+tree 节点 8K、entries 位域分布的定义，各端必须一致。
+
+`disk_struct.h` 是所有端的共同命脉，改它等同于改所有端的盘面兼容性。
+
+各端可以有自己的 I/O 实现、缓存策略、并发模型——但写到盘上的每一个 bit 必须遵守同一套布局。
+
+---
+
 ## 不要做的事
 
 | 事项 | 原因 |
 |------|------|
-| 提前设计算法通用抽象层 | Phase 1 上帝类就是标准实现，各端直接参考移植 |
+| 提前设计算法通用抽象层 | Phase 1 上帝类就是探索工具，各端独立参考 |
 | FUSE 作为一等目标 | 可实现但不优先，先打好 SQ/CQ + io_uring 基础 |
 | 自定义 socket 协议 | IPC 走 NVMe SQ/CQ 模型，为 kmod 积累经验 |
-| 多端共享的 I/O 层抽象 | `io_backend.h` 已经够薄，算法层不需要再包一层 |
+| 多端共享的 I/O 层抽象 | `io_backend.h` 已经够薄，算法层不需再包一层 |
+| 各端独立变更加契约字段 | 改 `disk_struct.h` 必须同步更新所有端 |
 | 在线事务/日志 | v1 不做 |
 | 动态 inode 分配 | mkfs 静态分配 + 离线扩容 |
 | 在线碎片整理 | v1 不做 |
