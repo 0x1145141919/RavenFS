@@ -150,9 +150,38 @@ libravenfs.a 编译通过
 
 ---
 
-## Phase 2 — ravendsrv
+## Phase 2 — ravendsrv（弑神）
 
 **目标**：用户态守护进程，打磨运行时文件系统理解和并发控制。
+
+### ⚠️ 与 Phase 1 的关系：弑神
+
+Phase 1 的上帝类是**必要之恶**——VFS（路径解析、句柄表、并发语义）和文件系统（B+tree、bitmap、inode）被有意揉合在一个类中，目的是降低探索期的认知负担。
+
+Phase 2 是长期主义的产物，**极大可能弑神**——VFS 和具体 FS 实现本质是两个东西，Phase 1 就是为了搞清楚这条边界在哪：
+
+```
+Phase 1 (必要之恶):
+┌──────────────────────────┐
+│        RavenFS            │
+│ VFS + FS + I/O 全部揉合  │
+└──────────────────────────┘
+
+Phase 2 (弑神后，方向待定):
+┌────────────┐  ┌──────────────────┐
+│ RavenVFS    │  │ RavenFSImpl      │
+│ · 路径解析  │  │ · B+tree/bitmap  │
+│ · 句柄表+锁 │  │ · inode/dentry   │
+│ · 并发控制  │  └──────────────────┘
+│ · io_uring  │          ↕
+│ · SQ/CQ IPC │  ┌──────────────────┐
+└────────────┘  │ IoBackend         │
+                │ (io_uring/NVMe)   │
+                └──────────────────┘
+```
+
+Phase 1 上帝类的使命就是帮**你**搞清楚 VFS 和 FS 的边界在哪——等摸清楚了，Phase 2 按那条线切开。
+上帝类不该活着进入生产态。
 
 ### 架构要点
 
@@ -163,7 +192,6 @@ libravenfs.a 编译通过
   - 不是自定义 socket 协议，而是借用 NVMe 队列语义
 
 - **I/O 引擎**：`io_uring`
-  - 替换 Phase 0/1 的 `pread`/`pwrite`
   - 异步提交 + 完成轮询
   - 为 `ravenfs.ko` 的 `bio_alloc`/`submit_bio_wait` 路径做铺垫
 
@@ -172,22 +200,6 @@ libravenfs.a 编译通过
   - 先保证 SQ/CQ + io_uring 路径正确，有余力再加 FUSE 导出
 
 - **并发模型**：待定（Phase 1 测试集给出压力数据后决定）
-  - 单线程 io_uring？（B+tree 不需要复杂并发）
-  - 多 SQ 多 CQ？（模仿 NVMe 多队列）
-
-### 与 Phase 1 的关系
-
-上帝类的全部文件操作直接复用，ravendsrv 只是替换 I/O 后端和添加 IPC 层：
-
-```
-God class (algorithm)  ← Phase 1 产物，不做算法抽象
-     ↕
-PosixIO    → 替换 →   IoUringIO     ← Phase 2 新后端
-     ↕                    ↕
-pread/pwrite          io_uring          ← I/O 引擎
-     ↕                    ↕
-loop file / 分区       NVMe 分区
-```
 
 ### 里程碑
 
@@ -206,18 +218,25 @@ ravendsrv 启动 → 接收 SQ 请求 → io_uring 读写 → CQ 完成通知
 ### 原则
 
 - **不要提前设计通用算法抽象**
-- Phase 1 的 god class 就是"标准实现"
-- 各端开发者直接参考 god class 的算法逻辑，按自己端的 API 翻译
-- B+tree 分裂/合并、inode 分配、bitmap 管理等核心逻辑完全一致
-- 差异只在 I/O 后端和外部接口（VFS 回调 vs kmod 函数指针表）
+- 各端开发者参考 Phase 1 上帝类中**验证过的算法**（B+tree 分裂/合并、inode 分配、bitmap 管理），按自己端的 API 翻译
+- Phase 2 弑神后的拆分架构（VFS vs FS impl）也是各端的参考方向
+- 差异在三端体现为：
+  - I/O 后端不同（io_uring vs bio_alloc vs NVMe 函数指针）
+  - 外部接口不同（用户态 VFS API vs Linux VFS 回调 vs kmod 符号表）
+  - 缓存策略不同（用户态 malloc vs kmalloc vs 自有分配器）
 
 ```
-God class (reference implementation)
-    ↓ 参考
-ravenfs.ko          SparrowOS kmod
-├─ I/O: bio_alloc   ├─ I/O: NVMe 驱动函数指针
-├─ VFS: file_op     ├─ 接口: kmod 符号表
-└─ 缓存: xfs_buf    └─ 缓存: 自有分配器
+Phase 2 拆分架构 (reference)       各端适配
+                                ┌──────────┐    ┌─────────┐
+┌──────────┐ ┌──────────────┐   │ravenfs.ko│    │SparrowOS│
+│ RavenVFS  │ │ RavenFSImpl  │   ├──────────┤    │  kmod   │
+│ (VFS层)   │ │ (FS算法)     │   │Linux VFS │    │kmod符号 │
+│           │ │              │   │回调→ impl│    │表→ impl │
+│ path_res. │ │ B+tree       │   │bio_alloc │    │NVMe 驱动│
+│ handle_tbl│ │ bitmap/inode │   │page cache│    │自有cache│
+│ locks     │ │ dentry       │   └──────────┘    └─────────┘
+│ io_uring  │ │              │
+└──────────┘ └──────────────┘
 ```
 
 ### 里程碑
