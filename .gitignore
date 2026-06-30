@@ -1,0 +1,10 @@
+build/
+*.o
+*.a
+*.kmod
+*.ko
+*.img
+*.tar.gz
+__pycache__/
+.vscode/
+compile_commands.json
