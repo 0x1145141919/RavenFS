@@ -94,24 +94,21 @@ bitmap 自身占用的 block 在 mkfs 时预先标记为已分配，运营期间
 ```c
 struct raven_Inode_t {
     uint64_t  flags;                  // type + tree_height + other flags
-    uint32_t  link_count;
     uint32_t  uid;
     uint32_t  gid;
     uint32_t  m_ns_stamp;            // mtime 纳秒余数
     uint32_t  c_ns_stamp;            // ctime 纳秒余数
     uint32_t  a_ns_stamp;            // atime 纳秒余数
-    uint32_t  user_permission_bits;
-    uint32_t  group_permission_bits;
-    uint32_t  other_permission_bits;
+    uint64_t  permission_bits;       // 编码后权限位
     uint64_t  size;
     uint64_t  mtime;                  // seconds
     uint64_t  ctime;                  // seconds
     uint64_t  atime;                  // seconds
     uint64_t  data_root;             // 0 = inline, else data address
-    uint32_t  parent_inode;
-    uint32_t  generation;
+    uint32_t  link_count;
+    uint64_t  padding[2];            // 元数据扩展预留
     uint8_t   inline_data[160];
-};
+} __attribute__((packed));
 static_assert(sizeof(raven_Inode_t) == 256, "");
 ```
 
@@ -205,11 +202,11 @@ uint64_t inline f_blkitv_end(f_blkitv itv) {
 ```c
 union node_meta_t {
     struct {
-        uint64_t entry_count_minus1 : 8;   // 有效 entry 数-1
-        uint64_t is_internal_node   : 1;   // 0=leaf, 1=internal
+        uint64_t entry_count_minus1 : 8;   /* 有效 entry 数-1 */
+        uint64_t is_internal_node   : 1;   /* 0=leaf, 1=internal */
         uint64_t reserved           : 3;
-        uint64_t parent_ptr         : 52;  // 父节点(0=root)
-    };
+        uint64_t parent_ptr         : 52;  /* 父节点块号，0=根节点 */
+    } fields;
     uint64_t raw;
 };
 ```
