@@ -251,23 +251,20 @@ struct Bptree_node_t {
 };
 static_assert(sizeof(Bptree_node_t) == 8192, "");
 struct raven_Inode_t{                                                                                                     
-    uint64_t  flags;                  // type + other flags                                                               
-    uint32_t  link_count;                                                                                                 
+    uint64_t  flags;                  // type + other flags                                                                                                                                               
     uint32_t  uid;                                                                                                        
     uint32_t  gid; 
     uint32_t  m_ns_stamp;
-    uint32_t  c_ns_stamp;
+    uint32_t  c_ns_stamp;   
     uint32_t  a_ns_stamp;
-    uint32_t  user_permission_bits;
-    uint32_t  group_permission_bits;
-    uint32_t  other_permission_bits;                                                                                                       
+    uint64_t  permission_bits;                                                                                                  
     uint64_t  size;                                                                                                       
     uint64_t  mtime;                                                                                                      
     uint64_t  ctime;   
     uint64_t  atime;                                                                                                    
-    uint64_t  data_root;            // 0 = inline                                                                        
-    uint32_t  parent_inode;                                                                                               
-    uint32_t  generation;   
+    uint64_t  data_root;            // 0 = inline       
+    uint32_t  link_count;    
+    uint64_t padding[2];                                                                                                                                                              
     uint8_t inline_data[160];
-};
+}__attribute__((packed));
 static_assert(sizeof(raven_Inode_t)==256,"Inode size must met 256B");
