@@ -454,7 +454,73 @@ Dentry 本身不区分类型——类型信息在目标 inode 的 `flags` 中。
 
 ---
 
-## 7. mkfs 参数化
+## 7. 灾难恢复设计
+
+### 7.1 魔数纪律
+
+两种 B+tree 节点在 on-disk 布局中均引入了 4 × uint64_t（256-bit）固定魔数签名：
+
+| B+tree 类型 | 魔数位置 | 定义 |
+|:---|:---|:---|
+| `Bptree_node_t`（文件区段） | `entry[3..6].words[3]` | `BPTREE_MAGIC1`–`BPTREE_MAGIC4` |
+| `Dentry_Bptree_node_t`（目录项） | `head.magic1`–`magic4` | `DENTRY_MAGIC1`–`DENTRY_MAGIC4` |
+
+**写盘纪律：** 任何一个 B+tree 节点写回磁盘时，必须保证四个魔数字段都写入正确的值。
+
+**内存缓存推荐：** 即使节点加载到内存（buffer cache），也建议保持魔数字段不变。这允许在内存中同样使用魔数校验判断节点类型。
+
+### 7.2 全盘扫描与节点识别
+
+在元数据严重损坏（如 superblock 损毁、inode array 丢失）的场景下，可通过全盘扫描恢复 B+tree 结构。
+
+扫描算法：
+
+```
+for each 8K-aligned block in partition:
+    read block
+    match = count of magic1..magic4 that match
+    if match ≥ 3:
+        → 该块是 B+tree 节点（高可靠）
+        if match == 4:
+            → 完整签名，节点+魔数区域均无损坏
+        elif match == 3:
+            → 一个魔数字段损坏，其余数据可能也受损
+        read node_meta_t 获取 entry_count, is_internal, is_root, parent_ptr
+        if is_root:
+            parent_ptr = owner inode → 定位到文件/目录
+        if is_leaf:
+            entries[0..n].key/ptr → 恢复 extent 或 dentry
+```
+
+### 7.3 按 3/4 容错匹配
+
+| 命中魔数 | 判定 | 含义 |
+|:---:|:---|:---|
+| 4/4 | ✅ 确信节点 | 魔数区域完整无损 |
+| 3/4 | ⚠️ 高概率节点 | 一个魔数字段损坏，其他数据可能也有坏区 |
+| 2/4 | ❌ 不确定 | 误报风险过高，丢弃 |
+| < 2 | ❌ 非节点 | 不做处理 |
+
+假阳性分析（详见 `Docs/scan_fp_analysis.md`）：
+
+- K=4（全部匹配）：512GB 盘期望误报 ≈ 2^-256，物理不可能级别
+- K=3（3/4 容错）：假阳性率 ≈ 4 × 2^-192，512GB 盘期望误报仍 < 2^-165
+- **结论：3/4 容错在工程上假阳性仍然为零**
+
+### 7.4 恢复后的索引重建
+
+在扫描汇总所有 B+tree 节点后：
+
+1. 遍历所有根节点（`is_root_node=1`），通过 `parent_ptr` 获取 owner inode
+2. 对每个根节点递归向下遍历，重建完整 B+tree 拓扑
+3. 汇总所有叶子节点中的 dentry / extent 数据，恢复文件系统目录树
+4. 重新计算并重建 bitmap
+
+此流程供下一代容灾工具实现参考，v1 不做自动恢复。
+
+---
+
+## 8. mkfs 参数化
 
 ```
 mkfs.ravenfs <device> [options]
@@ -471,7 +537,7 @@ Options:
 
 ---
 
-## 8. 测试方案
+## 9. 测试方案
 
 ```
 host:  mkfs.ravenfs /dev/nvme0n1pX   → 确定性盘面布局（元数据尾部）
@@ -487,7 +553,7 @@ guest: 驱动读盘 → 解析 superblock → 验证布局正确
 
 ---
 
-## 9. v1 不做
+## 10. v1 不做
 
 | 特性 | 原因 |
 |------|------|
