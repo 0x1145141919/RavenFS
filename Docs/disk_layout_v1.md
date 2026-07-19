@@ -46,25 +46,23 @@ I = ceil(inode_count × 256 / 4096)
 ```c
 struct RavenSuperblock {
     uint64_t  magic;                // "RAVN" = 0x5241564E
-    uint32_t  version;              // 格式版本号
-    uint32_t  block_size;           // 固定 4096
+    uint32_t  version;              // 格式版本号,[0:7]编码LBA_size到文件系统实际块的乘数
+    uint32_t  LBA_size;             // NVMe LBA 尺寸
 
     uint64_t  total_blocks;         // 分区总块数
     uint64_t  bitmap_start;         // 位图起始块号
     uint64_t  bitmap_blocks;        // 位图占用块数
 
     uint64_t  inode_array_base;     // inode 数组起始块号
+    uint64_t  inode_array_bitmap_base; // inode 位图起始块号
     uint64_t  inode_array_count;    // 用户选定的 inode 上限
-    uint16_t  inode_size;           // 256
-    uint16_t  reserved0;
-
-    uint32_t  root_inode;           // 根目录 inode 编号
+    uint64_t  root_inode;           // 根目录 inode 编号
     uint8_t   uuid[16];
     uint8_t   volume_name[48];
 
     uint32_t  crc32;
-    uint8_t   pad[];                // 凑满 4096
-};
+    uint8_t   pad[3956];            // 凑满 4096
+} __attribute__((packed));
 ```
 
 关键字段由用户 mkfs 时指定：

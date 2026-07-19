@@ -268,3 +268,28 @@ struct raven_Inode_t{
     uint8_t inline_data[160];
 }__attribute__((packed));
 static_assert(sizeof(raven_Inode_t)==256,"Inode size must met 256B");
+struct RavenDentry{
+    uint64_t target_inode_idx;
+    char filename[120];
+}__attribute__((packed));
+static_assert(sizeof(RavenDentry)==128,"RavenDentry size must be 128B");
+struct RavenSuperblock {
+    uint64_t  magic;                // "RAVN" = 0x5241564E
+    uint32_t  version;              // 格式版本号,[0:7]编码LBA_size到文件系统实际块的乘数
+    uint32_t  LBA_size;
+
+    uint64_t  total_blocks;         // 分区总块数
+    uint64_t  bitmap_start;         // 位图起始块号
+    uint64_t  bitmap_blocks;        // 位图占用块数
+
+    uint64_t  inode_array_base;     // inode 数组起始块号
+    uint64_t  inode_array_bitmap_base;     // inode 数组起始块号
+    uint64_t  inode_array_count;    // 用户选定的 inode 上限
+    uint64_t  root_inode;           // 根目录 inode 编号
+    uint8_t   uuid[16];
+    uint8_t   volume_name[48];
+
+    uint32_t  crc32;
+    uint8_t   pad[3956];                // 凑满 4096
+}__attribute__((packed));
+static_assert(sizeof(RavenSuperblock)==4096,"RavenSuperblock size must be 4096B");
