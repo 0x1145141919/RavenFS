@@ -200,13 +200,14 @@ uint64_t inline f_blkitv_end(f_blkitv itv) {
 ```c
 union node_meta_t {
     struct {
-        uint64_t entry_count_minus1 : 8;   /* 有效 entry 数-1 */
+        uint64_t entry_count_minus1 : 8;   /* 有效 entry 数 - 1 */
         uint64_t is_internal_node   : 1;   /* 0=leaf, 1=internal */
-        uint64_t reserved           : 3;
-        uint64_t parent_ptr         : 52;  /* 父节点块号，0=根节点 */
+        uint64_t is_root_node       : 1;   /* 1=根节点 */
+        uint64_t reserved           : 2;
+        uint64_t parent_ptr         : 52;  /* 非根→父节点块号 | 根→所属 inode 编号 */
     } fields;
     uint64_t raw;
-};
+} __attribute__((packed));
 ```
 
 仅 entry[0].words[3] 做 node meta。其他 entry 的 words[3] 含义见各节点类型。
@@ -224,7 +225,7 @@ union node_meta_t {
 | 语义  | key = fblkbase (区间左端) | len (末端偏移, 闭区间) | pblkbase | 附加元数据 |
 
 words[3] 分配：
-- entry[0] → `node_meta_t`（entry_count_minus1, is_internal_node, parent_ptr）
+- entry[0] → `node_meta_t`（entry_count_minus1, is_internal_node, is_root_node, parent_ptr）
 - entry[1] → `prev_sibling`（同级链表前驱）
 - entry[2] → `next_sibling`（同级链表后驱）
 - entries[3..] → 自由使用

@@ -59,11 +59,12 @@ union node_meta_t {
     struct {
         uint64_t entry_count_minus1 : 8;   /* 有效 entry 数 - 1 */
         uint64_t is_internal_node   : 1;   /* 0=leaf, 1=internal */
-        uint64_t reserved           : 3;
-        uint64_t parent_ptr         : 52;  /* 父节点物理块号 */
+        uint64_t is_root_node   : 1;
+        uint64_t reserved           : 2;
+        uint64_t parent_ptr         : 52;  /* 父节点物理块号/根节点 */
     } fields;
     uint64_t raw;
-};
+}__attribute__((packed));
 static_assert(sizeof(node_meta_t) == 8, "");
 
 /* ═══════════════════════════════════════════════════════
@@ -228,7 +229,7 @@ struct Bptree_node_t {
     uint64_t get_parent_ptr() const {
         return entries[0].get_meta().fields.parent_ptr;
     }
-    void set_parent_ptr(uint64_t p) {//parent_ptr为0则表示根节点
+    void set_parent_ptr(uint64_t p) {//非根→父节点块号 | 根→所属inode编号，由is_root_node区分
         node_meta_t m = entries[0].get_meta();
         m.fields.parent_ptr = p & MASK_LOW52;
         entries[0].set_meta(m);
@@ -268,11 +269,6 @@ struct raven_Inode_t{
     uint8_t inline_data[160];
 }__attribute__((packed));
 static_assert(sizeof(raven_Inode_t)==256,"Inode size must met 256B");
-struct RavenDentry{
-    uint64_t target_inode_idx;
-    char filename[120];
-}__attribute__((packed));
-static_assert(sizeof(RavenDentry)==128,"RavenDentry size must be 128B");
 struct RavenSuperblock {
     uint64_t  magic;                // "RAVN" = 0x5241564E
     uint32_t  version;              // 格式版本号,[0:7]编码LBA_size到文件系统实际块的乘数
