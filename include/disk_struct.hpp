@@ -23,6 +23,9 @@
 /* words[2] 位域 */
 #define ADDR_FLAGS  (0xFFFULL << 52)       /* bits[63:52]: 地址标志位 */
 #define ADDR_BTREE  (1ULL << 63)           /* bit63: 块类型 (1=btree node, 0=data) */
+constexpr uint8_t INODE_TYPE_REGULAR=0;
+constexpr uint8_t INODE_TYPE_DIR=1;
+constexpr uint8_t INODE_TYPE_SOFT_LINK=2;
 
 /* ═══════════════════════════════════════════════════════════════════
  * 节点元数据 — entry[0].words[3] 编码
@@ -265,7 +268,9 @@ struct Bptree_node_t {
 };
 static_assert(sizeof(Bptree_node_t) == 8192, "");
 struct raven_Inode_t{                                                                                                     
-    uint64_t  flags;                  // type + other flags                                                                                                                                               
+    uint64_t  type:2;                  // INODE_TYPE_REGULAR/DIR/SOFT_LINK
+    uint64_t  is_data_root_direct_bit:1;
+    uint64_t  other:61;                                                                                                                                                             
     uint32_t  uid;                                                                                                        
     uint32_t  gid; 
     uint32_t  m_ns_stamp;
@@ -332,23 +337,44 @@ struct Dentry_Bptree_node_t {
 }__attribute__((packed));
 static_assert(sizeof(Dentry_Bptree_node_t) == 8192, "");
 
+/* ═══════════════════════════════════════════════════════
+ * RavenSuperblock — 统一结构体
+ *
+ * Primary Superblock（上岗）：
+ *   位置：裸盘 LBA[0] / GPT 分区 offset=0
+ *   不在 FS_block 世界内，bitmap 不管理
+ *   角色：FS_block 世界的定义者和入口
+ *   backup_prev = 0（哨兵）
+ *   backup_next = 链表头（第一个 Backup 的 FS_block 号）
+ *   backup_count = 备份总数
+ *
+ * Backup Superblock（备胎）：
+ *   位置：随机散落在 FS_block 世界内，bitmap 标记 allocated
+ *   内容：与 Primary 全同（magic ~ crc32 所有字段一致）
+ *   backup_prev = 前驱 Backup 的 FS_block 号（0=链头）
+ *   backup_next = 后继 Backup 的 FS_block 号（0=链尾）
+ *   backup_count = 备份总数（与 Primary 交叉校验）
+ * ═══════════════════════════════════════════════════════ */
 struct RavenSuperblock {
     uint64_t  magic;                // "RAVN" = 0x5241564E
-    uint32_t  version;              // 格式版本号,[0:7]编码LBA_size到文件系统实际块的乘数
-    uint32_t  LBA_size;
+    uint32_t  version;              // 格式版本号
+    uint32_t  pad0;                 // 对齐，替代 LBA_size（NVMe Identify 已知，不落盘）
+    uint64_t  world_base_lba;       // FS_block[0] 在设备 LBA 空间的起始 LBA
+    uint64_t  total_blocks;         // FS_block 世界总块数
 
-    uint64_t  total_blocks;         // 分区总块数
-    uint64_t  bitmap_start;         // 位图起始块号
-    uint64_t  bitmap_blocks;        // 位图占用块数
-
-    uint64_t  inode_array_base;     // inode 数组起始块号
-    uint64_t  inode_array_bitmap_base;     // inode 数组起始块号
-    uint64_t  inode_array_count;    // 用户选定的 inode 上限
-    uint64_t  root_inode;           // 根目录 inode 编号
+    uint64_t  inode_array_count;         // Inode 上限（推导出 inode_blocks, inode_bitmap_blocks）
+    uint64_t  root_inode;                // 根目录 inode 索引
     uint8_t   uuid[16];
     uint8_t   volume_name[48];
 
     uint32_t  crc32;
-    uint8_t   pad[3956];                // 凑满 4096
+
+    /* ── 备份链表（角色双解码） ── */
+    uint64_t  backup_prev;          // Primary: 0 | Backup: 前驱 FS_block 号
+    uint64_t  backup_next;          // Primary: 链头 | Backup: 后继 FS_block 号
+    uint32_t  backup_count;         // 两者均存，交叉校验
+
+    // pad 尺寸由你补，跑一下 static_assert 确认
+    uint8_t   pad[3960];
 }__attribute__((packed));
 static_assert(sizeof(RavenSuperblock)==4096,"RavenSuperblock size must be 4096B");

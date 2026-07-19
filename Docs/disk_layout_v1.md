@@ -9,89 +9,255 @@
 ## 1. 分区布局
 
 ```
-block 0:              Superblock               ← 固定
-block 1..:            Data Blocks               ← 向前增长
-                      [空闲空间 / 未来扩容]   
-block T-B-I..T-I-1:   Bitmap (B 块)            ← 从尾巴向后分配
-block T-I..T-1:       Inode Array (I 块)        ← 从尾巴向后分配
+物理视图（设备 LBA 空间）:
+  partition_offset_0:  Primary Superblock ← 不在 FS_block 世界内
+
+FS_block 世界视图（4096B blocks）:
+  block 0..:            Data Blocks / Backup Superblocks ← 随机散落
+  block 1..:            Data Blocks               ← 向前增长
+                        [空闲空间 / 未来扩容]
+  block T-B-I-IB..T-B-I-1:  Inode Bitmap (IB 块)     ← 从尾巴连续分配
+  block T-B-I..T-B-1:       Inode Array (I 块)        ← 从尾巴连续分配
+  block T-B..T-1:           Bitmap (B 块)              ← 固定在尾巴
 
 T = total_blocks
-B = ceil(T / (4096 × 8))
-I = ceil(inode_count × 256 / 4096)
+B = ceil(T / (4096 × 8))          ← 运行时推导，不落盘
+I  = ceil(inode_count × 256 / 4096)
+IB = ceil(inode_count / (4096 × 8))
 ```
 
-元数据（bitmap、inode array）从分区**尾巴**开始向后分配，数据区从 block 1 向前增长。中间留空作为扩容余量。
+元数据从分区**尾巴**开始连续分配，自右向左：**Bitmap → Inode Array → Inode Bitmap**。
+数据区从 block 1 向前增长，中间留空作为扩容余量。
+
+Backup Superblock 在 FS_block 世界内随机散落，被 bitmap 标记为 allocated，通过双向链表连接。详见 §2.1。
 
 ### 扩容策略
 
 增加分区大小 Δ 块（T′ = T + Δ）：
 
 ```
-旧: bitmap [T-B-I, T-I), inode [T-I, T)
-新: bitmap [T′-B-I, T′-I), inode [T′-I, T′)
+旧: inode [T-B-I, T-B), bitmap [T-B, T)
+新: inode [T′-B-I, T′-B), bitmap [T′-B, T′)
 ```
 
 1. 读旧 bitmap + 旧 inode array
 2. 写到新尾巴位置
 3. 新 bitmap 中：标记新元数据块为 allocated，旧位置释放为 free
-4. 更新 superblock.total_blocks = T′
+4. 更新 superblock.total_blocks = T′（Backup 的 total_blocks 也需一并更新）
 5. 数据块原地不动
 
 最怂但最稳妥——只搬元数据，不动数据。
 
+**注意：** Bitmap 固定在尾巴，扩容后新 bitmap_start = T′ - B 自动重新推导，不需额外计算。
+
 ---
 
-## 2. Superblock（1 block = 4096B）
+## 2. Primary Superblock（上岗）
+
+Primary Superblock 是 RavenFS 的唯一入口和定义者。
+
+**位置：**
+- 裸盘：LBA[0] offset=0
+- GPT 分区：`gpt_entry.starting_lba` offset=0
+
+**FS_block 世界关系：** 不在 FS_block 世界内。bitmap 不管理它。
+
+### 结构
 
 ```c
 struct RavenSuperblock {
     uint64_t  magic;                // "RAVN" = 0x5241564E
-    uint32_t  version;              // 格式版本号,[0:7]编码LBA_size到文件系统实际块的乘数
-    uint32_t  LBA_size;             // NVMe LBA 尺寸
+    uint32_t  version;              // 格式版本号
+    uint32_t  pad0;                 // 对齐，替代 LBA_size（NVMe Identify 已知，不落盘）
+    uint64_t  world_base_lba;       // FS_block[0] 在设备 LBA 空间的起始 LBA
+    uint64_t  total_blocks;         // FS_block 世界总块数
 
-    uint64_t  total_blocks;         // 分区总块数
-    uint64_t  bitmap_start;         // 位图起始块号
-    uint64_t  bitmap_blocks;        // 位图占用块数
-
-    uint64_t  inode_array_base;     // inode 数组起始块号
-    uint64_t  inode_array_bitmap_base; // inode 位图起始块号
-    uint64_t  inode_array_count;    // 用户选定的 inode 上限
-    uint64_t  root_inode;           // 根目录 inode 编号
+    uint64_t  inode_array_count;         // Inode 上限（推导出 inode_blocks, inode_bitmap_blocks）
+    uint64_t  root_inode;                // 根目录 inode 索引
     uint8_t   uuid[16];
     uint8_t   volume_name[48];
 
     uint32_t  crc32;
-    uint8_t   pad[3956];            // 凑满 4096
+
+    /* ── 备份链表 ── */
+    uint64_t  backup_prev;          // Primary: 0（哨兵）
+    uint64_t  backup_next;          // Primary: 链表头（第一个 Backup FS_block 号）
+    uint32_t  backup_count;         // 备份总数
+
+    uint8_t   pad[3936];            // 删了 bitmap_start，调整此值使 sizeof == 4096
 } __attribute__((packed));
 ```
 
+### Primary 角色下的字段语义
+
+| 字段 | 值 | 说明 |
+|------|----|------|
+| `backup_prev` | 0 | 哨兵，Primary 无前驱 |
+| `backup_next` | FS_block# | 第一个 Backup Superblock 的块号 |
+| `backup_count` | N | 备份总数。mount 时遍历链表计数校验 |
+
 关键字段由用户 mkfs 时指定：
 ```
-mkfs.ravenfs /dev/nvme0n1 --inodes=65536 --inode-ratio=16
+mkfs.ravenfs /dev/nvme0n1 --inodes=65536 --inode-ratio=16 --backups=4
+```
+
+`--backups=N` 控制 mkfs 时散布的 Backup Superblock 数量。默认建议 3。
+
+---
+
+## 2.1 Backup Superblock（备胎）
+
+Backup Superblock 是 Primary 的完整冗余副本，散落在 FS_block 世界内用于容灾。
+
+**位置：** FS_block 世界内，mkfs 时由随机种子选择散布位置，
+bitmap 标记为 allocated。
+
+**内容与 Primary 全同：** `magic` ~ `crc32` 所有字段值一致。
+仅 `backup_prev` / `backup_next` 的角色语义不同。
+
+### Backup 角色下的字段语义
+
+| 字段 | 值 | 说明 |
+|------|----|------|
+| `backup_prev` | FS_block# / 0 | 前驱 Backup 块号（0=链头，即 Primary 后的第一个） |
+| `backup_next` | FS_block# / 0 | 后继 Backup 块号（0=链尾） |
+| `backup_count` | N | 与 Primary 交叉验证。挂载时遍历链表，计数必须一致 |
+
+### 链表拓扑
+
+```
+Primary (不在世界内)
+  └─ backup_next → Backup#0 (FS_block[P0])
+                      ├─ backup_prev = 0  (链头，前驱为 Primary)
+                      ├─ backup_next → Backup#1 (FS_block[P1])
+                      └─ backup_count = 3
+                  Backup#1 (FS_block[P1])
+                      ├─ backup_prev = P0
+                      ├─ backup_next → Backup#2 (FS_block[P2])
+                      └─ backup_count = 3
+                  Backup#2 (FS_block[P2])
+                      ├─ backup_prev = P1
+                      ├─ backup_next = 0  (链尾)
+                      └─ backup_count = 3
+```
+
+链头（Backup#0）的 `backup_prev = 0`。
+链尾（Backup#last）的 `backup_next = 0`。
+
+### 挂载校验
+
+```
+1. 读 Primary（partition offset 0）
+2. 遍历 backup_next 链表：
+   a. 对每个节点校验 magic + crc32
+   b. 校验 backup_count == Primary.backup_count
+   c. 校验 common 字段（total_blocks, inode_array_count, ...）== Primary
+3. 若 Primary 校验失败 → 尝试扫描各 Backup 选举主用
+   （v1 暂不实现自动选举，人工工具辅助）
+```
+
+### mkfs 散布策略
+
+Backup Superblock 散布位置由 `--backups=N` 指定，
+mkfs 在 `[0, total_blocks)` 范围内均匀/随机选取 N 个 FS_block。
+mkfs 后立即被 bitmap 标记为 allocated，运营期间保持亮灯。
+
+---
+
+## 3. Bitmap（FS_block 分配图）
+
+### 3.1 位置
+
+Bitmap 固定在 FS_block 世界**最末尾**连续分配，区间由 `total_blocks` 唯一推导（见 block_model.md §3.2）：
+
+```
+bitmap_blocks = ceil(total_blocks / 32768)      ← 不落盘，运行时推导
+bitmap_start  = total_blocks - bitmap_blocks     ← 不落盘，运行时推导
+bitmap 区间:  FS_block[bitmap_start, total_blocks)
+```
+
+### 3.2 内部布局
+
+Bitmap 是**连续的 bit 数组**，从区间首 FS_block 的 byte offset 0 开始排列。
+
+```
+FS_block[bitmap_start]:
+  byte[0]      byte[1]      ...  byte[4095]
+  [b7 b6..b0]  [b7 b6..b0]  ...  [b7 b6..b0]
+    ↑                          ↑
+  bit[0]                    bit[32767]
+
+FS_block[bitmap_start + 1]:
+  bit[32768] ... bit[65535]
+
+...
+
+FS_block[total_blocks - 1] (最后一个 bitmap block):
+  bit[(B-1)×32768] ... bit[B×32768 - 1]
+```
+
+### 3.3 bit 语义
+
+```
+bit[i] = 0  → FS_block[i] 空闲（可分配）
+bit[i] = 1  → FS_block[i] 已分配（有主）
+```
+
+即 bit 编号 = FS_block 编号，一一对应。
+
+### 3.4 尾巴填充
+
+Bitmap 总位数 = `bitmap_blocks × 32768`，但 FS_block 世界只有 `total_blocks` 个块。
+超出部分（`bitmap_blocks × 32768 - total_blocks` 位）**必须全为 1**：
+
+```
+tail_bits = bitmap_blocks × 32768 - total_blocks   // 尾部冗余位数
+条件: 1 ≤ tail_bits < 32768                        // 最多差一个 FS_block
+要求: bit[total_blocks] ... bit[bitmap_blocks × 32768 - 1] = 全部 1
+```
+
+原因：这些 bit 不对应任何实际 FS_block，永远不会被分配。
+置为 1 使分配器不会误认为它们是空闲块。
+
+### 3.5 自描述规则
+
+Bitmap 自身占用的 FS_block 区间 `[bitmap_start, total_blocks)` 在 mkfs 时亮灯（全部置 1），
+运营期间保持常亮，不参与分配回收。
+
+挂载校验（见 block_model.md §6.6）：
+
+```
+1. 推导 bitmap_blocks, bitmap_start
+2. 校验 bitmap 区间内所有 bit 非零
+3. 校验 tail_bits 全部为 1
+4. 校验 inode 元数据区域的 bits 全部为 1
 ```
 
 ---
 
-## 3. Bitmap
+## 4. Inode 元数据
 
-尺寸由 mkfs 计算：
+### 4.1 Inode 结构
+
+每个 inode 256B 固定，v1 不支持其他尺寸。
+
+#### 类型常量
+
+```c
+constexpr uint8_t INODE_TYPE_REGULAR = 0;   // 普通文件
+constexpr uint8_t INODE_TYPE_DIR     = 1;   // 目录
+constexpr uint8_t INODE_TYPE_SOFT_SYM = 2;  // 软链接
 ```
-bitmap_blocks = ceil(total_blocks / (4096 × 8))
-```
 
-每个 bit 代表一个 block：
-- 0 = 空闲
-- 1 = 已分配
+`type` 2-bit 字段编码，存储于 inode 首 64-bit 的 bits[1:0]。
 
-bitmap 自身占用的 block 在 mkfs 时预先标记为已分配，运营期间不进入自管理。无自指问题。
-
----
-
-## 4. Inode（256B）
+#### 结构体定义
 
 ```c
 struct raven_Inode_t {
-    uint64_t  flags;                  // type + tree_height + other flags
+    uint64_t  type:2;                  // INODE_TYPE_REGULAR/DIR/SOFT_LINK
+    uint64_t  is_data_root_direct_bit:1; // 1=direct extent, 0=B+tree root (dir always 0)
+    uint64_t  other:61;                // 预留
     uint32_t  uid;
     uint32_t  gid;
     uint32_t  m_ns_stamp;            // mtime 纳秒余数
@@ -102,7 +268,7 @@ struct raven_Inode_t {
     uint64_t  mtime;                  // seconds
     uint64_t  ctime;                  // seconds
     uint64_t  atime;                  // seconds
-    uint64_t  data_root;             // 0 = inline, else data address
+    uint64_t  data_root;             // 0 = inline, else FS_block#
     uint32_t  link_count;
     uint64_t  padding[2];            // 元数据扩展预留
     uint8_t   inline_data[160];
@@ -110,26 +276,110 @@ struct raven_Inode_t {
 static_assert(sizeof(raven_Inode_t) == 256, "");
 ```
 
+#### 位域布局
+
+```
+byte[0..7] = { type:2 | is_data_root_direct_bit:1 | other:61 }
+              bits[1:0] = type
+              bits[2]   = is_data_root_direct_bit
+              bits[63:3] = 预留
+```
+
 ### data_root 三态语义
 
-| `size` | `data_root` | `flags.tree_height` | 含义 | I/O 次数 |
-|---------|-------------|---------------------|------|---------|
-| 0~160B | = 0 | 任意 | **内联**，内容在 inline_data[] | 0 |
-| 161~8K | ≠ 0 | = 0 | **直指块**：data_root → 单个 8K 数据块 | 1 |
-| > 8K | ≠ 0 | ≥ 1 | **B+tree**：data_root → btree 根节点 | ≥ 2 |
+| `size` | `data_root` | `is_data_root_direct_bit` | 含义 | I/O 次数 |
+|---------|-------------|---------------------------|------|---------|
+| 0~160 | = 0 | don't care | **内联**，内容在 inline_data[] | 0 |
+| — | ≠ 0 | = 1 | **直指 extent**：data_root → 单个数据块 | 1 |
+| — | ≠ 0 | = 0 | **B+tree**：data_root → btree 根节点 | ≥ 2 |
 
-树高度 0 的语义：不创建 btree 节点，data_root 直接是文件数据块地址。8K 以内的小文件省去一次 btree 根节点 I/O。
+前两行由 size 判定。`data_root ≠ 0` 后用 `is_data_root_direct_bit` 区分 direct / B+tree。
 
-### Inode 数组
+**各类型默认行为：**
 
-mkfs 在分区尾部静态分配连续区域：
+| 类型 | is_data_root_direct_bit | 说明 |
+|------|------------------------|------|
+| `INODE_TYPE_REGULAR` | 0 / 1 | size ≤ 4K 可直指；跨 8K 翻转为 0，创建 B+tree |
+| `INODE_TYPE_DIR` | 始终 0 | 目录永远走 dentry B+tree |
+| `INODE_TYPE_SOFT_LINK` | 0 / 1 | 同 regular，target 路径超过 inline 时分配数据 |
+
+### 4.2 Inode 数组
+
+Inode 数组是**连续的 inode 记录序列**，紧挨 Bitmap 向左排列。
+
 ```
-inode_blocks = ceil(inode_array_count × 256 / 4096)
-inode_size   = 256  (fixed in v1)
-inode_array_base = total_blocks - bitmap_blocks - inode_blocks
+inode_blocks = ceil(inode_array_count × 256 / 4096)    ← 不落盘
+
+inode 区间:  FS_block[inode_array_base, bitmap_start)
+
+内部布局（从区间首 FS_block 的 byte offset 0 开始连续排列）:
+  byte[0..255]     → inode[0]
+  byte[256..511]   → inode[1]
+  ...
+  byte[(i×256)..(i×256+255)] → inode[i]
+
+inode_index 即 inode 编号，0 ≤ i < inode_array_count。
 ```
 
+inode 数组之后（`inode_array_base` 到 `bitmap_start` 之间）不跨块外填充：
+数组尾部可能在一个 FS_block 内有未用空间（`FS_block_bytes - inode_array_count × 256 % FS_block_bytes` 字节），
+**这些未用字节全零**，写入时保留即可。
+
+所有位置由 `total_blocks` + `inode_array_count` 链式推导（见 block_model.md §3.2），
 离线扩容工具见 §1。
+
+### 4.3 Inode Bitmap（inode 分配图）
+
+Inode Bitmap 跟踪每个 inode 的分配状态，紧挨 Inode 数组向左排列。
+
+```
+inode_bitmap_blocks = ceil(inode_array_count / 32768)   ← 不落盘
+inode_bitmap_base   = inode_array_base - inode_bitmap_blocks  ← 不落盘
+
+Inode bitmap 区间:  FS_block[inode_bitmap_base, inode_array_base)
+```
+
+#### 内部布局
+
+与 FS_block Bitmap（§3）同结构——连续的 bit 数组，从区间首 FS_block 的 byte offset 0 开始：
+
+```
+FS_block[inode_bitmap_base]:
+  byte[0]      byte[1]      ...  byte[4095]
+  [b7 b6..b0]  [b7 b6..b0]  ...  [b7 b6..b0]
+    ↑                          ↑
+  bit[0]                    bit[32767]
+
+FS_block[inode_bitmap_base + 1]:
+  bit[32768] ... bit[65535]
+
+...
+
+FS_block[inode_array_base - 1] (最后一个 inode bitmap block):
+  bit[(IB-1)×32768] ... bit[IB×32768 - 1]
+```
+
+#### bit 语义
+
+```
+bit[j] = 0  → inode[j] 空闲（可分配）
+bit[j] = 1  → inode[j] 已分配（有主）
+```
+
+bit 编号 = inode 编号，一一对应。
+
+#### 尾巴填充
+
+Inode bitmap 总位数 = `inode_bitmap_blocks × 32768`，
+但 inode 只有 `inode_array_count` 个。超出部分**必须全为 1**：
+
+```
+tail_bits = inode_bitmap_blocks × 32768 - inode_array_count
+条件: 1 ≤ tail_bits < 32768
+要求: bit[inode_array_count] ... bit[IB × 32768 - 1] = 全部 1
+```
+
+原因同 §3.4：这些 bit 不对应任何实际 inode，置 1 防止被误分配。
 
 ---
 
