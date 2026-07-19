@@ -228,18 +228,24 @@ words[3] 分配：
 - entry[0] → `node_meta_t`（entry_count_minus1, is_internal_node, is_root_node, parent_ptr）
 - entry[1] → `prev_sibling`（同级链表前驱）
 - entry[2] → `next_sibling`（同级链表后驱）
-- entries[3..] → 自由使用
+- entry[3..6] → `magic1..magic4`（256-bit 扫描签名）
+- entries[7..] → 自由使用
 
 布局示意：
 ```
 entry[0]: { key_0  |  len_0  |  pblkbase_0  |  node_meta_t     }
 entry[1]: { key_1  |  len_1  |  pblkbase_1  |  prev_sibling    }
 entry[2]: { key_2  |  len_2  |  pblkbase_2  |  next_sibling    }
-entry[3]: { key_3  |  len_3  |  pblkbase_3  |  free            }
+entry[3]: { key_3  |  len_3  |  pblkbase_3  |  magic1          }
+entry[4]: { key_4  |  len_4  |  pblkbase_4  |  magic2          }
+entry[5]: { key_5  |  len_5  |  pblkbase_5  |  magic3          }
+entry[6]: { key_6  |  len_6  |  pblkbase_6  |  magic4          }
+entry[7]: { key_7  |  len_7  |  pblkbase_7  |  free            }
 ...
 ```
 
 最大 256 个 extent (entries[0..255] 的 words[0..2] 都存 extent)。
+entries[3..6] 的 words[3] 被签名占用，但其 words[0..2] 仍可存 extent —— 不影响有效 entry 容量。
 
 #### 内部节点解码
 
@@ -258,12 +264,20 @@ entry[1]: { R_1      |  —  |  child_1       |  free           }
           ← R_1 = max_R(child_1)
 entry[2]: { R_2      |  —  |  child_2       |  free           }
           ← R_2 = max_R(child_2)
+entry[3]: { R_3      |  —  |  child_3       |  magic1         }
+          ← R_3 = max_R(child_3)
+entry[4]: { R_4      |  —  |  child_4       |  magic2         }
+          ← R_4 = max_R(child_4)
+entry[5]: { R_5      |  —  |  child_5       |  magic3         }
+          ← R_5 = max_R(child_5)
+entry[6]: { R_6      |  —  |  child_6       |  magic4         }
+          ← R_6 = max_R(child_6)
 ...
 entry[n]: { R_n      |  —  |  child_n       |  free           }
           ← R_n = max_R(child_n)
 ```
 
-entry[0].words[3] 存 node_meta_t，其余 entry 的 words[3] 自由。
+entry[0].words[3] 存 node_meta_t，entry[3..6].words[3] 存 256-bit 扫描签名，其余自由。
 
 查找：`target ≤ entry[i].key (= max_R(child_i))` 即命中 child_i 区间。
 

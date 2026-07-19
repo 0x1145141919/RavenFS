@@ -200,6 +200,9 @@ static_assert(sizeof(btree_node_entry_t) == 32, "");
  * B+tree 节点 (8K = 256 entries × 32B = 2 × 4K pages)
  *
  * entry[0].words[3]  → node_meta_t
+ * entry[1].words[3]  → prev_sibling
+ * entry[2].words[3]  → next_sibling
+ * entry[3..6].words[3] → magic1..magic4 (256-bit 扫描签名)
  * 叶子：所有 entry 的 words[0..2] 存 extent (key,len,pblkbase)
  * 内部：所有 entry 的 words[0] 存 key=max_R(子树 fblkbase+len), words[2] 存 subptr
  * 
@@ -234,6 +237,16 @@ struct Bptree_node_t {
         m.fields.parent_ptr = p & MASK_LOW52;
         entries[0].set_meta(m);
     }
+
+    /* ─── 扫描签名 (entry[3..6].words[3], 256-bit, K=4) ─── */
+    uint64_t get_magic1() const { return entries[3].words[3]; }
+    void set_magic1(uint64_t v) { entries[3].words[3] = v; }
+    uint64_t get_magic2() const { return entries[4].words[3]; }
+    void set_magic2(uint64_t v) { entries[4].words[3] = v; }
+    uint64_t get_magic3() const { return entries[5].words[3]; }
+    void set_magic3(uint64_t v) { entries[5].words[3] = v; }
+    uint64_t get_magic4() const { return entries[6].words[3]; }
+    void set_magic4(uint64_t v) { entries[6].words[3] = v; }
 
     /* ─── 兄弟指针 (同级链表: entry[1/2].words[3]) ─── */
     uint64_t get_prev_sibling() const {
