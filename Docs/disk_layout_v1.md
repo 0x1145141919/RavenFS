@@ -301,23 +301,156 @@ return 0;  // 不应到达
 
 ---
 
-## 6. Dentry（分离路线）
+## 6. Dentry B+tree
 
-inode 与 dentry 分离。目录的 data B+tree 存储目录项：
+目录项专用 B+tree，与文件区段 B+tree（`Bptree_node_t`）使用不同的 entry 格式。
+所有 inode 类型为 `RAVEN_DIR` 的数据内容由此树组织。
+
+### 6.1 节点布局
+
+```
+Dentry_Bptree_node_t (8K = 8192B)
++────────────────────────────────────────────┐
+│ Dentry_head_t head                   128B  │
++────────────────────────────────────────────┤
+│ Dentry_common_t entries[0]           128B  │
+│ Dentry_common_t entries[1]           128B  │
+│ ...                                        │
+│ Dentry_common_t entries[62]          128B  │
++────────────────────────────────────────────┤
+│ ← 63 × 128 = 8064B                         │
++────────────────────────────────────────────┘
+```
+
+最大 entry 数：**63**（根节点最少 1 个，非根节点分裂时 ≥ 31）。
 
 ```c
-struct RavenDentry {
-    uint64_t  hash;              // key = filename hash
-    uint64_t  inode;             // inode 编号
-    uint32_t  group;             // inode 所在块组 (保留)
-    uint8_t   name_len;
-    uint8_t   file_type;
-    uint16_t  _pad;
-    char      name[];            // 变长
+struct Dentry_head_t {
+    dentry_node_meta_t  head;        // 8B: 节点元数据
+    uint64_t            ptr1;        // 8B: 内部→最左子树 | 叶子→前驱
+    uint64_t            ptr2;        // 8B: 内部→空闲     | 叶子→后继
+    uint64_t            reserved0;   // 8B: 预留
+    uint64_t            magic1;      // 8B: 256-bit 扫描签名
+    uint64_t            magic2;      // 8B: 256-bit 扫描签名
+    uint64_t            magic3;      // 8B: 256-bit 扫描签名
+    uint64_t            magic4;      // 8B: 256-bit 扫描签名
+    uint64_t            reserved2[8]; // 64B: 扩展预留
+};
+
+union dentry_node_meta_t {
+    struct {
+        uint64_t entry_count    : 6;  // 有效 entry 数 - 1（最大 63）
+        uint64_t reserved0      : 2;
+        uint64_t is_internal_node : 1; // 0=leaf, 1=internal
+        uint64_t is_root_node   : 1;  // 1=根节点
+        uint64_t reserved       : 2;
+        uint64_t parent_ptr     : 52; // 非根→父节点块号 | 根→所属 inode 编号
+    } fields;
+    uint64_t raw;
+};
+
+struct Dentry_common_t {
+    uint64_t ptr;        // 8B: 叶子→inode编号 | 内部→child块号
+    char     name[120];  // 120B: 文件名（字典序 key）
 };
 ```
 
-目录作为特殊文件，其 `data_root` 指向目录项 B+tree（与文件数据 B+tree 同结构，但 entry 语义不同）。
+### 6.2 双解码视角
+
+同一 `Dentry_common_t` 按 `head.is_internal_node` 解码：
+
+**叶子：**
+
+```
+entries[i].ptr   = target inode 编号
+entries[i].name  = 文件名（排序 key）
+ptr1 → 前驱叶子块号（同级链表左）
+ptr2 → 后继叶子块号（同级链表右）
+```
+
+叶子节点 entry 按文件名字典序排列，满足 `strcmp(name[i], name[i+1]) < 0`。
+
+**内部：**
+
+```
+                  ┌─── ptr1 ──→ child_0（最左子树）
+entry[0].name  =  child_1 子树最小文件名
+entry[0].ptr   →  child_1
+entry[1].name  =  child_2 子树最小文件名
+entry[1].ptr   →  child_2
+...
+entry[n].name  =  child_{n+1} 子树最小文件名
+entry[n].ptr   →  child_{n+1}
+```
+
+共 `entry_count + 1` 个子树（ptr1 + 每个 entry 的 ptr）。
+
+路由规则：
+
+```
+target < entry[0].name                  →  ptr1（child_0）
+entry[0].name ≤ target < entry[1].name  →  entry[0].ptr（child_1）
+...
+entry[n].name ≤ target                  →  entry[n].ptr（child_{n+1}）
+```
+
+### 6.3 扫描签名
+
+`head.magic1`–`magic4` 共 256-bit（K=4）固定魔数。假阳性分析详见 `Docs/scan_fp_analysis.md`，K=4 时 512GB 盘期望误报 < 2^-256。
+
+魔数值定义见 `include/magics.h`（`DENTRY_MAGIC1`–`DENTRY_MAGIC4`）。
+
+### 6.4 同级链表
+
+叶子节点通过 `ptr1` / `ptr2` 连成双向链表：
+
+```
+leaf_A.ptr2 = B
+leaf_B.ptr1 = A, leaf_B.ptr2 = C
+leaf_C.ptr1 = B, leaf_C.ptr2 = 0 (tail)
+```
+
+范围遍历（`readdir`/`ls`）沿链表顺序扫描，无需回溯父节点。
+
+### 6.5 基础操作
+
+**查找：**
+1. 从 root inode 读取根节点
+2. 内部节点 → `find_child()` → 读 child → 递归
+3. 到达叶子后二分/线性查找 `entries[]`
+
+**插入（分裂）：**
+1. 下溯到目标叶子
+2. 未满（entry_count < 63）：字典序插入
+3. 已满：右半 32 entry 分到新节点，最小 name 提升到父节点
+4. 父节点满 → 递归分裂 → 根满则创建新根
+
+**删除：** v1 标记 tombstone，不主动合并。
+
+### 6.6 与文件区段 B+tree 的对比
+
+| 维度 | 文件区段 `Bptree_node_t` | Dentry `Dentry_Bptree_node_t` |
+|:---|:---|:---|
+| Entry 大小 | 32B | 128B |
+| 每节点 entry 数 | 256 | 63 |
+| Key 类型 | `uint64_t`（fblkbase / max_R） | `char[120]`（字典序） |
+| 扫描签名 | entry[3..6].words[3] | head.magic1..magic4 |
+| 叶子 ptr | pblkbase | inode 编号 |
+| 内部 ptr | sub_block_num | child 块号 |
+| 内部最左子树 | entry[0].words[2]（统一格式） | head.ptr1（独立字段） |
+| 同级链表 | entry[1/2].words[3] | head.ptr1 / head.ptr2 |
+| 排序 | fblk_cmp（区间序） | strcmp（字典序） |
+| 查找 | ≤ 右端点 | ≥ 最小文件名 |
+
+### 6.7 文件类型与 Dentry 的关系
+
+| 文件类型 | Dentry 的 inode 指向 | 备注 |
+|:---|:---|:---|
+| `RAVEN_REG` | 普通文件 inode | 文件数据走 `raven_Inode_t.data_root` |
+| `RAVEN_DIR` | 子目录 inode | 子目录自己的 Dentry B+tree root |
+| `RAVEN_SYMLNK` | 软链接 inode | target 路径在 `inline_data` 或扩展块 |
+
+Dentry 本身不区分类型——类型信息在目标 inode 的 `flags` 中。
 
 ---
 

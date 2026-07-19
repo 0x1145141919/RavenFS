@@ -282,6 +282,56 @@ struct raven_Inode_t{
     uint8_t inline_data[160];
 }__attribute__((packed));
 static_assert(sizeof(raven_Inode_t)==256,"Inode size must met 256B");
+
+/* ═══════════════════════════════════════════════════════
+ * Dentry B+tree — 目录项专用节点
+ *
+ * 与文件区段 B+tree (Bptree_node_t) 不同 entry/node 格式。
+ * 所有 inode 类型为 RAVEN_DIR 的数据内容由此树组织。
+ *
+ * Dentry_Bptree_node_t (8K):
+ *   Dentry_head_t head (128B)
+ *   Dentry_common_t entries[63] (63 × 128B = 8064B)
+ * ═══════════════════════════════════════════════════════ */
+
+union dentry_node_meta_t {
+    struct {
+        uint64_t entry_count    : 6;   /* 有效 entry 数 - 1 (最大 63) */
+        uint64_t reserved0      : 2;
+        uint64_t is_internal_node : 1; /* 0=leaf, 1=internal */
+        uint64_t is_root_node   : 1;   /* 1=根节点 */
+        uint64_t reserved       : 2;
+        uint64_t parent_ptr     : 52;  /* 非根→父节点块号 | 根→所属 inode 编号 */
+    } fields;
+    uint64_t raw;
+}__attribute__((packed));
+static_assert(sizeof(dentry_node_meta_t) == 8, "");
+
+struct Dentry_head_t {
+    dentry_node_meta_t head;        // 8B: 节点元数据
+    uint64_t           ptr1;        // 8B: 内部→最左子树 | 叶子→前驱
+    uint64_t           ptr2;        // 8B: 内部→空闲     | 叶子→后继
+    uint64_t           reserved0;   // 8B: 预留
+    uint64_t           magic1;      // 8B: 256-bit 扫描签名
+    uint64_t           magic2;      // 8B: 256-bit 扫描签名
+    uint64_t           magic3;      // 8B: 256-bit 扫描签名
+    uint64_t           magic4;      // 8B: 256-bit 扫描签名
+    uint64_t           reserved2[8]; // 64B: 扩展预留
+}__attribute__((packed));
+static_assert(sizeof(Dentry_head_t) == 128, "");
+
+struct Dentry_common_t {
+    uint64_t ptr;        // 8B: 叶子→inode编号 | 内部→child块号
+    char     name[120];  // 120B: 文件名 (字典序 key)
+}__attribute__((packed));
+static_assert(sizeof(Dentry_common_t) == 128, "");
+
+struct Dentry_Bptree_node_t {
+    Dentry_head_t    head;
+    Dentry_common_t  entries[63];
+}__attribute__((packed));
+static_assert(sizeof(Dentry_Bptree_node_t) == 8192, "");
+
 struct RavenSuperblock {
     uint64_t  magic;                // "RAVN" = 0x5241564E
     uint32_t  version;              // 格式版本号,[0:7]编码LBA_size到文件系统实际块的乘数
