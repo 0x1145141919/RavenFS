@@ -84,7 +84,6 @@ FS_block[n] 在设备 LBA 空间的区间:
 ```
 // 一、常量
 FS_BLOCK_BYTES   = 4096
-BYTES_PER_BIT    = 1                           // bit 到 byte 换算
 BITS_PER_FSBLOCK = FS_BLOCK_BYTES × 8          // = 32768
 INODE_BYTES      = 256                         // v1 固定
 

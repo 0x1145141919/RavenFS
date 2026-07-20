@@ -84,7 +84,7 @@ struct RavenSuperblock {
     uint64_t  backup_next;          // Primary: 链表头（第一个 Backup FS_block 号）
     uint32_t  backup_count;         // 备份总数
 
-    uint8_t   pad[3936];            // 删了 bitmap_start，调整此值使 sizeof == 4096
+    uint8_t   pad[3960];            // 删了 bitmap_start，调整此值使 sizeof == 4096
 } __attribute__((packed));
 ```
 
@@ -589,7 +589,7 @@ struct Dentry_head_t {
 
 union dentry_node_meta_t {
     struct {
-        uint64_t entry_count    : 6;  // 有效 entry 数 - 1（最大 63）
+        uint64_t entry_count    : 6;  // 有效 entry 数（0~63，根节点最少 1）
         uint64_t reserved0      : 2;
         uint64_t is_internal_node : 1; // 0=leaf, 1=internal
         uint64_t is_root_node   : 1;  // 1=根节点
@@ -781,7 +781,7 @@ Options:
   --label=NAME       卷标 (最长 48B)
 ```
 
-默认 `--inode-ratio=16` = 1 inode / 64KB。inode 数组空间开销约 0.2%。
+默认 `--inode-ratio=8` = 1 inode / 32KB。inode 数组空间开销约 0.4%。
 
 `--inode-ratio=4` 用于大量小文件场景（约 0.8% 空间开销）。
 

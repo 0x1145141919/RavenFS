@@ -301,7 +301,7 @@ static_assert(sizeof(raven_Inode_t)==256,"Inode size must met 256B");
 
 union dentry_node_meta_t {
     struct {
-        uint64_t entry_count    : 6;   /* 有效 entry 数 - 1 (最大 63) */
+        uint64_t entry_count    : 6;   /* 有效 entry 数（0~63，根节点最少 1） */
         uint64_t reserved0      : 2;
         uint64_t is_internal_node : 1; /* 0=leaf, 1=internal */
         uint64_t is_root_node   : 1;   /* 1=根节点 */

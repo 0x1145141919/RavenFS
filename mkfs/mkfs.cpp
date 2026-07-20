@@ -11,11 +11,37 @@
 #include <sys/sysmacros.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 #include <linux/fs.h>
 #include <linux/hdreg.h>
 #include <linux/nvme_ioctl.h>
 #include <uuid/uuid.h>
+
+/* ═══════════════════════════════════════════════════════════════
+ * CRC32 (Castagnoli polynomial 0xEDB88320)
+ * ═══════════════════════════════════════════════════════════════ */
+static uint32_t crc32_table[256];
+static bool crc32_table_init = false;
+
+static void crc32_init(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t crc = i;
+        for (int j = 0; j < 8; j++)
+            crc = (crc >> 1) ^ (crc & 1 ? 0xEDB88320 : 0);
+        crc32_table[i] = crc;
+    }
+    crc32_table_init = true;
+}
+
+static uint32_t crc32_compute(const void *data, size_t len) {
+    if (!crc32_table_init) crc32_init();
+    uint32_t crc = 0xFFFFFFFF;
+    const uint8_t *buf = (const uint8_t *)data;
+    for (size_t i = 0; i < len; i++)
+        crc = crc32_table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFF;
+}
 
 /* ═══════════════════════════════════════════════════════════════
  * FsGeometry
@@ -258,10 +284,8 @@ bool check_existing_fs(int fd) {
  *   9. read-back verification
  * ═══════════════════════════════════════════════════════════════ */
 
-static uint64_t fs_block_offset(const FsGeometry &, uint64_t block,
-                                 const MkfsParams &p) {
-    uint64_t dev_lba = p.world_base_lba + block * p.multiplier;
-    return dev_lba * p.lba_size;
+static uint64_t block_to_offset(uint64_t block, const MkfsParams &p) {
+    return (p.world_base_lba + block * p.multiplier) * p.lba_size;
 }
 
 static uint64_t rand_range(uint64_t lo, uint64_t hi, uint64_t *seed) {
@@ -271,8 +295,7 @@ static uint64_t rand_range(uint64_t lo, uint64_t hi, uint64_t *seed) {
 
 static void build_superblock(RavenSuperblock *sb, const MkfsParams &p,
                               const FsGeometry &geo,
-                              const uint64_t *backup_blocks,
-                              uint64_t root_dentry_block) {
+                              const uint64_t *backup_blocks) {
     memset(sb, 0, sizeof(*sb));
     sb->magic          = SUPERBLOCK_MAGIC;
     sb->version        = 1;
@@ -282,83 +305,15 @@ static void build_superblock(RavenSuperblock *sb, const MkfsParams &p,
     sb->root_inode     = 0;
     memcpy(sb->uuid, p.uuid, 16);
     memcpy(sb->volume_name, p.label, sizeof(sb->volume_name));
-
     sb->backup_prev  = 0;
     sb->backup_next  = p.backups > 0 ? backup_blocks[0] : 0;
     sb->backup_count = p.backups;
-
-    // crc32 computed at time of write
-    (void)root_dentry_block;
 }
 
-static void build_bitmap(uint8_t *bitmap, uint64_t bitmap_bytes,
-                          const FsGeometry &geo,
-                          const uint64_t *backup_blocks, uint32_t backup_count,
-                          uint64_t root_dentry_block) {
-    memset(bitmap, 0, bitmap_bytes);
-
-    // Helper: set bit i
-    auto set_bit = [&](uint64_t i) {
-        bitmap[i / 8] |= (uint8_t)(1 << (i % 8));
-    };
-
-    // FS_block[0] reserved (overlaps Primary SB)
-    set_bit(0);
-
-    // Root dentry B+tree root
-    set_bit(root_dentry_block);
-
-    // Bitmap self
-    for (uint64_t i = geo.bitmap_start; i < geo.total_blocks; i++)
-        set_bit(i);
-
-    // Inode array
-    for (uint64_t i = geo.inode_array_base; i < geo.bitmap_start; i++)
-        set_bit(i);
-
-    // Inode bitmap
-    for (uint64_t i = geo.inode_array_bitmap_base; i < geo.inode_array_base; i++)
-        set_bit(i);
-
-    // Backup blocks
-    for (uint32_t bi = 0; bi < backup_count; bi++)
-        set_bit(backup_blocks[bi]);
-
-    // Tail padding bits past total_blocks
-    uint64_t total_bits = geo.bitmap_blocks * 32768;
-    for (uint64_t i = geo.total_blocks; i < total_bits; i++)
-        set_bit(i);
-}
-
-static void build_inode_bitmap(uint8_t *ibm, uint64_t ibm_bytes,
-                                uint64_t inode_count) {
-    memset(ibm, 0, ibm_bytes);
-
-    // Root inode (index 0)
-    ibm[0] |= 1;
-
-    // Tail padding
-    uint64_t total_bits = ((inode_count + 32767) / 32768) * 32768;
-    for (uint64_t i = inode_count; i < total_bits; i++)
-        ibm[i / 8] |= (uint8_t)(1 << (i % 8));
-}
-
-static void build_root_inode(raven_Inode_t *inode, uint64_t root_dentry_block) {
-    memset(inode, 0, sizeof(*inode));
-    inode->type                   = INODE_TYPE_DIR;
-    inode->is_data_root_direct_bit = 0;
-    inode->uid                     = 0;
-    inode->gid                     = 0;
-    inode->permission_bits         = 0755;
-    inode->size                    = 0;
-    inode->data_root               = root_dentry_block;
-    inode->link_count              = 1;
-}
-
-static void build_root_dentry_node(Dentry_Bptree_node_t *node,
-                                    uint64_t parent_block) {
+static void build_root_dentry_node(Dentry_Bptree_node_t *node)
+{
     memset(node, 0, sizeof(*node));
-    node->head.head.fields.entry_count        = 0;
+    node->head.head.fields.entry_count        = 2;
     node->head.head.fields.is_internal_node   = 0;
     node->head.head.fields.is_root_node       = 1;
     node->head.head.fields.parent_ptr         = 0;
@@ -368,22 +323,128 @@ static void build_root_dentry_node(Dentry_Bptree_node_t *node,
     node->head.magic2 = DENTRY_MAGIC2;
     node->head.magic3 = DENTRY_MAGIC3;
     node->head.magic4 = DENTRY_MAGIC4;
-
-    // "." → self (inode 0)
     node->entries[0].ptr = 0;
     strcpy(node->entries[0].name, ".");
-
-    // ".." → parent (root, same as self)
     node->entries[1].ptr = 0;
     strcpy(node->entries[1].name, "..");
-
-    node->head.head.fields.entry_count = 1;
-
-    (void)parent_block;
 }
 
+static void build_root_inode(raven_Inode_t *inode, uint64_t root_dentry_block) {
+    memset(inode, 0, sizeof(*inode));
+    inode->type                    = INODE_TYPE_DIR;
+    inode->is_data_root_direct_bit = 0;
+    inode->uid                     = 0;
+    inode->gid                     = 0;
+    inode->permission_bits         = 0755;
+    inode->size                    = 0;
+    inode->data_root               = root_dentry_block;
+    inode->link_count              = 2;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * BufBlock — RAII 元数据缓冲区
+ *
+ * 构造：mmap 匿名页（内核保证零初始化）
+ * 析构：pwrite 落盘 → munmap 释放
+ * ═══════════════════════════════════════════════════════════════ */
+struct BufBlock {
+    uint8_t *base;
+    size_t   bytes;
+    int      fd;
+    uint64_t offset;
+
+    BufBlock(int fd_, size_t bytes_, uint64_t offset_)
+        : base((uint8_t *)mmap(nullptr, bytes_,
+                                PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS,
+                                -1, 0)),
+          bytes(bytes_), fd(fd_), offset(offset_)
+    {
+    }
+
+    ~BufBlock() {
+        if (base && base != MAP_FAILED) {
+            pwrite(fd, base, bytes, offset);
+            munmap(base, bytes);
+        }
+    }
+
+    BufBlock(const BufBlock &) = delete;
+    BufBlock &operator=(const BufBlock &) = delete;
+};
+
+/* ═══════════════════════════════════════════════════════════════
+ * BitmapBuf — FS_block 分配图
+ * ═══════════════════════════════════════════════════════════════ */
+struct BitmapBuf {
+    BufBlock blk;
+    uint64_t total_blocks;
+    uint64_t bitmap_blocks;
+
+    BitmapBuf(int fd, const FsGeometry &geo, uint64_t bm_off)
+        : blk(fd, geo.bitmap_blocks * 4096, bm_off),
+          total_blocks(geo.total_blocks),
+          bitmap_blocks(geo.bitmap_blocks) {}
+
+    void mark(uint64_t i) {
+        blk.base[i / 8] |= (uint8_t)(1 << (i % 8));
+    }
+
+    void mark_range(uint64_t base, uint64_t count) {
+        for (uint64_t i = base; i < base + count; i++)
+            mark(i);
+    }
+
+    void mark_backup(const uint64_t *blocks, uint32_t count) {
+        for (uint32_t i = 0; i < count; i++)
+            mark(blocks[i]);
+    }
+
+    void mark_tail() {
+        uint64_t total_bits = bitmap_blocks * 32768;
+        for (uint64_t i = total_blocks; i < total_bits; i++)
+            mark(i);
+    }
+};
+
+/* ═══════════════════════════════════════════════════════════════
+ * InodeArrayBuf — Inode 数组
+ * ═══════════════════════════════════════════════════════════════ */
+struct InodeArrayBuf {
+    BufBlock blk;
+
+    InodeArrayBuf(int fd, const FsGeometry &geo, uint64_t ia_off)
+        : blk(fd, geo.inode_blocks * 4096, ia_off) {}
+
+    void set(uint64_t idx, const raven_Inode_t *inode) {
+        memcpy(blk.base + idx * sizeof(raven_Inode_t), inode, sizeof(raven_Inode_t));
+    }
+};
+
+/* ═══════════════════════════════════════════════════════════════
+ * InodeBitmapBuf — Inode 分配图
+ * ═══════════════════════════════════════════════════════════════ */
+struct InodeBitmapBuf {
+    BufBlock blk;
+    uint64_t inode_count;
+
+    InodeBitmapBuf(int fd, const FsGeometry &geo, uint64_t ibm_off, uint64_t inode_count_)
+        : blk(fd, geo.inode_bitmap_blocks * 4096, ibm_off),
+          inode_count(inode_count_) {}
+
+    void mark(uint64_t i) {
+        blk.base[i / 8] |= (uint8_t)(1 << (i % 8));
+    }
+
+    void mark_tail() {
+        uint64_t total_bits = ((inode_count + 32767) / 32768) * 32768;
+        for (uint64_t i = inode_count; i < total_bits; i++)
+            mark(i);
+    }
+};
+
 int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
-    uint64_t root_dentry_block = 1;  // block[0] reserved, block[1] = root dentry
+    uint64_t root_dentry_block = 1;
 
     /* ─── Backup locations ─── */
     uint64_t backup_blocks[256];
@@ -407,75 +468,64 @@ int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
 
     /* ─── Superblock (memory) ─── */
     RavenSuperblock sb;
-    build_superblock(&sb, params, geo, backup_blocks, root_dentry_block);
+    build_superblock(&sb, params, geo, backup_blocks);
+    sb.crc32 = 0;
+    sb.crc32 = crc32_compute(&sb, sizeof(sb));
 
-    /* ─── 1. Bitmap ─── */
-    uint64_t bitmap_bytes = geo.bitmap_blocks * 4096;
-    uint8_t *bitmap = (uint8_t *)malloc(bitmap_bytes);
-    build_bitmap(bitmap, bitmap_bytes, geo, backup_blocks, bc, root_dentry_block);
+    /* ─── 偏移量 ─── */
+    uint64_t bm_off  = block_to_offset(geo.bitmap_start, params);
+    uint64_t ia_off  = block_to_offset(geo.inode_array_base, params);
+    uint64_t ibm_off = block_to_offset(geo.inode_array_bitmap_base, params);
+    uint64_t dn_off  = block_to_offset(root_dentry_block, params);
 
-    uint64_t bm_off = fs_block_offset(geo, geo.bitmap_start, params);
-    pwrite(fd, bitmap, bitmap_bytes, bm_off);
-    if (params.verbose)
-        fprintf(stderr, "  bitmap:  %lu blocks at offset %lu\n",
-                (unsigned long)geo.bitmap_blocks, (unsigned long)bm_off);
-
-    /* ─── 2. Inode Bitmap ─── */
-    uint64_t ibm_bytes = geo.inode_bitmap_blocks * 4096;
-    uint8_t *ibm = (uint8_t *)malloc(ibm_bytes);
-    build_inode_bitmap(ibm, ibm_bytes, params.inode_count);
-
-    uint64_t ibm_off = fs_block_offset(geo, geo.inode_array_bitmap_base, params);
-    pwrite(fd, ibm, ibm_bytes, ibm_off);
-    if (params.verbose)
-        fprintf(stderr, "  inode bm: %lu blocks at offset %lu\n",
-                (unsigned long)geo.inode_bitmap_blocks, (unsigned long)ibm_off);
-
-    /* ─── 3. Inode Array ─── */
-    uint64_t inode_bytes = geo.inode_blocks * 4096;
-    uint8_t *inode_buf = (uint8_t *)calloc(1, inode_bytes);
-
-    raven_Inode_t *root_i = (raven_Inode_t *)(inode_buf);
-    build_root_inode(root_i, root_dentry_block);
-
-    uint64_t ia_off = fs_block_offset(geo, geo.inode_array_base, params);
-    pwrite(fd, inode_buf, inode_bytes, ia_off);
-    if (params.verbose)
-        fprintf(stderr, "  inodes:   %lu blocks at offset %lu\n",
-                (unsigned long)geo.inode_blocks, (unsigned long)ia_off);
-
-    /* ─── 4. Root dentry B+tree node ─── */
     Dentry_Bptree_node_t dentry_node;
-    build_root_dentry_node(&dentry_node, root_dentry_block);
+    build_root_dentry_node(&dentry_node);
 
-    uint64_t dn_off = fs_block_offset(geo, root_dentry_block, params);
-    pwrite(fd, &dentry_node, sizeof(dentry_node), dn_off);
-    if (params.verbose)
-        fprintf(stderr, "  dentry:   block %lu at offset %lu\n",
-                (unsigned long)root_dentry_block, (unsigned long)dn_off);
+    raven_Inode_t root_inode;
+    build_root_inode(&root_inode, root_dentry_block);
 
-    /* ─── 5. Backup Superblocks ─── */
-    for (uint32_t bi = 0; bi < bc; bi++) {
-        RavenSuperblock backup_sb = sb;
-        if (bi == 0)
-            backup_sb.backup_prev = 0;
-        else
-            backup_sb.backup_prev = backup_blocks[bi - 1];
-        backup_sb.backup_next = (bi + 1 < bc) ? backup_blocks[bi + 1] : 0;
+    {
+        BitmapBuf      bitmap(fd, geo, bm_off);
+        InodeArrayBuf  inodes(fd, geo, ia_off);
+        InodeBitmapBuf ibitmap(fd, geo, ibm_off, params.inode_count);
 
-        uint64_t bk_off = fs_block_offset(geo, backup_blocks[bi], params);
-        // Zero out then write
-        uint8_t zero[4096] = {};
-        pwrite(fd, zero, 4096, bk_off);
-        pwrite(fd, &backup_sb, sizeof(backup_sb), bk_off);
-        if (params.verbose)
-            fprintf(stderr, "  backup#%u: block %lu at offset %lu\n",
-                    bi, (unsigned long)backup_blocks[bi], (unsigned long)bk_off);
+        bitmap.mark_range(root_dentry_block, 1);
+        bitmap.mark_range(geo.inode_array_bitmap_base, geo.inode_bitmap_blocks);
+        bitmap.mark_range(geo.inode_array_base, geo.inode_blocks);
+        bitmap.mark_range(geo.bitmap_start, geo.bitmap_blocks);
+        bitmap.mark_backup(backup_blocks, bc);
+        bitmap.mark_tail();
+
+        inodes.set(0, &root_inode);
+
+        ibitmap.mark(0);
+        ibitmap.mark_tail();
+
+        // Root dentry + Backup SBs（显式写）
+        pwrite(fd, &dentry_node, sizeof(dentry_node), dn_off);
+        for (uint32_t bi = 0; bi < bc; bi++) {
+            RavenSuperblock backup_sb = sb;
+            backup_sb.backup_prev = bi > 0 ? backup_blocks[bi - 1] : 0;
+            backup_sb.backup_next =
+                (bi + 1 < bc) ? backup_blocks[bi + 1] : 0;
+            uint64_t bk_off = block_to_offset(backup_blocks[bi], params);
+            pwrite(fd, &backup_sb, sizeof(backup_sb), bk_off);
+        }
+
+        if (params.verbose) {
+            fprintf(stderr, "  bitmap:   %lu blocks at offset %lu\n",
+                    (unsigned long)geo.bitmap_blocks, (unsigned long)bm_off);
+            fprintf(stderr, "  inodes:   %lu blocks at offset %lu\n",
+                    (unsigned long)geo.inode_blocks, (unsigned long)ia_off);
+            fprintf(stderr, "  inode bm: %lu blocks at offset %lu\n",
+                    (unsigned long)geo.inode_bitmap_blocks, (unsigned long)ibm_off);
+            fprintf(stderr, "  dentry:   block 1 at offset %lu\n",
+                    (unsigned long)dn_off);
+        }
     }
 
-    /* ─── 6. Primary Superblock ─── */
-    uint64_t sb_off = 0;
-    pwrite(fd, &sb, sizeof(sb), sb_off);
+    /* ─── Primary Superblock（最后写：崩溃安全） ─── */
+    pwrite(fd, &sb, sizeof(sb), 0);
     if (params.verbose)
         fprintf(stderr, "  primary:  at offset 0\n");
 
@@ -484,14 +534,7 @@ int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
     pread(fd, &verify, sizeof(verify), 0);
     if (verify.magic != SUPERBLOCK_MAGIC) {
         fprintf(stderr, "ERROR: Primary Superblock verify failed\n");
-        free(bitmap);
-        free(ibm);
-        free(inode_buf);
         return -1;
     }
-
-    free(bitmap);
-    free(ibm);
-    free(inode_buf);
     return 0;
 }
