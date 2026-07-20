@@ -113,6 +113,9 @@ DevType probe_hardware(int fd, const char *device_path) {
 #ifndef BLKGETSIZE64
 #define BLKGETSIZE64 _IOR(0x12, 114, size_t)
 #endif
+#ifndef BLKSSZGET
+#define BLKSSZGET  _IO(0x12, 104)
+#endif
 
 static bool is_mounted(const char *path) {
     struct stat st;
@@ -176,6 +179,46 @@ int get_device_info(const char *path, DevInfo *info) {
     }
 
     return -1;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * 分区探测（sysfs）
+ * ═══════════════════════════════════════════════════════════════ */
+uint64_t detect_partition_start(const char *device_path) {
+    struct stat st;
+    if (stat(device_path, &st) < 0 || !S_ISBLK(st.st_mode))
+        return 0;
+
+    char path[512];
+    snprintf(path, sizeof(path),
+             "/sys/dev/block/%d:%d/start",
+             major(st.st_rdev), minor(st.st_rdev));
+
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    uint64_t start = 0;
+    if (fscanf(f, "%lu", &start) != 1) start = 0;
+    fclose(f);
+    return start;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * LBA_size 探测（ioctl）
+ * ═══════════════════════════════════════════════════════════════ */
+uint64_t get_lba_size(int fd, DevType type) {
+    if (type == DEV_REGULAR) return 4096;
+
+    int sz = 0;
+    if (ioctl(fd, BLKSSZGET, &sz) != 0 || sz <= 0) {
+        fprintf(stderr, "error: BLKSSZGET failed to determine LBA_size\n");
+        return 0;
+    }
+    if (4096 % (unsigned)sz != 0) {
+        fprintf(stderr, "error: LBA_size %d does not divide 4096\n", sz);
+        return 0;
+    }
+    return (uint64_t)sz;
 }
 
 /* ═══════════════════════════════════════════════════════════════

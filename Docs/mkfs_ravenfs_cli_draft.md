@@ -19,7 +19,7 @@ mkfs.ravenfs [options] <device>
 
 | 参数 | 必选 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--inode-count=N` | **必选** | — | Inode 上限，直接指定，无默认值 |
+| `--inode-ratio=N` | 否 | 8 | 每 inode 平均管辖多少 FS_block，16 向上取整 |
 | `--backups=N` | 否 | 3 | Backup Superblock 散布数量 |
 | `--label=NAME` | 否 | 空 | 卷标，最长 48 字节 |
 | `--uuid=UUID` | 否 | 自动生成 | 显式指定 UUID，否则随机生成 |
@@ -27,13 +27,24 @@ mkfs.ravenfs [options] <device>
 | `--verbose` / `-v` | 否 | 无 | 打印布局详情（元数据区间、块号等） |
 | `--help` / `-h` | 否 | 无 | 打印帮助信息并退出 |
 
-### 2.1 `--inode-count=N` — 必选参数
+### 2.1 `--inode-ratio=N` — inode 密度控制
 
-**设计理由：** 用户自行规划 inode 上限是最稳妥的做法。无默认值，不提供 `--inode-ratio` 推导，要求用户明确指定。
+**语义：** 期望每个 inode 平均管辖 N 个 FS_block。N 越小 → inode 越多，适合海量小文件；N 越大 → inode 越少，元数据开销更低。
+
+**默认：** 8（即每 32 KB 数据一个 inode，兼顾多数场景）。
+
+**换算公式：**
+
+```
+raw_count    = ceil(total_blocks / inode_ratio)
+inode_count  = ceil(raw_count / 16) × 16
+```
+
+16 向上取整的理由：每个 FS_block（4096B）恰好容纳 16 个 inode 条目（256B/个），使 inode 数组尾部不浪费部分 FS_block。
 
 **行为：**
-- N 必须是正整数，且 N ≤ 对应分区大小下合理范围（工具内部校验）
-- 推导：`inode_blocks = ceil(N × 256 / 4096)`（block_model.md §3.2）
+- N 必须是正整数
+- 推导：`inode_blocks = ceil(inode_count × 256 / 4096)`（block_model.md §3.2）
 
 ### 2.2 `--backups=N` — Backup Superblock 数量
 
@@ -121,7 +132,7 @@ backup locations:
 2. stat() 检查 device 是否存在、是否为普通文件或块设备
 3. 块设备 → 检查是否已挂载（已挂载直接拒，`-f` 也不放过）
 4. 检测已有文件系统（有则拒，`-f` 跳过此项）
-5. `--inode-count` 合法性检查（正整数、不超过分区 inode 空间上限）
+5. `--inode-ratio` 合法性检查（正整数）
 6. `--backups` 合法性检查（≤ total_blocks/1024）
 7. `--label` 长度检查（≤ 48B）
 8. `--uuid` 格式检查（如指定）

@@ -144,7 +144,11 @@ GPT 分区:
 - Primary 是 **FS_block 世界的定义者和入口**
 - Primary 本身不占用任何 FS_block 编号
 - `bitmap` 覆盖 `[0, total_blocks)`，不包含 Primary
-- `world_base_lba` 的值在 mkfs 时写入，与 Primary 的物理位置无推导关系
+- `world_base_lba` 的值在 mkfs 时写入，其含义是 FS_block[0] 的设备 LBA
+- **推导关系：** Primary 占据分区/设备开头 4096 字节，
+  `world_base_lba × lba_size` = Primary 末尾字节偏移 = 4096（裸盘/文件）
+  或 `(world_base_lba - partition_start_lba) × lba_size` = 4096（GPT 分区）
+  即 `world_base_lba = partition_start_lba + multiplier`（裸盘时 partition_start_lba = 0）
 
 ### 4.2 Backup Superblock（备胎）
 
@@ -363,15 +367,17 @@ mkfs 流程:
 partition_start_lba = 0
 
 读 LBA 0 → magic = "RAVN" → 是 RavenFS 裸盘
-读 world_base_lba = 0
-读 total_blocks = M
+读 world_base_lba = 8            (= multiplier, Primary SB 占据 LBA[0,8))
+读 total_blocks = N/8 - 1        (减去 Primary 占用的 1 个 FS_block 等价空间)
 multiplier = 4096 / 512 = 8
 
-验证: total_blocks × 8 ≤ total_dev_lba  → OK
+验证: world_base_lba == multiplier              → 校验通过
+      world_base_lba + total_blocks × 8 ≤ N     → 即 8 + (N/8-1)×8 = N ≤ N → OK
+      Primary SB 占据 LBA[0,8)，FS_block 世界占据 LBA[8, N)  → 无重叠
 
 Backup 校验:
   从 Primary.backup_next 遍历链表:
-    每个 Backup 校验 magic + crc32 + backup_count == Primary.backup_count
+     每个 Backup 校验 magic + crc32 + backup_count == Primary.backup_count
   遍历计数 == Primary.backup_count
 ```
 
@@ -382,12 +388,13 @@ Backup 校验:
 partition_start_lba = gpt_entry.starting_lba = 2048
 
 读 LBA 2048 (分区 offset 0) → magic = "RAVN" → 是 RavenFS
-读 world_base_lba = 2048
-读 total_blocks = M
+读 world_base_lba = 2056          (= partition_start_lba + multiplier)
+读 total_blocks = M-1             (减去 Primary 占用的 1 个 FS_block 等价空间)
 multiplier = 8
 
-验证: world_base_lba == partition_start_lba  → 校验通过（可选）
-      total_blocks × 8 + 2048 ≤ 分区 last_lba  → OK
+验证: world_base_lba == partition_start_lba + multiplier  → 校验通过
+      分区内 FS_block 世界字节偏移: (world_base_lba - partition_start_lba) × 512 = 4096
+      → Primary 占据分区开头 4096 字节，FS_block 世界从偏移 4096 开始  → 无重叠
 
 Backup 校验: 同裸盘流程
 ```

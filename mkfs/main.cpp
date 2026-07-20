@@ -14,10 +14,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [options] <device>\n"
         "\n"
-        "Mandatory:\n"
-        "  --inode-count=N    Inode upper limit (required)\n"
-        "\n"
         "Options:\n"
+        "  --inode-ratio=N    FS_blocks per inode (default: 8)\n"
         "  --backups=N        Backup Superblock count (default: 3)\n"
         "  --label=NAME       Volume label (max 48 bytes)\n"
         "  --uuid=UUID        Explicit UUID (auto-generated if omitted)\n"
@@ -38,11 +36,12 @@ static void print_usage(const char *prog) {
 
 int main(int argc, char *argv[]) {
     MkfsParams params{};
+    params.inode_ratio = 8;
     params.backups = 3;
     uuid_clear(params.uuid);
 
     static struct option long_opts[] = {
-        {"inode-count", required_argument, 0, 'i'},
+        {"inode-ratio", required_argument, 0, 'r'},
         {"backups",     required_argument, 0, 'b'},
         {"label",       required_argument, 0, 'l'},
         {"uuid",        required_argument, 0, 'u'},
@@ -55,11 +54,11 @@ int main(int argc, char *argv[]) {
     int opt;
     while ((opt = getopt_long(argc, argv, "fvh", long_opts, nullptr)) != -1) {
         switch (opt) {
-        case 'i': {
+        case 'r': {
             char *end = nullptr;
-            params.inode_count = strtoull(optarg, &end, 0);
-            if (*end || params.inode_count == 0) {
-                fprintf(stderr, "invalid --inode-count: %s\n", optarg);
+            params.inode_ratio = strtoull(optarg, &end, 0);
+            if (*end || params.inode_ratio == 0) {
+                fprintf(stderr, "invalid --inode-ratio: %s\n", optarg);
                 return 1;
             }
             break;
@@ -108,11 +107,6 @@ int main(int argc, char *argv[]) {
     }
     params.device = argv[optind];
 
-    if (params.inode_count == 0) {
-        fprintf(stderr, "error: --inode-count is required\n");
-        return 1;
-    }
-
     /* ─── 设备检测 ─── */
     DevInfo dev{};
     if (get_device_info(params.device, &dev) < 0)
@@ -126,10 +120,10 @@ int main(int argc, char *argv[]) {
     }
 
     if (dev.type == DEV_REGULAR) {
-        // File hack: LBA_size=4096, multiplier=1, world_base_lba=0
+        // File: LBA_size=4096, multiplier=1, world_base_lba=1 (skip past Primary SB at byte 0)
         params.lba_size      = 4096;
         params.multiplier    = 1;
-        params.world_base_lba = 0;
+        params.world_base_lba = 1;
 
         if (dev.bytes % 4096 != 0) {
             fprintf(stderr, "error: file size %lu not 4096-aligned\n",
@@ -156,11 +150,17 @@ int main(int argc, char *argv[]) {
             return 2;
         }
 
-        // Hardware: LBA_size from NVMe Identify or assume 512 for SATA
-        // TODO: NVMe Identify LBAF0 for real LBA_size; for now hardcode 512
-        params.lba_size      = 512;
+        // 实测 LBA_size（ioctl BLKSSZGET）
+        params.lba_size = get_lba_size(fd, hw);
+        if (params.lba_size == 0) { close(fd); return 5; }
+
         params.multiplier    = 4096 / params.lba_size;
-        params.world_base_lba = 0; // TODO: parse GPT partition_start_lba
+
+        // 探测 GPT 分区起始 LBA；裸盘返回 0
+        uint64_t part_start = detect_partition_start(params.device);
+        // world_base_lba = partition_start_lba + multiplier
+        // Primary SB 占据分区开头 4096 字节，FS_block[0] 紧随其后
+        params.world_base_lba = params.multiplier + part_start;
     }
 
     /* ─── 已有 FS 检测 ─── */
@@ -169,8 +169,15 @@ int main(int argc, char *argv[]) {
         return 3;
     }
 
+    /* ─── inode ratio → count 换算 ─── */
+    // inode_count = ceil(total_blocks / inode_ratio)，再 16 向上取整（单 FS_block 装 16 个 inode）
+    uint64_t total_blocks = dev.bytes / 4096 - 1;
+    {
+        uint64_t raw = (total_blocks + params.inode_ratio - 1) / params.inode_ratio;
+        params.inode_count = ((raw + 15) / 16) * 16;
+    }
+
     /* ─── 几何计算 ─── */
-    uint64_t total_blocks = dev.bytes / 4096;
     FsGeometry geo = calc_geometry(total_blocks, params.inode_count);
 
     if (geo.inode_array_bitmap_base <= 1) {
@@ -187,6 +194,7 @@ int main(int argc, char *argv[]) {
             "type:            %s\n"
             "bytes:           %lu\n"
             "total_blocks:    %lu\n"
+            "inode_ratio:     %lu\n"
             "inode_count:     %lu\n"
             "backups:         %u\n"
             "lba_size:        %lu\n"
@@ -202,6 +210,7 @@ int main(int argc, char *argv[]) {
                 dev.type == DEV_BLOCK_ATA ? "ATA" : "file",
             (unsigned long)dev.bytes,
             (unsigned long)geo.total_blocks,
+            (unsigned long)params.inode_ratio,
             (unsigned long)params.inode_count,
             (unsigned)params.backups,
             (unsigned long)params.lba_size,
@@ -229,10 +238,11 @@ int main(int argc, char *argv[]) {
     if (ret == 0) {
         char uuid_str[37];
         uuid_unparse(params.uuid, uuid_str);
-        printf("mkfs.ravenfs: done  device=%s  blocks=%lu  inodes=%lu  "
-               "backups=%u  uuid=%s\n",
+        printf("mkfs.ravenfs: done  device=%s  blocks=%lu  "
+               "ratio=%lu  inodes=%lu  backups=%u  uuid=%s\n",
                params.device,
                (unsigned long)geo.total_blocks,
+               (unsigned long)params.inode_ratio,
                (unsigned long)params.inode_count,
                (unsigned)params.backups,
                uuid_str);

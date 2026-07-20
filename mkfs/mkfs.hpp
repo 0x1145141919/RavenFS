@@ -8,7 +8,8 @@
 
 struct MkfsParams {
     const char *device;
-    uint64_t    inode_count;
+    uint64_t    inode_ratio;     // 每 inode 管辖的 FS_block 数（默认 8）
+    uint64_t    inode_count;     // 输出：由 ratio 换算得，16 向上取整
     uint32_t    backups;
     char        label[48];
     uint8_t     uuid[16];
@@ -48,6 +49,8 @@ struct DevInfo {
 
 DevType probe_hardware(int fd, const char *device_path);
 int     get_device_info(const char *path, DevInfo *info);
+uint64_t get_lba_size(int fd, DevType type);
+uint64_t detect_partition_start(const char *device_path);
 bool    check_existing_fs(int fd);
 
 int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo);
