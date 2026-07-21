@@ -11,15 +11,17 @@
 
 ### 1.1 三层模型
 
+每个 level 的 opcode 独立从 0 起始——不同环物理隔离，不需全局编号对齐。
+
 ```
 Level 0:  Global Admin Ring (1 个全局, /dev/shm/ravenfsd-admin)
-            用户管理: USER_REGISTER / USER_UNREGISTER
+            命令表 → level_0_global_admin.md
 
-Level 1:  Per-User Admin Ring (每用户 1 个)
-            资源管理: CANVAS_CREATE / DESTROY, RING_CREATE / DESTROY
+Level 1:  Per-Session Admin Ring (每 session 1 个)
+            命令表 → level_1_user_admin.md
 
-Level 2:  IO Rings (每用户 N 个)
-            FS 操作: MKDIR / READ / WRITE ...
+Level 2:  IO Rings (每 session N 个)
+            命令表 → level_2_io_ring.md
 ```
 
 ### 1.2 文件系统路径
@@ -28,16 +30,16 @@ Level 2:  IO Rings (每用户 N 个)
 Global:
   /dev/shm/ravenfsd-admin                      ← 全局管理环
 
-Per-User:
-  /tmp/ravenfsd_guests/{uid}/
-    ├── admin_ring     (8KB)                    ← 用户管理环
+Per-Session:
+  /tmp/ravenfsd_sessions/{session_id}/
+    ├── admin_ring     (8KB)                    ← session 管理环
     ├── canvas_0       (size 字节, 默认 2MB)    ← 数据画布
     ├── canvas_1       ...
     ├── ring_1         (8KB)                    ← IO 命令环
     └── ring_2         (8KB)
 ```
 
-用户目录及其所有文件由 server 在 USER_REGISTER/UNREGISTER 时创建/销毁。
+session 目录及其所有文件由 server 在 SESSION_REGISTER/UNREGISTER 时创建/销毁。
 
 ---
 
@@ -45,12 +47,12 @@ Per-User:
 
 ### 2.1 布局
 
-三种环 (Global Admin / Per-User Admin / IO) 使用相同的 8KB 布局：
+三种环 (Global Admin / Per-Session Admin / IO) 使用相同的 8KB 布局：
 
 ```
 偏移量      大小       字段         说明
 ───────────────────────────────────────────
-0x0000     64B        meta         元数据 (lock/block_token/head/tail)
+0x0000     64B        meta         元数据 (server_pid/ring_bridge_id/block_token/head/tail)
 0x0040     64B        ring[0]      命令槽 0
 0x0080     64B        ring[1]      命令槽 1
 ...                   ...
@@ -66,24 +68,55 @@ Per-User:
 ```c
 struct command_common_t {
     uint32_t  opcode;         // RavenOpcode
-    uint32_t  res_code;       // CMD_NOT_PROCESSED → 0 / errno
+    uint32_t  res_code;       // CMD_NOT_PROCESSED → 语义返回值 / -errno
     uint64_t  param[6];       // 6 × 8 = 48B 自由参数
-    uint64_t  reserved;
+    uint64_t  reserved;       // 扩展预留
 };
 ```
 
-### 2.3 元数据 (64B)
+### 2.3 门铃信息与元数据 (64B)
+
+每个环的元数据是门铃的完整描述——guest mmap 后直接读出 server_pid
+和 ring_bridge_id 即可 `sigqueue`，无需额外握手。
 
 ```c
 struct bridge_meta_t {
-    uint32_t         block_token;   // Global Admin: server_pid
-                                    // Per-User Admin / IO: BRIDGE_HAS_WAITER
-    uint8_t          head_idx;      // server 写入, 写锁保护
-    uint8_t          tail_idx;      // guest 写入, 写锁保护
-    spinrwlock_cpp_t rwlock;        // 保护 head/tail/cmd
-    uint8_t          reserved[56];
+    uint32_t         block_token;       // 0:  futex word (BRIDGE_HAS_WAITER / 0)
+    int32_t          server_pid;        // 4:  sigqueue 目标 PID
+    uint32_t         ring_bridge_id;    // 8:  sigqueue sival_int 值
+    uint8_t          head_idx;          // 12: server 写入, 写锁保护
+    uint8_t          tail_idx;          // 13: guest 写入, 写锁保护
+    spinrwlock_cpp_t rwlock;            // 14: 保护 head/tail/cmd
+    uint8_t          reserved[40];      // 24: 扩展预留
 };
+// static_assert(sizeof(bridge_meta_t) == 64) 已验证于头文件
 ```
+
+### 2.4 ring_bridge_id 分配方案
+
+`ring_bridge_id` 是信号中 `sival_int` 的值，server 据此识别触发哪个环。
+
+| 范围 | 用途 | 分配时机 |
+|------|------|---------|
+| 0 (`GLOBAL_ADMIN_ID`) | Global Admin Ring | 固定 |
+| `[1, MAX_SESSIONS]` | Per-Session Admin Rings | SESSION_REGISTER 时分配，`bridge_id = session_id + 1` |
+| `MAX_SESSIONS + 1 ..` | IO Rings（全局池） | RING_CREATE 时从全局 ID pool 分配 |
+
+**信令格式（统一，不因环类型而异）：**
+
+```c
+union sigval sv;
+sv.sival_int = ring_bridge_id;          // 从 meta 读取
+sigqueue(meta.server_pid, SIGRTMIN + 0, sv);
+```
+
+**初始化时序：**
+
+1. server 启动 → 创建 Global Admin ring：`server_pid=getpid()`, `ring_bridge_id=0`, `block_token=0`
+2. SESSION_REGISTER → 创建 admin_ring：`server_pid=getpid()`（全进程共享一个接待员线程 PID），`ring_bridge_id=session_id+1`, `block_token=0`
+3. RING_CREATE → 创建 IO ring：`server_pid=getpid()`, `ring_bridge_id` 从全局池分配, `block_token=0`
+
+Guest 端从 mmap 的 `meta` 中读取后直接使用，不依赖任何带外信息。
 
 ---
 
@@ -118,80 +151,56 @@ server 收到后：
 ```c
 uint32_t cid = data_ptr_canvas(cmd->param[0]);
 uint32_t off = data_ptr_offset(cmd->param[0]);
-char *path = (char*)(user->canvases[cid].mmap_addr + off);
+char *path = (char*)(session->canvases[cid].mmap_addr + off);
 ```
 
 解耦效果：一个 ring 可以引用任意 canvas 的数据，不绑定。
 
 ---
 
-## 4. 操作码
+## 4. 命令表分文档
 
-```c
-enum RavenOpcode : uint32_t {
-    /* Level 0 */
-    CMD_USER_REGISTER   = 0,   // param[0]=uid
-    CMD_USER_UNREGISTER = 1,   // param[0]=uid
+opcode 按所在环独立编号，各 level 文档自包含：
 
-    /* Level 1 */
-    CMD_CANVAS_CREATE   = 2,   // param[0]=size → param[1]=canvas_id
-    CMD_CANVAS_DESTROY  = 3,   // param[0]=canvas_id
-    CMD_RING_CREATE     = 4,   // → param[0]=ring_id
-    CMD_RING_DESTROY    = 5,   // param[0]=ring_id
+| Level | 文档 | 环类型 |
+|-------|------|--------|
+| 0 | `level_0_global_admin.md` | Global Admin Ring |
+| 1 | `level_1_user_admin.md` | Per-Session Admin Ring |
+| 2 | `level_2_io_ring.md` | IO Rings |
 
-    /* Level 2 */
-    CMD_NOP             = 6,
-    CMD_MKDIR           = 7,
-    CMD_RMDIR           = 8,
-    CMD_CREATE          = 9,
-    CMD_UNLINK          = 10,
-    CMD_OPEN            = 11,
-    CMD_CLOSE           = 12,
-    CMD_READ            = 13,
-    CMD_WRITE           = 14,
-    CMD_STAT            = 15,
-    CMD_READDIR         = 16,
-    CMD_RENAME          = 17,
-};
-```
+各文档定义了：opcode 枚举、param[0..5] 逐字段语义、res_code 返回值约定、
+输出参数位置、错误码列表。
+
+本文档 §3 的数据指针编码约定对所有 Level 2 命令有效（Level 0/1 直接使用
+param 中的整数值，不引用 canvas）。
 
 ---
 
-## 5. 参数语义表
+## 5. res_code 语义约定
 
-记号: `dp` = `encode_data_ptr(canvas_id, offset)` 编码的数据指针
+`res_code` 是命令的唯一返回值槽，同时承载错误码和语义返回值。
+以 `int32_t` 视角解读 `uint32_t`：
 
-### Level 0 — Global Admin
+```
+  -1 (0xFFFFFFFF)   → CMD_NOT_PROCESSED（未处理）
+  < 0               → -errno（错误码）
+  ≥ 0               → 命令自身的语义返回值
+```
 
-| opcode | param[0] | 完成→ |
-|--------|---------|------|
-| `CMD_USER_REGISTER` | uid | res_code = 0 |
-| `CMD_USER_UNREGISTER` | uid | — |
+各命令返回的语义值类型由各 level 文档定义：
 
-### Level 1 — Per-User Admin
+| res_code ≥ 0 时 | 含义 |
+|-----------------|------|
+| 0 | 仅表示成功，无额外语义 |
+| session_id | 注册 session 时分配的 ID |
+| canvas_id | 创建画布时分配的 ID |
+| ring_id | 创建 IO 环时分配的 ID |
+| ino | 打开文件返回的 inode 编号 |
+| bytes_read | 实际读取的字节数 |
+| bytes_written | 实际写入的字节数 |
 
-| opcode | param[0] | param[1] | 完成→ |
-|--------|---------|---------|------|
-| `CMD_CANVAS_CREATE` | size | — | param[1]=canvas_id |
-| `CMD_CANVAS_DESTROY` | canvas_id | — | — |
-| `CMD_RING_CREATE` | — | — | param[0]=ring_id |
-| `CMD_RING_DESTROY` | ring_id | — | — |
-
-### Level 2 — IO
-
-| opcode | param[0] | param[1] | param[2] | param[3] |
-|--------|---------|---------|---------|---------|
-| `CMD_MKDIR` | dp(路径) | 路径长度 | — | — |
-| `CMD_RMDIR` | dp(路径) | 路径长度 | — | — |
-| `CMD_CREATE` | dp(路径) | 路径长度 | flags | — |
-| `CMD_UNLINK` | dp(路径) | 路径长度 | — | — |
-| `CMD_OPEN` | dp(路径) | 路径长度 | flags | *(完成→ino)* |
-| `CMD_CLOSE` | ino | — | — | — |
-| `CMD_READ` | ino | dp(接收缓冲区) | 长度 | 文件偏移 |
-| `CMD_WRITE` | ino | dp(数据源) | 长度 | 文件偏移 |
-| `CMD_STAT` | dp(路径) | 路径长度 | — | — |
-| `CMD_READDIR` | ino | dp(接收区) | 最大条数 | — |
-| `CMD_RENAME` | dp(旧路径) | 旧长度 | dp(新路径) | 新长度 |
+部分命令通过 `param[4]/param[5]` 携带额外输出，
+这些输出只有在 `res_code ≥ 0` 时才有效。
 
 ---
 
@@ -202,9 +211,9 @@ constexpr uint32_t CMD_NOT_PROCESSED = 0xFFFF'FFFF;
 constexpr uint32_t BRIDGE_HAS_WAITER = 0xFFFF'FFFF;
 constexpr uint32_t GLOBAL_ADMIN_ID   = 0;
 
-constexpr int MAX_USERS          = 256;
-constexpr int MAX_CANVAS_PER_USER = 2048;
-constexpr int MAX_RING_PER_USER  = 64;
+constexpr int MAX_SESSIONS       = 256;
+constexpr int MAX_CANVAS_PER_SESSION = 2048;
+constexpr int MAX_RING_PER_SESSION  = 64;
 
 constexpr uint32_t CMD_RING_BYTES     = 8192;
 constexpr uint32_t DEFAULT_CANVAS_BYTES = 2097152;
@@ -225,8 +234,9 @@ constexpr int      CMD_RING_SLOTS     = 127;
    meta.tail_idx++;
    meta.rwlock.write_unlock();
 
-3. sigqueue(server_pid, SIGRTMIN + 0,
-            (union sigval){ .sival_int = ring_bridge_id })
+3. union sigval sv;
+   sv.sival_int = meta.ring_bridge_id;   // 从 meta 读取
+   sigqueue(meta.server_pid, SIGRTMIN + 0, sv);
 
 4. 若需等待完成:
    meta.block_token = BRIDGE_HAS_WAITER;
@@ -268,102 +278,125 @@ while (1):
 ```
 ravenfsd /dev/nvme0n1pX [options]
 
+Server 多线程架构:
+  Thread R (接待员): sigwaitinfo 接收全部信号
+                     Level 0/1: 亲自同步处理 (内存操作, 无 I/O)
+                     Level 2:   甩给工作者线程池
+  Thread W0..Wn (IO 工作者): 只处理 IO 环命令 (可能涉及 io_uring)
+  Thread F (文件系统): io_uring 等 I/O 密集型路径
+
+工作者线程启动后必须 `pthread_sigmask(SIG_BLOCK, ...)` 屏蔽 SIGRTMIN。
+接待员在处理 Level 0/1 期间不响应新信号——但这类 batch 处理极快
+(纯内存操作)，不会造成 guest 端明显阻塞。
+
+初始化:
   1. mount FS
 
   2. Global Admin Ring:
      shm_open / ravenfsd-admin, mmap
-     meta.block_token = getpid()
+     meta.server_pid    = getpid();
+     meta.ring_bridge_id = GLOBAL_ADMIN_ID;
+     meta.block_token    = 0;
 
-  3. /tmp/ravenfsd_guests/ 目录 (若不存在则创建)
+  3. /tmp/ravenfsd_sessions/ 目录 (若不存在则创建)
 
-  4. sigaction(SIGRTMIN + 0, handler)
-     handler: 存 ring_id + 设 flag
+  4. 启动 IO 工作者线程池
 
-  5. main loop:
-     sigsuspend(mask)
-     if flag:
-       switch ring_id:
-         GLOBAL_ADMIN_ID → process_global_admin()
-         per-user admin   → process_user_admin(uid)
-         IO ring          → process_io(uid, ring_id)
+  5. 接待员线程:
+     while (true):
+       info = sigwaitinfo(mask)             // 阻塞等信号
+       ring_bridge_id = info.si_value.sival_int
+
+       // 快照
+       ring = lookup_ring(ring_bridge_id)
+       ring.meta.rwlock.read_lock()
+       saved_tail = ring.meta.tail_idx
+       saved_head = ring.meta.head_idx
+       ring.meta.rwlock.read_unlock()
+       if saved_head == saved_tail: continue
+
+       if ring_bridge_id <= MAX_SESSIONS:    // Level 0/1 亲自处理
+           process_admin(ring, saved_head, saved_tail)
+           // 推进 head + futex_wake (已包含在 process_admin 内)
+       else:                                 // Level 2 甩给工作者
+           session = lookup_session_by_ring(ring_bridge_id);
+           io_work_queue.push({ring, saved_head, saved_tail, session})
+
+     // 不会到达此处 (CMD_SERVER_SHUTDOWN 直接 exit)
 ```
 
-### 8.1 Global Admin 处理
+### 8.1 Admin 处理（接待员内联）
+
+Level 0 (Global Admin) 和 Level 1 (Per-Session Admin) 由接待员线程
+同步处理，不进工作队列。所有命令都是内存操作，无阻塞 I/O。
 
 ```c
-void process_global_admin() {
-    // 读 ring, 取 [saved_head, saved_tail) 快照
-    for (cmd in batch) {
-        if (cmd->opcode == CMD_USER_REGISTER) {
-            uid_t uid = cmd->param[0];
-            // 创建 /tmp/ravenfsd_guests/{uid}/
-            // 创建 admin_ring (8KB), mmap
-            // 初始化: block_token=0, head=tail=0, 所有 res_code=NOT_PROCESSED
-            cmd->res_code = 0;  // 成功
+void process_admin(command_ring_t *ring, uint8_t head, uint8_t tail) {
+    for each cmd in ring->ring[head .. tail):
+        switch (cmd.opcode) {
+        case CMD_SESSION_REGISTER:
+            fs_uid = (uint32_t)cmd.param[0];
+            fs_gid = (uint32_t)cmd.param[1];
+            sid = alloc_session_id(fs_uid, fs_gid);
+            // 创建目录 + admin_ring + mmap + init meta
+            cmd.res_code = sid;
+        case CMD_SESSION_UNREGISTER:
+            sid = (uint32_t)cmd.param[0];
+            cmd.res_code = session_has_live_resources(sid) ? -EBUSY :
+                           (release_session(sid), 0);
+        case CMD_SERVER_SHUTDOWN:
+            if (allocated_session_count > 0)
+                cmd.res_code = -EBUSY;
+            else {
+                cmd.res_code = 0;
+                sync();                     // 刷盘
+                destroy_global_ring();       // 收 Global Admin
+                rmdir("/tmp/ravenfsd_sessions/");
+                exit(0);                    // 接待员直接关机
+            }
+        case CMD_CANVAS_CREATE:
+            cid = alloc_canvas_id(session_of(ring));
+            cmd.res_code = cid;
+        case CMD_CANVAS_DESTROY:
+            destroy_canvas(session_of(ring), cmd.param[0]);
+            cmd.res_code = 0;
+        case CMD_RING_CREATE:
+            rid = alloc_ring_id(session_of(ring));
+            bridge_id = alloc_io_bridge_id();
+            cmd.res_code = rid;
+        case CMD_RING_DESTROY:
+            cmd.res_code = destroy_ring(session_of(ring), cmd.param[0]);
+        case CMD_SESSION_CHDIR:
+            set_cwd(session_of(ring), cmd.param[0..1]);
+            cmd.res_code = 0;
         }
-        if (cmd->opcode == CMD_USER_UNREGISTER) {
-            uid_t uid = cmd->param[0];
-            // 遍历销毁所有 canvas/ring 文件
-            // 销毁 admin_ring, munmap + shm_unlink
-            // rmdir /tmp/ravenfsd_guests/{uid}/
-            cmd->res_code = 0;
-        }
-    }
-    // 推进 head, 唤醒
+    // 推进 head (sigblock_guard + write_lock)
+    // futex_wake(block_token)
 }
 ```
 
-### 8.2 Per-User Admin 处理
+### 8.2 IO 处理（工作者线程）
 
 ```c
-void process_user_admin(uid_t uid) {
-    // 读 ring 快照
-    for (cmd in batch) {
-        if (cmd->opcode == CMD_CANVAS_CREATE) {
-            uint64_t size = cmd->param[0];
-            int cid = alloc_canvas_id(uid);
-            // shm_open /tmp/ravenfsd_guests/{uid}/canvas_{cid}
-            // ftruncate + mmap
-            cmd->param[1] = cid;
-            cmd->res_code = 0;
+void io_worker(command_ring_t *ring, uint8_t head, uint8_t tail,
+               session_t *s) {
+    for each cmd in ring->ring[head .. tail):
+        // 解析路径数据指针 → canvas + offset
+        dp = cmd.param[0];
+        path = (char*)(s->canvases[data_ptr_canvas(dp)].addr
+                       + data_ptr_offset(dp));
+        switch (cmd.opcode) {
+        case CMD_MKDIR:  ret = fs_mkdir(path, cmd.param[2]); break;
+        case CMD_RMDIR:  ret = fs_rmdir(path); break;
+        case CMD_CREATE: ret = fs_create(path, cmd.param[2], cmd.param[3]); break;
+        case CMD_OPEN:   ret = fs_open(path); cmd.res_code = ret; continue;
+        case CMD_READ:   ret = fs_read(cmd.param[0], cmd.param[1..3]); break;
+        case CMD_WRITE:  ret = fs_write(cmd.param[0], cmd.param[1..4]); break;
+        case CMD_STAT:   ret = fs_stat(path, cmd.param[2..3]); break;
+        case CMD_READDIR: ret = fs_readdir(cmd.param[0..5]); break;
         }
-        if (cmd->opcode == CMD_RING_CREATE) {
-            int rid = alloc_ring_id(uid);
-            // 同上, 创建 ring_{rid} 文件, mmap
-            cmd->param[0] = rid;
-            cmd->res_code = 0;
-        }
-        // CANVAS_DESTROY / RING_DESTROY: 逆操作
-    }
-    // 推进 head, 唤醒
-}
-```
-
-### 8.3 IO 处理
-
-```c
-void process_io(uid_t uid, int ring_id) {
-    user_t *u = &users[uid];
-    command_ring_t *ring = u->io_rings[ring_id];
-
-    // 读 ring 快照
-    for (cmd in batch) {
-        if (cmd->res_code != CMD_NOT_PROCESSED) continue;
-
-        // 解析数据指针 → canvas + offset
-        uint64_t dp = cmd->param[0];
-        uint32_t canvas_id = data_ptr_canvas(dp);
-        uint32_t offset    = data_ptr_offset(dp);
-        char *path = (char*)(u->canvases[canvas_id].addr + offset);
-
-        switch (cmd->opcode) {
-        case CMD_MKDIR: ret = fs_mkdir(path); break;
-        case CMD_RMDIR: ret = fs_rmdir(path); break;
-        // ...
-        }
-        cmd->res_code = (uint32_t)(ret < 0 ? -ret : 0);
-    }
-    // 推进 head, 唤醒
+        cmd.res_code = (uint32_t)(ret < 0 ? -ret : ret);
+    // 推进 head (sigblock_guard + write_lock), 唤醒 guest
 }
 ```
 
@@ -378,7 +411,9 @@ void process_io(uid_t uid, int ring_id) {
 | `CMD_NOT_PROCESSED` | `0xFFFF'FFFF` |
 | `BRIDGE_HAS_WAITER` | `0xFFFF'FFFF` |
 | 锁保护 | head/tail/cmd, **不含 block_token** |
-| 信令 | Guest → Server, `SIGRTMIN + ring_bridge_id` |
+| 门铃目标 | `meta.server_pid`（Global Admin init 时写入 `getpid()`） |
+| 门铃载荷 | `meta.ring_bridge_id`（见 §2.4 分配方案） |
+| 信令格式 | `sigqueue(meta.server_pid, SIGRTMIN+0, {.sival_int = meta.ring_bridge_id})` |
 | 断连检测 | server 扫描 `/proc/{guest_tid}`, 回收资源 |
 
 ---
