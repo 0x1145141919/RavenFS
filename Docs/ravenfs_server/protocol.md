@@ -229,16 +229,18 @@ constexpr int      CMD_RING_SLOTS     = 127;
 ```
 1. 写 ring[tail_idx].opcode + param[], res_code = CMD_NOT_PROCESSED
 
-2. 写锁保护 tail:
+2. wmb();  // 确保命令数据已提交, server 读到新 tail 时必见完整 cmd
+
+3. 写锁保护 tail:
    meta.rwlock.write_lock();
    meta.tail_idx++;
    meta.rwlock.write_unlock();
 
-3. union sigval sv;
+4. union sigval sv;
    sv.sival_int = meta.ring_bridge_id;   // 从 meta 读取
    sigqueue(meta.server_pid, SIGRTMIN + 0, sv);
 
-4. 若需等待完成:
+5. 若需等待完成:
    meta.block_token = BRIDGE_HAS_WAITER;
    wmb();
    if (cmd.res_code == CMD_NOT_PROCESSED)
@@ -304,6 +306,9 @@ Server 多线程架构:
 
   5. 接待员线程:
      while (true):
+       // 先扫工单, 推进已完成 batch 的 head (见 §8.2 drain_work_orders)
+       drain_work_orders();
+
        info = sigwaitinfo(mask)             // 阻塞等信号
        ring_bridge_id = info.si_value.sival_int
 
@@ -317,10 +322,17 @@ Server 多线程架构:
 
        if ring_bridge_id <= MAX_SESSIONS:    // Level 0/1 亲自处理
            process_admin(ring, saved_head, saved_tail)
-           // 推进 head + futex_wake (已包含在 process_admin 内)
-       else:                                 // Level 2 甩给工作者
-           session = lookup_session_by_ring(ring_bridge_id);
-           io_work_queue.push({ring, saved_head, saved_tail, session})
+           // process_admin 内已推进 head + futex_wake
+       else {
+           // Level 2: 填写工单, 唤醒线程池
+           order = alloc_work_order();
+           order.ring    = ring;
+           order.head    = saved_head;
+           order.tail    = saved_tail;
+           order.session = lookup_session_by_ring(ring_bridge_id);
+           order.state   = ORDER_PENDING;
+           thread_pool_wake();
+         }
 
      // 不会到达此处 (CMD_SERVER_SHUTDOWN 直接 exit)
 ```
@@ -338,7 +350,6 @@ void process_admin(command_ring_t *ring, uint8_t head, uint8_t tail) {
             fs_uid = (uint32_t)cmd.param[0];
             fs_gid = (uint32_t)cmd.param[1];
             sid = alloc_session_id(fs_uid, fs_gid);
-            // 创建目录 + admin_ring + mmap + init meta
             cmd.res_code = sid;
         case CMD_SESSION_UNREGISTER:
             sid = (uint32_t)cmd.param[0];
@@ -349,10 +360,10 @@ void process_admin(command_ring_t *ring, uint8_t head, uint8_t tail) {
                 cmd.res_code = -EBUSY;
             else {
                 cmd.res_code = 0;
-                sync();                     // 刷盘
-                destroy_global_ring();       // 收 Global Admin
+                sync();
+                destroy_global_ring();
                 rmdir("/tmp/ravenfsd_sessions/");
-                exit(0);                    // 接待员直接关机
+                exit(0);
             }
         case CMD_CANVAS_CREATE:
             cid = alloc_canvas_id(session_of(ring));
@@ -375,29 +386,97 @@ void process_admin(command_ring_t *ring, uint8_t head, uint8_t tail) {
 }
 ```
 
-### 8.2 IO 处理（工作者线程）
+### 8.2 IO 处理（线程池工作者）
 
-```c
-void io_worker(command_ring_t *ring, uint8_t head, uint8_t tail,
-               session_t *s) {
-    for each cmd in ring->ring[head .. tail):
-        // 解析路径数据指针 → canvas + offset
-        dp = cmd.param[0];
-        path = (char*)(s->canvases[data_ptr_canvas(dp)].addr
-                       + data_ptr_offset(dp));
-        switch (cmd.opcode) {
-        case CMD_MKDIR:  ret = fs_mkdir(path, cmd.param[2]); break;
-        case CMD_RMDIR:  ret = fs_rmdir(path); break;
-        case CMD_CREATE: ret = fs_create(path, cmd.param[2], cmd.param[3]); break;
-        case CMD_OPEN:   ret = fs_open(path); cmd.res_code = ret; continue;
-        case CMD_READ:   ret = fs_read(cmd.param[0], cmd.param[1..3]); break;
-        case CMD_WRITE:  ret = fs_write(cmd.param[0], cmd.param[1..4]); break;
-        case CMD_STAT:   ret = fs_stat(path, cmd.param[2..3]); break;
-        case CMD_READDIR: ret = fs_readdir(cmd.param[0..5]); break;
-        }
-        cmd.res_code = (uint32_t)(ret < 0 ? -ret : ret);
-    // 推进 head (sigblock_guard + write_lock), 唤醒 guest
+```cpp
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+
+/* ─── 工单 ─── */
+struct work_order_t {
+    command_ring_t *ring;
+    session_t      *session;
+    uint8_t         head;
+    uint8_t         tail;        // 完成后即新 head
+    std::atomic<int> state;      // FREE / PENDING / DONE
+};
+constexpr int MAX_ORDERS = 128;
+work_order_t g_orders[MAX_ORDERS];
+
+/* ─── 线程池 ─── */
+std::mutex              g_pool_mtx;
+std::condition_variable g_pool_cv;
+int                     g_pending_count = 0;
+
+/* 接待员: 填好工单后通知工作者 */
+void wake_io_worker(work_order_t *order) {
+    order->state.store(ORDER_PENDING, std::memory_order_release);
+    {
+        std::lock_guard lk(g_pool_mtx);
+        g_pending_count++;
+    }
+    g_pool_cv.notify_one();
 }
+
+/* 工作者: 处理工单 → 标记完成 (不碰 head) */
+void io_worker() {
+    while (true) {
+        work_order_t *order = nullptr;
+        {
+            std::unique_lock lk(g_pool_mtx);
+            g_pool_cv.wait(lk, []{ return g_pending_count > 0; });
+            for (auto &o : g_orders)
+                if (cmpxchg(o.state, ORDER_PENDING, ORDER_INPROGRESS))
+                    { order = &o; break; }
+            g_pending_count--;
+        }
+        if (!order) continue;
+
+        // 处理 batch
+        for each cmd in order->ring->ring[order->head .. order->tail):
+            dp = cmd.param[0];
+            path = order->session->canvases[
+                data_ptr_canvas(dp)].addr + data_ptr_offset(dp);
+            switch (cmd.opcode) {
+            case CMD_MKDIR:  ret = fs_mkdir(path, cmd.param[2]); break;
+            case CMD_RMDIR:  ret = fs_rmdir(path); break;
+            case CMD_CREATE: ret = fs_create(path, cmd.param[2], cmd.param[3]); break;
+            case CMD_OPEN:   ret = fs_open(path); cmd.res_code = ret; continue;
+            case CMD_READ:   ret = fs_read(cmd.param[0], cmd.param[1..3]); break;
+            case CMD_WRITE:  ret = fs_write(cmd.param[0], cmd.param[1..4]); break;
+            case CMD_STAT:   ret = fs_stat(path, cmd.param[2..3]); break;
+            case CMD_READDIR: ret = fs_readdir(cmd.param[0..5]); break;
+            }
+            cmd.res_code = (uint32_t)(ret < 0 ? -ret : ret);
+
+        order->state.store(ORDER_DONE, std::memory_order_release);
+    }
+}
+
+/* 接待员: 每次 sigwaitinfo 返回前扫工单 */
+void drain_work_orders() {
+    for (auto &order : g_orders) {
+        int exp = ORDER_DONE;
+        if (order.state.compare_exchange_strong(exp, ORDER_FREE)) {
+            sigblock_guard_t guard(SIGRTMIN);
+            order.ring->meta.rwlock.write_lock();
+            order.ring->meta.head_idx = order.tail;  // 推进 head
+            order.ring->meta.rwlock.write_unlock();
+            // ~guard: 恢复 SIGRTMIN
+            uint32_t exp2 = BRIDGE_HAS_WAITER;
+            if (cmpxchg(&order.ring->meta.block_token, exp2, 0))
+                futex(&order.ring->meta.block_token, FUTEX_WAKE, 1);
+        }
+    }
+}
+
+/* 初始化: 启动 N 个工作者线程 */
+void start_io_pool(int n) {
+    for (int i = 0; i < n; i++)
+        new std::thread(io_worker);
+}
+```
 ```
 
 ---
