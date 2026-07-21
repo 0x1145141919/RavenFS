@@ -1,10 +1,26 @@
+# 构建输出
 build/
+build_fresh/
+*/build/
+
+# 编译中间产物
 *.o
 *.a
-*.kmod
-*.ko
-*.img
-*.tar.gz
-__pycache__/
+*.so
+
+# 可执行文件
+ravenfs_test
+mkfs.ravenfs
+ravenfs.fsck
+stress_mkdir
+ravenfs_cli
+
+# IDE / 编辑器
 .vscode/
-compile_commands.json
+.idea/
+*.swp
+*.swo
+
+# 系统
+core
+core.*
