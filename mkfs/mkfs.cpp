@@ -305,28 +305,26 @@ static void build_superblock(RavenSuperblock *sb, const MkfsParams &p,
     sb->root_inode     = 0;
     memcpy(sb->uuid, p.uuid, 16);
     memcpy(sb->volume_name, p.label, sizeof(sb->volume_name));
-    sb->backup_prev  = 0;
-    sb->backup_next  = p.backups > 0 ? backup_blocks[0] : 0;
+    sb->backup_prev  = ~0ULL;
+    sb->backup_next  = p.backups > 0 ? backup_blocks[0] : ~0ULL;
     sb->backup_count = p.backups;
 }
 
 static void build_root_dentry_node(Dentry_Bptree_node_t *node)
 {
+    /* 状态2：根叶子 — parent_ptr=. inode, ptr2=.. inode */
     memset(node, 0, sizeof(*node));
-    node->head.head.fields.entry_count        = 2;
+    node->head.head.fields.entry_count        = 0;
     node->head.head.fields.is_internal_node   = 0;
     node->head.head.fields.is_root_node       = 1;
-    node->head.head.fields.parent_ptr         = 0;
-    node->head.ptr1 = 0;
-    node->head.ptr2 = 0;
+    node->head.head.fields.parent_ptr         = 0;  /* . = 根 inode 自身 */
+    node->head.ptr1 = ~0ULL;                              /* 根无前驱 */
+    node->head.ptr2 = 0;                              /* .. = 根 inode（根的父亲是自己） */
     node->head.magic1 = DENTRY_MAGIC1;
     node->head.magic2 = DENTRY_MAGIC2;
     node->head.magic3 = DENTRY_MAGIC3;
     node->head.magic4 = DENTRY_MAGIC4;
-    node->entries[0].ptr = 0;
-    strcpy(node->entries[0].name, ".");
-    node->entries[1].ptr = 0;
-    strcpy(node->entries[1].name, "..");
+    /* entries 为空 — . 和 .. 由 parent_ptr/ptr2 提供 */
 }
 
 static void build_root_inode(raven_Inode_t *inode, uint64_t root_dentry_block) {
@@ -444,7 +442,7 @@ struct InodeBitmapBuf {
 };
 
 int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
-    uint64_t root_dentry_block = 1;
+    uint64_t root_dentry_block = 0;
 
     /* ─── Backup locations ─── */
     uint64_t backup_blocks[256];
@@ -453,14 +451,16 @@ int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
     uint64_t seed = 0;
     memcpy(&seed, params.uuid, sizeof(seed));
 
+    /* Backup 散布在数据区 [2, inode_array_bitmap_base)，
+     * 避开根 dentry (block 0-1) 和所有元数据（bitmap、inode array、inode bitmap） */
+    uint64_t data_lo = 2;
+    uint64_t data_hi = geo.inode_array_bitmap_base;
     for (uint32_t bi = 0; bi < bc; bi++) {
-        uint64_t lo = geo.inode_array_bitmap_base;
-        uint64_t hi = geo.total_blocks;
-        if (hi - lo < 2) { lo = 2; hi = geo.total_blocks; }
+        if (data_hi - data_lo < 2) break;  // 数据区太小，能放几个放几个
         uint64_t blk;
     retry:
-        blk = rand_range(lo, hi, &seed);
-        if (blk == root_dentry_block) goto retry;
+        blk = rand_range(data_lo, data_hi, &seed);
+        if (blk == root_dentry_block || blk == root_dentry_block + 1) goto retry;
         for (uint32_t j = 0; j < bi; j++)
             if (backup_blocks[j] == blk) goto retry;
         backup_blocks[bi] = blk;
@@ -489,7 +489,7 @@ int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
         InodeArrayBuf  inodes(fd, geo, ia_off);
         InodeBitmapBuf ibitmap(fd, geo, ibm_off, params.inode_count);
 
-        bitmap.mark_range(root_dentry_block, 1);
+        bitmap.mark_range(root_dentry_block, 2);
         bitmap.mark_range(geo.inode_array_bitmap_base, geo.inode_bitmap_blocks);
         bitmap.mark_range(geo.inode_array_base, geo.inode_blocks);
         bitmap.mark_range(geo.bitmap_start, geo.bitmap_blocks);
@@ -505,9 +505,11 @@ int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
         pwrite(fd, &dentry_node, sizeof(dentry_node), dn_off);
         for (uint32_t bi = 0; bi < bc; bi++) {
             RavenSuperblock backup_sb = sb;
-            backup_sb.backup_prev = bi > 0 ? backup_blocks[bi - 1] : 0;
+            backup_sb.backup_prev = bi > 0 ? backup_blocks[bi - 1] : ~0ULL;
             backup_sb.backup_next =
-                (bi + 1 < bc) ? backup_blocks[bi + 1] : 0;
+                (bi + 1 < bc) ? backup_blocks[bi + 1] : ~0ULL;  // ~0ull = 链尾哨兵（文档 §2.1）
+            backup_sb.crc32 = 0;  // 重算 CRC32（backup_prev/next 与 Primary 不同）
+            backup_sb.crc32 = crc32_compute(&backup_sb, sizeof(backup_sb));
             uint64_t bk_off = block_to_offset(backup_blocks[bi], params);
             pwrite(fd, &backup_sb, sizeof(backup_sb), bk_off);
         }

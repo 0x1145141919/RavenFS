@@ -80,7 +80,7 @@ struct RavenSuperblock {
     uint32_t  crc32;
 
     /* ── 备份链表 ── */
-    uint64_t  backup_prev;          // Primary: 0（哨兵）
+    uint64_t  backup_prev;          // Primary: ~0ull（哨兵）
     uint64_t  backup_next;          // Primary: 链表头（第一个 Backup FS_block 号）
     uint32_t  backup_count;         // 备份总数
 
@@ -92,7 +92,7 @@ struct RavenSuperblock {
 
 | 字段 | 值 | 说明 |
 |------|----|------|
-| `backup_prev` | 0 | 哨兵，Primary 无前驱 |
+| `backup_prev` | ~0ull | 哨兵，Primary 无前驱 |
 | `backup_next` | FS_block# | 第一个 Backup Superblock 的块号 |
 | `backup_count` | N | 备份总数。mount 时遍历链表计数校验 |
 
@@ -119,8 +119,8 @@ bitmap 标记为 allocated。
 
 | 字段 | 值 | 说明 |
 |------|----|------|
-| `backup_prev` | FS_block# / 0 | 前驱 Backup 块号（0=链头，即 Primary 后的第一个） |
-| `backup_next` | FS_block# / 0 | 后继 Backup 块号（0=链尾） |
+| `backup_prev` | FS_block# / ~0ull | 前驱 Backup 块号（~0ull=链头，即 Primary 后的第一个） |
+| `backup_next` | FS_block# / ~0ull | 后继 Backup 块号（~0ull=链尾） |
 | `backup_count` | N | 与 Primary 交叉验证。挂载时遍历链表，计数必须一致 |
 
 ### 链表拓扑
@@ -128,7 +128,7 @@ bitmap 标记为 allocated。
 ```
 Primary (不在世界内)
   └─ backup_next → Backup#0 (FS_block[P0])
-                      ├─ backup_prev = 0  (链头，前驱为 Primary)
+                      ├─ backup_prev = ~0ull  (链头，前驱为 Primary)
                       ├─ backup_next → Backup#1 (FS_block[P1])
                       └─ backup_count = 3
                   Backup#1 (FS_block[P1])
@@ -137,12 +137,12 @@ Primary (不在世界内)
                       └─ backup_count = 3
                   Backup#2 (FS_block[P2])
                       ├─ backup_prev = P1
-                      ├─ backup_next = 0  (链尾)
+                      ├─ backup_next = ~0ull  (链尾)
                       └─ backup_count = 3
 ```
 
-链头（Backup#0）的 `backup_prev = 0`。
-链尾（Backup#last）的 `backup_next = 0`。
+链头（Backup#0）的 `backup_prev = ~0ull`。
+链尾（Backup#last）的 `backup_next = ~0ull`。
 
 ### 挂载校验
 
@@ -256,7 +256,7 @@ constexpr uint8_t INODE_TYPE_SOFT_SYM = 2;  // 软链接
 ```c
 struct raven_Inode_t {
     uint64_t  type:2;                  // INODE_TYPE_REGULAR/DIR/SOFT_LINK
-    uint64_t  is_data_root_direct_bit:1; // 1=direct extent, 0=B+tree root (dir always 0)
+    uint64_t  is_data_root_direct_bit:1; // type=DIR 时忽略；REGULAR/SOFT_LINK: 1=直指, 0=B+tree
     uint64_t  other:61;                // 预留
     uint32_t  uid;
     uint32_t  gid;
@@ -264,11 +264,11 @@ struct raven_Inode_t {
     uint32_t  c_ns_stamp;            // ctime 纳秒余数
     uint32_t  a_ns_stamp;            // atime 纳秒余数
     uint64_t  permission_bits;       // 编码后权限位
-    uint64_t  size;
+    uint64_t  size;                  // REGULAR: 文件字节数; DIR: 非 . 非 .. 的 dentry 条目数
     uint64_t  mtime;                  // seconds
     uint64_t  ctime;                  // seconds
     uint64_t  atime;                  // seconds
-    uint64_t  data_root;             // 0 = inline, else FS_block#
+    uint64_t  data_root;             // ~0ull = inline, else FS_block#
     uint32_t  link_count;
     uint64_t  padding[2];            // 元数据扩展预留
     uint8_t   inline_data[160];
@@ -281,27 +281,34 @@ static_assert(sizeof(raven_Inode_t) == 256, "");
 ```
 byte[0..7] = { type:2 | is_data_root_direct_bit:1 | other:61 }
               bits[1:0] = type
-              bits[2]   = is_data_root_direct_bit
+              bits[2]   = is_data_root_direct_bit（DIR 忽略）
               bits[63:3] = 预留
 ```
 
-### data_root 三态语义
+### data_root 解码 — 按 type 分岔
 
-| `size` | `data_root` | `is_data_root_direct_bit` | 含义 | I/O 次数 |
-|---------|-------------|---------------------------|------|---------|
-| 0~160 | = 0 | don't care | **内联**，内容在 inline_data[] | 0 |
-| — | ≠ 0 | = 1 | **直指 extent**：data_root → 单个数据块 | 1 |
-| — | ≠ 0 | = 0 | **B+tree**：data_root → btree 根节点 | ≥ 2 |
+`data_root` 和 `is_data_root_direct_bit` 的语义由 `type` 字段联合决定，不能脱离 type 独立解读。
 
-前两行由 size 判定。`data_root ≠ 0` 后用 `is_data_root_direct_bit` 区分 direct / B+tree。
+#### type == DIR（目录）
 
-**各类型默认行为：**
+`is_data_root_direct_bit` **完全忽略**（可为 0 或 1，不区分）。
 
-| 类型 | is_data_root_direct_bit | 说明 |
-|------|------------------------|------|
-| `INODE_TYPE_REGULAR` | 0 / 1 | size ≤ 4K 可直指；跨 8K 翻转为 0，创建 B+tree |
-| `INODE_TYPE_DIR` | 始终 0 | 目录永远走 dentry B+tree |
-| `INODE_TYPE_SOFT_LINK` | 0 / 1 | 同 regular，target 路径超过 inline 时分配数据 |
+| `data_root` | 含义 | `size` 语义 |
+|-------------|------|------------|
+| ~0ull | 错误状态（mkfs 后不应出现） | — |
+| ≠ ~0ull | Dentry B+tree 根节点 FS_block# | 非 `.` `..` 的 dentry 条目数，空目录 = 0 |
+
+#### type == REGULAR / SOFT_LINK（文件/软链接）
+
+按 `is_data_root_direct_bit` 分岔：
+
+| `data_root` | `is_data_root_direct_bit` | 含义 | `size` 语义 |
+|-------------|---------------------------|------|------------|
+| ~0ull | don't care | **内联**：内容在 `inline_data[0..size-1]`，size=0~160 | 文件字节数 |
+| ≠ ~0ull | = 1 | **直指区间**：`data_root` 起始，`ceil(size/4096)` 个连续 FS_block，数据从 `data_root` 的 byte[0] 开始 | 文件字节数（无尺寸上限） |
+| ≠ ~0ull | = 0 | **B+tree**：`data_root` → `Bptree_node_t` 区段 B+tree 根节点 FS_block# | 文件字节数 |
+
+直指区间是最优路径：一次间接（data_root → 连续数据块），零 B+tree 节点读取。任何文件（不论大小）只要其数据块在磁盘上连续即可用直指区间。只有当文件碎片化到无法用一个连续区间描述时（如中间块被释放/空洞），才回退为 B+tree 区段树。v1 实现：creat/write 在连续分配时优先走直指区间，遇到空洞时自动升级为 B+tree。
 
 ### 4.2 Inode 数组
 
@@ -577,8 +584,8 @@ Dentry_Bptree_node_t (8K = 8192B)
 ```c
 struct Dentry_head_t {
     dentry_node_meta_t  head;        // 8B: 节点元数据
-    uint64_t            ptr1;        // 8B: 内部→最左子树 | 叶子→前驱
-    uint64_t            ptr2;        // 8B: 内部→空闲     | 叶子→后继
+    uint64_t            ptr1;        // 8B: 语义见 §6.2 四态枚举
+    uint64_t            ptr2;        // 8B: 语义见 §6.2 四态枚举
     uint64_t            reserved0;   // 8B: 预留
     uint64_t            magic1;      // 8B: 256-bit 扫描签名
     uint64_t            magic2;      // 8B: 256-bit 扫描签名
@@ -594,55 +601,41 @@ union dentry_node_meta_t {
         uint64_t is_internal_node : 1; // 0=leaf, 1=internal
         uint64_t is_root_node   : 1;  // 1=根节点
         uint64_t reserved       : 2;
-        uint64_t parent_ptr     : 52; // 非根→父节点块号 | 根→所属 inode 编号
+        uint64_t parent_ptr     : 52; // 语义见 §6.2 四态枚举
     } fields;
     uint64_t raw;
 };
 
 struct Dentry_common_t {
-    uint64_t ptr;        // 8B: 叶子→inode编号 | 内部→child块号
-    char     name[120];  // 120B: 文件名（字典序 key）
+    uint64_t ptr;        // 8B: 语义见 §6.2 四态枚举
+    char     name[120];  // 120B: 文件名（叶子：排序 key / 内部：分隔 key）
 };
 ```
 
-### 6.2 双解码视角
+### 6.2 四态枚举 — `{is_root, is_internal}` 解码表
 
-同一 `Dentry_common_t` 按 `head.is_internal_node` 解码：
+`Dentry_Bptree_node_t` 的全部字段语义由 `head.head.fields` 中两个独立位联合决定：
 
-**叶子：**
+| # | `is_root` | `is_internal` | 角色 | `parent_ptr` | `ptr1` | `ptr2` | `entries[i].ptr` | `entries[i].name` |
+|---|-----------|---------------|------|-------------|--------|--------|-----------------|-------------------|
+| 0 | 0 | 0 | 非根叶子 | 父节点块号 | 前驱叶子块号 | 后继叶子块号 | 目标 inode | 文件名（字典序 key） |
+| 1 | 0 | 1 | 非根内部 | 父节点块号 | 最左子树块号 | 0 | 子树块号 | 分隔 key（子树最小文件名） |
+| 2 | 1 | 0 | 根叶子 | `.` inode（自身） | 0 | `..` inode（父目录） | 目标 inode | 文件名（字典序 key） |
+| 3 | 1 | 1 | 根内部 | `.` inode（自身） | 最左子树块号 | `..` inode（父目录） | 子树块号 | 分隔 key（子树最小文件名） |
 
-```
-entries[i].ptr   = target inode 编号
-entries[i].name  = 文件名（排序 key）
-ptr1 → 前驱叶子块号（同级链表左）
-ptr2 → 后继叶子块号（同级链表右）
-```
+**说明：**
 
-叶子节点 entry 按文件名字典序排列，满足 `strcmp(name[i], name[i+1]) < 0`。
-
-**内部：**
-
-```
-                  ┌─── ptr1 ──→ child_0（最左子树）
-entry[0].name  =  child_1 子树最小文件名
-entry[0].ptr   →  child_1
-entry[1].name  =  child_2 子树最小文件名
-entry[1].ptr   →  child_2
-...
-entry[n].name  =  child_{n+1} 子树最小文件名
-entry[n].ptr   →  child_{n+1}
-```
-
-共 `entry_count + 1` 个子树（ptr1 + 每个 entry 的 ptr）。
-
-路由规则：
+- **状态 0 / 2（叶子）**：所有 entry 按文件名字典序排列，满足 `strcmp(entries[i].name, entries[i+1].name) < 0`。`entries[i].ptr` 为该文件/目录的 inode 编号。
+- **状态 1 / 3（内部）**：共有 `entry_count + 1` 个子树，由 `ptr1`（最左子树）+ 每个 entry 的 `ptr`（第 i+1 子树）组成。`entries[i].name` 为第 i+1 子树的最小文件名（分隔 key）。路由规则：
 
 ```
-target < entry[0].name                  →  ptr1（child_0）
-entry[0].name ≤ target < entry[1].name  →  entry[0].ptr（child_1）
-...
-entry[n].name ≤ target                  →  entry[n].ptr（child_{n+1}）
+target < entries[0].name                  →  ptr1（child_0）
+entries[i].name ≤ target < entries[i+1].name  →  entries[i].ptr（child_{i+1}）
+entries[n].name ≤ target                  →  entries[n].ptr（child_{n+1}）
 ```
+
+- **根节点（状态 2 / 3）**：`parent_ptr` 直接存本目录的 inode 编号（即 `.`），`ptr2` 存父目录的 inode 编号（即 `..`）。避免在 entry 槽位中为 `.` / `..` 各占一个位置。分裂后新生的非根叶子/内部节点恢复正常语义（状态 0 / 1），根节点保持状态 2 / 3 不变。
+- **非根内部（状态 1）**：`ptr2` 恒为 0（空闲）。
 
 ### 6.3 扫描签名
 
@@ -652,13 +645,15 @@ entry[n].name ≤ target                  →  entry[n].ptr（child_{n+1}）
 
 ### 6.4 同级链表
 
-叶子节点通过 `ptr1` / `ptr2` 连成双向链表：
+非根叶子节点（状态 0）通过 `ptr1` / `ptr2` 连成双向链表：
 
 ```
 leaf_A.ptr2 = B
 leaf_B.ptr1 = A, leaf_B.ptr2 = C
-leaf_C.ptr1 = B, leaf_C.ptr2 = 0 (tail)
+leaf_C.ptr1 = B, leaf_C.ptr2 = ~0ull (tail)
 ```
+
+根叶子（状态 2）的 `ptr2` 不参与链表（改存 `..` inode），根不存在链表关系。内部节点（状态 1/3）不涉及同级链表。
 
 范围遍历（`readdir`/`ls`）沿链表顺序扫描，无需回溯父节点。
 

@@ -281,7 +281,7 @@ struct raven_Inode_t{
     uint64_t  mtime;                                                                                                      
     uint64_t  ctime;   
     uint64_t  atime;                                                                                                    
-    uint64_t  data_root;            // 0 = inline       
+    uint64_t  data_root;            // ~0ull = inline       
     uint32_t  link_count;    
     uint64_t padding[2];                                                                                                                                                              
     uint8_t inline_data[160];
@@ -344,15 +344,15 @@ static_assert(sizeof(Dentry_Bptree_node_t) == 8192, "");
  *   位置：裸盘 LBA[0] / GPT 分区 offset=0
  *   不在 FS_block 世界内，bitmap 不管理
  *   角色：FS_block 世界的定义者和入口
- *   backup_prev = 0（哨兵）
+ *   backup_prev = ~0ull（哨兵）
  *   backup_next = 链表头（第一个 Backup 的 FS_block 号）
  *   backup_count = 备份总数
  *
  * Backup Superblock（备胎）：
  *   位置：随机散落在 FS_block 世界内，bitmap 标记 allocated
  *   内容：与 Primary 全同（magic ~ crc32 所有字段一致）
- *   backup_prev = 前驱 Backup 的 FS_block 号（0=链头）
- *   backup_next = 后继 Backup 的 FS_block 号（0=链尾）
+ *   backup_prev = 前驱 Backup 的 FS_block 号（~0ull=链头）
+ *   backup_next = 后继 Backup 的 FS_block 号（~0ull=链尾）
  *   backup_count = 备份总数（与 Primary 交叉校验）
  * ═══════════════════════════════════════════════════════ */
 struct RavenSuperblock {
@@ -370,7 +370,7 @@ struct RavenSuperblock {
     uint32_t  crc32;
 
     /* ── 备份链表（角色双解码） ── */
-    uint64_t  backup_prev;          // Primary: 0 | Backup: 前驱 FS_block 号
+    uint64_t  backup_prev;          // Primary: ~0ull（哨兵）| Backup: 前驱 FS_block 号
     uint64_t  backup_next;          // Primary: 链头 | Backup: 后继 FS_block 号
     uint32_t  backup_count;         // 两者均存，交叉校验
 

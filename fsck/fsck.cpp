@@ -339,7 +339,7 @@ static void dump_root_dentry(int fd, const RavenSuperblock *sb,
 
     PRINT_FIELD("block",           "%lu",     (unsigned long)data_root);
     uint8_t ec = node.head.head.fields.entry_count;
-    PRINT_FIELD("entry_count",     "%u",      ec);
+    PRINT_FIELD("entry_count",     "%u",      ec);  /* fixed: ec, not ec+1 (see 643b4f9) */
     PRINT_FIELD("is_internal",     "%s",      node.head.head.fields.is_internal_node ? "yes" : "no");
     PRINT_FIELD("is_root",         "%s",      node.head.head.fields.is_root_node ? "yes" : "no");
     PRINT_FIELD("ptr1/ptr2",       "%lu / %lu",
@@ -348,7 +348,7 @@ static void dump_root_dentry(int fd, const RavenSuperblock *sb,
 
     if (!node.head.head.fields.is_internal_node) {
         print_sec("  Directory entries");
-        for (int i = 0; i < ec && i < 63; i++) {
+        for (int i = 0; i < ec && i < 63; i++) {  /* fixed: i < ec, not i <= ec (see 643b4f9) */
             char name[121] = {};
             memcpy(name, node.entries[i].name, 120);
             char lb[32];
