@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>
 #include <map>
 #include <set>
 #include <string>
@@ -10,6 +11,7 @@
 
 #include "disk_struct.hpp"
 #include "magics.h"
+#include "util/lock.h"
 
 /* ═══════════════════════════════════════════════════════════════
  * 挂载错误码
@@ -37,6 +39,138 @@ struct FsGeometry {
     uint64_t inode_array_base;
     uint64_t inode_bitmap_blocks;
     uint64_t inode_array_bitmap_base;
+};
+
+/* ═══════════════════════════════════════════════════════════════
+ * BlockDevice — 块设备抽象（用户态具体类）
+ *
+ * 持有 fd + LBA 参数，read_block/write_block 直接 pread/pwrite。
+ * 移植到内核时重写此 struct，方法签名不变。
+ * ═══════════════════════════════════════════════════════════════ */
+
+struct BlockDevice {
+    int      fd;
+    uint64_t lba_size;
+    uint64_t multiplier;
+
+    void read_block(uint64_t fblock, void *buf) const {
+        ::pread(fd, buf, 4096, 4096 + fblock * 4096);
+    }
+    void write_block(uint64_t fblock, const void *buf) const {
+        ::pwrite(fd, buf, 4096, 4096 + fblock * 4096);
+    }
+};
+
+/* ═══════════════════════════════════════════════════════════════
+ * Inode Cache — 文件作用域数据结构
+ *
+ * Inode_cache_line：     数据行（4096B = 16 inode）
+ * Inode_cache_line_controller：每 slot 控制块（24B）
+ * controller_set：      1 组（8 way × 24B = 192B）
+ *
+ * inum 位域编码:
+ *   [0:3]     → row（行内引索）
+ *   [4:4+N-1] → set_idx（组索引）
+ *   [4+N:63]  → tag（高比特验证）
+ *   N = num_of_entries_log2
+ * ═══════════════════════════════════════════════════════════════ */
+
+struct Inode_cache_line {
+    raven_Inode_t entries[16];
+};
+static_assert(sizeof(Inode_cache_line) == 4096, "Inode cache line must be 4096B");
+
+struct Inode_cache_line_controller {
+    uint16_t           flags;               // [V:1 | D:1 | T:1 | reserved:13]
+    spintrylock_cpp_t  lock;
+    uint8_t            reserved0;
+    uint32_t           num_of_accessor;
+    uint64_t           last_access_stamp;
+    uint64_t           tag;
+};
+static_assert(sizeof(Inode_cache_line_controller) == 24,
+              "Controller must be 24B");
+
+static constexpr uint16_t INODE_CACHE_V = 1 << 0;
+static constexpr uint16_t INODE_CACHE_D = 1 << 1;
+static constexpr uint16_t INODE_CACHE_T = 1 << 2;
+
+static constexpr uint8_t WAYS_PER_SET = 8;
+
+struct controller_set {
+    Inode_cache_line_controller controllers[WAYS_PER_SET];
+};
+static_assert(sizeof(controller_set) == 192,
+              "controller_set must be 192B (8 × 24B)");
+
+/* ─── InodeCacheConfig — 初始化信息包 ───
+ *
+ * 控制器构造时一次性传入，之后不可变。
+ * 所有内存由外部（RavenFS）分配，控制器只使用不拥有。
+ */
+struct InodeCacheConfig {
+    const BlockDevice  *dev;                 // I/O 通道
+    uint64_t            inode_array_base;    // inode 数组基址（FS_block 号）
+    uint64_t            inode_array_count;   // inode 总数上限（超限请求被拒绝）
+    controller_set     *all_entries;         // [sets] 控制面
+    Inode_cache_line   *cache_lines;         // [total_slots] 数据面
+    uint8_t             num_of_entries_log2; // N: sets = 1 << N
+};
+
+/* ─── Inode_cache_controller — 附生式缓存控制器 ───
+ *
+ * 纯使用者，不分配不释放任何资源。
+ * 构造时接收 InodeCacheConfig，之后所有操作基于配置指针。
+ * 无 init/destroy，无业务返回值。
+ */
+class Inode_cache_controller {
+    InodeCacheConfig cfg;
+    uint64_t         access_stamp_counter;
+
+    Inode_cache_line *slot_data(uint64_t set, int way) const {
+        return cfg.cache_lines + (set * WAYS_PER_SET + way);
+    }
+
+public:
+    Inode_cache_controller(const InodeCacheConfig &cfg)
+        : cfg(cfg), access_stamp_counter(0) {}
+
+    raven_Inode_t *cache_get(uint64_t inum);
+    void           cache_put(uint64_t inum);
+    void           mark_dirty(uint64_t inum);
+    void           flush_all();
+    void           flush_inum(uint64_t inum);
+
+    uint64_t sets()            const { return 1ULL << cfg.num_of_entries_log2; }
+    uint64_t total_slots()     const { return sets() * WAYS_PER_SET; }
+    uint64_t bytes()           const { return total_slots() * 4096; }
+    bool     is_valid()        const { return cfg.all_entries != nullptr && cfg.cache_lines != nullptr; }
+
+    const InodeCacheConfig &config() const { return cfg; }
+
+private:
+    struct InumFields {
+        uint64_t row;
+        uint64_t set_idx;
+        uint64_t tag;
+    };
+
+    InumFields decode_inum(uint64_t inum) const {
+        uint64_t set_mask = (1ULL << cfg.num_of_entries_log2) - 1;
+        return {
+            .row     = inum & 0xF,
+            .set_idx = (inum >> 4) & set_mask,
+            .tag     = inum >> (4 + cfg.num_of_entries_log2)
+        };
+    }
+
+    uint64_t inum_to_block(uint64_t inum) const {
+        return cfg.inode_array_base + (inum / 16);
+    }
+    int  select_victim_and_lock(controller_set *cs);
+
+    raven_Inode_t *load_slot_locked(controller_set *cs, int way,
+                              uint64_t inum, const InumFields &f);
 };
 
 /* ═══════════════════════════════════════════════════════════════
@@ -68,7 +202,7 @@ public:
 
     /* ─── 手动卸载（可选，否则析构自动调） ─── */
     void unmount();
-    bool is_mounted() const { return dev_fd >= 0; }
+    bool is_mounted() const { return bdev.fd >= 0; }
 
     /* ─── 目录操作（0=成功，负值=-errno） ─── */
     int  mkdir(const char *path);
@@ -87,6 +221,55 @@ public:
 
     /* ─── Dentry B+tree 全量校验（从根递归，走块缓存） ─── */
     int validate_dentry_tree();
+
+    /* ─── InodeSession — RAII inode session ─── */
+    class InodeSession {
+        RavenFS  *fs;
+        uint64_t  inum_;
+    public:
+        raven_Inode_t *inode;
+
+        InodeSession(RavenFS *fs, uint64_t inum)
+            : fs(fs), inum_(inum), inode(nullptr) {
+            if (fs && fs->icache)
+                inode = fs->icache->cache_get(inum);
+        }
+
+        ~InodeSession() {
+            if (fs && fs->icache && inode)
+                fs->icache->cache_put(inum_);
+        }
+
+        InodeSession(const InodeSession &) = delete;
+        InodeSession &operator=(const InodeSession &) = delete;
+
+        InodeSession(InodeSession &&other) noexcept
+            : fs(other.fs), inum_(other.inum_), inode(other.inode) {
+            other.fs    = nullptr;
+            other.inode = nullptr;
+        }
+
+        InodeSession &operator=(InodeSession &&other) noexcept {
+            if (this != &other) {
+                if (fs && fs->icache && inode) fs->icache->cache_put(inum_);
+                fs    = other.fs;
+                inum_ = other.inum_;
+                inode = other.inode;
+                other.fs    = nullptr;
+                other.inode = nullptr;
+            }
+            return *this;
+        }
+
+        void dirty() {
+            if (fs && fs->icache && inode)
+                fs->icache->mark_dirty(inum_);
+        }
+
+        uint64_t inum()    const { return inum_; }
+        bool     ok()      const { return inode != nullptr; }
+        explicit operator bool() const { return ok(); }
+    };
 
 private:
     /* ═══════════════════════════════════════════════════════════
@@ -221,6 +404,8 @@ private:
     uint8_t *ibitmap_cache  = nullptr;
     bool     bitmap_dirty   = false;
     bool     ibitmap_dirty  = false;
+    uint64_t bitmap_alloc_hint  = 0;   // 上次成功分配 FS_block 的下一位
+    uint64_t ibitmap_alloc_hint = 1;   // 上次成功分配 inode 的下一位
 
     /* ═══════════════════════════════════════════════════════════
      * 缓存 — Inode Table（组相联写回，堆分配）
@@ -245,6 +430,11 @@ private:
     void inode_cache_load(uint64_t abs_fblock, uint8_t *buf);
     void inode_cache_commit(uint64_t abs_fblock, const uint8_t *buf);
 
+    // v2 inode cache — 内存由上帝类分配，控制器只使用
+    controller_set          *cache_entries = nullptr;  // [sets]
+    Inode_cache_line        *cache_data    = nullptr;   // [total_slots]
+    Inode_cache_controller  *icache        = nullptr;
+
     /* ═══════════════════════════════════════════════════════════
      * 缓存 — 通用 block cache（4K 块，直写直读）
      *
@@ -263,12 +453,8 @@ private:
     /* ═══════════════════════════════════════════════════════════
      * 状态
      * ═══════════════════════════════════════════════════════════ */
-    int     dev_fd = -1;
-
-    uint64_t lba_size       = 0;
-    uint64_t multiplier     = 0;
-    uint64_t world_base_lba = 0;
-    uint64_t root_inum      = 0;
+    BlockDevice bdev = { -1, 0, 0 };
+    uint64_t    root_inum = 0;
 
     FsGeometry geo;
     RavenSuperblock sb;

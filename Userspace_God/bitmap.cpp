@@ -64,16 +64,26 @@ uint64_t RavenFS::bitmap_alloc_block() {
 }
 
 uint64_t RavenFS::bitmap_alloc_blocks(uint64_t count) {
-    for (uint64_t i = 0; i <= geo.total_blocks - count; i++) {
-        bool ok = true;
-        for (uint64_t j = 0; j < count; j++) {
-            if (bitmap_test(i + j)) { ok = false; break; }
+    uint64_t limit = geo.total_blocks - count + 1;
+
+    for (uint64_t phase = 0; phase < 2; phase++) {
+        uint64_t start = (phase == 0) ? bitmap_alloc_hint : 0;
+        uint64_t end   = (phase == 0) ? limit : bitmap_alloc_hint;
+        if (start >= end) continue;
+
+        for (uint64_t i = start; i < end; i++) {
+            bool ok = true;
+            for (uint64_t j = 0; j < count; j++) {
+                if (bitmap_test(i + j)) { ok = false; break; }
+            }
+            if (!ok) continue;
+            for (uint64_t j = 0; j < count; j++)
+                bitmap_set(i + j);
+            bitmap_alloc_hint = i + count;
+            return i;
         }
-        if (!ok) continue;
-        for (uint64_t j = 0; j < count; j++)
-            bitmap_set(i + j);
-        return i;
     }
+
     fprintf(stderr, "RavenFS: no %lu consecutive free FS_blocks (total=%lu)\n",
             (unsigned long)count, (unsigned long)geo.total_blocks);
     return (uint64_t)-1;
@@ -134,10 +144,19 @@ void RavenFS::ibitmap_clear(uint64_t inum) {
 }
 
 uint64_t RavenFS::ibitmap_alloc_inode() {
-    for (uint64_t i = 1; i < sb.inode_array_count; i++) {
-        if (!ibitmap_test(i))
-            return i;
+    for (uint64_t phase = 0; phase < 2; phase++) {
+        uint64_t start = (phase == 0) ? ibitmap_alloc_hint : 1;
+        uint64_t end   = (phase == 0) ? sb.inode_array_count : ibitmap_alloc_hint;
+
+        for (uint64_t i = start; i < end; i++) {
+            if (!ibitmap_test(i)) {
+                ibitmap_set(i);
+                ibitmap_alloc_hint = i + 1;
+                return i;
+            }
+        }
     }
+
     fprintf(stderr, "RavenFS: no free inode (max=%lu)\n",
             (unsigned long)sb.inode_array_count);
     return (uint64_t)-1;

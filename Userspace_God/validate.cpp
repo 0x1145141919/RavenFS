@@ -2,11 +2,12 @@
 #include <cstdio>
 
 uint64_t RavenFS::validate_world_base() {
-    if (world_base_lba * lba_size != 4096) {
+    uint64_t wbl = sb.world_base_lba;
+    if (wbl * bdev.lba_size != 4096) {
         fprintf(stderr, "RavenFS: world_base_lba=%lu  lba_size=%lu  "
                         "product=%lu, expected 4096\n",
-                (unsigned long)world_base_lba, (unsigned long)lba_size,
-                (unsigned long)(world_base_lba * lba_size));
+                (unsigned long)wbl, (unsigned long)bdev.lba_size,
+                (unsigned long)(wbl * bdev.lba_size));
         return RAVENFS_ERR_WORLD_BASE;
     }
     return RAVENFS_OK;

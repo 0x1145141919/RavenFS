@@ -10,15 +10,15 @@ RavenFS::RavenFS(const char *device_path, uint64_t *res_code) {
 RavenFS::~RavenFS() { unmount(); }
 
 uint64_t RavenFS::fblock_to_byte(uint64_t fblock) const {
-    return (world_base_lba + fblock * multiplier) * lba_size;
+    return 4096 + fblock * 4096;
 }
 
 void RavenFS::read_raw(uint64_t byte_off, void *buf, size_t len) {
-    pread(dev_fd, buf, len, byte_off);
+    ::pread(bdev.fd, buf, len, byte_off);
 }
 
 void RavenFS::write_raw(uint64_t byte_off, const void *buf, size_t len) {
-    pwrite(dev_fd, buf, len, byte_off);
+    ::pwrite(bdev.fd, buf, len, byte_off);
 }
 
 void RavenFS::read_block(uint64_t fblock, void *buf) {

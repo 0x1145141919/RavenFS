@@ -158,8 +158,8 @@ void RavenFS::dump_info() const {
         (unsigned long)geo.inode_array_bitmap_base,
         (unsigned long)geo.inode_array_base,
         (unsigned long)geo.inode_bitmap_blocks,
-        (unsigned long)lba_size,
-        (unsigned long)multiplier,
-        (unsigned long)world_base_lba
+        (unsigned long)bdev.lba_size,
+        (unsigned long)bdev.multiplier,
+        (unsigned long)sb.world_base_lba
     );
 }

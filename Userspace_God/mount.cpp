@@ -7,59 +7,58 @@
 #include <linux/fs.h>
 
 uint64_t RavenFS::init_mount(const char *device_path) {
-    if (dev_fd >= 0) {
+    if (bdev.fd >= 0) {
         fprintf(stderr, "RavenFS: already mounted\n");
         return RAVENFS_ERR_OPEN;
     }
 
-    dev_fd = open(device_path, O_RDWR);
-    if (dev_fd < 0) {
+    bdev.fd = open(device_path, O_RDWR);
+    if (bdev.fd < 0) {
         perror("RavenFS: open");
         return RAVENFS_ERR_OPEN;
     }
 
     struct stat st;
     bool is_regular_file = false;
-    if (fstat(dev_fd, &st) == 0 && S_ISREG(st.st_mode))
+    if (fstat(bdev.fd, &st) == 0 && S_ISREG(st.st_mode))
         is_regular_file = true;
 
     if (is_regular_file) {
-        lba_size = 4096;
+        bdev.lba_size = 4096;
     } else {
         int sz = 0;
-        if (ioctl(dev_fd, BLKSSZGET, &sz) != 0 || sz <= 0) {
+        if (ioctl(bdev.fd, BLKSSZGET, &sz) != 0 || sz <= 0) {
             fprintf(stderr, "RavenFS: BLKSSZGET failed, assuming 512\n");
-            lba_size = 512;
+            bdev.lba_size = 512;
         } else {
-            lba_size = (uint64_t)sz;
+            bdev.lba_size = (uint64_t)sz;
         }
     }
 
-    if (4096 % lba_size != 0) {
+    if (4096 % bdev.lba_size != 0) {
         fprintf(stderr, "RavenFS: LBA_size %lu does not divide 4096\n",
-                (unsigned long)lba_size);
-        close(dev_fd); dev_fd = -1;
+                (unsigned long)bdev.lba_size);
+        close(bdev.fd); bdev.fd = -1;
         return RAVENFS_ERR_LBA;
     }
 
-    multiplier = 4096 / lba_size;
+    bdev.multiplier = 4096 / bdev.lba_size;
 
     read_raw(0, &sb, sizeof(sb));
 
     if (sb.magic != SUPERBLOCK_MAGIC) {
         fprintf(stderr, "RavenFS: no RAVN magic at offset 0 (got 0x%016lX)\n",
                 (unsigned long)sb.magic);
-        close(dev_fd); dev_fd = -1;
+        close(bdev.fd); bdev.fd = -1;
         return RAVENFS_ERR_NOMAGIC;
     }
 
     if (sb.version != 1) {
         fprintf(stderr, "RavenFS: unsupported version %u\n", sb.version);
-        close(dev_fd); dev_fd = -1;
+        close(bdev.fd); bdev.fd = -1;
         return RAVENFS_ERR_VERSION;
     }
 
-    world_base_lba = sb.world_base_lba;
     root_inum      = sb.root_inode;
 
     uint64_t bb = (sb.total_blocks + 32767) / 32768;
@@ -81,16 +80,16 @@ uint64_t RavenFS::init_mount(const char *device_path) {
     {
         uint64_t err;
         err = validate_world_base();
-        if (err) { close(dev_fd); dev_fd = -1; return err; }
+        if (err) { close(bdev.fd); bdev.fd = -1; return err; }
 
         err = validate_sb_crc32();
-        if (err) { close(dev_fd); dev_fd = -1; return err; }
+        if (err) { close(bdev.fd); bdev.fd = -1; return err; }
 
         err = validate_backup_chain();
-        if (err) { close(dev_fd); dev_fd = -1; return err; }
+        if (err) { close(bdev.fd); bdev.fd = -1; return err; }
 
         err = validate_bitmap_self_consistency();
-        if (err) { close(dev_fd); dev_fd = -1; return err; }
+        if (err) { close(bdev.fd); bdev.fd = -1; return err; }
     }
 
     fprintf(stderr, "RavenFS: mounted  blocks=%lu  inodes=%lu  root=%lu\n",
@@ -101,7 +100,15 @@ uint64_t RavenFS::init_mount(const char *device_path) {
 }
 
 void RavenFS::unmount() {
-    if (dev_fd >= 0) {
+    if (bdev.fd >= 0) {
+        if (icache) {
+            icache->flush_all();
+            delete icache;
+            icache = nullptr;
+        }
+        delete[] cache_data;    cache_data    = nullptr;
+        delete[] cache_entries; cache_entries = nullptr;
+
         cache_flush();
 
         free(bitmap_cache);    bitmap_cache    = nullptr;
@@ -110,8 +117,8 @@ void RavenFS::unmount() {
         free(inode_evict_next); inode_evict_next = nullptr;
         free(block_cache);     block_cache     = nullptr;
 
-        close(dev_fd);
-        dev_fd = -1;
+        close(bdev.fd);
+        bdev.fd = -1;
         fprintf(stderr, "RavenFS: unmounted\n");
     }
 }
