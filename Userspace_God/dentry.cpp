@@ -307,7 +307,7 @@ bool RavenFS::dentry_insert(uint64_t dir_inode, const char *name, uint64_t targe
     split_leaf(leaf, name, target_inum, &new_leaf, separator, sizeof(separator));
 
     /* 分配新叶子块 */
-    uint64_t new_block = bitmap_alloc_blocks(2);
+    uint64_t new_block = bcache->hard_alloc(2);
     if (new_block == (uint64_t)-1) return false;
 
     /* 更新兄弟指针 */
@@ -339,8 +339,13 @@ bool RavenFS::dentry_insert(uint64_t dir_inode, const char *name, uint64_t targe
         depth--;
         if (depth < 0) {
             /* 根分裂：创建新根（内部节点） */
-            uint64_t new_root_block = bitmap_alloc_blocks(2);
+            uint64_t new_root_block = bcache->hard_alloc(2);
             if (new_root_block == (uint64_t)-1) return false;
+
+            /* 从原根读取 .. inode 保留给新根 */
+            Dentry_Bptree_node_t old_root_guard;
+            read_btnode(root_fblock, &old_root_guard, sizeof(Dentry_Bptree_node_t));
+            uint64_t dotdot_inode = old_root_guard.head.ptr2;
 
             Dentry_Bptree_node_t new_root;
             memset(&new_root, 0, sizeof(new_root));
@@ -349,7 +354,7 @@ bool RavenFS::dentry_insert(uint64_t dir_inode, const char *name, uint64_t targe
             new_root.head.head.fields.is_root_node       = 1;
             new_root.head.head.fields.parent_ptr         = dir_inode;  // . = 目录自身
             new_root.head.ptr1 = root_fblock;                          // 最左子树 = 原根
-            new_root.head.ptr2 = 0;  // 根目录 .. inode 需要外部设置
+            new_root.head.ptr2 = dotdot_inode;                         // .. = 原根的 .. inode
             memcpy(new_root.entries[0].name, separator, 120);
             new_root.entries[0].ptr = promoted_block;
             new_root.head.magic1 = DENTRY_MAGIC1;
@@ -412,7 +417,7 @@ bool RavenFS::dentry_insert(uint64_t dir_inode, const char *name, uint64_t targe
             split_internal(parent, separator, promoted_block,
                           &new_internal, next_sep, sizeof(next_sep));
 
-            uint64_t new_int_block = bitmap_alloc_blocks(2);
+            uint64_t new_int_block = bcache->hard_alloc(2);
             if (new_int_block == (uint64_t)-1) return false;
 
             new_internal.head.head.fields.parent_ptr =
@@ -560,7 +565,8 @@ int RavenFS::dentry_enumerate(uint64_t dir_inode,
             n++;
         }
         uint64_t next = leaf.head.ptr2;
-        if (next == 0 || next == ~0ull) break;
+        /* 根叶子（state 2）：ptr2 是 `..` 的 Inode 指针，非 sibling 块指针 */
+        if (leaf.head.head.fields.is_root_node || next == 0 || next == ~0ull) break;
         cur = next;
     }
 

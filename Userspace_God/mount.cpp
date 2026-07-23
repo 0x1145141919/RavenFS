@@ -75,21 +75,64 @@ uint64_t RavenFS::init_mount(const char *device_path) {
     geo.inode_array_bitmap_base  = geo.inode_array_base - ibb;
     geo.total_blocks             = sb.total_blocks;
 
-    cache_load();
+    block_cache = (decltype(block_cache))calloc(BLOCK_CACHE_ENTRIES, sizeof(*block_cache));
+    if (!block_cache)
+        fprintf(stderr, "RavenFS: WARNING block cache OOM (%d MB), fallback to direct I/O\n",
+                (int)(BLOCK_CACHE_ENTRIES * 4096 / 1024 / 1024));
 
     {
         uint64_t err;
         err = validate_world_base();
-        if (err) { close(bdev.fd); bdev.fd = -1; return err; }
+        if (err) { unmount(); return err; }
 
         err = validate_sb_crc32();
-        if (err) { close(bdev.fd); bdev.fd = -1; return err; }
+        if (err) { unmount(); return err; }
 
         err = validate_backup_chain();
-        if (err) { close(bdev.fd); bdev.fd = -1; return err; }
+        if (err) { unmount(); return err; }
 
         err = validate_bitmap_self_consistency();
-        if (err) { close(bdev.fd); bdev.fd = -1; return err; }
+        if (err) { unmount(); return err; }
+    }
+
+    /* ── 5. v2 Inode Cache ── */
+    cache_entries = new controller_set[INODE_CACHE_SETS]();
+    cache_data    = new Inode_cache_line[INODE_CACHE_SETS * WAYS_PER_SET]();
+
+    {
+        InodeCacheConfig ic_cfg;
+        ic_cfg.dev                 = &bdev;
+        ic_cfg.inode_array_base    = geo.inode_array_base;
+        ic_cfg.inode_array_count   = sb.inode_array_count;
+        ic_cfg.all_entries         = cache_entries;
+        ic_cfg.cache_lines         = cache_data;
+        ic_cfg.num_of_entries_log2 = 8;
+        icache = new Inode_cache_controller(ic_cfg);
+    }
+
+    /* ── 6. Bitmap Cache Controller ── */
+    {
+        long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+        if (nproc < 1) nproc = 1;
+
+        BitmapCacheConfig bm_cfg;
+        bm_cfg.dev                          = &bdev;
+        bm_cfg.bitmap_base                  = geo.bitmap_start;
+        bm_cfg.bitmap_block_count           = geo.bitmap_blocks;
+        bm_cfg.processor_max                = (uint16_t)nproc;
+        bm_cfg.num_of_blocks_per_bucket_log2 = 3;
+        bcache = new BitmapCacheController(bm_cfg);
+    }
+
+    /* ── 7. Inode Bitmap Cache Controller ── */
+    {
+        InodeBitmapCacheConfig ib_cfg;
+        ib_cfg.dev                       = &bdev;
+        ib_cfg.bitmap_base               = geo.inode_array_bitmap_base;
+        ib_cfg.bitmap_block_count        = geo.inode_bitmap_blocks;
+        ib_cfg.inode_array_count         = sb.inode_array_count;
+        ib_cfg.num_of_blocks_per_bucket_log2 = 3;
+        ibcache = new InodeBitmapCacheController(ib_cfg);
     }
 
     fprintf(stderr, "RavenFS: mounted  blocks=%lu  inodes=%lu  root=%lu\n",
@@ -101,6 +144,18 @@ uint64_t RavenFS::init_mount(const char *device_path) {
 
 void RavenFS::unmount() {
     if (bdev.fd >= 0) {
+        if (bcache) {
+            bcache->shutdown_all();
+            delete bcache;
+            bcache = nullptr;
+        }
+
+        if (ibcache) {
+            ibcache->shutdown_all();
+            delete ibcache;
+            ibcache = nullptr;
+        }
+
         if (icache) {
             icache->flush_all();
             delete icache;
@@ -109,12 +164,6 @@ void RavenFS::unmount() {
         delete[] cache_data;    cache_data    = nullptr;
         delete[] cache_entries; cache_entries = nullptr;
 
-        cache_flush();
-
-        free(bitmap_cache);    bitmap_cache    = nullptr;
-        free(ibitmap_cache);   ibitmap_cache   = nullptr;
-        free(inode_cache);     inode_cache     = nullptr;
-        free(inode_evict_next); inode_evict_next = nullptr;
         free(block_cache);     block_cache     = nullptr;
 
         close(bdev.fd);

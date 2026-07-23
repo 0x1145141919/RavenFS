@@ -18,12 +18,12 @@ int RavenFS::mkdir(const char *path) {
         return -EEXIST;
     }
 
-    uint64_t new_inum = ibitmap_alloc_inode();
+    uint64_t new_inum = ibcache ? ibcache->alloc_inode() : (uint64_t)-1;
     if (new_inum == (uint64_t)-1) return -ENOSPC;
 
-    uint64_t dentry_block = bitmap_alloc_blocks(2);
+    uint64_t dentry_block = bcache ? bcache->hard_alloc(2) : (uint64_t)-1;
     if (dentry_block == (uint64_t)-1) {
-        ibitmap_clear(new_inum);
+        if (ibcache) ibcache->free_inode(new_inum);
         return -ENOSPC;
     }
 
@@ -54,12 +54,10 @@ int RavenFS::mkdir(const char *path) {
     inode.link_count              = 2;
 
     inode_write(new_inum, &inode);
-    ibitmap_set(new_inum);
 
     if (!dentry_insert(parent_inode, leaf_name, new_inum)) {
-        ibitmap_clear(new_inum);
-        bitmap_clear(dentry_block);
-        bitmap_clear(dentry_block + 1);
+        if (ibcache) ibcache->free_inode(new_inum);
+        if (bcache) { bcache->free(dentry_block, 1); bcache->free(dentry_block + 1, 1); }
         memset(&inode, 0, sizeof(inode));
         inode_write(new_inum, &inode);
         return -ENOSPC;
@@ -97,10 +95,8 @@ int RavenFS::rmdir(const char *path) {
     if (!dentry_remove(parent_inode, leaf_name))
         return -ENOENT;
 
-    bitmap_clear(root_block);
-    bitmap_clear(root_block + 1);
-
-    ibitmap_clear(target_inum);
+    if (bcache) { bcache->free(root_block, 1); bcache->free(root_block + 1, 1); }
+    if (ibcache) ibcache->free_inode(target_inum);
 
     memset(&inode, 0, sizeof(inode));
     inode_write(target_inum, &inode);

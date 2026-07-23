@@ -8,6 +8,8 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <thread>
+#include <atomic>
 
 #include "disk_struct.hpp"
 #include "magics.h"
@@ -173,7 +175,208 @@ private:
                               uint64_t inum, const InumFields &f);
 };
 
+/* ─── Controller state ─── */
+static constexpr uint8_t BITMAP_CTRL_OFFLINE     = 0;
+static constexpr uint8_t BITMAP_CTRL_ONLINE      = 1;
+static constexpr uint8_t BITMAP_CTRL_INTEGRATING = 2;
+
+/* ─── Forward declarations ─── */
+struct BitmapFields;
+struct BitmapBlockController;
+struct ProcessorBitmapState;
+struct BitmapCacheConfig;
+
 /* ═══════════════════════════════════════════════════════════════
+ * BitmapCacheController — 位图缓存控制器
+ *
+ * 自包含模块：构造时分配所有内存，析构时通过 shutdown_all 刷盘清理。
+ * 上帝类只传建参数，内存生命周期在模块内部管理。
+ *
+ * 锁序: alloc_lock → controller.lock (单向，无死环)
+ * ═══════════════════════════════════════════════════════════════ */
+class BitmapCacheController {
+public:
+    explicit BitmapCacheController(const BitmapCacheConfig &cfg);
+    ~BitmapCacheController();
+
+    BitmapCacheController(const BitmapCacheController &) = delete;
+    BitmapCacheController &operator=(const BitmapCacheController &) = delete;
+
+    /* ─── Core API ─── */
+    uint64_t hard_alloc(uint64_t count);       // 返回 ~0ULL = 全盘满
+    uint64_t soft_alloc(uint64_t max_count);   // 返回实际分配数，~0ULL = 全盘满
+    void     free(uint64_t fblock, uint64_t count);
+
+    /* ─── 上帝类驱动的关闭流程 ─── */
+    void shutdown_all();
+
+    bool is_valid() const { return all_controller != nullptr; }
+
+private:
+    /* ─── 构造参数副本 ─── */
+    const BlockDevice  *dev;
+    uint64_t            bitmap_base;
+    uint64_t            bitmap_block_count;
+    uint16_t            processor_max;
+    uint8_t             N;
+
+    /* ─── 推导值 ─── */
+    uint64_t            ctrl_count;
+    uint64_t            bucket_sz;        // (1<<N) * 4096
+    uint64_t            bucket_bits;      // (1<<N) * 32768
+    uint64_t            ctrl_seg_bits;    // 1ULL << (N + 15)
+
+    /* ─── 内部表 ─── */
+    BitmapBlockController *all_controller;      // [ctrl_count]
+    ProcessorBitmapState  *all_proc_state;      // [processor_max]
+    uint8_t               *raw_buckets;         // [processor_max * bucket_sz]
+
+    /* ─── Sweeper ─── */
+    std::thread            sweeper;
+    std::atomic<bool>      sweeper_stop{false};
+    uint8_t               *sweeper_bucket;      // 专职 buffer
+
+    /* ─── 位图运算 (静态，操作裸 buffer) ─── */
+    static uint64_t scan_run(const uint8_t *buf, uint64_t buf_bits,
+                              uint64_t start, uint64_t need);
+    static uint64_t find_longest(const uint8_t *buf, uint64_t buf_bits,
+                                  uint64_t max_count);
+    static void     set_bits(uint8_t *buf, uint64_t start, uint64_t count);
+    static void     clear_bits(uint8_t *buf, uint64_t start, uint64_t count);
+
+    /* ─── I/O ─── */
+    void load_bucket(uint8_t *bucket, uint64_t cid) const;
+    void flush_bucket(const uint8_t *bucket, uint64_t cid) const;
+
+    /* ─── Decode / encode ─── */
+    BitmapFields decode(uint64_t bit_idx) const;
+    uint64_t     encode(uint64_t cid, uint64_t bucket_pos) const;
+
+    /* ─── 分配器内部逻辑 ─── */
+    uint64_t try_alloc(ProcessorBitmapState *ps, uint64_t cid,
+                        uint64_t count);
+    uint64_t try_alloc_soft(ProcessorBitmapState *ps, uint64_t cid,
+                             uint64_t max_count);
+    void     consume_head(uint8_t *bucket, BitmapBlockController *ctrl);
+    void     switch_to(uint64_t old_cid, uint64_t new_cid);
+
+    /* ─── 清理 ─── */
+    void flush_processor(uint64_t pid);
+    void flush_controller(uint64_t cid);
+    void stop_sweeper();
+    void sweeper_loop();
+};
+
+/* ─── BitmapFields — 全局 bit 引索三级分解 ───
+ *
+ * 全局 bit 引索（对应 FS_block 编号或 inode 编号）拆为三段:
+ *   [0:14]     → bit_in_block（bitmap 块内 bit 偏移）
+ *   [15:15+N-1]→ block_idx（controller 段内的 bitmap 块索引）
+ *   [15+N:63]  → controller_id
+ *
+ * N = num_of_blocks_per_bucket_log2
+ * 32768 = 1<<15（每 bitmap FS_block 管理的 bit 数）
+ */
+struct BitmapFields {
+    uint64_t controller_id;     // 哪个 controller
+    uint64_t block_idx;         // controller 段内的 bitmap 块索引
+    uint64_t bit_in_block;      // bitmap 块内的 bit 偏移 (0..32767)
+};
+
+static inline BitmapFields decode_bitmap_idx(uint64_t bit_idx, uint8_t N) {
+    uint64_t ctrl_mask = (1ULL << N) - 1;
+    return {
+        .controller_id = bit_idx >> (N + 15),
+        .block_idx     = (bit_idx >> 15) & ctrl_mask,
+        .bit_in_block  = bit_idx & 0x7FFF
+    };
+}
+
+struct bitmap_return_record_sll{
+    bitmap_return_record_sll*next;
+    uint32_t base;
+    uint32_t entry_count;
+};//[base,base+entry_count]的区间进行归还
+struct BitmapBlockController{
+    spinlock_cpp_t lock;             // 保护 state 转换、free_count、head 链表的原子性
+    uint8_t state;                   // 0=offline, 1=online
+    uint16_t flags;                  // 扩展预留
+    uint32_t free_count;             // 本段空闲 FS_block 计数（近似值）
+    uint64_t scan_hint;              // 位图桶隐式状态：上次成功分配的 bit 偏移
+    bitmap_return_record_sll*head;   // 外来归还链表
+};
+struct ProcessorBitmapState {
+    spinlock_cpp_t   alloc_lock;    // 保护本处理器分配状态机（current_cid + hint 变更是原子的）
+    uint64_t         current_cid;   // 当前临幸的 controller_id
+    uint64_t         last_hint_cid; // 上次成功分配的 controller_id（慢路径扫描起点）
+    uint8_t         *bucket;        // 本处理器桶数据指针（上帝类分配，指向 raw_work_sets[p]）
+};
+struct BitmapCacheConfig {
+    const BlockDevice     *dev;                  // I/O 通道
+    uint64_t               bitmap_base;          // Bitmap 数组基址（FS_block 号）
+    uint64_t               bitmap_block_count;   // Bitmap FS_block 总数上限
+    uint16_t               processor_max;        // 最大处理器数
+    uint8_t                num_of_blocks_per_bucket_log2; // N: 每桶对应 1<<N 个 bitmap FS_block
+};
+
+/* ═══════════════════════════════════════════════════════════════
+ * InodeBitmapCacheConfig — Inode Bitmap 缓存控制器的构造参数
+ * ═══════════════════════════════════════════════════════════════ */
+struct InodeBitmapCacheConfig {
+    const BlockDevice     *dev;                  // I/O 通道
+    uint64_t               bitmap_base;          // geoinode_array_bitmap_base
+    uint64_t               bitmap_block_count;   // geo.inode_bitmap_blocks
+    uint64_t               inode_array_count;    // sb.inode_array_count（分配上限）
+    uint8_t                num_of_blocks_per_bucket_log2; // N
+};
+
+class InodeBitmapCacheController {
+public:
+    explicit InodeBitmapCacheController(const InodeBitmapCacheConfig &cfg);
+    ~InodeBitmapCacheController();
+
+    InodeBitmapCacheController(const InodeBitmapCacheController &) = delete;
+    InodeBitmapCacheController &operator=(const InodeBitmapCacheController &) = delete;
+
+    uint64_t alloc_inode();   // ~0ULL = full
+    void     free_inode(uint64_t inum);
+    bool     test_inode(uint64_t inum);
+
+    void     shutdown_all();
+    bool     is_valid() const { return all_controller != nullptr; }
+
+private:
+    const BlockDevice   *dev;
+    uint64_t             bitmap_base;
+    uint64_t             bitmap_block_count;
+    uint64_t             inode_array_upper;
+    uint8_t              N;
+
+    uint64_t             ctrl_count;
+    uint64_t             bucket_sz;
+    uint64_t             bucket_bits;
+    uint64_t             ctrl_seg_bits;
+
+    BitmapBlockController *all_controller;       // [ctrl_count]
+    ProcessorBitmapState   proc;                 // single processor
+    uint8_t               *bucket;               // single bucket
+
+    void load_bucket(uint64_t cid);
+    void flush_bucket(uint64_t cid);
+    void consume_head(BitmapBlockController *ctrl);
+
+    uint64_t try_alloc();
+    void     switch_to(uint64_t new_cid);
+
+    static uint64_t scan_run(const uint8_t *buf, uint64_t buf_bits, uint64_t start);
+    static void     set_bits(uint8_t *buf, uint64_t start, uint64_t count);
+    static void     clear_bits(uint8_t *buf, uint64_t start, uint64_t count);
+
+    BitmapFields decode(uint64_t inum) const;
+    uint64_t     encode(uint64_t cid, uint64_t bucket_pos) const;
+};
+
+/* ═════════════════════════════════════════════════W══════════════
  * RavenFS — 上帝类 v1 (Phase 1)
  *
  * RAII 风格：构造即挂载，析构即卸载
@@ -301,21 +504,10 @@ private:
     uint64_t init_mount(const char *device_path);
 
     /* ═══════════════════════════════════════════════════════════
-     * FS_block 位图
+     * 位图校验直读（仅 validate 使用，不走 bcache/ibcache）
      * ═══════════════════════════════════════════════════════════ */
     bool   bitmap_test(uint64_t fblock);
-    void   bitmap_set(uint64_t fblock);
-    void   bitmap_clear(uint64_t fblock);
-    uint64_t bitmap_alloc_block();
-    uint64_t bitmap_alloc_blocks(uint64_t count);
-
-    /* ═══════════════════════════════════════════════════════════
-     * Inode 位图
-     * ═══════════════════════════════════════════════════════════ */
     bool   ibitmap_test(uint64_t inum);
-    void   ibitmap_set(uint64_t inum);
-    void   ibitmap_clear(uint64_t inum);
-    uint64_t ibitmap_alloc_inode();
 
     /* ═══════════════════════════════════════════════════════════
      * Inode 数组
@@ -397,43 +589,22 @@ private:
     uint64_t validate_backup_chain();
     uint64_t validate_bitmap_self_consistency();
 
-    /* ═══════════════════════════════════════════════════════════
-     * 缓存 — Bitmap（全量 DRAM）
-     * ═══════════════════════════════════════════════════════════ */
-    uint8_t *bitmap_cache   = nullptr;
-    uint8_t *ibitmap_cache  = nullptr;
-    bool     bitmap_dirty   = false;
-    bool     ibitmap_dirty  = false;
-    uint64_t bitmap_alloc_hint  = 0;   // 上次成功分配 FS_block 的下一位
-    uint64_t ibitmap_alloc_hint = 1;   // 上次成功分配 inode 的下一位
-
-    /* ═══════════════════════════════════════════════════════════
-     * 缓存 — Inode Table（组相联写回，堆分配）
-     *
-     * 线路 = 4KB（16 × 256B inodes）
-     * 256 sets × 8 ways = 2048 lines, 总计 8MB
-     * ═══════════════════════════════════════════════════════════ */
+    /* v2 inode cache — 内存由上帝类分配，控制器只使用 */
     static const uint64_t INODE_CACHE_SETS = 256;
     static const uint64_t INODE_CACHE_WAYS = 8;
-
-    struct InodeCacheLine {
-        uint8_t  data[4096];
-        uint64_t tag;
-        bool     valid;
-        bool     dirty;
-    };
-    InodeCacheLine *inode_cache = nullptr;  // [sets][ways], heap
-    uint8_t        *inode_evict_next = nullptr;  // [sets]
-
-    void cache_load();          // 装载 bitmaps + 重置 inode cache
-    void cache_flush();         // 回写所有脏数据
-    void inode_cache_load(uint64_t abs_fblock, uint8_t *buf);
-    void inode_cache_commit(uint64_t abs_fblock, const uint8_t *buf);
-
-    // v2 inode cache — 内存由上帝类分配，控制器只使用
     controller_set          *cache_entries = nullptr;  // [sets]
     Inode_cache_line        *cache_data    = nullptr;   // [total_slots]
     Inode_cache_controller  *icache        = nullptr;
+
+    /* ═══════════════════════════════════════════════════════════
+     * 缓存 — Bitmap Cache（分片 write-back, per-processor 单桶）
+     * ═══════════════════════════════════════════════════════════ */
+    BitmapCacheController      *bcache        = nullptr;
+
+    /* ═══════════════════════════════════════════════════════════
+     * 缓存 — Inode Bitmap Cache（分片 write-back，单核简化）
+     * ═══════════════════════════════════════════════════════════ */
+    InodeBitmapCacheController *ibcache       = nullptr;
 
     /* ═══════════════════════════════════════════════════════════
      * 缓存 — 通用 block cache（4K 块，直写直读）
