@@ -281,7 +281,7 @@ bool RavenFS::dentry_insert(uint64_t dir_inode, const char *name, uint64_t targe
 
     /* ─── 未满或虽有墓碑但物理有槽：按排序位置插入 ─── */
     if (count < 63) {
-        int insert_at = -(-(int)count - 1) - 1;
+        int insert_at = -dup_pos - 1;
         if (insert_at < count)
             dentry_node_shift_entries(leaf, insert_at, 1);
         leaf->entries[insert_at].ptr = target_inum;
@@ -371,9 +371,13 @@ bool RavenFS::dentry_insert(uint64_t dir_inode, const char *name, uint64_t targe
             old_root.head.head.fields.parent_ptr    = new_root_block;
             write_btnode(root_fblock, &old_root, sizeof(Dentry_Bptree_node_t));
 
-            /* 新叶子 parent_ptr */
-            new_leaf.head.head.fields.parent_ptr = new_root_block;
-            write_btnode(new_block, &new_leaf, sizeof(Dentry_Bptree_node_t));
+            /* 更新 promoted_block 的 parent_ptr（可能是叶子或内部节点） */
+            {
+                Dentry_Bptree_node_t prom_node;
+                read_btnode(promoted_block, &prom_node, sizeof(prom_node));
+                prom_node.head.head.fields.parent_ptr = new_root_block;
+                write_btnode(promoted_block, &prom_node, sizeof(prom_node));
+            }
 
             /* 更新目录 inode 的 data_root 指向新根 */
             dinode.data_root = new_root_block;
@@ -397,9 +401,13 @@ bool RavenFS::dentry_insert(uint64_t dir_inode, const char *name, uint64_t targe
 
             write_btnode(path[depth].block, parent, sizeof(Dentry_Bptree_node_t));
 
-            /* 更新子节点 parent_ptr */
-            new_leaf.head.head.fields.parent_ptr = path[depth].block;
-            write_btnode(new_block, &new_leaf, sizeof(Dentry_Bptree_node_t));
+            /* 更新 promoted_block 的 parent_ptr（可能是叶子或内部节点） */
+            {
+                Dentry_Bptree_node_t prom_node;
+                read_btnode(promoted_block, &prom_node, sizeof(prom_node));
+                prom_node.head.head.fields.parent_ptr = path[depth].block;
+                write_btnode(promoted_block, &prom_node, sizeof(prom_node));
+            }
 
             break;
         } else {

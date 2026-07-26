@@ -18,6 +18,7 @@
 #include "bitmap_types.hpp"
 #include "bitmap_cache.hpp"
 #include "inode_bitmap_cache.hpp"
+#include "vfs_cache.hpp"
 #include "../disk_struct.hpp"
 #include "../magics.h"
 
@@ -47,6 +48,9 @@ public:
     int  inode_type(uint64_t inum);
 
     void dump_info() const;
+
+    /** 调试：打印当前 dentry cache 状态 vs 磁盘 B+tree */
+    void debug_dump(const char *label);
 
     int validate_dentry_tree();
 
@@ -171,6 +175,20 @@ private:
     uint64_t validate_sb_crc32();
     uint64_t validate_backup_chain();
     uint64_t validate_bitmap_self_consistency();
+
+    /* ─── VFS 逻辑缓存层 ─── */
+    VFSCache vcache;
+
+    void vfs_cache_init();
+    void vfs_cache_destroy();
+
+    LogicalInode *logical_inode_get(uint64_t inum);
+    void          logical_inode_put(LogicalInode *li);
+
+    uint64_t dentry_cache_lookup(uint64_t parent_inum, const char *name);
+    bool     dentry_cache_insert(uint64_t parent_inum, const char *name, uint64_t target_inum);
+    bool     dentry_cache_remove(uint64_t parent_inum, const char *name);
+    void     dentry_cache_warm(uint64_t parent_inum, const char *name, uint64_t target_inum);
 
     static const uint64_t INODE_CACHE_SETS = 256;
     static const uint64_t INODE_CACHE_WAYS = 8;
