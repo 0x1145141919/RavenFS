@@ -385,6 +385,177 @@ LogicalInode 是两层的交界——VFS 管它的生命周期，FS 管它 `disk
 
 ---
 
+## 七、Phase 1 设计修正 (2026-07-26)
+
+### 7.1 修正：LogicalInode 不再持有原始磁盘数据
+
+原设计（第一节报告）的 `LogicalInode` 包含 `raven_Inode_t disk_data` 字段，这导致两个问题：
+
+1. **数据冗余：** 物理缓存（组相联 `Inode_cache_controller`）已经持有一份 `raven_Inode_t` 的内存副本，LogicalInode 再持有一份就是双份
+2. **一致性问题：** 谁写了还得同步，多次拷贝浪费时间
+3. **内存浪费：** 每个 LogicalInode（可能几万到上百万）都带一份 inode 数据，物理缓存里也有一份
+
+**新设计：**
+
+```cpp
+struct LogicalInode {
+    /* 侵入式容器 Hook（完全不碰磁盘数据） */
+    bi::list_member_hook<>             lru_hook;           // → sb->inode_lru
+    bi::list_member_hook<>             dirty_hook;         // → sb->dirty_list
+    bi::unordered_set_member_hook<>    inum_hash_hook;     // → inum_hashtable
+
+    /* 运行时元数据（全部在内存，不占磁盘） */
+    uint64_t             inum;
+    std::atomic<int>     refcnt;
+    bool                 dirty : 1;
+    bool                 loaded : 1;          // 物理数据是否已从缓存获取
+    std::mutex           mtx;
+
+    /* 目录专用 */
+    DentryEntryCache    *dentry_cache = nullptr;
+
+    /* ❌ 删掉：raven_Inode_t disk_data — 物理数据交给 InodeSession */
+};
+```
+
+### 7.2 数据获取流程
+
+```
+路径解析命中 dentry_hashtable
+  → 拿到 target_inum
+  → inum_hashtable.find(target_inum) → LogicalInode* 或创建
+  → 需要读盘上数据时：
+      → InodeSession sess(fs, inum)        ← RAII 构造
+          → Inode_cache_controller::cache_get(inum)
+              → 组相联缓存命中 → 直接返回 raven_Inode_t*
+              → 缓存 miss → 从磁盘加载进 cache line → 返回指针
+      → 直接用 raven_Inode_t* 读写
+      → 修改后 sess.dirty()
+          → Inode_cache_controller::mark_dirty(inum)
+              → 只设 cache line controller 的 DIRTY 位
+              → 不刷盘
+  → InodeSession 析构
+      → cache_put(inum) → 释放访问计数
+      → 不主动刷盘！
+```
+
+### 7.3 写回策略
+
+```
+mark_dirty() 只做一件事：
+  对应 cache line controller 的 flags |= INODE_CACHE_D
+之前以为只需要手动调用 mark_dirty，不需要手动 flush
+
+什么时候真正写盘：
+  ① LRU 淘汰选中这个 cache line 时
+      → evict 前检查 DIRTY 位
+      → 脏就 write_block() 刷盘
+  ② umount / flush_all()
+      → 遍历所有 cache line controller
+      → DIRTY 的全部刷盘
+  ③ 析构
+      → 同上
+```
+
+**这么做的好处：**
+
+```cpp
+// 场景：一个物理 cache line 包含 16 个 inode (4096B / 256B-per-inode)
+// 修改其中任意一个 inode
+InodeSession sess1(fs, inum_5);
+sess1.inode->nlink = 2;  // 改 inum_5
+sess1.dirty();           // 整条 cache line 标记脏
+
+// 紧接着改同一 cache line 的另一个 inode
+InodeSession sess2(fs, inum_7);
+sess2.inode->size = 1024;  // 改 inum_7
+sess2.dirty();              // 同一 cache line 已脏，无事可做
+
+// 直到 LRU 淘汰这个 cache line 时，一次 write_block 刷 16 个 inode
+// 磁盘 I/O 从 2 次合并为 1 次
+```
+
+### 7.4 LogicalInode 生命周期（修正后）
+
+```
+new LogicalInode
+  → refcnt = 0
+  → 链入 inum_hashtable（未被 pin，可 evict）
+  → loaded = false（物理数据未获取）
+
+step() 或 open()
+  → LogicalInode.refcnt++
+  → 需要修改数据时：
+      InodeSession sess(fs, inum);     // 触发 cache_get
+      // raven_Inode_t* 直接可用
+      sess.inode->xyz = val;
+      sess.dirty();                    // 标脏 cache line
+  → sess 析构 → cache_put（物理缓存访问计数归零，但不一定 evict）
+
+close() / 路径离开
+  → LogicalInode.refcnt--
+
+ref == 0 && dirty → 挂 dirty_list（标记，不刷盘）
+ref == 0 && !dirty → LRU 等淘汰
+
+LRU evict LogicalInode
+  → 从 inum_hashtable 摘除
+  → delete LogicalInode
+  → 不刷盘！物理数据还在组相联缓存里
+```
+
+**关键：LogicalInode 的 LRU 和物理 cache line 的 LRU 是两条独立淘汰线。**
+
+```
+LogicalInode LRU          → 运行时元数据淘汰（refcnt、锁、目录缓存）
+物理 cache line LRU       → 磁盘数据淘汰（raven_Inode_t 生命周期）
+```
+
+两个互不依赖。LogicalInode 释放了，物理数据还在组相联缓存里，下次另一个路径解析进来直接复用。反之亦然——物理 cache line 被逐出了，LogicalInode 还在 (`loaded = false`)，下次访问时重新 `cache_get` 就重新加载了。
+
+### 7.5 初始分配策略
+
+```cpp
+// 借鉴 Linux 内核策略：
+// 初始化时分配一大块 hash table bucket 数组（连续内存）
+
+// dentry_hashtable
+//   Linux: alloc_large_system_hash("Dentry cache", sizeof(hlist_bl_head), ..., HASH_ZERO)
+//   Raven: new hlist_head[1 << dentry_hash_shift]  // bucket 数组，一次性分配
+
+// inum_hashtable
+//   Linux: alloc_large_system_hash("Inode-cache", sizeof(hlist_head), ..., HASH_ZERO)
+//   Raven: new hlist_head[1 << inum_hash_shift]     // bucket 数组，一次性分配
+
+// 两个数组生命周期 = FS 生命周期，不做缩容
+```
+
+### 7.6 修正后的容关系
+
+| 层 | 容器 | 成员 | 生命周期 | 写回触发 |
+|----|------|------|----------|----------|
+| VFS 逻辑层 | `inum_hashtable` (global hash) | `LogicalInode*` | LRU evict | N/A（不持盘上数据）|
+| VFS 逻辑层 | `dentry_hashtable` (global hash) | `DentryEntry*` | LRU evict | N/A |
+| VFS 逻辑层 | `inode_lru` | LogicalInode | 内存压力 | N/A |
+| VFS 逻辑层 | `dirty_list` | LogicalInode（仅标记） | umount | 不直接刷 |
+| 物理层 | 组相联 cache lines | `raven_Inode_t[16]` per line | LRU evict/析构 | **真正的写盘点** |
+| 物理层 | cache line controllers | flags(V/D/T) + tag | 与 cache lines 同生 | — |
+
+### 7.7 关键设计原则
+
+> **专业的事交给专业的缓存层。**
+>
+> InodeSession 负责 raven_Inode_t 的生命周期管理。
+> LogicalInode 只关心运行时元数据。
+> dentry cache 只管 name→inum 映射。
+> 三个层次各管各的淘汰，不互相绑架。
+>
+> 磁盘 I/O 次数降到最低——同一个物理 cache line 上的 16 个 inode，
+> 不管哪个被改，最终一次 write_block 写完。
+
+---
+
 > **本文结论**
 >
 > Linux VFS 的 dentry/inode 两层缓存都是全局侵入式哈希表。RavenFS 上帝类在用户态用 Boost.Intrusive 可以实现相同的设计，同时借助 C++ 的类型安全和 RAII 避免内核那套宏操作。dentry_hashtable 和 inum_hashtable 是两个独立的侵入式容器，中间通过 inum 整数桥接——dentry 不持有 inode 引用，解决了 Linux 的 dentry→inode 循环 pin 问题。
+> LogicalInode 不持原始磁盘数据，通过 InodeSession 从组相联缓存获取 raven_Inode_t* 指针，让物理缓存层全权管理数据生命周期和写回时机。

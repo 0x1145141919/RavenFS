@@ -28,7 +28,6 @@ struct DentryValidateCtx {
     int   fd;
     int   errors;
     int   warnings;
-    uint64_t world_base_lba;
 
     std::set<uint64_t> visited;   // 已访问节点，防循环
 };
@@ -45,8 +44,7 @@ struct DentryValidateCtx {
 
 /* ─── 读一个 FS_block ─── */
 static bool read_fs_block(DentryValidateCtx &ctx, uint64_t fblock, void *buf) {
-    uint64_t base = (ctx.world_base_lba == 0) ? 0 : 4096;
-    uint64_t off  = base + fblock * 4096;
+    uint64_t off  = 4096 + fblock * 4096;
     return pread(ctx.fd, buf, 4096, off) == 4096;
 }
 
@@ -230,7 +228,6 @@ int validate_dentry_tree(int fd, uint64_t world_base_lba,
     ctx.fd             = fd;
     ctx.errors         = 0;
     ctx.warnings       = 0;
-    ctx.world_base_lba = world_base_lba;
 
     VPRINT("dentry tree validation");
     VPRINT("────────────────────────────");
@@ -239,8 +236,7 @@ int validate_dentry_tree(int fd, uint64_t world_base_lba,
     FsGeometry geo = derive_geometry(total_blocks, inode_count);
 
     /* 读根 inode */
-    uint64_t base_off = (world_base_lba == 0) ? 0 : 4096;
-    uint64_t inode_off = base_off + geo.inode_array_base * 4096 + root_inode * 256;
+    uint64_t inode_off = 4096 + geo.inode_array_base * 4096 + root_inode * 256;
     raven_Inode_t root_ino;
     if (pread(fd, &root_ino, sizeof(root_ino), inode_off) != (ssize_t)sizeof(root_ino)) {
         fprintf(stderr, "ERROR: cannot read root inode at offset %lu\n",

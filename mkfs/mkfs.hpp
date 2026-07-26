@@ -9,7 +9,8 @@
 struct MkfsParams {
     const char *device;
     uint64_t    inode_ratio;     // 每 inode 管辖的 FS_block 数（默认 8）
-    uint64_t    inode_count;     // 输出：由 ratio 换算得，16 向上取整
+    uint64_t    inode_count;     // 输出：由 ratio 换算得，或 --inode-count 直指定，16 向上取整
+    bool        inode_count_explicit; // true 表示 --inode-count / --inodes 直指定
     uint32_t    backups;
     char        label[48];
     uint8_t     uuid[16];
@@ -18,7 +19,7 @@ struct MkfsParams {
 
     uint64_t    lba_size;        // NVMe→Identify, file→4096
     uint64_t    multiplier;      // 4096 / lba_size
-    uint64_t    world_base_lba;  // 分区起始 LBA
+    uint64_t    world_base_lba;  // FS_block[0] 字节偏移 / lba_size
 };
 
 struct FsGeometry {
@@ -50,7 +51,6 @@ struct DevInfo {
 DevType probe_hardware(int fd, const char *device_path);
 int     get_device_info(const char *path, DevInfo *info);
 uint64_t get_lba_size(int fd, DevType type);
-uint64_t detect_partition_start(const char *device_path);
 bool    check_existing_fs(int fd);
 
 int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo);

@@ -208,28 +208,6 @@ int get_device_info(const char *path, DevInfo *info) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * 分区探测（sysfs）
- * ═══════════════════════════════════════════════════════════════ */
-uint64_t detect_partition_start(const char *device_path) {
-    struct stat st;
-    if (stat(device_path, &st) < 0 || !S_ISBLK(st.st_mode))
-        return 0;
-
-    char path[512];
-    snprintf(path, sizeof(path),
-             "/sys/dev/block/%d:%d/start",
-             major(st.st_rdev), minor(st.st_rdev));
-
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-
-    uint64_t start = 0;
-    if (fscanf(f, "%lu", &start) != 1) start = 0;
-    fclose(f);
-    return start;
-}
-
-/* ═══════════════════════════════════════════════════════════════
  * LBA_size 探测（ioctl）
  * ═══════════════════════════════════════════════════════════════ */
 uint64_t get_lba_size(int fd, DevType type) {
@@ -318,7 +296,7 @@ static void build_root_dentry_node(Dentry_Bptree_node_t *node)
     node->head.head.fields.is_internal_node   = 0;
     node->head.head.fields.is_root_node       = 1;
     node->head.head.fields.parent_ptr         = 0;  /* . = 根 inode 自身 */
-    node->head.ptr1 = ~0ULL;                              /* 根无前驱 */
+    node->head.ptr1 = 0;                                  /* State 2: 根叶子 ptr1=0(空闲) */
     node->head.ptr2 = 0;                              /* .. = 根 inode（根的父亲是自己） */
     node->head.magic1 = DENTRY_MAGIC1;
     node->head.magic2 = DENTRY_MAGIC2;

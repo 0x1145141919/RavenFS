@@ -25,7 +25,7 @@
 #define ADDR_BTREE  (1ULL << 63)           /* bit63: 块类型 (1=btree node, 0=data) */
 constexpr uint8_t INODE_TYPE_REGULAR=0;
 constexpr uint8_t INODE_TYPE_DIR=1;
-constexpr uint8_t INODE_TYPE_SOFT_LINK=2;
+constexpr uint8_t INODE_TYPE_SOFT_SYM=2;
 
 /* ═══════════════════════════════════════════════════════════════════
  * 节点元数据 — entry[0].words[3] 编码

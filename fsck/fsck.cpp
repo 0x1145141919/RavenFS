@@ -134,14 +134,10 @@ static void dump_layout(const FsGeometry &g, uint64_t inode_count) {
 }
 
 /* ─── FS_block byte offset helper ─── */
-// FS_block[n] byte offset = world_base_lba * lba_size + n * 4096.
-// For new-format FS (world_base_lba != 0): world_base_lba * lba_size = 4096
-//   (Primary occupies byte 0-4095, FS_block world starts at 4096)
-// For old-format FS (world_base_lba == 0): world_base_lba * lba_size = 0
-//   (buggy layout, Primary overlaps FS_block[0])
-static uint64_t blk_off(uint64_t world_base_lba, uint64_t block) {
-    uint64_t base = (world_base_lba == 0) ? 0 : 4096;
-    return base + block * 4096;
+// Primary SB 占据设备/分区 fd byte[0, 4096)，FS_block 世界从 byte 4096 开始。
+// FS_block[n] 在 fd 内的字节偏移 = 4096 + n × 4096
+static uint64_t blk_off(uint64_t block) {
+    return 4096 + block * 4096;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -151,12 +147,12 @@ static int dump_backups(int fd, const RavenSuperblock *sb, bool verbose) {
     print_sec("Backup Chain");
     int errors = 0;
     int count = 0;
-    uint64_t prev_block = 0;
+    uint64_t prev_block = ~0ULL;  // Primary 的 backup_prev 哨兵值
     uint64_t next = sb->backup_next;
 
-    while (next != 0 && count < 256) {
+    while (next != ~0ULL && count < 256) {
         RavenSuperblock bs;
-        uint64_t off = blk_off(sb->world_base_lba, next);
+        uint64_t off = blk_off(next);
         if (pread(fd, &bs, sizeof(bs), off) != (ssize_t)sizeof(bs)) {
             PRINT_FIELD("ERROR", "read backup at block %lu",
                         (unsigned long)next);
@@ -222,15 +218,14 @@ static int dump_backups(int fd, const RavenSuperblock *sb, bool verbose) {
 /* ═══════════════════════════════════════════════════════════════
  * Bitmap
  * ═══════════════════════════════════════════════════════════════ */
-static void dump_bitmap(int fd, const FsGeometry &g, bool verbose,
-                         uint64_t world_base_lba) {
+static void dump_bitmap(int fd, const FsGeometry &g, bool verbose) {
     print_sec("Bitmap");
 
     uint64_t bytes = g.bitmap_blocks * 4096;
     uint8_t *bm = (uint8_t *)malloc(bytes);
     if (!bm) { PRINT_FIELD("ERROR", "alloc failed"); return; }
 
-    if (pread(fd, bm, bytes, blk_off(world_base_lba, g.bitmap_start)) != (ssize_t)bytes) {
+    if (pread(fd, bm, bytes, blk_off(g.bitmap_start)) != (ssize_t)bytes) {
         PRINT_FIELD("ERROR", "read bitmap");
         free(bm);
         return;
@@ -285,10 +280,9 @@ static void dump_bitmap(int fd, const FsGeometry &g, bool verbose,
 /* ═══════════════════════════════════════════════════════════════
  * Root Inode
  * ═══════════════════════════════════════════════════════════════ */
-static raven_Inode_t read_inode(int fd, uint64_t idx, const FsGeometry &g,
-                                 uint64_t world_base_lba) {
+static raven_Inode_t read_inode(int fd, uint64_t idx, const FsGeometry &g) {
     raven_Inode_t ino = {};
-    uint64_t off = blk_off(world_base_lba, g.inode_array_base) + idx * 256;
+    uint64_t off = blk_off(g.inode_array_base) + idx * 256;
     pread(fd, &ino, sizeof(ino), off);
     return ino;
 }
@@ -296,18 +290,18 @@ static raven_Inode_t read_inode(int fd, uint64_t idx, const FsGeometry &g,
 static void dump_root_inode(int fd, const RavenSuperblock *sb, const FsGeometry &g) {
     print_sec("Root Inode");
 
-    raven_Inode_t ino = read_inode(fd, sb->root_inode, g, sb->world_base_lba);
+    raven_Inode_t ino = read_inode(fd, sb->root_inode, g);
 
     const char *t = "?";
     if (ino.type == INODE_TYPE_REGULAR)   t = "REGULAR";
     else if (ino.type == INODE_TYPE_DIR)  t = "DIR";
-    else if (ino.type == INODE_TYPE_SOFT_LINK) t = "SOFT_LINK";
+    else if (ino.type == INODE_TYPE_SOFT_SYM)   t = "SOFT_LINK";
 
     PRINT_FIELD("inode",           "%lu",     (unsigned long)sb->root_inode);
     PRINT_FIELD("type",            "%s",      t);
     PRINT_FIELD("data_root",       "%lu (%s)",
                 (unsigned long)ino.data_root,
-                ino.data_root == 0 ? "inline" :
+                ino.data_root == ~0ull ? "inline" :
                     ino.is_data_root_direct_bit ? "direct" : "B+tree");
     PRINT_FIELD("size",            "%lu",     (unsigned long)ino.size);
     PRINT_FIELD("link_count",      "%u",      ino.link_count);
@@ -320,16 +314,16 @@ static void dump_root_inode(int fd, const RavenSuperblock *sb, const FsGeometry 
  * ═══════════════════════════════════════════════════════════════ */
 static void dump_root_dentry(int fd, const RavenSuperblock *sb,
                                const FsGeometry &g) {
-    raven_Inode_t ino = read_inode(fd, sb->root_inode, g, sb->world_base_lba);
+    raven_Inode_t ino = read_inode(fd, sb->root_inode, g);
     uint64_t data_root = ino.data_root;
 
-    if (data_root == 0) {
+    if (data_root == ~0ull) {
         PRINT_FIELD("dentry tree",  "(inline, none)");
         return;
     }
 
     Dentry_Bptree_node_t node;
-    if (pread(fd, &node, sizeof(node), blk_off(sb->world_base_lba, data_root)) != sizeof(node)) {
+    if (pread(fd, &node, sizeof(node), blk_off(data_root)) != sizeof(node)) {
         PRINT_FIELD("ERROR",        "read dentry node at block %lu",
                     (unsigned long)data_root);
         return;
@@ -382,7 +376,7 @@ int fsck_dump(int fd, bool verbose, uint64_t lba_size) {
     FsGeometry g = derive_geometry(sb.total_blocks, sb.inode_array_count);
     dump_layout(g, sb.inode_array_count);
     errors += dump_backups(fd, &sb, verbose);
-    dump_bitmap(fd, g, verbose, sb.world_base_lba);
+    dump_bitmap(fd, g, verbose);
     dump_root_inode(fd, &sb, g);
     dump_root_dentry(fd, &sb, g);
 

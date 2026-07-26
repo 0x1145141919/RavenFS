@@ -16,6 +16,8 @@ static void print_usage(const char *prog) {
         "\n"
         "Options:\n"
         "  --inode-ratio=N    FS_blocks per inode (default: 8)\n"
+        "  --inode-count=N    Direct inode count (overrides --inode-ratio)\n"
+        "  --inodes=N         Alias for --inode-count\n"
         "  --backups=N        Backup Superblock count (default: 3)\n"
         "  --label=NAME       Volume label (max 48 bytes)\n"
         "  --uuid=UUID        Explicit UUID (auto-generated if omitted)\n"
@@ -42,6 +44,8 @@ int main(int argc, char *argv[]) {
 
     static struct option long_opts[] = {
         {"inode-ratio", required_argument, 0, 'r'},
+        {"inode-count", required_argument, 0, 'n'},
+        {"inodes",      required_argument, 0, 'n'},
         {"backups",     required_argument, 0, 'b'},
         {"label",       required_argument, 0, 'l'},
         {"uuid",        required_argument, 0, 'u'},
@@ -61,6 +65,16 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "invalid --inode-ratio: %s\n", optarg);
                 return 1;
             }
+            break;
+        }
+        case 'n': {
+            char *end = nullptr;
+            params.inode_count = strtoull(optarg, &end, 0);
+            if (*end || params.inode_count == 0) {
+                fprintf(stderr, "invalid --inode-count: %s\n", optarg);
+                return 1;
+            }
+            params.inode_count_explicit = true;
             break;
         }
         case 'b': {
@@ -156,11 +170,9 @@ int main(int argc, char *argv[]) {
 
         params.multiplier    = 4096 / params.lba_size;
 
-        // 探测 GPT 分区起始 LBA；裸盘返回 0
-        uint64_t part_start = detect_partition_start(params.device);
-        // world_base_lba = partition_start_lba + multiplier
-        // Primary SB 占据分区开头 4096 字节，FS_block[0] 紧随其后
-        params.world_base_lba = params.multiplier + part_start;
+        // 块设备统一模型：设备 fd offset 0 = Primary SB
+        // FS_block 世界从设备 fd offset 4096 开始
+        params.world_base_lba = params.multiplier;
     }
 
     /* ─── 已有 FS 检测 ─── */
@@ -169,12 +181,15 @@ int main(int argc, char *argv[]) {
         return 3;
     }
 
-    /* ─── inode ratio → count 换算 ─── */
-    // inode_count = ceil(total_blocks / inode_ratio)，再 16 向上取整（单 FS_block 装 16 个 inode）
+    /* ─── inode count 确定 ─── */
     uint64_t total_blocks = dev.bytes / 4096 - 1;
-    {
+    if (!params.inode_count_explicit) {
+        // inode_count = ceil(total_blocks / inode_ratio)，再 16 向上取整
         uint64_t raw = (total_blocks + params.inode_ratio - 1) / params.inode_ratio;
         params.inode_count = ((raw + 15) / 16) * 16;
+    } else if (params.inode_count % 16 != 0) {
+        // 直指定的 inode_count 也 16 向上取整
+        params.inode_count = ((params.inode_count + 15) / 16) * 16;
     }
 
     /* ─── 几何计算 ─── */

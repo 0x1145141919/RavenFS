@@ -3,14 +3,19 @@
 > 2026-06-25 推倒 v0 草案从头设计。
 > 基于 B+tree 的文件系统，NVMe 驱动验收场景驱动。
 > 设计哲学：跑起来第一，用户自己规划上限。
+>
+> **指针类型约定（定义见 `block_model.md §5`）：**
+> - **块指针（Block Ptr）**：FS_block 索引，取值 `[0, total_blocks)`，指向一个 FS_block
+> - **Inode 指针（Inode Ptr）**：Inode 索引，取值 `[0, inode_array_count)`，指向 inode array 中的一个 inode
+> - **联合指针（Union Ptr）**：u64 复用，由上下文位域（`is_root`、`type` 等）解码为块指针或 Inode 指针，不得脱离位域单独解读
 
 ---
 
 ## 1. 分区布局
 
 ```
-物理视图（设备 LBA 空间）:
-  partition_offset_0:  Primary Superblock ← 不在 FS_block 世界内
+物理视图（打开 fd 的 byte 地址空间）:
+  byte[0, 4096):         Primary Superblock ← 不在 FS_block 世界内
 
 FS_block 世界视图（4096B blocks）:
   block 0..:            Data Blocks / Backup Superblocks ← 随机散落
@@ -57,8 +62,7 @@ Backup Superblock 在 FS_block 世界内随机散落，被 bitmap 标记为 allo
 Primary Superblock 是 RavenFS 的唯一入口和定义者。
 
 **位置：**
-- 裸盘：LBA[0] offset=0
-- GPT 分区：`gpt_entry.starting_lba` offset=0
+- 打开设备/文件 fd 的 byte[0, 4096)
 
 **FS_block 世界关系：** 不在 FS_block 世界内。bitmap 不管理它。
 
@@ -73,15 +77,15 @@ struct RavenSuperblock {
     uint64_t  total_blocks;         // FS_block 世界总块数
 
     uint64_t  inode_array_count;         // Inode 上限（推导出 inode_blocks, inode_bitmap_blocks）
-    uint64_t  root_inode;                // 根目录 inode 索引
+    uint64_t  root_inode;                // Inode 指针：根目录 inode 索引
     uint8_t   uuid[16];
     uint8_t   volume_name[48];
 
     uint32_t  crc32;
 
-    /* ── 备份链表 ── */
-    uint64_t  backup_prev;          // Primary: ~0ull（哨兵）
-    uint64_t  backup_next;          // Primary: 链表头（第一个 Backup FS_block 号）
+    /* ── 备份链表（块指针） ── */
+    uint64_t  backup_prev;          // 块指针：Primary:~0ull（哨兵）；Backup:前驱块号，~0ull=链头
+    uint64_t  backup_next;          // 块指针：Primary:链头块号；Backup:后继块号，~0ull=链尾
     uint32_t  backup_count;         // 备份总数
 
     uint8_t   pad[3960];            // 删了 bitmap_start，调整此值使 sizeof == 4096
@@ -90,15 +94,15 @@ struct RavenSuperblock {
 
 ### Primary 角色下的字段语义
 
-| 字段 | 值 | 说明 |
-|------|----|------|
-| `backup_prev` | ~0ull | 哨兵，Primary 无前驱 |
-| `backup_next` | FS_block# | 第一个 Backup Superblock 的块号 |
-| `backup_count` | N | 备份总数。mount 时遍历链表计数校验 |
+| 字段 | 指针类型 | 值 | 说明 |
+|------|---------|----|------|
+| `backup_prev` | 块指针 | ~0ull | 哨兵，Primary 无前驱 |
+| `backup_next` | 块指针 | FS_block# | 第一个 Backup Superblock 的块号 |
+| `backup_count` | — | N | 备份总数。mount 时遍历链表计数校验 |
 
 关键字段由用户 mkfs 时指定：
 ```
-mkfs.ravenfs /dev/nvme0n1 --inodes=65536 --inode-ratio=16 --backups=4
+mkfs.ravenfs /dev/nvme0n1p1 --inode-count=65536 --backups=4
 ```
 
 `--backups=N` 控制 mkfs 时散布的 Backup Superblock 数量。默认建议 3。
@@ -117,11 +121,11 @@ bitmap 标记为 allocated。
 
 ### Backup 角色下的字段语义
 
-| 字段 | 值 | 说明 |
-|------|----|------|
-| `backup_prev` | FS_block# / ~0ull | 前驱 Backup 块号（~0ull=链头，即 Primary 后的第一个） |
-| `backup_next` | FS_block# / ~0ull | 后继 Backup 块号（~0ull=链尾） |
-| `backup_count` | N | 与 Primary 交叉验证。挂载时遍历链表，计数必须一致 |
+| 字段 | 指针类型 | 值 | 说明 |
+|------|---------|----|------|
+| `backup_prev` | 块指针 | FS_block# / ~0ull | 前驱 Backup 块号（~0ull=链头，即 Primary 后的第一个） |
+| `backup_next` | 块指针 | FS_block# / ~0ull | 后继 Backup 块号（~0ull=链尾） |
+| `backup_count` | — | N | 与 Primary 交叉验证。挂载时遍历链表，计数必须一致 |
 
 ### 链表拓扑
 
@@ -159,7 +163,7 @@ Primary (不在世界内)
 ### mkfs 散布策略
 
 Backup Superblock 散布位置由 `--backups=N` 指定，
-mkfs 在 `[0, total_blocks)` 范围内均匀/随机选取 N 个 FS_block。
+mkfs 在未分配的数据区范围内均匀/随机选取 N 个 FS_block（避开元数据尾区和根 dentry）。
 mkfs 后立即被 bitmap 标记为 allocated，运营期间保持亮灯。
 
 ---
@@ -268,7 +272,7 @@ struct raven_Inode_t {
     uint64_t  mtime;                  // seconds
     uint64_t  ctime;                  // seconds
     uint64_t  atime;                  // seconds
-    uint64_t  data_root;             // ~0ull = inline, else FS_block#
+    uint64_t  data_root;             // 块指针(~0ull 哨兵)：~0ull=内联；≠~0ull=块指针，按 type+is_data_root_direct_bit 解码
     uint32_t  link_count;
     uint64_t  padding[2];            // 元数据扩展预留
     uint8_t   inline_data[160];
@@ -293,20 +297,20 @@ byte[0..7] = { type:2 | is_data_root_direct_bit:1 | other:61 }
 
 `is_data_root_direct_bit` **完全忽略**（可为 0 或 1，不区分）。
 
-| `data_root` | 含义 | `size` 语义 |
-|-------------|------|------------|
-| ~0ull | 错误状态（mkfs 后不应出现） | — |
-| ≠ ~0ull | Dentry B+tree 根节点 FS_block# | 非 `.` `..` 的 dentry 条目数，空目录 = 0 |
+| `data_root` | 指针类型 | 含义 | `size` 语义 |
+|-------------|---------|------|------------|
+| ~0ull | — | 错误状态（mkfs 后不应出现） | — |
+| ≠ ~0ull | 块指针 | Dentry B+tree 根节点 | 非 `.` `..` 的 dentry 条目数，空目录 = 0 |
 
 #### type == REGULAR / SOFT_LINK（文件/软链接）
 
 按 `is_data_root_direct_bit` 分岔：
 
-| `data_root` | `is_data_root_direct_bit` | 含义 | `size` 语义 |
-|-------------|---------------------------|------|------------|
-| ~0ull | don't care | **内联**：内容在 `inline_data[0..size-1]`，size=0~160 | 文件字节数 |
-| ≠ ~0ull | = 1 | **直指区间**：`data_root` 起始，`ceil(size/4096)` 个连续 FS_block，数据从 `data_root` 的 byte[0] 开始 | 文件字节数（无尺寸上限） |
-| ≠ ~0ull | = 0 | **B+tree**：`data_root` → `Bptree_node_t` 区段 B+tree 根节点 FS_block# | 文件字节数 |
+| `data_root` | 指针类型 | `is_data_root_direct_bit` | 含义 | `size` 语义 |
+|-------------|---------|---------------------------|------|------------|
+| ~0ull | — (哨兵) | don't care | **内联**：内容在 `inline_data[0..size-1]`，size=0~160 | 文件字节数 |
+| ≠ ~0ull | 块指针 | = 1 | **直指区间**：`data_root` 起始，`ceil(size/4096)` 个连续 FS_block，数据从 `data_root` 的 byte[0] 开始 | 文件字节数（无尺寸上限） |
+| ≠ ~0ull | 块指针 | = 0 | **B+tree**：`data_root` → 区段 B+tree 根节点 | 文件字节数 |
 
 直指区间是最优路径：一次间接（data_root → 连续数据块），零 B+tree 节点读取。任何文件（不论大小）只要其数据块在磁盘上连续即可用直指区间。只有当文件碎片化到无法用一个连续区间描述时（如中间块被释放/空洞），才回退为 B+tree 区段树。v1 实现：creat/write 在连续分配时优先走直指区间，遇到空洞时自动升级为 B+tree。
 
@@ -461,7 +465,7 @@ union node_meta_t {
         uint64_t is_internal_node   : 1;   /* 0=leaf, 1=internal */
         uint64_t is_root_node       : 1;   /* 1=根节点 */
         uint64_t reserved           : 2;
-        uint64_t parent_ptr         : 52;  /* 非根→父节点块号 | 根→所属 inode 编号 */
+        uint64_t parent_ptr         : 52;  /* 联合指针：is_root_node=0 → 块指针(父节点)；=1 → Inode 指针(所属 inode) */
     } fields;
     uint64_t raw;
 } __attribute__((packed));
@@ -479,25 +483,25 @@ union node_meta_t {
 
 | Field | words[0] | words[1] | words[2] | words[3] |
 |-------|---------|---------|---------|---------|
-| 语义  | key = fblkbase (区间左端) | len (末端偏移, 闭区间) | pblkbase | 附加元数据 |
+| 语义  | key = fblkbase (区间左端) | len (末端偏移, 闭区间) | pblkbase (块指针) | 附加元数据 |
 
 words[3] 分配：
 - entry[0] → `node_meta_t`（entry_count_minus1, is_internal_node, is_root_node, parent_ptr）
-- entry[1] → `prev_sibling`（同级链表前驱）
-- entry[2] → `next_sibling`（同级链表后驱）
+- entry[1] → `prev_sibling`（块指针，同级链表前驱）
+- entry[2] → `next_sibling`（块指针，同级链表后驱）
 - entry[3..6] → `magic1..magic4`（256-bit 扫描签名）
 - entries[7..] → 自由使用
 
 布局示意：
 ```
-entry[0]: { key_0  |  len_0  |  pblkbase_0  |  node_meta_t     }
-entry[1]: { key_1  |  len_1  |  pblkbase_1  |  prev_sibling    }
-entry[2]: { key_2  |  len_2  |  pblkbase_2  |  next_sibling    }
-entry[3]: { key_3  |  len_3  |  pblkbase_3  |  magic1          }
-entry[4]: { key_4  |  len_4  |  pblkbase_4  |  magic2          }
-entry[5]: { key_5  |  len_5  |  pblkbase_5  |  magic3          }
-entry[6]: { key_6  |  len_6  |  pblkbase_6  |  magic4          }
-entry[7]: { key_7  |  len_7  |  pblkbase_7  |  free            }
+entry[0]: { key_0  |  len_0  |  块指针:pblkbase_0  |  node_meta_t(联合指针:parent_ptr) }
+entry[1]: { key_1  |  len_1  |  块指针:pblkbase_1  |  块指针:prev_sibling        }
+entry[2]: { key_2  |  len_2  |  块指针:pblkbase_2  |  块指针:next_sibling        }
+entry[3]: { key_3  |  len_3  |  块指针:pblkbase_3  |  magic1                     }
+entry[4]: { key_4  |  len_4  |  块指针:pblkbase_4  |  magic2                     }
+entry[5]: { key_5  |  len_5  |  块指针:pblkbase_5  |  magic3                     }
+entry[6]: { key_6  |  len_6  |  块指针:pblkbase_6  |  magic4                     }
+entry[7]: { key_7  |  len_7  |  块指针:pblkbase_7  |  free                       }
 ...
 ```
 
@@ -508,29 +512,29 @@ entries[3..6] 的 words[3] 被签名占用，但其 words[0..2] 仍可存 extent
 
 | Field | words[0] | words[1] | words[2] | words[3] |
 |-------|---------|---------|---------|---------|
-| 语义  | key = max_R_subtree (子树最大右端点=fblkbase+len) | 未使用 | subptr | 自由 |
+| 语义  | key = max_R_subtree (子树最大右端点=fblkbase+len) | 未使用 | subptr (块指针) | 自由 |
 
 内部节点是 256 阶 B+tree（方案 A）：所有 entry 统一，key = max_R_subtree。
 
 **key 语义**：`entry[i].key = max_R(child_i)`，即该子树中所有 extent 的最大右端点 `max(fblkbase+len)`。路由判定 `target ≤ max_R_subtree` 保证任何落入该子树覆盖范围的逻辑块号都能正确路由。
 
 ```
-entry[0]: { R_0      |  —  |  child_0       |  node_meta_t    }
+entry[0]: { R_0      |  —  |  块指针:child_0  |  node_meta_t(联合指针:parent_ptr) }
           ← R_0 = max_R(child_0)
-entry[1]: { R_1      |  —  |  child_1       |  free           }
+entry[1]: { R_1      |  —  |  块指针:child_1  |  free                             }
           ← R_1 = max_R(child_1)
-entry[2]: { R_2      |  —  |  child_2       |  free           }
+entry[2]: { R_2      |  —  |  块指针:child_2  |  free                             }
           ← R_2 = max_R(child_2)
-entry[3]: { R_3      |  —  |  child_3       |  magic1         }
+entry[3]: { R_3      |  —  |  块指针:child_3  |  magic1                           }
           ← R_3 = max_R(child_3)
-entry[4]: { R_4      |  —  |  child_4       |  magic2         }
+entry[4]: { R_4      |  —  |  块指针:child_4  |  magic2                           }
           ← R_4 = max_R(child_4)
-entry[5]: { R_5      |  —  |  child_5       |  magic3         }
+entry[5]: { R_5      |  —  |  块指针:child_5  |  magic3                           }
           ← R_5 = max_R(child_5)
-entry[6]: { R_6      |  —  |  child_6       |  magic4         }
+entry[6]: { R_6      |  —  |  块指针:child_6  |  magic4                           }
           ← R_6 = max_R(child_6)
 ...
-entry[n]: { R_n      |  —  |  child_n       |  free           }
+entry[n]: { R_n      |  —  |  块指针:child_n  |  free                             }
           ← R_n = max_R(child_n)
 ```
 
@@ -541,7 +545,7 @@ entry[0].words[3] 存 node_meta_t，entry[3..6].words[3] 存 256-bit 扫描签�
 ```cpp
 for (i = 0; i < get_entry_count(); i++) {
     if (target <= entries[i].get_key())
-        return entries[i].get_subptr();   // → child_i
+        return entries[i].get_subptr();   // → 块指针：child_i
 }
 return 0;  // 不应到达
 ```
@@ -552,7 +556,7 @@ return 0;  // 不应到达
 
 ### 同级链表
 
-所有 B+tree 节点（叶子和内部均可用，但 v1 仅在叶子层使用）通过 `entry[1].words[3]`（prev）和 `entry[2].words[3]`（next）连接为双向链表。
+所有 B+tree 节点（叶子和内部均可用，但 v1 仅在叶子层使用）通过 `entry[1].words[3]`（块指针，prev_sibling）和 `entry[2].words[3]`（块指针，next_sibling）连接为双向链表。
 
 范围遍历无需回溯父节点：先沿链表找到起始位置再顺序向前扫描。
 
@@ -584,8 +588,8 @@ Dentry_Bptree_node_t (8K = 8192B)
 ```c
 struct Dentry_head_t {
     dentry_node_meta_t  head;        // 8B: 节点元数据
-    uint64_t            ptr1;        // 8B: 语义见 §6.2 四态枚举
-    uint64_t            ptr2;        // 8B: 语义见 §6.2 四态枚举
+    uint64_t            ptr1;        // 8B: 块指针（见 §6.2 四态枚举）
+    uint64_t            ptr2;        // 8B: 联合指针（见 §6.2 四态枚举）
     uint64_t            reserved0;   // 8B: 预留
     uint64_t            magic1;      // 8B: 256-bit 扫描签名
     uint64_t            magic2;      // 8B: 256-bit 扫描签名
@@ -601,13 +605,13 @@ union dentry_node_meta_t {
         uint64_t is_internal_node : 1; // 0=leaf, 1=internal
         uint64_t is_root_node   : 1;  // 1=根节点
         uint64_t reserved       : 2;
-        uint64_t parent_ptr     : 52; // 语义见 §6.2 四态枚举
+        uint64_t parent_ptr     : 52; // 联合指针（见 §6.2 四态枚举）
     } fields;
     uint64_t raw;
 };
 
 struct Dentry_common_t {
-    uint64_t ptr;        // 8B: 语义见 §6.2 四态枚举
+    uint64_t ptr;        // 8B: 联合指针（见 §6.2 四态枚举）
     char     name[120];  // 120B: 文件名（叶子：排序 key / 内部：分隔 key）
 };
 ```
@@ -616,17 +620,17 @@ struct Dentry_common_t {
 
 `Dentry_Bptree_node_t` 的全部字段语义由 `head.head.fields` 中两个独立位联合决定：
 
-| # | `is_root` | `is_internal` | 角色 | `parent_ptr` | `ptr1` | `ptr2` | `entries[i].ptr` | `entries[i].name` |
-|---|-----------|---------------|------|-------------|--------|--------|-----------------|-------------------|
-| 0 | 0 | 0 | 非根叶子 | 父节点块号 | 前驱叶子块号 | 后继叶子块号 | 目标 inode | 文件名（字典序 key） |
-| 1 | 0 | 1 | 非根内部 | 父节点块号 | 最左子树块号 | 0 | 子树块号 | 分隔 key（子树最小文件名） |
-| 2 | 1 | 0 | 根叶子 | `.` inode（自身） | 0 | `..` inode（父目录） | 目标 inode | 文件名（字典序 key） |
-| 3 | 1 | 1 | 根内部 | `.` inode（自身） | 最左子树块号 | `..` inode（父目录） | 子树块号 | 分隔 key（子树最小文件名） |
+| # | `is_root` | `is_internal` | 角色 | `parent_ptr`（联合指针） | `ptr1`（块指针） | `ptr2`（联合指针） | `entries[i].ptr`（联合指针） | `entries[i].name` |
+|---|-----------|---------------|------|-------------------------|-----------------|-------------------|-----------------------------|-------------------|
+| 0 | 0 | 0 | 非根叶子 | 块指针(父节点) | 前驱叶子块号 | 块指针(后继叶子块号) | Inode 指针(目标 inode) | 文件名（字典序 key） |
+| 1 | 0 | 1 | 非根内部 | 块指针(父节点) | 最左子树块号 | 0(空闲) | 块指针(子树块号) | 分隔 key（子树最小文件名） |
+| 2 | 1 | 0 | 根叶子 | Inode 指针(自身/`.`) | 0(空闲) | Inode 指针(`..`) | Inode 指针(目标 inode) | 文件名（字典序 key） |
+| 3 | 1 | 1 | 根内部 | Inode 指针(自身/`.`) | 最左子树块号 | Inode 指针(`..`) | 块指针(子树块号) | 分隔 key（子树最小文件名） |
 
 **说明：**
 
-- **状态 0 / 2（叶子）**：所有 entry 按文件名字典序排列，满足 `strcmp(entries[i].name, entries[i+1].name) < 0`。`entries[i].ptr` 为该文件/目录的 inode 编号。
-- **状态 1 / 3（内部）**：共有 `entry_count + 1` 个子树，由 `ptr1`（最左子树）+ 每个 entry 的 `ptr`（第 i+1 子树）组成。`entries[i].name` 为第 i+1 子树的最小文件名（分隔 key）。路由规则：
+- **状态 0 / 2（叶子）**：所有 entry 按文件名字典序排列，满足 `strcmp(entries[i].name, entries[i+1].name) < 0`。`entries[i].ptr` 为 Inode 指针，指向该文件/目录的 inode。
+- **状态 1 / 3（内部）**：共有 `entry_count + 1` 个子树，由 `ptr1`（块指针，最左子树）+ 每个 entry 的 `ptr`（块指针，第 i+1 子树）组成。`entries[i].name` 为第 i+1 子树的最小文件名（分隔 key）。路由规则：
 
 ```
 target < entries[0].name                  →  ptr1（child_0）
@@ -634,7 +638,7 @@ entries[i].name ≤ target < entries[i+1].name  →  entries[i].ptr（child_{i+1
 entries[n].name ≤ target                  →  entries[n].ptr（child_{n+1}）
 ```
 
-- **根节点（状态 2 / 3）**：`parent_ptr` 直接存本目录的 inode 编号（即 `.`），`ptr2` 存父目录的 inode 编号（即 `..`）。避免在 entry 槽位中为 `.` / `..` 各占一个位置。分裂后新生的非根叶子/内部节点恢复正常语义（状态 0 / 1），根节点保持状态 2 / 3 不变。
+- **根节点（状态 2 / 3）**：`parent_ptr` 为 Inode 指针，存本目录的自身 inode 编号（即 `.`）；`ptr2` 为 Inode 指针，存父目录的 inode 编号（即 `..`）。避免在 entry 槽位中为 `.` / `..` 各占一个位置。分裂后新生的非根叶子/内部节点恢复正常语义（状态 0 / 1），根节点保持状态 2 / 3 不变。
 - **非根内部（状态 1）**：`ptr2` 恒为 0（空闲）。
 
 ### 6.3 扫描签名
@@ -645,15 +649,15 @@ entries[n].name ≤ target                  →  entries[n].ptr（child_{n+1}）
 
 ### 6.4 同级链表
 
-非根叶子节点（状态 0）通过 `ptr1` / `ptr2` 连成双向链表：
+非根叶子节点（状态 0）通过 `ptr1` / `ptr2`（块指针）连成双向链表：
 
 ```
-leaf_A.ptr2 = B
+leaf_A.ptr2 = B            // 块指针 → 后继叶子
 leaf_B.ptr1 = A, leaf_B.ptr2 = C
 leaf_C.ptr1 = B, leaf_C.ptr2 = ~0ull (tail)
 ```
 
-根叶子（状态 2）的 `ptr2` 不参与链表（改存 `..` inode），根不存在链表关系。内部节点（状态 1/3）不涉及同级链表。
+根叶子（状态 2）的 `ptr2` 不参与链表（改存 Inode 指针 `..`），根不存在链表关系。内部节点（状态 1/3）不涉及同级链表。
 
 范围遍历（`readdir`/`ls`）沿链表顺序扫描，无需回溯父节点。
 
@@ -680,9 +684,9 @@ leaf_C.ptr1 = B, leaf_C.ptr2 = ~0ull (tail)
 | 每节点 entry 数 | 256 | 63 |
 | Key 类型 | `uint64_t`（fblkbase / max_R） | `char[120]`（字典序） |
 | 扫描签名 | entry[3..6].words[3] | head.magic1..magic4 |
-| 叶子 ptr | pblkbase | inode 编号 |
-| 内部 ptr | sub_block_num | child 块号 |
-| 内部最左子树 | entry[0].words[2]（统一格式） | head.ptr1（独立字段） |
+| 叶子 ptr | 块指针(pblkbase) | Inode 指针 |
+| 内部 ptr | 块指针(sub_block_num) | 块指针(child 块号) |
+| 内部最左子树 | entry[0].words[2]（块指针，统一格式） | head.ptr1（块指针，独立字段） |
 | 同级链表 | entry[1/2].words[3] | head.ptr1 / head.ptr2 |
 | 排序 | fblk_cmp（区间序） | strcmp（字典序） |
 | 查找 | ≤ 右端点 | ≥ 最小文件名 |
@@ -732,7 +736,7 @@ for each 8K-aligned block in partition:
             → 一个魔数字段损坏，其余数据可能也受损
         read node_meta_t 获取 entry_count, is_internal, is_root, parent_ptr
         if is_root:
-            parent_ptr = owner inode → 定位到文件/目录
+            parent_ptr = Inode 指针(owner inode) → 定位到文件/目录
         if is_leaf:
             entries[0..n].key/ptr → 恢复 extent 或 dentry
 ```
@@ -756,7 +760,7 @@ for each 8K-aligned block in partition:
 
 在扫描汇总所有 B+tree 节点后：
 
-1. 遍历所有根节点（`is_root_node=1`），通过 `parent_ptr` 获取 owner inode
+1. 遍历所有根节点（`is_root_node=1`），通过 `parent_ptr`（联合指针→Inode 指针）获取 owner inode
 2. 对每个根节点递归向下遍历，重建完整 B+tree 拓扑
 3. 汇总所有叶子节点中的 dentry / extent 数据，恢复文件系统目录树
 4. 重新计算并重建 bitmap
@@ -771,9 +775,14 @@ for each 8K-aligned block in partition:
 mkfs.ravenfs <device> [options]
 
 Options:
-  --inode-ratio=N    每 N block 分配 1 个 inode (默认 16)
-  --inode-count=N    直接指定 inode 上限
+  --inode-ratio=N    每 N block 分配 1 个 inode (默认 8)
+  --inode-count=N    直接指定 inode 上限（覆盖 --inode-ratio）
+  --backups=N        Backup Superblock 数量 (默认 3)
   --label=NAME       卷标 (最长 48B)
+  --uuid=UUID        显式 UUID（省略则自动生成）
+  -f, --force        覆盖已有文件系统
+  -v, --verbose      打印详细布局
+  -h, --help         帮助
 ```
 
 默认 `--inode-ratio=8` = 1 inode / 32KB。inode 数组空间开销约 0.4%。
@@ -785,7 +794,7 @@ Options:
 ## 9. 测试方案
 
 ```
-host:  mkfs.ravenfs /dev/nvme0n1pX   → 确定性盘面布局（元数据尾部）
+host:  mkfs.ravenfs <device>          → 确定性盘面布局（元数据尾部）
 guest: KVM + VFIO passthrough         → 真实 NVMe 驱动路径
 guest: 驱动读盘 → 解析 superblock → 验证布局正确
        → 查目录 → 读文件 → 跨 extent 大文件

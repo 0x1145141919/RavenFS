@@ -25,17 +25,16 @@ FS_block 空间的地址是 RavenFS **内部唯一地址语言**。设备 LBA �
 
 ```
 LBA_size           ← NVMe Identify Namespace LBAF0.LBA_Data_Size（单位：字节）
-                   例：512e → 512，4Kn → 4096，FDP → 可查
+                    例：512e → 512，4Kn → 4096，FDP → 可查
 
 total_dev_lba      ← NVMe Identify Namespace NSZE（单位：LBA）
-                   例：1TB 512e 盘 → 1953525168
-
-partition_start_lba ← 设备分区起始，来源：
-                     裸盘（whole disk）→ 0
-                     GPT 分区  → gpt_entry.starting_lba
+                    例：1TB 512e 盘 → 1953525168
 ```
 
-这三个常量的设备 LBA 单位可能不同（512 vs 4096），换算到字节一律用 `LBA_size`：
+**设备模型统一**：不论整盘（`/dev/nvme0n1`）、分区（`/dev/nvme0n1p1`）还是普通文件，用户态打开后均视为一个从 byte 0 开始的连续地址空间。
+内核已在块设备层自动翻译分区偏移，用户态无需感知 `partition_start_lba`。
+
+换算到字节一律用 `LBA_size`：
 
 ```
 byte_offset = lba_number × LBA_size
@@ -50,8 +49,9 @@ byte_offset = lba_number × LBA_size
 FS_block 世界由 `RavenSuperblock` 中字段以及相关隐式常量联合定义：
 
 ```
-world_base_lba    ← FS_block[0] 在设备 LBA 空间的起始 LBA（单位：device LBA）
-                    Mkfs 时写入，之后只由离线扩容工具修改
+world_base_lba    ← FS_block[0] 的 LBA 号（单位：device LBA）。
+                    恒等于 multiplier = 4096 / LBA_size。
+                    Mkfs 时写入，之后只由离线扩容工具修改。
 
 total_blocks      ← FS_block 世界中的总块数（单位：FS_block）
 
@@ -63,17 +63,12 @@ multiplier        ← FS_block_size / LBA_size = 4096 / LBA_size
 **核心换算公式（唯一路径）：**
 
 ```
-FS_block[n] 在设备 LBA 空间的区间:
+FS_block[n] 在打开设备/文件 fd 内的字节偏移:
 
-  起点 LBA = world_base_lba + n × multiplier
-  终点 LBA = world_base_lba + (n+1) × multiplier - 1   (闭区间)
-  字节数   = multiplier × LBA_size = 4096
+   字节偏移 = world_base_lba × LBA_size + n × 4096
+            = 4096 + n × 4096                       ← 因 world_base_lba × LBA_size ≡ 4096
 
-逆换算（设备 LBA → FS_block）:
-
-  n = (lba - world_base_lba) / multiplier
-  商为 FS_block 号，余数为此 FS_block 内的 LBA 偏移
-  注意：lba < world_base_lba 时不在本 FS 范围内
+   即 Primary Superblock 占据 fd byte[0, 4096)，FS_block[0] 从 byte 4096 开始。
 ```
 
 ### 3.2 几何推导（零冗余）
@@ -112,6 +107,7 @@ inode_array_bitmap_base   = inode_array_base - inode_bitmap_blocks
 ```
 
 **Superblock 只需存 `total_blocks` 和 `inode_array_count`，零冗余。**
+`world_base_lba` 由 `multiplier` 恒等推导，不携带额外信息。
 
 ---
 
@@ -123,18 +119,13 @@ RavenFS 中存在两个角色的 Superblock：**Primary（上岗）**和 **Backu
 
 **不在 FS_block 世界内。**
 
-物理位置是**裸盘/分区 LBA offset 0**（即设备 LBA `partition_start_lba` 处），
+物理位置是**打开设备/文件 fd 的 byte offset 0**。
 指向该位置的 `RavenSuperblock.magic` 必须为 `"RAVN"`。
 
 ```
-裸盘:
-  LBA 0 ────────────────────────→ Primary Superblock
+打开 fd:
+  byte[0, 4096) ─────────────────→ Primary Superblock
                                     ↑
-                                不在 FS_block 区间内
-
-GPT 分区:
-  gpt_entry.starting_lba ────────→ Primary Superblock
-  (即 partition_start_lba)         ↑
                                 不在 FS_block 区间内
 ```
 
@@ -143,11 +134,8 @@ GPT 分区:
 - Primary 是 **FS_block 世界的定义者和入口**
 - Primary 本身不占用任何 FS_block 编号
 - `bitmap` 覆盖 `[0, total_blocks)`，不包含 Primary
-- `world_base_lba` 的值在 mkfs 时写入，其含义是 FS_block[0] 的设备 LBA
-- **推导关系：** Primary 占据分区/设备开头 4096 字节，
-  `world_base_lba × lba_size` = Primary 末尾字节偏移 = 4096（裸盘/文件）
-  或 `(world_base_lba - partition_start_lba) × lba_size` = 4096（GPT 分区）
-  即 `world_base_lba = partition_start_lba + multiplier`（裸盘时 partition_start_lba = 0）
+- `world_base_lba` 恒等于 `multiplier = 4096 / LBA_size`。
+  Primary 占据 fd byte[0, 4096)，**FS_block[0] 从 byte 4096 开始**。
 
 ### 4.2 Backup Superblock（备胎）
 
@@ -168,11 +156,11 @@ FS_block 世界:
 
 **字段语义（统一结构体，角色双解码）：**
 
-| 字段 | Primary | Backup |
-|------|---------|--------|
-| `backup_prev` | 0（哨兵） | 前驱 Backup FS_block 号（0=链头） |
-| `backup_next` | 链头 FS_block 号 | 后继 Backup FS_block 号（0=链尾） |
-| `backup_count` | 备份总数 | 备份总数（交叉校验） |
+| 字段 | 指针类型 | Primary | Backup |
+|------|---------|---------|--------|
+| `backup_prev` | 块指针 | ~0ull（哨兵） | 前驱块号（~0ull=链头） |
+| `backup_next` | 块指针 | 链头块号 | 后继块号（~0ull=链尾） |
+| `backup_count` | — | 备份总数 | 备份总数（交叉校验） |
 
 **Backup 与 FS_block 世界的关系：**
 
@@ -204,51 +192,68 @@ v1 禁用 online expand 场景下 Backup 与 Primary 不一致的可能。
 
 ---
 
-## 5. 字段坐标系标注
+## 5. 字段指针类型标注
 
-以下列出 RavenFS on-disk 结构中所有涉及"块号"的字段，标注其所属坐标系。
+RavenFS on-disk 结构中存在三类指针语义，所有涉及"地址/索引"的字段严格按此分类标注：
+
+| 指针类型 | 含义 | 取值空间 |
+|---------|------|---------|
+| **块指针（Block Ptr）** | FS_block 索引，指向一个 FS_block | `[0, total_blocks)` |
+| **Inode 指针（Inode Ptr）** | Inode 索引，指向 inode array 中的一个 inode | `[0, inode_array_count)` |
+| **联合指针（Union Ptr）** | u64 复用，由上下文位域（`is_root`、`type`、`is_internal` 等）解码为块指针或 Inode 指针 | 见各字段说明 |
+
+三个取值空间彼此独立。联合指针的当前语义由上下文位域决定，不得脱离位域单独解读裸值。
+
+---
 
 ### RavenSuperblock
 
-| 字段 | 坐标系 | 说明 |
-|------|--------|------|
-| `magic` | — | 固定魔数，不参与地址计算 |
+| 字段 | 指针类型 | 说明 |
+|------|---------|------|
+| `magic` | — | 固定魔数 |
 | `version` | — | 格式版本号 |
 | `pad0` | — | 对齐填充 |
-| **`world_base_lba`** | **device LBA** | FS_block 世界锚点，单位与设备 LBA_size 一致 |
-| **`total_blocks`** | **FS_block** | 世界中 FS_block 总数 |
-| `inode_array_count` | — | Inode 上限计数，非地址 |
-| `root_inode` | — | Inode 索引号，非 FS_block 号 |
+| `world_base_lba` | device LBA | 非指针。FS_block 世界锚点，单位与设备 LBA_size 一致 |
+| `total_blocks` | — | 非指针。定义块指针取值上限 |
+| `inode_array_count` | — | 非指针。定义 Inode 指针取值上限 |
+| `root_inode` | Inode 指针 | 根目录 inode 索引 |
 | `uuid` | — | — |
 | `volume_name` | — | — |
 | `crc32` | — | — |
-| **`backup_prev`** | **FS_block** | Primary: 0 \| Backup: 前驱块号 |
-| **`backup_next`** | **FS_block** | Primary: 链头 \| Backup: 后继块号 |
-| `backup_count` | — | 备份总数，非地址 |
+| `backup_prev` | 块指针 | Primary: ~0ull（哨兵）\| Backup: 前驱块号，~0ull=链头 |
+| `backup_next` | 块指针 | Primary: 链头块号 \| Backup: 后继块号，~0ull=链尾 |
+| `backup_count` | — | 非指针。备份总数 |
+
+---
 
 ### B+tree 节点（`Bptree_node_t`）
 
-| 字段 | 坐标系 | 说明 |
-|------|--------|------|
-| `entries[i].get_pbase()` | **FS_block** | 叶子：extent 的物理块号 |
-| `entries[i].get_subptr()` | **FS_block** | 内部：子节点块号 |
-| `entry[0].get_meta().parent_ptr` | **FS_block** | 非根→父节点块号；根→所属 inode 编号 |
-| `entry[1].words[3]` (prev_sibling) | **FS_block** | 前驱兄弟节点块号 |
-| `entry[2].words[3]` (next_sibling) | **FS_block** | 后继兄弟节点块号 |
+| 字段 | 指针类型 | 说明 |
+|------|---------|------|
+| `entries[i].words[2].addr` (get_pbase) | 块指针 | 叶子：extent 的物理起始块号 |
+| `entries[i].words[2].addr` (get_subptr) | 块指针 | 内部：子节点块号 |
+| `entry[0].words[3].fields.parent_ptr` | 联合指针 | `is_root_node=0` → 块指针(父节点)；`is_root_node=1` → Inode 指针(所属 inode 编号) |
+| `entry[1].words[3]` (prev_sibling) | 块指针 | 前驱兄弟节点块号 |
+| `entry[2].words[3]` (next_sibling) | 块指针 | 后继兄弟节点块号 |
+
+---
 
 ### Dentry B+tree 节点（`Dentry_Bptree_node_t`）
 
-| 字段 | 坐标系 | 说明 |
-|------|--------|------|
-| `head.ptr1` | **FS_block** | 叶子→前驱块号 / 内部→最左子树块号 |
-| `head.ptr2` | **FS_block** | 叶子→后继块号 / 内部→空闲 |
-| `head.head.fields.parent_ptr` | **FS_block** | 非根→父节点块号；根→所属 inode 编号 |
+| 字段 | 指针类型 | 说明 |
+|------|---------|------|
+| `head.ptr1` | 块指针 | 非根叶子→前驱块号；内部→最左子树块号；根叶子→0(空闲) |
+| `head.ptr2` | 联合指针 | 非根叶子→块指针(后继块号)；根→Inode 指针(`..` inode)；非根内部→0(空闲) |
+| `head.head.fields.parent_ptr` | 联合指针 | `is_root_node=0` → 块指针(父节点块号)；`is_root_node=1` → Inode 指针(自身 inode / `.`) |
+| `entries[i].ptr` | 联合指针 | 叶子→Inode 指针(目标 inode 编号)；内部→块指针(子树块号) |
+
+---
 
 ### Inode
 
-| 字段 | 坐标系 | 说明 |
-|------|--------|------|
-| `data_root` | **FS_block** | 0=inline数据；非零=B+tree根节点或直接数据块 |
+| 字段 | 指针类型 | 说明 |
+|------|---------|------|
+| `data_root` | 块指针（带 ~0ull 哨兵） | ~0ull=内联(非指针)；≠~0ull=块指针，按 `type` + `is_data_root_direct_bit` 解码为 dentry B+tree 根 / 直指区间起始 / 区段 B+tree 根 |
 
 ---
 
@@ -357,22 +362,25 @@ mkfs 流程:
 
 ---
 
-## 7. 两条路径验证
+## 7. 统一挂载验证
 
-### 裸盘 mount
+RavenFS 统一块设备模型下，挂载验证只有一条路径——不论整盘、分区还是文件：
 
 ```
-设备: NVMe 整盘，LBA_size = 512, total_dev_lba = N
-partition_start_lba = 0
+设备: 任意块设备或文件，LBA_size = S
 
-读 LBA 0 → magic = "RAVN" → 是 RavenFS 裸盘
-读 world_base_lba = 8            (= multiplier, Primary SB 占据 LBA[0,8))
-读 total_blocks = N/8 - 1        (减去 Primary 占用的 1 个 FS_block 等价空间)
-multiplier = 4096 / 512 = 8
+读 fd byte[0, 4096) → Primary Superblock
+校验 magic = "RAVN"
 
-验证: world_base_lba == multiplier              → 校验通过
-      world_base_lba + total_blocks × 8 ≤ N     → 即 8 + (N/8-1)×8 = N ≤ N → OK
-      Primary SB 占据 LBA[0,8)，FS_block 世界占据 LBA[8, N)  → 无重叠
+读 world_base_lba   ← 从 Superblock
+读 total_blocks     ← 从 Superblock
+
+验证 world_base_lba × S == 4096          ← Primary 占据 byte[0, 4096)，FS_block[0] 从 byte 4096 开始
+验证 total_blocks > 0
+
+multiplier = 4096 / S                    ← 运行时推导
+
+FS_block 世界占据 fd byte[4096, 4096 + total_blocks × 4096)，Primary 在其前，无重叠
 
 Backup 校验:
   从 Primary.backup_next 遍历链表:
@@ -380,35 +388,16 @@ Backup 校验:
   遍历计数 == Primary.backup_count
 ```
 
-### GPT 分区 mount
-
-```
-设备: GPT 分区 nvme0n1p3, LBA_size = 512
-partition_start_lba = gpt_entry.starting_lba = 2048
-
-读 LBA 2048 (分区 offset 0) → magic = "RAVN" → 是 RavenFS
-读 world_base_lba = 2056          (= partition_start_lba + multiplier)
-读 total_blocks = M-1             (减去 Primary 占用的 1 个 FS_block 等价空间)
-multiplier = 8
-
-验证: world_base_lba == partition_start_lba + multiplier  → 校验通过
-      分区内 FS_block 世界字节偏移: (world_base_lba - partition_start_lba) × 512 = 4096
-      → Primary 占据分区开头 4096 字节，FS_block 世界从偏移 4096 开始  → 无重叠
-
-Backup 校验: 同裸盘流程
-```
-
 ### 迁移保护
 
 ```
 同一块设备在不同机器上：
-  LBA_size 是否一致？   → NVMe 属性，跨机器不变，OK
-  partition_start_lba？ → GPT 不变则相同
+  LBA_size 不变 → world_base_lba 不需更新
 
 手动 dd 到另一分区 / 文件 image：
-  world_base_lba 需要更新
-  Backup 的 world_base_lba 也需要一并更新
-  → v1 不支持在线迁移，仅通过离线扩容工具修改
+  world_base_lba 不变（恒 = multiplier = 4096 / LBA_size）
+  Backup 的 world_base_lba 也同样不变
+  → v1 不做在线迁移，仅通过离线扩容工具修改备份计数
 ```
 
 ---
@@ -424,17 +413,15 @@ B+tree 叶子 entry 记录:
 
 设备 LBA_size = 512
 multiplier = 8
-world_base_lba = 2048
+world_base_lba = 8   (= multiplier)
 
 换算:
-  FS_block[1024] 的 LBA 区间:
-    [2048 + 1024 × 8, 2048 + (1024+1) × 8 - 1]
-    = [2048 + 8192, 2048 + 8192 + 7]
-    = [10240, 10247]
+  FS_block[1024] 的 fd 字节偏移:
+    4096 + 1024 × 4096 = 4198400
+    对应 LBA: 4198400 / 512 = 8200
 
-  FS_block[1024..1027] (4块) 的 LBA 区间:
-    [10240, 10240 + 4 × 8 - 1] = [10240, 10271]
-    字节: 10240 × 512 = 5242880, 长度 16 × 512 = 8192
+  FS_block[1024..1027] (4块) 的 fd 字节区间:
+    [4198400, 4198400 + 4 × 4096) = [4198400, 4214784)
 ```
 
 ### 场景：读 inode array
@@ -452,9 +439,9 @@ inode_array_base = 99980  ← FS_block 号
 bitmap 区间:  [99996, 100000)
 inode 区间:   [99980, 99996)
 
-设备 LBA (world_base_lba = 2048, multiplier = 8):
-  start_lba = 2048 + 99980 × 8 = 2048 + 799840 = 801888
-  end_lba   = 801888 + 16 × 8 - 1 = 802015
+fd 字节偏移:
+  start_byte = 4096 + 99980 × 4096 = 4096 + 409518080 = 409522176
+  end_byte   = 409522176 + 16 × 4096 - 1 = 409587711
 ```
 
 ---
@@ -463,11 +450,11 @@ inode 区间:   [99980, 99996)
 
 - `disk_layout_v1.md` 中所有 "block" 均指 **FS_block**（除非特别标注 "LBA"）
 - 分区布局图中 `block 0 = Superblock` 是物理视图，不是 FS_block 世界内的编号
-- 扩容策略中的块号均为 FS_block 号，扩容后重新计算 `world_base_lba` 不变（因 `partition_start_lba` 不变），只更新 `total_blocks`
+- 扩容策略中的块号均为 FS_block 号，扩容后 `world_base_lba` 不变（恒 = multiplier），只更新 `total_blocks`
 
 ---
 
 > **一句话记**
 >
 > Primary 是世界的创造者，**不在**世界内。Backup 是世界的备胎居民。
-> FS_block[n] = `world_base_lba + n × (4096 / LBA_size)`，仅此一条公式贯穿全局。
+> FS_block[n] byte offset = `4096 + n × 4096`，仅此一条公式贯穿全局。
