@@ -40,6 +40,7 @@ static bool need_validate(int i) {
 }
 
 static int silent_validate(RavenFS &fs) {
+    fflush(stdout);
     int saved = dup(STDOUT_FILENO);
     int null_fd = open("/dev/null", O_WRONLY);
     dup2(null_fd, STDOUT_FILENO);
@@ -47,6 +48,7 @@ static int silent_validate(RavenFS &fs) {
 
     int err = fs.validate_dentry_tree();
 
+    fflush(stdout);
     dup2(saved, STDOUT_FILENO);
     close(saved);
     return err;
@@ -57,13 +59,40 @@ static int loud_validate(RavenFS &fs, int seq, const char *label) {
     return fs.validate_dentry_tree();
 }
 
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s <device> [options]\n"
+        "Options:\n"
+        "  --sequential         delete in readdir order (default: shuffled)\n"
+        "  --seed <n>           random seed for shuffle (default: 42)\n"
+        "  --order-file <path>  path to save/read deletion order (default: delete_order.txt)\n"
+        , prog);
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <device>\n", argv[0]);
+        usage(argv[0]);
         return 1;
     }
 
     const char *device = argv[1];
+    bool sequential = false;
+    int seed = 42;
+    const char *order_file = "delete_order.txt";
+
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--sequential") == 0) {
+            sequential = true;
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--order-file") == 0 && i + 1 < argc) {
+            order_file = argv[++i];
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            usage(argv[0]);
+            return 1;
+        }
+    }
 
     fprintf(stderr, "stress_delete: mounting %s\n", device);
     uint64_t rc;
@@ -85,12 +114,36 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    /* 生成乱序删除顺序（固定种子确保可复现） */
+    /* 生成完整路径列表，names 天然是 B+tree 字典序 */
+    std::vector<std::string> full_paths;
+    full_paths.reserve(N);
+    for (int i = 0; i < N; i++) {
+        char full[256];
+        snprintf(full, sizeof(full), "/stress_test/%s", names[i].c_str());
+        full_paths.push_back(full);
+    }
+
+    /* 删除顺序：默认乱序并保存到文件 */
     std::vector<int> order(N);
     for (int i = 0; i < N; i++) order[i] = i;
-    std::mt19937 g(12345);
-    std::shuffle(order.begin(), order.end(), g);
-    fprintf(stderr, "stress_delete: shuffled delete, checkpoint validate\n");
+
+    if (!sequential) {
+        std::mt19937 g(seed);
+        std::shuffle(order.begin(), order.end(), g);
+
+        FILE *fp = fopen(order_file, "w");
+        if (!fp) {
+            fprintf(stderr, "FAIL: cannot write %s\n", order_file);
+            return 1;
+        }
+        for (int i = 0; i < N; i++)
+            fprintf(fp, "%s\n", full_paths[order[i]].c_str());
+        fclose(fp);
+        fprintf(stderr, "stress_delete: shuffled (seed=%d), order saved to %s\n",
+                seed, order_file);
+    } else {
+        fprintf(stderr, "stress_delete: sequential delete\n");
+    }
 
     /* baseline */
     {
@@ -101,9 +154,8 @@ int main(int argc, char *argv[]) {
 
     int err_count = 0;
     for (int idx = 0; idx < N; idx++) {
-        int i = order[idx];
-        char full[256];
-        snprintf(full, sizeof(full), "/stress_test/%s", names[i].c_str());
+        int i = sequential ? idx : order[idx];
+        const char *full = full_paths[i].c_str();
 
         int ret = fs.rmdir(full);
         if (ret != 0) {

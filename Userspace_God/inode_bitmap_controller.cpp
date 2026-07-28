@@ -425,9 +425,6 @@ InodeBitmapCacheController::InodeBitmapCacheController(const InodeBitmapCacheCon
             best_cid  = cid;
         }
 
-        fprintf(stderr, "  controller[%lu]: free_count=%u (range=%lu..%lu)\n",
-                (unsigned long)cid, ctrl->free_count,
-                (unsigned long)first_inum, (unsigned long)last_inum);
     }
 
     delete[] tmp;
@@ -439,9 +436,6 @@ InodeBitmapCacheController::InodeBitmapCacheController(const InodeBitmapCacheCon
         proc.current_cid   = best_cid;
         proc.last_hint_cid = best_cid;
         all_controller[best_cid].state = BITMAP_CTRL_ONLINE;
-
-        fprintf(stderr, "InodeBitmapCache: processor ← controller[%lu] (free=%u)\n",
-                (unsigned long)best_cid, all_controller[best_cid].free_count);
     }
 
     fprintf(stderr, "InodeBitmapCache: ready\n");

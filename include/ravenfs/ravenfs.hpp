@@ -54,6 +54,7 @@ public:
     void debug_dump(const char *label);
 
     int validate_dentry_tree();
+    void dump_dentry_tree(FILE *fp);
 
     class InodeSession {
         RavenFS  *fs;
@@ -175,6 +176,9 @@ private:
     void validate_subtree(uint64_t block, uint64_t expected_parent,
                           int depth, std::set<uint64_t> &visited,
                           std::map<uint64_t, Dentry_Bptree_node_t> &pin);
+
+    void dump_subtree(FILE *fp, uint64_t block, uint64_t expected_parent,
+                      int depth, std::set<uint64_t> &visited);
 
     uint64_t validate_world_base();
     uint64_t validate_sb_crc32();

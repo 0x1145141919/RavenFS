@@ -135,6 +135,9 @@ uint64_t RavenFS::init_mount(const char *device_path) {
         ibcache = new InodeBitmapCacheController(ib_cfg);
     }
 
+    /* ── 8. VFS 逻辑缓存层 ── */
+    vfs_cache_init();
+
     fprintf(stderr, "RavenFS: mounted  blocks=%lu  inodes=%lu  root=%lu\n",
             (unsigned long)sb.total_blocks,
             (unsigned long)sb.inode_array_count,
@@ -144,6 +147,8 @@ uint64_t RavenFS::init_mount(const char *device_path) {
 
 void RavenFS::unmount() {
     if (bdev.fd >= 0) {
+        vfs_cache_destroy();
+
         if (bcache) {
             bcache->shutdown_all();
             delete bcache;

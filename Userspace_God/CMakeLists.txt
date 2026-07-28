@@ -14,6 +14,7 @@ add_library(ravenfs_god STATIC
     validate_dentry.cpp
     bitmap_cache_controller.cpp
     inode_bitmap_controller.cpp
+    vfs_cache.cpp
 )
 target_include_directories(ravenfs_god PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(ravenfs_god PUBLIC Threads::Threads)

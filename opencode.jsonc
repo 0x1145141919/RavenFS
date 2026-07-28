@@ -1,0 +1,60 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "permission": {
+    // bash: 命令执行权限
+    "bash": {
+      "*":                            "ask",     // 默认询问
+      "grep *":                       "allow",   // 搜索自动放行
+      "cat *":                        "allow",   // 文件预览
+      "head *":                       "allow",
+      "tail *":                       "allow",
+      "ls *":                         "allow",   // 目录浏览
+      "find *":                       "allow",
+      "which *":                      "allow",
+      "echo *":                       "allow",
+      "pwd":                          "allow",
+      "dd *":                         "ask",     // dd 写盘/镜像要确认
+      "losetup *":                    "ask",     // loop 设备操作问
+      "sfdisk *":                     "ask",     // 分区操作问
+      "unshare *":                    "ask",
+      "git diff*":                    "allow",   // git diff 安全
+      "git status*":                  "allow",
+      "git log*":                     "allow",
+      "git show*":                    "allow",
+      "git *":                        "ask",     // 其他 git 操作问
+      "git add *":                    "ask",
+      "git commit *":                 "ask",
+      "git push *":                   "deny",    // push 你手动
+      "cmake *":                      "allow",   // cmake configure 安全
+      "make *":                       "allow",   // 编译直接跑
+      "./ravenfs_cli *":              "ask",     // 格式化/扩容等实际写盘操作
+      "*.o *":                        "ask",
+      "rm *":                         "deny",    // 删除禁止
+      "mv *":                         "ask",
+      "cp *":                         "ask",
+      "chmod *":                      "ask",
+      "chown *":                      "ask",
+      "sudo *":                       "deny"     // 提权禁止
+    },
+
+    // edit: 文件修改
+    "edit": {
+      "*":                                "allow",
+      "/home/PS/.openclaw/workspace/*":   "deny"
+    },
+
+    // read: 文件读取
+    "read": {
+      "*":              "allow",
+      ".env*":          "deny",
+      "*.key":          "deny",
+      "*token*":        "deny"
+    },
+
+    // 外部目录访问
+    "external_directory": {
+      "*":              "allow"
+    }
+  }
+}

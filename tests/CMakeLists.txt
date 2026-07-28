@@ -20,3 +20,13 @@ add_executable(ravenfs_stress_delete
     stress_delete.cpp
 )
 target_link_libraries(ravenfs_stress_delete PRIVATE ravenfs_god)
+
+add_executable(ravenfs_replay_delete
+    replay_delete.cpp
+)
+target_link_libraries(ravenfs_replay_delete PRIVATE ravenfs_god)
+
+add_executable(ravenfs_replay_insert
+    replay_insert.cpp
+)
+target_link_libraries(ravenfs_replay_insert PRIVATE ravenfs_god)

@@ -67,6 +67,15 @@ struct command_common_t {
     uint64_t param[6];
     uint64_t reserved;
 };
+struct sparrowOS_command_common_t {
+    union 
+    {
+        uint64_t opcode;
+        uint64_t result_code;
+    }rax;
+    uint64_t param[6];
+    uint64_t tag;
+};
 static_assert(sizeof(command_common_t) == 64,
               "command_common_t must be 64B (one cache line)");
 

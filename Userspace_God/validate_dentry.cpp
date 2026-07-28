@@ -3,6 +3,95 @@
 #include <cstring>
 
 /* ═══════════════════════════════════════════════════════════════
+ * dump_dentry_tree — 全量打印磁盘 B+tree 所有节点内容到 fp
+ *
+ * 与 validate 不同：不校验，纯输出（便于 diff 对比）。
+ * ═══════════════════════════════════════════════════════════════ */
+
+void RavenFS::dump_subtree(FILE *fp, uint64_t block, uint64_t expected_parent,
+                           int depth, std::set<uint64_t> &visited)
+{
+    if (visited.find(block) != visited.end()) return;
+    visited.insert(block);
+
+    Dentry_Bptree_node_t node;
+    read_btnode(block, &node, sizeof(node));
+
+    dentry_node_meta_t meta_packed = node.head.head;
+    auto meta = meta_packed.fields;
+    uint8_t ec = meta.entry_count;
+    bool is_int  = meta.is_internal_node != 0;
+    bool is_root = meta.is_root_node != 0;
+    uint64_t parent_ptr = meta.parent_ptr;
+
+    const char *indent = depth == 0 ? "" : "  ";
+    fprintf(fp, "%sblock=%-10lu  ec=%-2u  %s  parent=%-10lu",
+            indent, (unsigned long)block, ec,
+            is_int ? "internal" : "leaf",
+            (unsigned long)parent_ptr);
+
+    if (is_int) {
+        fprintf(fp, "  ptr1=%-10lu", (unsigned long)node.head.ptr1);
+        fprintf(fp, "  ptr2=%-10lu", (unsigned long)node.head.ptr2);
+        fprintf(fp, "\n");
+
+        if (node.head.ptr1 != ~0ull)
+            dump_subtree(fp, node.head.ptr1, block, depth + 1, visited);
+
+        for (uint8_t i = 0; i < ec; i++) {
+            fprintf(fp, "%s  [%u] \"%s\" -> child=%-10lu\n",
+                    indent, i, node.entries[i].name,
+                    (unsigned long)node.entries[i].ptr);
+            if (node.entries[i].ptr != ~0ull)
+                dump_subtree(fp, node.entries[i].ptr, block, depth + 1, visited);
+        }
+    } else {
+        fprintf(fp, "  prev=%-10lu  next=%-10lu\n",
+                (unsigned long)node.head.ptr1,
+                (unsigned long)node.head.ptr2);
+
+        for (uint8_t i = 0; i < ec; i++) {
+            if (node.entries[i].ptr == 0) continue;
+            fprintf(fp, "%s  [%u] \"%s\" -> inode=%-10lu",
+                    indent, i, node.entries[i].name,
+                    (unsigned long)node.entries[i].ptr);
+
+            raven_Inode_t child_ino;
+            inode_read(node.entries[i].ptr, &child_ino);
+            if (child_ino.type == INODE_TYPE_DIR &&
+                child_ino.data_root != block &&
+                child_ino.data_root != ~0ull)
+            {
+                fprintf(fp, "  (dentry_root=%lu)", (unsigned long)child_ino.data_root);
+                fprintf(fp, "\n");
+                dump_subtree(fp, child_ino.data_root, block, depth + 1, visited);
+            } else {
+                fprintf(fp, "\n");
+            }
+        }
+    }
+}
+
+void RavenFS::dump_dentry_tree(FILE *fp) {
+    raven_Inode_t root_ino;
+    inode_read(root_inum, &root_ino);
+
+    uint64_t dentry_root = root_ino.data_root;
+    if (dentry_root == ~0ull) {
+        fprintf(fp, "ERROR: root dentry data_root is ~0ull\n");
+        return;
+    }
+
+    fprintf(fp, "dentry tree dump  root_inum=%lu  dentry_root=%lu\n",
+            (unsigned long)root_inum, (unsigned long)dentry_root);
+
+    std::set<uint64_t> visited;
+    dump_subtree(fp, dentry_root, 0, 0, visited);
+
+    fprintf(fp, "dentry tree: %zu nodes\n", visited.size());
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * validate_dentry_tree — 从根目录递归校验 dentry B+tree
  *
  * 遍历期间所有 dentry 节点 pin 在 DRAM（map），不反复读盘。
@@ -32,6 +121,34 @@ static int g_err = 0;
             node_ptr = &_r.first->second;                               \
         }                                                               \
     } while(0)
+
+/* ─── find_leaf_range — 从 pin map 中找子树的最左/最右叶子首尾 key ─── */
+static void find_leaf_range(
+    const std::map<uint64_t, Dentry_Bptree_node_t> &pin,
+    uint64_t block,
+    const char **out_first, const char **out_last)
+{
+    auto it = pin.find(block);
+    if (it == pin.end()) return;
+    const Dentry_Bptree_node_t &node = it->second;
+    if (!node.head.head.fields.is_internal_node) {
+        /* leaf: 取第一个和最后一个有效 entry 的 name */
+        uint8_t ec = node.head.head.fields.entry_count;
+        for (uint8_t i = 0; i < ec; i++) {
+            if (node.entries[i].ptr == 0) continue;
+            if (!*out_first) *out_first = node.entries[i].name;
+            *out_last = node.entries[i].name;
+        }
+        return;
+    }
+    /* internal: 递归找最左子树的第一个和最右子树的最后一个 */
+    if (node.head.ptr1 != ~0ull)
+        find_leaf_range(pin, node.head.ptr1, out_first, out_last);
+    for (uint8_t i = 0; i < node.head.head.fields.entry_count; i++) {
+        if (node.entries[i].ptr != ~0ull)
+            find_leaf_range(pin, node.entries[i].ptr, out_first, out_last);
+    }
+}
 
 void RavenFS::validate_subtree(uint64_t block, uint64_t expected_parent,
                                 int depth, std::set<uint64_t> &visited,
@@ -92,6 +209,20 @@ void RavenFS::validate_subtree(uint64_t block, uint64_t expected_parent,
             }
             if (node->entries[i].ptr != ~0ull)
                 validate_subtree(node->entries[i].ptr, block, depth + 1, visited, pin);
+        }
+        /* ─── routing key 不变量：entries[0].name 必须 > ptr1 子树的最大 key ─── */
+        if (ec > 0 && node->head.ptr1 != ~0ull) {
+            const char *ptr1_max = nullptr, *e0_min = nullptr, *dummy = nullptr;
+            find_leaf_range(pin, node->head.ptr1, &dummy, &ptr1_max);
+            find_leaf_range(pin, node->entries[0].ptr, &e0_min, &dummy);
+            if (ptr1_max && e0_min && strcmp(ptr1_max, node->entries[0].name) >= 0) {
+                VERR("block %lu: routing key entries[0].name=\"%s\" <= ptr1 max=\"%s\"",
+                     (unsigned long)block, node->entries[0].name, ptr1_max);
+            }
+            if (ptr1_max && e0_min && strcmp(node->entries[0].name, e0_min) > 0) {
+                VERR("block %lu: routing key entries[0].name=\"%s\" > e[0] min=\"%s\"",
+                     (unsigned long)block, node->entries[0].name, e0_min);
+            }
         }
     } else {
         int last_valid = -1;

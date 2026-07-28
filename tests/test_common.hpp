@@ -28,8 +28,10 @@ extern int g_failures;
 } while(0)
 
 /* 成功: 返回 0 */
-#define CHECK_OK(expr, fmt, ...) \
-    CHECK((expr) == 0, fmt " (rc=0)", ##__VA_ARGS__)
+#define CHECK_OK(expr, fmt, ...) do {                                    \
+    int __rc_ok = (expr);                                                 \
+    CHECK(__rc_ok == 0, fmt " (got %d)", ##__VA_ARGS__, __rc_ok);        \
+} while(0)
 
 /* 失败: 返回指定 -errno */
 #define CHECK_ERR(expr, expected_err, fmt, ...) do {                    \

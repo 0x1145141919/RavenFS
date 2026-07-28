@@ -723,8 +723,6 @@ BitmapCacheController::BitmapCacheController(const BitmapCacheConfig &cfg)
             ctrl->free_count += zeros;
         }
 
-        fprintf(stderr, "  controller[%lu]: free_count=%u\n",
-                (unsigned long)cid, ctrl->free_count);
     }
 
     delete[] tmp;
@@ -760,10 +758,6 @@ BitmapCacheController::BitmapCacheController(const BitmapCacheConfig &cfg)
 
         load_bucket(ps->bucket, cid);
         all_controller[cid].state = BITMAP_CTRL_ONLINE;
-
-        fprintf(stderr, "  processor[%lu] ← controller[%lu] (free=%u)\n",
-                (unsigned long)p, (unsigned long)cid,
-                all_controller[cid].free_count);
     }
 
     /* 未分配到处理器的 processor 保持 current_cid = ~0ULL */

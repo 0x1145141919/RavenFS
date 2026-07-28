@@ -13,19 +13,53 @@
  *   1. 在 /stress_test 下创建 65536 个子目录
  *   2. 生成顺序 dir_00000 … dir_65535
  *   3. 打乱成随机顺序后逐个 mkdir
- *   4. 挂载后任何 mkdir 错误立即停机
- *
- * 前置: device 已由 mkfs.ravenfs 格式化
+ *   4. 支持 --until N 在 N 次后停止（用于二分定位）
+ *   5. 支持 --order-file 导出插入顺序
+ *   6. 支持 --validate 在结束后校验 B+tree
  * ═══════════════════════════════════════════════════════════════ */
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s <device> [options]\n"
+        "Options:\n"
+        "  --seed <n>           random seed (default: 42)\n"
+        "  --until <n>          stop after n mkdir (default: 65536)\n"
+        "  --order-file <path>  save insertion order to file\n"
+        "  --validate           validate dentry tree after insertion\n"
+        , prog);
+}
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <device>\n", argv[0]);
+        usage(argv[0]);
         return 1;
     }
 
     const char *device = argv[1];
-    const int N = 65536;
+    int seed = 42;
+    int until_n = 65536;
+    const char *order_file = nullptr;
+    bool do_validate = false;
+
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--until") == 0 && i + 1 < argc) {
+            until_n = atoi(argv[++i]);
+            if (until_n <= 0 || until_n > 65536) until_n = 65536;
+        } else if (strcmp(argv[i], "--order-file") == 0 && i + 1 < argc) {
+            order_file = argv[++i];
+        } else if (strcmp(argv[i], "--validate") == 0) {
+            do_validate = true;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage(argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            usage(argv[0]);
+            return 1;
+        }
+    }
 
     fprintf(stderr, "stress_mkdir_rev: mounting %s\n", device);
 
@@ -45,6 +79,7 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "stress_mkdir_rev: created /stress_test\n");
 
     /* 生成无序名称列表 */
+    int N = 65536;
     std::vector<std::string> names;
     names.reserve(N);
     for (int i = 0; i < N; i++) {
@@ -53,16 +88,31 @@ int main(int argc, char *argv[]) {
         names.push_back(path);
     }
 
-        /* 打乱（固定种子确保可复现） */
+    /* 打乱（固定种子确保可复现） */
     {
-        std::mt19937 g(42);
+        std::mt19937 g(seed);
         std::shuffle(names.begin(), names.end(), g);
     }
-    fprintf(stderr, "stress_mkdir_rev: shuffled %d names\n", N);
+    fprintf(stderr, "stress_mkdir_rev: shuffled %d names (seed=%d, until=%d)\n",
+            N, seed, until_n);
+
+    /* 保存插入顺序 */
+    if (order_file) {
+        FILE *fp = fopen(order_file, "w");
+        if (!fp) {
+            fprintf(stderr, "FAIL: cannot write %s\n", order_file);
+            return 1;
+        }
+        for (int i = 0; i < N; i++)
+            fprintf(fp, "%s\n", names[i].c_str());
+        fclose(fp);
+        fprintf(stderr, "stress_mkdir_rev: order saved to %s\n", order_file);
+    }
 
     /* 批量创建子目录 */
     int err_count = 0;
-    for (int i = 0; i < N; i++) {
+    int limit = until_n < N ? until_n : N;
+    for (int i = 0; i < limit; i++) {
         ret = fs.mkdir(names[i].c_str());
         if (ret != 0) {
             fprintf(stderr, "FAIL: mkdir %s returned %d at count=%d\n",
@@ -77,6 +127,15 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "  created %d directories...\n", i);
     }
 
-    fprintf(stderr, "SUCCESS: created %d directories under /stress_test (shuffled order)\n", N);
+    fprintf(stderr, "stress_mkdir_rev: created %d directories under /stress_test (shuffled order)\n", limit);
+
+    if (do_validate) {
+        fprintf(stderr, "stress_mkdir_rev: validating dentry tree...\n");
+        int e = fs.validate_dentry_tree();
+        fprintf(stderr, "stress_mkdir_rev: validate %s (%d errors)\n",
+                e == 0 ? "PASS" : "FAIL", e);
+        if (e > 0) return 1;
+    }
+
     return 0;
 }

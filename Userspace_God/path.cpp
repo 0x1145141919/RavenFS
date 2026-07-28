@@ -43,20 +43,12 @@ bool RavenFS::PathCursor::step() {
         return false;
     }
 
-    raven_Inode_t inode;
-    fs_ref.inode_read(cur_inode, &inode);
-    if (inode.type != INODE_TYPE_DIR) {
-        path_err = -ENOTDIR;
-        good = false;
-        return false;
-    }
-
     char buf[128];
     memcpy(buf, name, len);
     buf[len] = '\0';
 
-    uint64_t next;
-    if (!fs_ref.dentry_lookup(cur_inode, buf, &next)) {
+    uint64_t next = fs_ref.dentry_cache_lookup(cur_inode, buf);
+    if (next == ~0ULL) {
         path_err = -ENOENT;
         good = false;
         return false;

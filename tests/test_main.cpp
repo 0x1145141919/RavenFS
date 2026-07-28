@@ -1,44 +1,36 @@
+#include "../include/ravenfs/ravenfs.hpp"
 #include "test_common.hpp"
 
-/* 测试函数声明（定义在 test_mkdir_rmdir.cpp） */
-void test_mount_readdir(const char *device);
-void test_mkdir_single(const char *device);
-void test_mkdir_nested(const char *device);
-void test_rmdir(const char *device);
-void test_edge_cases(const char *device);
-void test_error_codes();
+/* 测试函数声明 */
+void test_mkdir_single(RavenFS &fs);
+void test_mkdir_nested(RavenFS &fs);
+void test_rmdir(RavenFS &fs);
+void test_edge_cases(RavenFS &fs);
 
-/* ═══════════════════════════════════════════════════════════════
- * main
- * ═══════════════════════════════════════════════════════════════ */
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <device>\n"
-                        "  e.g. %s /dev/nvme1n1\n"
-                        "  or   %s /tmp/ravenfs.img\n",
-                argv[0], argv[0], argv[0]);
+        fprintf(stderr, "Usage: %s <device>\n", argv[0]);
         return 1;
     }
 
-    const char *device = argv[1];
-
     fprintf(stderr,
         "\n"
-        "  ██████╗  █████╗ ██╗   ██╗███████╗███╗   ██╗███████╗███████╗\n"
-        "  ██╔══██╗██╔══██╗██║   ██║██╔════╝████╗  ██║██╔════╝██╔════╝\n"
-        "  ██████╔╝███████║╚██╗ ██╔╝█████╗  ██╔██╗ ██║█████╗  ███████╗\n"
-        "  ██╔══██╗██╔══██║ ╚████╔╝ ██╔══╝  ██║╚██╗██║██╔══╝  ╚════██║\n"
-        "  ██║  ██║██║  ██║  ╚██╔╝  ███████╗██║ ╚████║██║     ███████║\n"
-        "  ╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═══╝╚═╝     ╚══════╝\n"
-        "  Phase 1 — mkdir / rmdir\n\n"
-        "  Device: %s\n\n", device);
+        "  ╔══════════════════════════════════════════╗\n"
+        "  ║     RavenFS Phase 1 — VFS Cache Test    ║\n"
+        "  ╚══════════════════════════════════════════╝\n"
+        "  Device: %s\n\n", argv[1]);
 
-    test_mount_readdir(device);
-    test_mkdir_single(device);
-    test_mkdir_nested(device);
-    test_rmdir(device);
-    test_edge_cases(device);
-    test_error_codes();
+    uint64_t rc;
+    RavenFS fs(argv[1], &rc);
+    if (rc) {
+        fprintf(stderr, "Mount failed: %lu\n", rc);
+        return 1;
+    }
+
+    test_mkdir_single(fs);
+    test_mkdir_nested(fs);
+    test_rmdir(fs);
+    test_edge_cases(fs);
 
     print_summary();
     return g_failures > 0 ? 1 : 0;
