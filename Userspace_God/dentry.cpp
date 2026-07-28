@@ -3,9 +3,18 @@
 #include <cstring>
 #include <algorithm>
 
+/* 下溯路径节点类型（内部使用，不暴露到头文件） */
+struct RavenFS::DentryPathEntry {
+    uint64_t          block;
+    Dentry_Bptree_node_t node;
+};
+
 static bool entry_is_tombstone(const Dentry_common_t *e) {
     return e->ptr == 0;
 }
+
+/* ─── 前方声明 ─── */
+static int dentry_leaf_compact(Dentry_Bptree_node_t *node);
 
 /* 在节点中查找 name
  * 返回: ≥0 = entry 索引（找到，可能是墓碑）
@@ -458,13 +467,400 @@ bool RavenFS::dentry_insert(uint64_t dir_inode, const char *name, uint64_t targe
     return true;
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * dentry_remove — 墓碑删除
- *
- * 将目标 entry 标记为墓碑 (ptr=0)，不改变 entry_count 也不移动后续 entry。
- * 墓碑槽在后续 insert 中被复用。
- * 符合文档 §6.5: "v1 标记 tombstone，不主动合并"
- * ═══════════════════════════════════════════════════════════════ */
+/* ─── 常量 ─── */
+#define DENTRY_LEAF_MIN     32
+#define DENTRY_INTERNAL_MIN 32
+
+static int dentry_leaf_compact(Dentry_Bptree_node_t *node) {
+    int wp = 0;
+    uint8_t old_count = node->head.head.fields.entry_count;
+    for (int i = 0; i < old_count; i++) {
+        if (node->entries[i].ptr == 0) continue;
+        if (wp != i)
+            node->entries[wp] = node->entries[i];
+        wp++;
+    }
+    for (int i = wp; i < old_count; i++)
+        memset(&node->entries[i], 0, sizeof(Dentry_common_t));
+    node->head.head.fields.entry_count = wp;
+    return wp;
+}
+
+static int dentry_find_child_index(const Dentry_Bptree_node_t *parent,
+                                    uint64_t child_block) {
+    if (parent->head.ptr1 == child_block) return -1;
+    for (int i = 0; i < parent->head.head.fields.entry_count; i++) {
+        if (parent->entries[i].ptr == child_block) return i;
+    }
+    return -2;
+}
+
+void RavenFS::dentry_internal_remove_separator(
+    DentryPathEntry *path,
+    int depth, int separator_idx)
+{
+    Dentry_Bptree_node_t *node = &path[depth].node;
+    int count = node->head.head.fields.entry_count;
+    if (separator_idx < 0 || separator_idx >= count) return;
+
+    for (int i = separator_idx; i < count - 1; i++)
+        node->entries[i] = node->entries[i + 1];
+    memset(&node->entries[count - 1], 0, sizeof(Dentry_common_t));
+    node->head.head.fields.entry_count = count - 1;
+    write_btnode(path[depth].block, node, sizeof(Dentry_Bptree_node_t));
+
+    if (depth == 0) {
+        if (node->head.head.fields.entry_count > 0) return;
+        uint64_t child_block = node->head.ptr1;
+        Dentry_Bptree_node_t child;
+        read_btnode(child_block, &child, sizeof(Dentry_Bptree_node_t));
+        child.head.head.fields.is_root_node = 1;
+        child.head.head.fields.parent_ptr    = node->head.head.fields.parent_ptr;
+        if (!child.head.head.fields.is_internal_node)
+            child.head.ptr2 = node->head.ptr2;
+        write_btnode(child_block, &child, sizeof(Dentry_Bptree_node_t));
+        raven_Inode_t dinode;
+        inode_read(node->head.head.fields.parent_ptr, &dinode);
+        dinode.data_root = child_block;
+        inode_write(node->head.head.fields.parent_ptr, &dinode);
+        if (bcache) { bcache->free(path[0].block, 1); bcache->free(path[0].block + 1, 1); }
+        return;
+    }
+
+    if (node->head.head.fields.entry_count >= DENTRY_INTERNAL_MIN)
+        return;
+
+    Dentry_Bptree_node_t parent;
+    uint64_t parent_block = path[depth - 1].block;
+    read_btnode(parent_block, &parent, sizeof(Dentry_Bptree_node_t));
+
+    int my_idx = dentry_find_child_index(&parent, path[depth].block);
+    if (my_idx < -1) return;
+
+    bool has_left = (my_idx >= 0);
+    bool has_right = (my_idx < parent.head.head.fields.entry_count - 1);
+    if (my_idx == -1 && parent.head.head.fields.entry_count > 0)
+        has_right = true;
+    if (my_idx + 1 >= parent.head.head.fields.entry_count)
+        has_right = false;
+    if (!has_left && !has_right) return;
+
+    int left_count = 0, right_count = 0;
+    uint64_t left_block = 0, right_block = 0;
+    Dentry_Bptree_node_t left, right;
+
+    if (has_left) {
+        left_block = (my_idx == 0) ? parent.head.ptr1 : parent.entries[my_idx - 1].ptr;
+        read_btnode(left_block, &left, sizeof(Dentry_Bptree_node_t));
+        left_count = left.head.head.fields.entry_count;
+    }
+    if (has_right) {
+        right_block = (my_idx == -1) ? parent.entries[0].ptr : parent.entries[my_idx + 1].ptr;
+        read_btnode(right_block, &right, sizeof(Dentry_Bptree_node_t));
+        right_count = right.head.head.fields.entry_count;
+    }
+
+    bool use_left;
+    if (!has_left)           use_left = false;
+    else if (!has_right)     use_left = true;
+    else if (left_count > right_count) use_left = true;
+    else                     use_left = false;
+
+    int my_count = node->head.head.fields.entry_count;
+
+    if (use_left) {
+        int total = my_count + left_count;
+        if (total >= 2 * DENTRY_INTERNAL_MIN || total >= 63) {
+            int target = total / 2;
+            int move = left_count - target;
+            for (int i = my_count + move - 1; i >= move; i--)
+                node->entries[i] = node->entries[i - move];
+            for (int i = 0; i < move; i++) {
+                int src = left_count - move + i;
+                node->entries[i] = left.entries[src];
+                memset(&left.entries[src], 0, sizeof(Dentry_common_t));
+            }
+            for (int i = 0; i < move; i++) {
+                Dentry_Bptree_node_t child;
+                uint64_t b = node->entries[i].ptr;
+                read_btnode(b, &child, sizeof(Dentry_Bptree_node_t));
+                child.head.head.fields.parent_ptr = path[depth].block;
+                write_btnode(b, &child, sizeof(Dentry_Bptree_node_t));
+            }
+            left.head.head.fields.entry_count = target;
+            node->head.head.fields.entry_count = my_count + move;
+
+            int sep_idx = (my_idx == 0) ? 0 : my_idx;
+            memset(parent.entries[sep_idx].name, 0, 120);
+            memcpy(parent.entries[sep_idx].name, node->entries[0].name, 119);
+
+            write_btnode(left_block, &left, sizeof(Dentry_Bptree_node_t));
+            write_btnode(path[depth].block, node, sizeof(Dentry_Bptree_node_t));
+            write_btnode(parent_block, &parent, sizeof(Dentry_Bptree_node_t));
+        } else {
+            /* merge: left + my → left */
+            char sep_name[120];
+            {
+                Dentry_Bptree_node_t first_child;
+                read_btnode(node->head.ptr1, &first_child, sizeof(Dentry_Bptree_node_t));
+                memcpy(sep_name, first_child.entries[0].name, 120);
+                first_child.head.head.fields.parent_ptr = left_block;
+                write_btnode(node->head.ptr1, &first_child, sizeof(Dentry_Bptree_node_t));
+            }
+            for (int i = 0; i < my_count; i++) {
+                Dentry_Bptree_node_t child;
+                uint64_t b = node->entries[i].ptr;
+                read_btnode(b, &child, sizeof(Dentry_Bptree_node_t));
+                child.head.head.fields.parent_ptr = left_block;
+                write_btnode(b, &child, sizeof(Dentry_Bptree_node_t));
+            }
+            /* 在 left 中找到插入位置 */
+            int ins = 0;
+            while (ins < left_count && strcmp(left.entries[ins].name, sep_name) < 0)
+                ins++;
+            /* 先把 left 的 entry[ins..left_count-1] 右移 1 */
+            for (int i = left_count - 1; i >= ins; i--)
+                left.entries[i + 1] = left.entries[i];
+            /* 插入 my->ptr1 分隔符 */
+            memset(&left.entries[ins], 0, sizeof(Dentry_common_t));
+            memcpy(left.entries[ins].name, sep_name, 120);
+            left.entries[ins].ptr = node->head.ptr1;
+            /* 追加 my 的 entry[0..my_count-1] */
+            for (int i = 0; i < my_count; i++)
+                left.entries[left_count + 1 + i] = node->entries[i];
+            /* 检查 ptr1 是否需要调整 */
+            if (ins == 0) {
+                Dentry_Bptree_node_t ptr1_child;
+                read_btnode(left.head.ptr1, &ptr1_child, sizeof(Dentry_Bptree_node_t));
+                if (strcmp(ptr1_child.entries[0].name, sep_name) > 0) {
+                    uint64_t tmp_ptr = left.head.ptr1;
+                    left.head.ptr1 = left.entries[0].ptr;
+                    left.entries[0].ptr = tmp_ptr;
+                }
+            }
+            left.head.head.fields.entry_count = left_count + my_count + 1;
+            uint64_t my_next = node->head.ptr2;
+            left.head.ptr2 = my_next;
+            write_btnode(left_block, &left, sizeof(Dentry_Bptree_node_t));
+            if (my_next != 0 && my_next != ~0ULL) {
+                Dentry_Bptree_node_t next;
+                read_btnode(my_next, &next, sizeof(Dentry_Bptree_node_t));
+                next.head.ptr1 = left_block;
+                write_btnode(my_next, &next, sizeof(Dentry_Bptree_node_t));
+            }
+            if (bcache) { bcache->free(path[depth].block, 1); bcache->free(path[depth].block + 1, 1); }
+            int sep_to_remove = (my_idx == 0) ? 0 : my_idx;
+            dentry_internal_remove_separator(path, depth - 1, sep_to_remove);
+        }
+    } else {
+        int total = my_count + right_count;
+        if (total >= 2 * DENTRY_INTERNAL_MIN || total >= 63) {
+            int target = total / 2;
+            int move = right_count - target;
+            for (int i = 0; i < move; i++)
+                node->entries[my_count + i] = right.entries[i];
+            for (int i = 0; i < move; i++) {
+                Dentry_Bptree_node_t child;
+                uint64_t b = node->entries[my_count + i].ptr;
+                read_btnode(b, &child, sizeof(Dentry_Bptree_node_t));
+                child.head.head.fields.parent_ptr = path[depth].block;
+                write_btnode(b, &child, sizeof(Dentry_Bptree_node_t));
+            }
+            for (int i = move; i < right_count; i++)
+                right.entries[i - move] = right.entries[i];
+            for (int i = right_count - move; i < right_count; i++)
+                memset(&right.entries[i], 0, sizeof(Dentry_common_t));
+            right.head.head.fields.entry_count = target;
+            node->head.head.fields.entry_count = my_count + move;
+
+            int sep_idx = (my_idx == -1) ? 0 : my_idx + 1;
+            memset(parent.entries[sep_idx].name, 0, 120);
+            memcpy(parent.entries[sep_idx].name, right.entries[0].name, 119);
+
+            write_btnode(right_block, &right, sizeof(Dentry_Bptree_node_t));
+            write_btnode(path[depth].block, node, sizeof(Dentry_Bptree_node_t));
+            write_btnode(parent_block, &parent, sizeof(Dentry_Bptree_node_t));
+        } else {
+            /* merge: my + right → my */
+            char sep_name[120];
+            {
+                Dentry_Bptree_node_t first_child;
+                read_btnode(right.head.ptr1, &first_child, sizeof(Dentry_Bptree_node_t));
+                memcpy(sep_name, first_child.entries[0].name, 120);
+                first_child.head.head.fields.parent_ptr = path[depth].block;
+                write_btnode(right.head.ptr1, &first_child, sizeof(Dentry_Bptree_node_t));
+            }
+            for (int i = 0; i < right_count; i++) {
+                Dentry_Bptree_node_t child;
+                uint64_t b = right.entries[i].ptr;
+                read_btnode(b, &child, sizeof(Dentry_Bptree_node_t));
+                child.head.head.fields.parent_ptr = path[depth].block;
+                write_btnode(b, &child, sizeof(Dentry_Bptree_node_t));
+            }
+            /* 在 node 中找到插入位置 */
+            int ins = 0;
+            while (ins < my_count && strcmp(node->entries[ins].name, sep_name) < 0)
+                ins++;
+            /* 先把 node 的 entry[ins..my_count-1] 右移 1 */
+            for (int i = my_count - 1; i >= ins; i--)
+                node->entries[i + 1] = node->entries[i];
+            /* 插入 right->ptr1 分隔符 */
+            memset(&node->entries[ins], 0, sizeof(Dentry_common_t));
+            memcpy(node->entries[ins].name, sep_name, 120);
+            node->entries[ins].ptr = right.head.ptr1;
+            /* 追加 right 的 entry[0..right_count-1] */
+            for (int i = 0; i < right_count; i++)
+                node->entries[my_count + 1 + i] = right.entries[i];
+            /* 检查 ptr1 是否需要调整 */
+            if (ins == 0) {
+                Dentry_Bptree_node_t ptr1_child;
+                read_btnode(node->head.ptr1, &ptr1_child, sizeof(Dentry_Bptree_node_t));
+                if (strcmp(ptr1_child.entries[0].name, sep_name) > 0) {
+                    uint64_t tmp_ptr = node->head.ptr1;
+                    node->head.ptr1 = node->entries[0].ptr;
+                    node->entries[0].ptr = tmp_ptr;
+                }
+            }
+            node->head.head.fields.entry_count = my_count + right_count + 1;
+            uint64_t right_next = right.head.ptr2;
+            node->head.ptr2 = right_next;
+            write_btnode(path[depth].block, node, sizeof(Dentry_Bptree_node_t));
+            if (right_next != 0 && right_next != ~0ULL) {
+                Dentry_Bptree_node_t next;
+                read_btnode(right_next, &next, sizeof(Dentry_Bptree_node_t));
+                next.head.ptr1 = path[depth].block;
+                write_btnode(right_next, &next, sizeof(Dentry_Bptree_node_t));
+            }
+            if (bcache) { bcache->free(right_block, 1); bcache->free(right_block + 1, 1); }
+            int sep_to_remove = (my_idx == -1) ? 0 : my_idx + 1;
+            dentry_internal_remove_separator(path, depth - 1, sep_to_remove);
+        }
+    }
+}
+
+void RavenFS::dentry_rebalance_leaf(
+    DentryPathEntry *path,
+    int depth)
+{
+    Dentry_Bptree_node_t *leaf = &path[depth].node;
+    uint64_t leaf_block = path[depth].block;
+    Dentry_Bptree_node_t parent;
+    read_btnode(path[depth - 1].block, &parent, sizeof(Dentry_Bptree_node_t));
+
+    int my_idx = dentry_find_child_index(&parent, leaf_block);
+    if (my_idx < -1) return;
+
+    bool has_left = (my_idx >= 0);
+    bool has_right = (my_idx < parent.head.head.fields.entry_count - 1);
+    if (my_idx == -1 && parent.head.head.fields.entry_count > 0)
+        has_right = true;
+    if (my_idx + 1 >= parent.head.head.fields.entry_count)
+        has_right = false;
+    if (!has_left && !has_right) return;
+
+    int left_live = 0, right_live = 0;
+    uint64_t left_block = 0, right_block = 0;
+    Dentry_Bptree_node_t left, right;
+
+    if (has_left) {
+        left_block = (my_idx == 0) ? parent.head.ptr1 : parent.entries[my_idx - 1].ptr;
+        read_btnode(left_block, &left, sizeof(Dentry_Bptree_node_t));
+        left_live = dentry_leaf_compact(&left);
+    }
+    if (has_right) {
+        right_block = (my_idx == -1) ? parent.entries[0].ptr : parent.entries[my_idx + 1].ptr;
+        read_btnode(right_block, &right, sizeof(Dentry_Bptree_node_t));
+        right_live = dentry_leaf_compact(&right);
+    }
+
+    int cur_live = leaf->head.head.fields.entry_count;
+
+    bool take_left;
+    if (!has_left)            take_left = false;
+    else if (!has_right)      take_left = true;
+    else if (left_live > right_live) take_left = true;
+    else                      take_left = false;
+
+    if (take_left) {
+        int total = cur_live + left_live;
+        if (total >= 2 * DENTRY_LEAF_MIN) {
+            int target = total / 2;
+            int move = left_live - target;
+            for (int i = cur_live + move - 1; i >= move; i--)
+                leaf->entries[i] = leaf->entries[i - move];
+            for (int i = 0; i < move; i++) {
+                int src = left_live - move + i;
+                leaf->entries[i] = left.entries[src];
+                memset(&left.entries[src], 0, sizeof(Dentry_common_t));
+            }
+            left.head.head.fields.entry_count = target;
+            leaf->head.head.fields.entry_count = total - target;
+
+            int sep_idx = (my_idx == 0) ? 0 : my_idx;
+            memset(parent.entries[sep_idx].name, 0, 120);
+            memcpy(parent.entries[sep_idx].name, leaf->entries[0].name, 119);
+
+            write_btnode(left_block, &left, sizeof(Dentry_Bptree_node_t));
+            write_btnode(leaf_block, leaf, sizeof(Dentry_Bptree_node_t));
+            write_btnode(path[depth - 1].block, &parent, sizeof(Dentry_Bptree_node_t));
+        } else {
+            for (int i = 0; i < cur_live; i++)
+                left.entries[left_live + i] = leaf->entries[i];
+            left.head.head.fields.entry_count = total;
+            uint64_t leaf_next = leaf->head.ptr2;
+            left.head.ptr2 = leaf_next;
+            write_btnode(left_block, &left, sizeof(Dentry_Bptree_node_t));
+            if (leaf_next != 0 && leaf_next != ~0ULL) {
+                Dentry_Bptree_node_t next;
+                read_btnode(leaf_next, &next, sizeof(Dentry_Bptree_node_t));
+                next.head.ptr1 = left_block;
+                write_btnode(leaf_next, &next, sizeof(Dentry_Bptree_node_t));
+            }
+            if (bcache) { bcache->free(leaf_block, 1); bcache->free(leaf_block + 1, 1); }
+            int sep_to_move = (my_idx == 0) ? 0 : my_idx;
+            dentry_internal_remove_separator(path, depth - 1, sep_to_move);
+        }
+    } else {
+        int total = cur_live + right_live;
+        if (total >= 2 * DENTRY_LEAF_MIN) {
+            int target = total / 2;
+            int move = right_live - target;
+            for (int i = 0; i < move; i++)
+                leaf->entries[cur_live + i] = right.entries[i];
+            for (int i = move; i < right_live; i++)
+                right.entries[i - move] = right.entries[i];
+            for (int i = right_live - move; i < right_live; i++)
+                memset(&right.entries[i], 0, sizeof(Dentry_common_t));
+            right.head.head.fields.entry_count = target;
+            leaf->head.head.fields.entry_count = total - target;
+
+            int sep_idx = (my_idx == -1) ? 0 : my_idx + 1;
+            memset(parent.entries[sep_idx].name, 0, 120);
+            memcpy(parent.entries[sep_idx].name, right.entries[0].name, 119);
+
+            write_btnode(right_block, &right, sizeof(Dentry_Bptree_node_t));
+            write_btnode(leaf_block, leaf, sizeof(Dentry_Bptree_node_t));
+            write_btnode(path[depth - 1].block, &parent, sizeof(Dentry_Bptree_node_t));
+        } else {
+            for (int i = 0; i < right_live; i++)
+                leaf->entries[cur_live + i] = right.entries[i];
+            leaf->head.head.fields.entry_count = total;
+            uint64_t right_next = right.head.ptr2;
+            leaf->head.ptr2 = right_next;
+            write_btnode(leaf_block, leaf, sizeof(Dentry_Bptree_node_t));
+            if (right_next != 0 && right_next != ~0ULL) {
+                Dentry_Bptree_node_t next;
+                read_btnode(right_next, &next, sizeof(Dentry_Bptree_node_t));
+                next.head.ptr1 = leaf_block;
+                write_btnode(right_next, &next, sizeof(Dentry_Bptree_node_t));
+            }
+            if (bcache) { bcache->free(right_block, 1); bcache->free(right_block + 1, 1); }
+            int sep_to_move = (my_idx == -1) ? 0 : my_idx + 1;
+            dentry_internal_remove_separator(path, depth - 1, sep_to_move);
+        }
+    }
+}
+
 bool RavenFS::dentry_remove(uint64_t dir_inode, const char *name) {
     raven_Inode_t dinode;
     inode_read(dir_inode, &dinode);
@@ -475,39 +871,54 @@ bool RavenFS::dentry_remove(uint64_t dir_inode, const char *name) {
     if (root_fblock == ~0ull)
         return false;
 
-    Dentry_Bptree_node_t node;
-    uint64_t cur = root_fblock;
+    DentryPathEntry path[64];
+    int depth = 0;
 
-    for (;;) {
-        read_btnode(cur, &node, sizeof(node));
-        if (!node.head.head.fields.is_internal_node)
-            break;
-        uint8_t count = node.head.head.fields.entry_count;
+    path[0].block = root_fblock;
+    read_btnode(path[0].block, &path[0].node, sizeof(Dentry_Bptree_node_t));
+
+    while (path[depth].node.head.head.fields.is_internal_node) {
+        Dentry_Bptree_node_t *n = &path[depth].node;
+        uint8_t count = n->head.head.fields.entry_count;
         if (count == 0) return false;
 
-        if (strcmp(name, node.entries[0].name) < 0) {
-            cur = node.head.ptr1;
-            continue;
+        uint64_t child;
+        if (strcmp(name, n->entries[0].name) < 0) {
+            child = n->head.ptr1;
+        } else {
+            int found = -1;
+            for (int i = 0; i < count; i++) {
+                if (strcmp(name, n->entries[i].name) >= 0)
+                    found = i;
+            }
+            child = found < 0 ? n->head.ptr1 : n->entries[found].ptr;
         }
-        int found = -1;
-        for (int i = 0; i < count; i++) {
-            if (strcmp(name, node.entries[i].name) >= 0)
-                found = i;
-        }
-        cur = found < 0 ? node.head.ptr1 : node.entries[found].ptr;
+
+        depth++;
+        path[depth].block = child;
+        read_btnode(path[depth].block, &path[depth].node, sizeof(Dentry_Bptree_node_t));
     }
 
-    int pos = dentry_node_find(&node, name);
+    Dentry_Bptree_node_t *leaf = &path[depth].node;
+    uint64_t leaf_block = path[depth].block;
+
+    int pos = dentry_node_find(leaf, name);
     if (pos < 0) {
         fprintf(stderr, "RavenFS: '%s' not found\n", name);
         return false;
     }
 
-    /* 墓碑标记：ptr=0 表示已删除，insert 时可覆写 */
-    node.entries[pos].ptr = 0;
-    memset(node.entries[pos].name, 0, 120);
+    leaf->entries[pos].ptr = 0;
+    memset(leaf->entries[pos].name, 0, 120);
+    write_btnode(leaf_block, leaf, sizeof(Dentry_Bptree_node_t));
 
-    write_btnode(cur, &node, sizeof(node));
+    int live = dentry_leaf_compact(leaf);
+    write_btnode(leaf_block, leaf, sizeof(Dentry_Bptree_node_t));
+
+    if (depth == 0) return true;
+    if (live < DENTRY_LEAF_MIN)
+        dentry_rebalance_leaf(path, depth);
+
     return true;
 }
 

@@ -15,3 +15,8 @@ add_executable(ravenfs_stress_rev
     stress_mkdir_rev.cpp
 )
 target_link_libraries(ravenfs_stress_rev PRIVATE ravenfs_god)
+
+add_executable(ravenfs_stress_delete
+    stress_delete.cpp
+)
+target_link_libraries(ravenfs_stress_delete PRIVATE ravenfs_god)

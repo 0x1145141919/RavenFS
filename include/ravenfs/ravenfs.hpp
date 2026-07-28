@@ -10,6 +10,7 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <mutex>
 
 #include "error.hpp"
 #include "geometry.hpp"
@@ -127,12 +128,16 @@ private:
     void inode_read(uint64_t inum, raven_Inode_t *inode);
     void inode_write(uint64_t inum, const raven_Inode_t *inode);
 
+    struct DentryPathEntry;
+
     bool dentry_lookup(uint64_t dir_inode, const char *name, uint64_t *out_inum);
     bool dentry_insert(uint64_t dir_inode, const char *name, uint64_t target_inum);
     bool dentry_remove(uint64_t dir_inode, const char *name);
     int  dentry_enumerate(uint64_t dir_inode, DirEntryInfo *entries, int max_entries);
     int  dentry_node_find(const Dentry_Bptree_node_t *node, const char *name);
     void dentry_node_shift_entries(Dentry_Bptree_node_t *node, int start, int dir);
+    void dentry_rebalance_leaf(DentryPathEntry *path, int depth);
+    void dentry_internal_remove_separator(DentryPathEntry *path, int depth, int separator_idx);
 
     class PathCursor {
     public:
@@ -188,7 +193,7 @@ private:
     uint64_t dentry_cache_lookup(uint64_t parent_inum, const char *name);
     bool     dentry_cache_insert(uint64_t parent_inum, const char *name, uint64_t target_inum);
     bool     dentry_cache_remove(uint64_t parent_inum, const char *name);
-    void     dentry_cache_warm(uint64_t parent_inum, const char *name, uint64_t target_inum);
+    void dentry_cache_warm(uint64_t parent_inum, const char *name, uint64_t target_inum);
 
     static const uint64_t INODE_CACHE_SETS = 256;
     static const uint64_t INODE_CACHE_WAYS = 8;

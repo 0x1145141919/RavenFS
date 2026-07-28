@@ -53,10 +53,9 @@ int main(int argc, char *argv[]) {
         names.push_back(path);
     }
 
-        /* 打乱 */
+        /* 打乱（固定种子确保可复现） */
     {
-        std::random_device rd;
-        std::mt19937 g(rd());
+        std::mt19937 g(42);
         std::shuffle(names.begin(), names.end(), g);
     }
     fprintf(stderr, "stress_mkdir_rev: shuffled %d names\n", N);
