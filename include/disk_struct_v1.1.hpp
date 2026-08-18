@@ -22,11 +22,13 @@
  *    - 叶子内 (hash, name) 复合排序：hash 定位后碰撞区间内字典序，
  *      名字可二分
  *
- * 4. 长名外置：name 内联 40B；>40 走 full_char_remain_ptr
- *    = 块号[12:63] | 块内偏移[0:11]，一个 u64 寻址（12 位 = 4K 块内）
+ * 4. 长名外置：name 内联 40B；>40 由每目录名字堆（name heap）分配，
+ *    full_char_remain_ptr 物理定位（块号[12:63] | 块内偏移[0:11]，12 位 = 4K 块内），
+ *    堆只是分配器，解析不依赖堆上下文；文件名硬上限 2047B
  *
- * 5. 预留槽：inner hints = 阶数 + 2，作为分裂中间态临时空间
- *    （先在块内写完再整理）；正常态有效数 ≤ 阶数，过渡态禁止落盘
+ * 5. 容量 + 1 瞬时槽：所有节点数组 = 阶数 + 1，[阶数] 槽是插入瞬时
+ *    产物（插入先占槽，检查 count > 阶数 再分裂；单趟处理、内外统一）。
+ *    瞬时槽仅存内存，禁止落盘——误落盘会破坏 count 语义（v1 教训）
  *
  * 6. readdir 按 hash 乱序输出（路径解析高频、ls 低频，接受；. / .. 由
  *    readdir 路径合成，不在树内）
@@ -36,14 +38,42 @@ constexpr uint8_t INODE_TYPE_REGULAR=0;
 constexpr uint8_t INODE_TYPE_DIR=1;
 constexpr uint8_t INODE_TYPE_SOFT_SYM=2;
 
+/* 通用指针：52 位地址（块号或 inode 索引）+ 12 位上下文自由位
+ * free_to_use 语义由上下文定义（Dentry_t: 存 name_len） */
+struct ptr_in_idx{
+    uint64_t free_to_use:12;
+    uint64_t ptr:52;//块地址或者说是Inode引索
+};
 /* ── 常量 / 哨兵 ── */
 constexpr uint8_t  DENTRY_INLINE_NAME_MAX = 40;   /* name 内联上限：≤40 内联，>40 外置 */
 constexpr uint64_t PTR_INVALID            = (~0ULL); /* 通用无效指针哨兵（v1 惯例沿用） */
-
+/* 名字堆控制器（每目录至多 11 个，见 inode.dir_inode_name_heap_level）
+ * 异构堆：各堆粒度(bytes_per_bit_log2)与位图容量(total_bits_count_log2)独立，
+ * 按需创建；名字按长度分流到粒度匹配的堆，目标是各堆位图 bit 占用率尽量高。
+ * 位图 bit[i] 管辖数据区 [i×2^bytes_per_bit_log2, (i+1)×2^bytes_per_bit_log2)。
+ * ⚠ 名字数据必须连续：分配 = 找 N 个连续空闲 bit 并置位（非单 bit）。
+ * 文件名硬上限 2047B → 外置部分 ≤2007B < 4096B，永不跨块。 */
+struct name_heap_controller_t{
+    uint64_t bytes_per_bit_log2:6;      // 位图 1 bit 管辖的字节数 log2（实际取值 3~11，8B~2KB）
+    uint64_t total_bits_count_log2:6;   // 位图总位数 log2（位图占 FS_block 数 = 2^log2 / 32768 向上取整）
+    uint64_t bitmap_base_block_ptr:52;  // 位图所在 FS_block（全局 bitmap 亮灯）
+    uint64_t reserved:12;
+    uint64_t data_base_block_ptr:52;    // 数据区所在 FS_block（全局 bitmap 亮灯）
+};
 struct raven_Inode_t{                                                                                                     
     uint64_t  type:2;                  // INODE_TYPE_REGULAR/DIR/SOFT_LINK
     uint64_t  is_data_root_direct_bit:1;
-    uint64_t  other:61;                                                                                                                                                             
+    uint64_t  dir_inode_name_heap_level:2;// 仅 dir 型 inode 有效：名字堆级别
+    // level 0: 目录所有名字 ≤40B 全内联（Dentry_t.name），无堆，零开销
+    // level 1: inline_data[160] 充当位图；padding[1] 复用为 ptr_in_idx
+    //          (ptr=数据区块基址, free_to_use=一个 bit 管辖字节数 log2)；
+    //          位图留升级余量（不装满），升 level 2 时新建控制器承接，数据不搬
+    // level 2: padding[2](16B) + inline_data[160] = 11 个 name_heap_controller_t
+    //          位图/数据全外置，异构堆按需扩容
+    // level 3: 预留，未设计
+    // 注意：inline_data 语义按 type 分档 —— REGULAR=文件内联数据；
+    //       DIR level 1=位图；DIR level 2=控制器数组
+    uint64_t  other:59;                                                                                                                                                             
     uint32_t  uid;                                                                                                        
     uint32_t  gid; 
     uint32_t  m_ns_stamp;
@@ -61,12 +91,6 @@ struct raven_Inode_t{
 }__attribute__((packed));
 static_assert(sizeof(raven_Inode_t)==256,"Inode size must met 256B");
 
-/* 通用指针：52 位地址（块号或 inode 索引）+ 12 位上下文自由位
- * free_to_use 语义由上下文定义（Dentry_t: 存 name_len） */
-struct ptr_in_idx{
-    uint64_t free_to_use:12;
-    uint64_t ptr:52;//块地址或者说是Inode引索
-};
 
 /* 父指针：双位解码四态（is_inner_node × is_root_node）
  * 根节点: ptr = 自身 inode 编号（即 "."），非根: ptr = 父节点块号 */
@@ -108,7 +132,8 @@ struct extent_t{
 struct Dentry_t{
     ptr_in_idx inode_ptr;            // free_to_use = name_len
     uint64_t hash;                   // 名字 hash（查找主键）
-    uint64_t full_char_remain_ptr;   // name_len>40: 块号[12:63]|块内偏移[0:11] 指向 name[40..]；否则 PTR_INVALID
+    uint64_t full_char_remain_ptr;   // name_len>40: 名字堆分配器产生的物理定位
+                                     // 块号[12:63]|块内偏移[0:11] 指向 name[40..]；否则 PTR_INVALID
     char name[DENTRY_INLINE_NAME_MAX];
 };
 
@@ -128,15 +153,14 @@ struct extent_hint_t{
     ptr_in_idx sub_node_ptr;
 };
 
-/* 区段树 B+树，338 阶；inner hints = 338 + 2 预留槽
- * （预留槽 = 分裂中间态临时空间，先写块内再整理；正常有效数 ≤ 338，
- *   过渡态 339/340 仅存内存，禁止落盘） */
+/* 区段树 B+树，337 阶；inner hints = 338 槽，显然[337]是插入瞬时存在的产物，无论内外 */
 struct Bptree_extent_inner_node_t{
     Bptree_meta_t meta;
-    extent_hint_t extents[340];
-    uint64_t padding[336];
+    extent_hint_t extents[338];
+    uint64_t padding[340];
 }__attribute__((packed));
 static_assert(sizeof(Bptree_extent_inner_node_t)==8192,"" );
+/* 区段树叶子，337 阶；extents = 338 槽，[337] 为插入瞬时槽（同 inner） */
 struct Bptree_extent_leaf_node_t{
     Bptree_meta_t meta;
     extent_t extents[338];
@@ -144,16 +168,17 @@ struct Bptree_extent_leaf_node_t{
 }__attribute__((packed));
 static_assert(sizeof(Bptree_extent_leaf_node_t)==8192,"" );
 
-/* Dentry B+树，127 阶；inner hints = 127 + 2 预留槽（同上） */
+/* Dentry B+树，126 阶；显然[126]是插入瞬时存在的产物，无论内外 */
 struct Bptree_dentry_leaf_node_t{
     Bptree_meta_t meta;
     Dentry_t entries[127];
 }__attribute__((packed));
 static_assert(sizeof(Bptree_dentry_leaf_node_t)==8192,"" );
+/* Dentry B+树内部节点，126 阶；hints = 127 槽，[126] 为插入瞬时槽 */
 struct Bptree_dentry_inner_node_t{
     Bptree_meta_t meta;
-    Dentry_hint_t hints[129];
-    uint64_t padding[758];
+    Dentry_hint_t hints[127];
+    uint64_t padding[762];
 }__attribute__((packed));
 static_assert(sizeof(Bptree_dentry_inner_node_t)==8192,"" );
 
