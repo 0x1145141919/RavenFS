@@ -14,6 +14,7 @@ mkfs.ravenfs
 ravenfs.fsck
 stress_mkdir
 ravenfs_cli
+test_mount_bitmap
 
 # IDE / 编辑器
 .vscode/

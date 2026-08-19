@@ -276,39 +276,48 @@ static void build_superblock(RavenSuperblock *sb, const MkfsParams &p,
                               const uint64_t *backup_blocks) {
     memset(sb, 0, sizeof(*sb));
     sb->magic          = SUPERBLOCK_MAGIC;
-    sb->version        = 1;
+    sb->version        = RAVENFS_VERSION;   /* v1.1 = 2 */
     sb->world_base_lba = p.world_base_lba;
     sb->total_blocks   = geo.total_blocks;
     sb->inode_array_count = p.inode_count;
     sb->root_inode     = 0;
     memcpy(sb->uuid, p.uuid, 16);
     memcpy(sb->volume_name, p.label, sizeof(sb->volume_name));
-    sb->backup_prev  = ~0ULL;
-    sb->backup_next  = p.backups > 0 ? backup_blocks[0] : ~0ULL;
+    sb->backup_prev  = PTR_INVALID;
+    sb->backup_next  = p.backups > 0 ? backup_blocks[0] : PTR_INVALID;
     sb->backup_count = p.backups;
 }
 
-static void build_root_dentry_node(Dentry_Bptree_node_t *node)
+/* 52 位指针空间无效哨兵（PTR_INVALID 的 52 位截断形态；ptrs[i].ptr 为位域） */
+static constexpr uint64_t PTR52_INVALID = 0xFFFFFFFFFFFFFULL;
+
+static void build_root_dentry_node(Bptree_dentry_leaf_node_t *node)
 {
-    /* 状态2：根叶子 — parent_ptr=. inode, ptr2=.. inode */
+    /* v1.1 根叶子（Bptree_dentry_leaf_node_t）：
+     *   parent_ptr  = {entry_count:0, is_inner:0, is_root:1, ptr=0}  → . = 根 inode 自身
+     *   ptrs[1]     = .. inode（根目录的父亲是自己 = inode 0）
+     *   ptrs[0]/[2] = 预留（52 位全 1 = 无效）
+     *   entries     = 全空 — . / .. 由 parent_ptr / ptrs[1] 提供 */
     memset(node, 0, sizeof(*node));
-    node->head.head.fields.entry_count        = 0;
-    node->head.head.fields.is_internal_node   = 0;
-    node->head.head.fields.is_root_node       = 1;
-    node->head.head.fields.parent_ptr         = 0;  /* . = 根 inode 自身 */
-    node->head.ptr1 = 0;                                  /* State 2: 根叶子 ptr1=0(空闲) */
-    node->head.ptr2 = 0;                              /* .. = 根 inode（根的父亲是自己） */
-    node->head.magic1 = DENTRY_MAGIC1;
-    node->head.magic2 = DENTRY_MAGIC2;
-    node->head.magic3 = DENTRY_MAGIC3;
-    node->head.magic4 = DENTRY_MAGIC4;
-    /* entries 为空 — . 和 .. 由 parent_ptr/ptr2 提供 */
+    node->meta.magics[0] = DENTRY_MAGIC1;
+    node->meta.magics[1] = DENTRY_MAGIC2;
+    node->meta.magics[2] = DENTRY_MAGIC3;
+    node->meta.magics[3] = DENTRY_MAGIC4;
+    node->meta.parent_ptr.entry_count   = 0;
+    node->meta.parent_ptr.is_inner_node = 0;
+    node->meta.parent_ptr.is_root_node  = 1;
+    node->meta.parent_ptr.ptr           = 0;   /* . = 根 inode 自身 */
+    node->meta.ptrs[0].ptr = PTR52_INVALID;   /* 预留 */
+    node->meta.ptrs[1].ptr = 0;               /* .. = 根 inode（根的父亲是自己） */
+    node->meta.ptrs[2].ptr = PTR52_INVALID;   /* 预留 */
+    /* entries[127] 全零（memset） */
 }
 
 static void build_root_inode(raven_Inode_t *inode, uint64_t root_dentry_block) {
     memset(inode, 0, sizeof(*inode));
     inode->type                    = INODE_TYPE_DIR;
     inode->is_data_root_direct_bit = 0;
+    inode->dir_inode_name_heap_level = 0;   /* v1.1: 根目录无名字堆（全内联） */
     inode->uid                     = 0;
     inode->gid                     = 0;
     inode->permission_bits         = 0755;
@@ -456,7 +465,7 @@ int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
     uint64_t ibm_off = block_to_offset(geo.inode_array_bitmap_base, params);
     uint64_t dn_off  = block_to_offset(root_dentry_block, params);
 
-    Dentry_Bptree_node_t dentry_node;
+    Bptree_dentry_leaf_node_t dentry_node;
     build_root_dentry_node(&dentry_node);
 
     raven_Inode_t root_inode;
@@ -483,9 +492,9 @@ int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
         pwrite(fd, &dentry_node, sizeof(dentry_node), dn_off);
         for (uint32_t bi = 0; bi < bc; bi++) {
             RavenSuperblock backup_sb = sb;
-            backup_sb.backup_prev = bi > 0 ? backup_blocks[bi - 1] : ~0ULL;
+            backup_sb.backup_prev = bi > 0 ? backup_blocks[bi - 1] : PTR_INVALID;
             backup_sb.backup_next =
-                (bi + 1 < bc) ? backup_blocks[bi + 1] : ~0ULL;  // ~0ull = 链尾哨兵（文档 §2.1）
+                (bi + 1 < bc) ? backup_blocks[bi + 1] : PTR_INVALID;  // 链尾哨兵（文档 §2.1）
             backup_sb.crc32 = 0;  // 重算 CRC32（backup_prev/next 与 Primary 不同）
             backup_sb.crc32 = crc32_compute(&backup_sb, sizeof(backup_sb));
             uint64_t bk_off = block_to_offset(backup_blocks[bi], params);

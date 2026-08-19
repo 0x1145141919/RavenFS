@@ -1,10 +1,13 @@
 #pragma once
 
-#include "../include/disk_struct.hpp"
+#include "../include/disk_struct_v1.1.hpp"
 #include "../include/magics.h"
 
 #include <cstdint>
 #include <cstddef>
+
+/* 磁盘格式版本：v1=1，v1.1=2（disk_layout_v1.1.md §1：v1.1 起 bump） */
+constexpr uint32_t RAVENFS_VERSION = 2;
 
 struct MkfsParams {
     const char *device;

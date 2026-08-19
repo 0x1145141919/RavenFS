@@ -95,7 +95,7 @@ static_assert(sizeof(raven_Inode_t)==256,"Inode size must met 256B");
 /* 父指针：双位解码四态（is_inner_node × is_root_node）
  * 根节点: ptr = 自身 inode 编号（即 "."），非根: ptr = 父节点块号 */
 struct parent_ptr_t{
-    uint64_t free_to_use:10;
+    uint64_t entry_count:10;
     uint64_t is_inner_node:1;
     uint64_t is_root_node:1;//1表示为真，0表示为假
     uint64_t ptr:52;//根节点指向Inode引索，非根节点指向父节点的块引索基址

@@ -54,10 +54,12 @@ free_to_use:12 | ptr:52
 ### 2.2 `parent_ptr_t`（8B）
 
 ```
-free_to_use:10 | is_inner_node:1 | is_root_node:1 | ptr:52
+entry_count:10 | is_inner_node:1 | is_root_node:1 | ptr:52
 ```
 
-双位解码四态；根节点 `ptr` = 自身 inode 编号（即 `.`），非根 = 父节点块号。
+- `entry_count` = 节点有效 entry 数（0~阶数上限，10 bit 够 337；根/非根通用，
+  替代 v1 的 node_meta 字段，v1.1 节点计数唯一来源）
+- 双位解码四态；根节点 `ptr` = 自身 inode 编号（即 `.`），非根 = 父节点块号。
 
 ---
 
@@ -286,7 +288,7 @@ level 2: padding[2] + inline_data = 11 个控制器                   （异构�
 
 ### Dentry 树
 
-1. 叶子 entries 按 `(hash, name)` 复合序严格递增；count ≤ 126
+1. 叶子 entries 按 `(hash, name)` 复合序严格递增；count ≤ 126（count = `parent_ptr.entry_count`）
 2. 内部 hints 按 hash_max 递增；`hints[i].hash_max = 子树 i 最大 hash`
 3. 查找：`target ≤ hash_max[i]` → `sub_ptr[i]`（单规则，无最左子树特判）
 4. 分裂：瞬时槽占用后 count=127 → 右半 64 拷新块，左半 63，左半末位 hash 提升
