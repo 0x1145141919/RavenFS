@@ -6,6 +6,13 @@ add_executable(ravenfs_test
 target_include_directories(ravenfs_test PRIVATE ../include)
 target_link_libraries(ravenfs_test PRIVATE ravenfs_god)
 
+# v1.1 幼年期上帝类：root_dir_insert_dentry 接口专项测试
+add_executable(ravenfs_juv_insert
+    test_root_dir_insert.cpp
+)
+target_include_directories(ravenfs_juv_insert PRIVATE ../include)
+target_link_libraries(ravenfs_juv_insert PRIVATE ravenfs_juvenile)
+
 add_executable(ravenfs_stress
     stress_mkdir.cpp
 )

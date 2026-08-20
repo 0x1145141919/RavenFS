@@ -23,8 +23,8 @@
  *    未实现，>40B 一律 RC_ERR_NAME_LEN。后续名字堆接入后解除。
  * 4. 删除 = 物理删除（v1.1 §6.5）：memmove + 刷父 hash_max（上界路由
  *    对称代价，必走路径）；欠载不合并（min occupancy 待定，幼年期跳过）。
- * 5. hash 临时用 crc32（算法待定，v1.1 §9 决策项；实现时注意抗碰撞
- *    决策不影响接口签名）。
+ * 5. hash 用 XXH64（seed=0，v1.1 §9 已定；64 位熵 + 跨挂载稳定，
+ *    抗 DoS 升级路径：siphash + SB 持久 key，接口签名不变）。
  * 6. backup 链容灾不做（幼年期只认 Primary SB：magic/version/crc32/
  *    bitmap 自描述四连验）。
  * ═══════════════════════════════════════════════════════════════════ */
@@ -61,7 +61,13 @@ struct dentry_out {
     uint32_t name_len;      /* 名字长度（不含 '\0'） */
     char     character[256];
 };
-
+struct dentry_bptree_path_t {
+    uint64_t blocks[64];
+    uint16_t  child_idx[64];
+    int      depth;
+    bool  is_finally_hit;
+    // bool  is_break_biggest_record;
+};
 class RavenFS_juvenile {
 public:
     /* 构造即挂载：打开设备 → 读 Primary SB → 四连验 → 双位图全量入内存。
@@ -105,6 +111,12 @@ public:
     void dump_info() const;                     /* SB/几何/位图占用率/根节点 */
 
 private:
+    result_code_t dir_insert_dentry(uint64_t inode_idx,const char *name);
+
+    result_code_t dir_rm_dentry(uint64_t inode_idx,const char *name);
+
+    result_code_t dir_lookup(uint64_t inode_idx,const char *name, uint64_t *out_inum);
+    int64_t dir_readdir(uint64_t inode_idx,dentry_out **out_buf);
 /* ══════════════════════════════════════════════════════════
      * 位图接口组 A：FS_block 分配器（全量内存 bitmap）
      *   内存：block_bits[bitmap_blocks×4096]，bit i ↔ FS_block[i]
@@ -138,7 +150,10 @@ private:
     uint64_t fblock_to_byte(uint64_t blk) const { return 4096 + blk * 4096; }
     void read_block(uint64_t blk, void *buf);        /* pread 4096B */
     void write_block(uint64_t blk, const void *buf); /* pwrite 4096B */
-
+    /* 批量块 I/O（零缓存）：blk 起连续 blk_len 个 FS_block 一次读写。
+     * RC_OK / RC_ERR_STATE(参数非法) / RC_ERR_IO(短读短写) */
+    result_code_t read_buff(uint64_t blk, uint64_t blk_len, void *buf);
+    result_code_t write_buff(uint64_t blk, uint64_t blk_len, void *buf);
     /* ── inode I/O（零缓存）── */
     void inode_read(uint64_t inum, raven_Inode_t *out) const;
     void inode_write(uint64_t inum, const raven_Inode_t *in);
@@ -155,7 +170,7 @@ private:
                             uint64_t start); /* 单 bit first-fit（inode 组用） */
     void bm_set(uint8_t *bits, uint64_t bit, bool v);
 
-    /* ── 名字 hash（临时 crc32，算法待定 v1.1 §9）── */
+    /* ── 名字 hash（XXH64 seed=0，v1.1 §9 已定；跨挂载稳定）── */
     uint64_t name_hash(const char *name) const;
 
     /* ── dentry B+tree（仅 root_dir 单树）──
@@ -196,4 +211,42 @@ private:
     static bool     crc32_ready;
     static void     crc32_init();
     static uint32_t crc32_compute(const void *data, size_t len);
+    struct name_cmlpx_t{
+        char*name;
+        uint64_t hash;
+    };
+    result_code_t dentry_Bptree_walk(uint64_t root_blk_idx,dentry_bptree_path_t*trace,name_cmlpx_t*name);
+    struct leaf_node_result_t{
+        uint16_t greates_lower_bound_idx;
+        bool is_idx_hitted;
+    };
+    /* 叶子查找无下界哨兵：greates_lower_bound_idx == 此值 → 无下界，
+     * 插入位置 = 0（最左插入）。有效索引范围 [0, 126]，0xFFFF 永不冲突。 */
+    static constexpr uint16_t DENTRY_LEAF_GLB_NONE = 0xFFFF;
+    struct split_result_t{
+        result_code_t rc;
+        uint64_t low_node_blkidx;
+        uint64_t high_node_blkidx;
+        uint64_t low_node_maxhash;
+    };
+    leaf_node_result_t dentry_leaf_node_lookup(Bptree_dentry_leaf_node_t*leaf,name_cmlpx_t*name);/* is_idx_hitted=精准命中 */
+    uint16_t dentry_inner_node_lookup(Bptree_dentry_inner_node_t*node,uint64_t hash);
+    result_code_t dentry_leaf_entry_insert(uint64_t leaf_blk_base_idx,name_cmlpx_t* name,uint16_t idx,uint64_t&result_flags);//成功时result_flags有效，bits[0]代表内部探测是否需要分裂，bits[1]表示是否要改变父节点的对应entry的最大值
+    result_code_t dentry_leaf_entry_delete(uint64_t leaf_blk_base_idx,uint16_t idx,uint64_t&result_flags);//成功时result_flags有效，bits[0]代表内部探测是否需要合并，bits[1]表示是否要改变父节点的对应entry的最大值
+    split_result_t dentry_leaf_split(uint64_t victim_node_blkbase);//会内部进行叶子链表的维护，不会进行父节点的修改
+    split_result_t dentry_inner_split(uint64_t victim_node_blkbase);//不会进行父节点的修改
+    result_code_t dentry_spilt_parent_apply(uint64_t parent_node_blkbase,uint16_t victim_in_node_id,split_result_t result,bool&is_parent_spilt_acquire);
+    result_code_t dentry_node_balance(uint64_t parent_node_blkbase,uint16_t idx,bool&is_parent_need_balance);//给定的父节点以及相应引索，让其平衡则是，若节点到达平衡阈值，向前后邻居先看是否存在总entry数目小于等于126的,小于126则合并，不满足则抹匀
+    /* 分裂后新建根内部节点（低/高两个子节点提升为新根的 hints[0]/[1]）：
+     * 分配 2 块 → meta 初始化 → 填充 hints → 更新两子节点父指针 → 写回
+     * → 更新 root inode.data_root。low_blk/low_max 为左子块号及最大 hash，
+     * high_blk 为右子块号（其最大 hash 由本函数读节点现算）。 */
+    result_code_t dentry_new_root_inner(uint64_t low_blk, uint64_t low_max,
+                                        uint64_t high_blk, uint64_t root_inode_idx);
 };
+bool is_dentry_node(Bptree_meta_t*meta);
+bool is_extent_node(Bptree_meta_t*meta);
+/* 名字长度把关：strlen ≤ 39（名字堆未实现，全内联） */
+bool tmp_name_len_limiter(const char*name);
+/* 节点最大 hash：叶子末项 entry.hash / 内部末项 hint.hash_max */
+uint64_t node_max_hash(const void *node_buf);

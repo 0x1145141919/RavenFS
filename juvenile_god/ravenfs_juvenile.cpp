@@ -4,22 +4,38 @@
  * 本文件负责（Raven 分工）：
  *   构造/析构（挂载/卸载）、块 I/O、inode I/O、
  *   双位图分配器（block 组 + inode 组，全量内存 + write-through）
- *   CRC32、dump_info
+ *   CRC32、name_hash（XXH64）、dump_info
  *
- * 不实现（Sparrow 手写，见 dentry_tree.cpp）：
- *   name_hash / dentry_* 全套 / root_dir_* 全套 / dump_dentry_tree
+ * 不实现（Sparrow 手写，见同目录下）：
+ *   dentry_tree.cpp — dentry B+tree 全套（walk/lookup/insert/delete/split/balance）
+ *   root_dir.cpp    — root_dir_insert_dentry / root_dir_rm_dentry
  *
  * 零缓存原则：所有块/inode 访问直接 pread/pwrite，无缓存层。
  * ═══════════════════════════════════════════════════════════════════ */
 
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
-
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
 #include <cstdio>
 #include <new>
-
+bool tmp_name_len_limiter(const char*name){
+    return strlen(name)<=39;
+}
+bool is_extent_node(Bptree_meta_t *meta)
+{
+    return meta->magics[0]==BPTREE_MAGIC1&&
+    meta->magics[1]==BPTREE_MAGIC2&&
+    meta->magics[2]==BPTREE_MAGIC3&&
+    meta->magics[3]==BPTREE_MAGIC4;
+}
+bool is_dentry_node(Bptree_meta_t *meta)
+{
+    return meta->magics[0]==DENTRY_MAGIC1&&
+    meta->magics[1]==DENTRY_MAGIC2&&
+    meta->magics[2]==DENTRY_MAGIC3&&
+    meta->magics[3]==DENTRY_MAGIC4;
+}
 /* ═══════════════════════════════════════════════════════════════
  * CRC32（Castagnoli 0xEDB88320，查表）— SB 校验用
  * ═══════════════════════════════════════════════════════════════ */
@@ -46,11 +62,117 @@ uint32_t RavenFS_juvenile::crc32_compute(const void *data, size_t len) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * 构造即挂载
- *   open → 读 Primary SB → magic/version/crc32 三连验 → 几何推导
- *   → 双位图全量入内存 + 自描述校验 → 读 root inode（取树根块号）
- * 任一失败：清理资源、fd=-1、*res_code = RC_ERR_*
+ * 名字 hash：XXH64（seed=0）— v1.1 §9 决策（2026-08-20）
+ *
+ * 实现：移植自 xxHash v0.5.1（/home/PS/PS_git/xxHash，Cyan4973/xxHash，
+ * BSD 2-Clause），xxhash.c 的 XXH64_endian_align 精简版：
+ *   - 删除 endian/align 宏分支：目标平台 x64 固定小端，读 64/32 位
+ *     统一走 memcpy（天然处理非对齐，sparrowos 内核端可移植）
+ *   - seed 硬编码 0（本函数签名无 seed 参数）
+ *   - 无 XXH_ACCEPT_NULL_INPUT_POINTER 分支（name 恒非 NULL）
+ * 算法本体（PRIME 常量、round/mergeRound、尾部分档）与官方逐行同构。
+ *
+ * 为什么不是 crc32（原临时方案）：
+ *   - 只有 32 位熵：~77k 条目即出现生日碰撞；碰撞簇过大时叶子无法
+ *     正确分裂（不变量 #2：hints[i].hash_max 严格递增，全同 hash 时
+ *     左半最大 == 右半最大，separator 提升直接违反上界路由）
+ *   - crc32 线性可构造：攻击者可批量构造同 crc32 名字灌爆单叶
+ *   XXH64：64 位熵（~5e9 条目才期望首碰撞）、雪崩质量好、无 key、
+ *   自包含、x64 极快（名字 ≤2047B 耗时无感）。
+ *
+ * 稳定性约束：hash 值落盘（每个 dentry 都存），跨挂载必须可复现，
+ * 故 seed 固定 0，禁止按挂载随机 key。将来上网络服务（ravenfs_server）
+ * 要抗 DoS 时：换 SipHash-2-4，key mkfs 生成一次存 Superblock
+ * （pad 现成空间），接口签名不变。
  * ═══════════════════════════════════════════════════════════════ */
+uint64_t RavenFS_juvenile::name_hash(const char *name) const {
+    /* xxHash PRIME64 常量（xxhash.c 原值） */
+    const uint64_t P1 = 11400714785074694791ULL;
+    const uint64_t P2 = 14029467366897019727ULL;
+    const uint64_t P3 = 1609587929392839161ULL;
+    const uint64_t P4 = 9650029242287828579ULL;
+    const uint64_t P5 = 2870177450012600261ULL;
+    const uint64_t seed = 0;
+
+    const uint8_t *p  = (const uint8_t *)name;
+    const size_t   len = strlen(name);
+    const uint8_t *bEnd = p + len;
+    uint64_t h64;
+
+    auto rotl64 = [](uint64_t x, int r) { return (x << r) | (x >> (64 - r)); };
+    auto round  = [&](uint64_t acc, uint64_t input) {
+        acc += input * P2;
+        acc = rotl64(acc, 31);
+        acc *= P1;
+        return acc;
+    };
+    auto mergeRound = [&](uint64_t &acc, uint64_t val) {
+        val = round(0, val);
+        acc ^= val;
+        acc = acc * P1 + P4;
+    };
+
+    if (len >= 32) {
+        const uint8_t *limit = bEnd - 32;
+        uint64_t v1 = seed + P1 + P2;
+        uint64_t v2 = seed + P2;
+        uint64_t v3 = seed;
+        uint64_t v4 = seed - P1;
+        do {
+            uint64_t l1, l2, l3, l4;
+            memcpy(&l1, p, 8);        p += 8;
+            memcpy(&l2, p, 8);        p += 8;
+            memcpy(&l3, p, 8);        p += 8;
+            memcpy(&l4, p, 8);        p += 8;
+            v1 = round(v1, l1);
+            v2 = round(v2, l2);
+            v3 = round(v3, l3);
+            v4 = round(v4, l4);
+        } while (p <= limit);
+
+        h64 = rotl64(v1, 1) + rotl64(v2, 7) + rotl64(v3, 12) + rotl64(v4, 18);
+        mergeRound(h64, v1);
+        mergeRound(h64, v2);
+        mergeRound(h64, v3);
+        mergeRound(h64, v4);
+    } else {
+        h64 = seed + P5;
+    }
+
+    h64 += (uint64_t)len;
+
+    while (p + 8 <= bEnd) {
+        uint64_t k1;
+        memcpy(&k1, p, 8);
+        k1 *= P2;
+        k1 = rotl64(k1, 31);
+        k1 *= P1;
+        h64 ^= k1;
+        h64 = rotl64(h64, 27) * P1 + P4;
+        p += 8;
+    }
+    if (p + 4 <= bEnd) {
+        uint32_t k2;
+        memcpy(&k2, p, 4);
+        h64 ^= (uint64_t)k2 * P1;
+        h64 = rotl64(h64, 23) * P2 + P3;
+        p += 4;
+    }
+    while (p < bEnd) {
+        h64 ^= (uint64_t)(*p) * P5;
+        h64 = rotl64(h64, 11) * P1;
+        p++;
+    }
+
+    h64 ^= h64 >> 33;
+    h64 *= P2;
+    h64 ^= h64 >> 29;
+    h64 *= P3;
+    h64 ^= h64 >> 32;
+    return h64;
+}
+/* ── 获取节点最大 hash（叶子末项 hash 或内部末项 hint.hash_max） ── */
+
 RavenFS_juvenile::RavenFS_juvenile(const char *blk_device_path, uint64_t *res_code) {
     if (res_code) *res_code = RC_ERR_OPEN;   /* 默认失败态 */
 
@@ -134,6 +256,26 @@ void RavenFS_juvenile::read_block(uint64_t blk, void *buf) {
 
 void RavenFS_juvenile::write_block(uint64_t blk, const void *buf) {
     pwrite(fd, buf, 4096, (off_t)fblock_to_byte(blk));
+}
+
+/* 批量块 I/O（零缓存）：blk 起连续 blk_len 个 FS_block，一次 pread/pwrite。
+ * 参数非法（buf 为空 / 区间越界）→ RC_ERR_STATE；实际读写字节不符 → RC_ERR_IO。 */
+result_code_t RavenFS_juvenile::read_buff(uint64_t blk, uint64_t blk_len, void *buf) {
+    if (!buf || blk_len == 0) return RC_ERR_STATE;
+    if (blk >= total_blocks || blk_len > total_blocks - blk) return RC_ERR_STATE;
+    size_t bytes = blk_len * 4096;
+    if (pread(fd, buf, bytes, (off_t)fblock_to_byte(blk)) != (ssize_t)bytes)
+        return RC_ERR_IO;
+    return RC_OK;
+}
+
+result_code_t RavenFS_juvenile::write_buff(uint64_t blk, uint64_t blk_len, void *buf) {
+    if (!buf || blk_len == 0) return RC_ERR_STATE;
+    if (blk >= total_blocks || blk_len > total_blocks - blk) return RC_ERR_STATE;
+    size_t bytes = blk_len * 4096;
+    if (pwrite(fd, buf, bytes, (off_t)fblock_to_byte(blk)) != (ssize_t)bytes)
+        return RC_ERR_IO;
+    return RC_OK;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -343,9 +485,7 @@ void RavenFS_juvenile::dump_info() const {
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * 以下方法由 Sparrow 手写实现（dentry_tree.cpp）：
- *   name_hash / dentry_leaf_locate / dentry_leaf_shift /
- *   dentry_insert_recurse / dentry_remove_recurse / dentry_collect /
+ * 以下方法由 人类手写实现（dentry_tree.cpp）：
  *   root_dir_insert_dentry / root_dir_rm_dentry / root_dir_lookup /
- *   root_dir_readdir / dump_dentry_tree
+ *   root_dir_readdir
  * ═══════════════════════════════════════════════════════════════ */
