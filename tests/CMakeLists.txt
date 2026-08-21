@@ -1,11 +1,3 @@
-add_executable(ravenfs_test
-    test_main.cpp
-    test_mkdir_rmdir.cpp
-    debug_dump.cpp
-)
-target_include_directories(ravenfs_test PRIVATE ../include)
-target_link_libraries(ravenfs_test PRIVATE ravenfs_god)
-
 # v1.1 幼年期上帝类：root_dir_insert_dentry 接口专项测试
 add_executable(ravenfs_juv_insert
     test_root_dir_insert.cpp
@@ -13,27 +5,9 @@ add_executable(ravenfs_juv_insert
 target_include_directories(ravenfs_juv_insert PRIVATE ../include)
 target_link_libraries(ravenfs_juv_insert PRIVATE ravenfs_juvenile)
 
-add_executable(ravenfs_stress
-    stress_mkdir.cpp
+# v1.1 幼年期上帝类：root_dir_rm_dentry 接口专项测试
+add_executable(ravenfs_juv_delete
+    test_root_dir_delete.cpp
 )
-target_link_libraries(ravenfs_stress PRIVATE ravenfs_god)
-
-add_executable(ravenfs_stress_rev
-    stress_mkdir_rev.cpp
-)
-target_link_libraries(ravenfs_stress_rev PRIVATE ravenfs_god)
-
-add_executable(ravenfs_stress_delete
-    stress_delete.cpp
-)
-target_link_libraries(ravenfs_stress_delete PRIVATE ravenfs_god)
-
-add_executable(ravenfs_replay_delete
-    replay_delete.cpp
-)
-target_link_libraries(ravenfs_replay_delete PRIVATE ravenfs_god)
-
-add_executable(ravenfs_replay_insert
-    replay_insert.cpp
-)
-target_link_libraries(ravenfs_replay_insert PRIVATE ravenfs_god)
+target_include_directories(ravenfs_juv_delete PRIVATE ../include)
+target_link_libraries(ravenfs_juv_delete PRIVATE ravenfs_juvenile)
