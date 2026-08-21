@@ -801,6 +801,75 @@ result_code_t RavenFS_juvenile::dentry_node_balance(
     }
 }
 /* ═══════════════════════════════════════════════════════════════════
+ * dentry_root_shrink — 根收缩：根内部节点只剩 1 个孩子时提升孩子为新根
+ *
+ * 场景：删除路径上根内部节点合并到 entry_count==1（或 dentry_node_balance
+ * 对 idx==0 && parent_count==1 返回 RC_ERR_STATE 时），树退化为一层
+ * 无意义的根内部节点。此时把唯一孩子提升为新根：
+ *
+ *   孩子 is_root_node=1, parent_ptr.ptr = root_inode_idx（"." 自指 inode）
+ *   孩子是叶子 → ptrs[1] = root_inode_idx（".." 孤儿自指），ptrs[2] = INVALID
+ *   更新 root inode.data_root → root_dentry_blk → 释放旧根 2 块
+ *
+ * 返回：
+ *   RC_OK             成功（或无需收缩：非内部节点 / entry_count != 1）
+ *   RC_ERR_STATE      root_blk 不是根节点（调用方用错）
+ *   其他 RC_ERR_*      I/O 或结构错误
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::dentry_root_shrink(uint64_t root_blk, uint64_t root_inode_idx)
+{
+    alignas(Bptree_dentry_inner_node_t) uint8_t root_buf[8192];
+    Bptree_dentry_inner_node_t *root = (Bptree_dentry_inner_node_t *)root_buf;
+    result_code_t rc = RAVENFS_READ_8K_NODE(this, root_blk, root_buf);
+    if (rc != RC_OK) return rc;
+    if (!is_dentry_node(&root->meta)) return RC_ERR_STATE;
+    if (!root->meta.parent_ptr.is_root_node) return RC_ERR_STATE;
+
+    /* 非内部节点（根叶子）或孩子不止一个：无需收缩 */
+    if (!root->meta.parent_ptr.is_inner_node) return RC_OK;
+    uint16_t cnt = (uint16_t)root->meta.parent_ptr.entry_count;
+    if (cnt != 1) return RC_OK;
+
+    uint64_t child_blk = root->hints[0].sub_ptr.ptr;
+
+    /* ── 读唯一孩子，提升为新根 ── */
+    alignas(Bptree_dentry_leaf_node_t) uint8_t child_buf[8192];
+    Bptree_meta_t *child_meta = (Bptree_meta_t *)child_buf;
+    rc = RAVENFS_READ_8K_NODE(this, child_blk, child_buf);
+    if (rc != RC_OK) return rc;
+    if (!is_dentry_node(child_meta)) return RC_ERR_STATE;
+    if (child_meta->parent_ptr.is_root_node) return RC_ERR_STATE;   /* 孩子已是根？结构损坏 */
+
+    child_meta->parent_ptr.is_root_node  = 1;
+    child_meta->parent_ptr.ptr           = root_inode_idx;   /* "." 指向目录自身 inode */
+
+    /* 叶子：".." 孤儿自指（与 dir_insert_dentry 空目录建根对齐）；
+     * 根不做同级链表 → ptrs[2] 失效。内部节点 ptrs[1] 亦为 ".."。 */
+    if (!child_meta->parent_ptr.is_inner_node) {
+        auto *child_leaf = (Bptree_dentry_leaf_node_t *)child_buf;
+        child_leaf->meta.ptrs[0].ptr        = PTR_INVALID;
+        child_leaf->meta.ptrs[1].ptr        = root_inode_idx;   /* ".." */
+        child_leaf->meta.ptrs[2].ptr        = PTR_INVALID;
+    } else {
+        auto *child_inner = (Bptree_dentry_inner_node_t *)child_buf;
+        child_inner->meta.ptrs[1].ptr       = root_inode_idx;   /* ".." */
+    }
+
+    rc = RAVENFS_WRITE_8K_NODE(this, child_blk, child_buf);
+    if (rc != RC_OK) return rc;
+
+    /* ── 更新 root inode.data_root 与内存根句柄 ── */
+    raven_Inode_t root_inode;
+    inode_read(root_inode_idx, &root_inode);
+    root_inode.data_root = child_blk;
+    inode_write(root_inode_idx, &root_inode);
+    root_dentry_blk = child_blk;
+
+    /* ── 释放旧根（恒 2 块） ── */
+    block_free(root_blk, 2);
+    return RC_OK;
+}
+/* ═══════════════════════════════════════════════════════════════════
  * dentry_spilt_parent_apply — 将叶子/内部节点分裂结果应用到父层
  *
  * 入参：

@@ -674,7 +674,9 @@ leaf_C.ptr1 = B, leaf_C.ptr2 = ~0ull (tail)
 3. 已满：右半 32 entry 分到新节点，最小 name 提升到父节点
 4. 父节点满 → 递归分裂 → 根满则创建新根
 
-**删除：** v1 标记 tombstone，不主动合并。
+**删除：** v1 标记 tombstone，不主动合并。墓碑值 = `DENTRY_TOMBSTONE_PTR`（`~0ULL`）：
+叶子 `entries[i].ptr` 置 `~0ULL` 表示该槽位已删除、可复用，name 保留在树中维持字典序。
+禁止用 `0` 作墓碑——inode 0 是合法指针（根目录 inode，见 §4.2）。
 
 ### 6.6 与文件区段 B+tree 的对比
 

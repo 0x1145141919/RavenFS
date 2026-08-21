@@ -204,6 +204,17 @@ RavenFS on-disk 结构中存在三类指针语义，所有涉及"地址/索引"�
 
 三个取值空间彼此独立。联合指针的当前语义由上下文位域决定，不得脱离位域单独解读裸值。
 
+**哨兵值统一约定（`include/disk_struct.hpp` 宏，禁止裸写 `0` 或 `~0ULL`）：**
+
+| 宏 | 值 | 语义 |
+|----|----|------|
+| `FS_BLOCK_PTR_INVALID` | `~0ULL` | 无效块指针（如 `data_root`=inline、backup 链表头尾、兄弟指针无后继） |
+| `INODE_PTR_INVALID` | `~0ULL` | 无效 inode 指针（如 lookup 未命中返回） |
+| `DENTRY_TOMBSTONE_PTR` | `~0ULL` | Dentry 叶子条目墓碑：`entries[i].ptr` 置此值 = 已删除，槽位可复用 |
+
+`0` 在两类指针取值空间内都是**合法指针**（根目录 inode 编号为 0，见 disk_layout_v1.md §4.2），
+因此"无指针/已删除"一律用 `~0ULL` 哨兵，不得复用 `0`。
+
 ---
 
 ### RavenSuperblock

@@ -253,11 +253,31 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
     /* ── 阶段二：若叶子欠载，进行平衡/合并（向上递归） ── */
     if (flags & 1u) {
         if (trace.depth > 1) {
+            /* RC_ERR_STATE 捕获：验证是否为“根内部节点只剩 1 孩子”的
+             * 收缩场景（dentry_node_balance 设计上把根收缩交给上层）。
+             * 是则收缩并返回 true；否则返回 false（保留原错误）。 */
+            auto try_root_shrink = [&](uint64_t blk) -> bool {
+                alignas(Bptree_dentry_inner_node_t) uint8_t tmp[8192];
+                if (RAVENFS_READ_8K_NODE(this, blk, tmp) != RC_OK) return false;
+                Bptree_meta_t *m = (Bptree_meta_t *)tmp;
+                if (!is_dentry_node(m)) return false;
+                if (!m->parent_ptr.is_root_node) return false;
+                if (!m->parent_ptr.is_inner_node) return false;
+                if (m->parent_ptr.entry_count != 1) return false;
+                return dentry_root_shrink(blk, inode_idx) == RC_OK;
+            };
+
             uint64_t parent_blk = trace.blocks[trace.depth - 2];
             uint16_t child_idx = trace.child_idx[trace.depth - 2];
             bool need_parent_balance = false;
             rc = dentry_node_balance(parent_blk, child_idx, need_parent_balance);
-            if (rc) return rc;
+            if (rc == RC_ERR_STATE) {
+                /* 根收缩场景：父是根内部节点且只剩 1 孩子 */
+                if (!try_root_shrink(parent_blk)) return RC_ERR_STATE;
+                need_parent_balance = false;   /* 收缩后无欠载链 */
+            } else if (rc) {
+                return rc;
+            }
 
             uint64_t cur_parent_blk = parent_blk;
             while (need_parent_balance) {
@@ -267,6 +287,8 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
                 if (rc) return rc;
 
                 if (parent_node->meta.parent_ptr.is_root_node) {
+                    /* 根内部节点只剩 1 孩子（合并残留）→ 收缩 */
+                    try_root_shrink(cur_parent_blk);
                     break;
                 }
 
@@ -287,9 +309,20 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
                 if (!found) return RC_ERR_STATE;
 
                 rc = dentry_node_balance(grand_parent_blk, grand_idx, need_parent_balance);
-                if (rc) return rc;
+                if (rc == RC_ERR_STATE) {
+                    /* 祖父是根且只剩 1 孩子 → 收缩后链结束 */
+                    if (!try_root_shrink(grand_parent_blk)) return RC_ERR_STATE;
+                    need_parent_balance = false;
+                    break;
+                } else if (rc) {
+                    return rc;
+                }
                 cur_parent_blk = grand_parent_blk;
             }
+
+            /* 阶段二收尾：合并路径可能留下“根内部节点 entry_count==1”
+             * 的残留形态（根不置 need_balance），统一收缩。 */
+            try_root_shrink(root_dentry_blk);
         }
     }
 

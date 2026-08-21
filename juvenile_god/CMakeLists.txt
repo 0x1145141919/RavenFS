@@ -9,4 +9,3 @@ add_library(ravenfs_juvenile STATIC
     dentry_tree.cpp
     root_dir.cpp
 )
-target_include_directories(ravenfs_juvenile PRIVATE ${CMAKE_SOURCE_DIR}/include)

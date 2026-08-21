@@ -18,6 +18,13 @@ static inline void cpu_relax() {
     __asm__ __volatile__("pause" ::: "memory");
 }
 
+/* ─── rdtsc_timestamp — TSC 时间戳 ─── */
+static inline uint64_t rdtsc_timestamp() {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 /* ─── 常量 ─── */
 static constexpr uint8_t SPIN_LOCKED   = 1;
 static constexpr uint8_t SPIN_UNLOCKED = 0;

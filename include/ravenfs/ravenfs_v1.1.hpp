@@ -237,6 +237,17 @@ private:
     split_result_t dentry_inner_split(uint64_t victim_node_blkbase);//不会进行父节点的修改
     result_code_t dentry_spilt_parent_apply(uint64_t parent_node_blkbase,uint16_t victim_in_node_id,split_result_t result,bool&is_parent_spilt_acquire);
     result_code_t dentry_node_balance(uint64_t parent_node_blkbase,uint16_t idx,bool&is_parent_need_balance);//给定的父节点以及相应引索，让其平衡则是，若节点到达平衡阈值，向前后邻居先看是否存在总entry数目小于等于126的,小于126则合并，不满足则抹匀
+    /* 根收缩：根内部节点只剩 1 个孩子时，把唯一孩子提升为新根。
+     * 调用场景：dentry_node_balance 对 idx==0 && parent_count==1 返回
+     * RC_ERR_STATE（设计上根收缩由上层处理）；以及合并路径留下的
+     * “根 entry_count==1”形态收尾。
+     * 语义：
+     *   - 非内部节点或 entry_count != 1 → RC_OK（无需收缩）
+     *   - root_blk 不是根 → RC_ERR_STATE（调用者用错）
+     *   - 成功：孩子 is_root_node=1、parent_ptr.ptr=inode_idx（"."）、
+     *     叶子则 ptrs[1]=inode_idx（".." 孤儿自指）/ptrs[2]=PTR_INVALID，
+     *     更新 root inode.data_root、root_dentry_blk、释放旧根 2 块 */
+    result_code_t dentry_root_shrink(uint64_t root_blk, uint64_t root_inode_idx);
     /* 分裂后新建根内部节点（低/高两个子节点提升为新根的 hints[0]/[1]）：
      * 分配 2 块 → meta 初始化 → 填充 hints → 更新两子节点父指针 → 写回
      * → 更新 root inode.data_root。low_blk/low_max 为左子块号及最大 hash，

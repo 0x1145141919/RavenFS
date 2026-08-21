@@ -2739,7 +2739,7 @@ static_assert(sizeof(Dentry_common_t) == 128);
 ---
 
 ## 👤 USER (msg 67)
-> 📎 附件: name_len_freq_home.txt
+> 📎 附件: name_len_freq_ehome.txt
 
 这是我/home下的统计结果，ext4文件系统
 

@@ -182,6 +182,33 @@ struct Bptree_dentry_inner_node_t{
 }__attribute__((packed));
 static_assert(sizeof(Bptree_dentry_inner_node_t)==8192,"" );
 
+/* ═══════════════════════════════════════════════════════════
+ * 8K 节点便捷 I/O 宏（配合 RavenFS_juvenile::read_buff/write_buff）
+ *
+ * B+tree 节点（Bptree_*_node_t）恒为 8192B = 2 个连续 FS_block，
+ * 读写整节点不再手写 blk_len=2：
+ *
+ *   Bptree_dentry_leaf_node_t leaf;
+ *   if (RAVENFS_READ_8K_NODE(fs, blk, &leaf) != RC_OK) ...
+ *   RAVENFS_WRITE_8K_NODE(fs, blk, &leaf);
+ *
+ * fs   = RavenFS_juvenile 实例**或指针**（this / &obj 均可，
+ *        经 ravenfs_fs_ref 统一解引用；须能访问其 read_buff/write_buff，
+ *        即类内部/友元上下文）
+ * blk  = 节点起始 FS_block 号
+ * node = 8K 节点结构体指针；blk_len 由 sizeof 推导（8192/4096=2），
+ *        传错类型编译期即报错
+ * 返回 read_buff/write_buff 的结果码：RC_OK / RC_ERR_STATE / RC_ERR_IO
+ * ═══════════════════════════════════════════════════════════ */
+/* 宏参数统一：实例左值 → 自身；指针 → 解引用（两者都得到对象引用） */
+template <class T> static inline T &ravenfs_fs_ref(T &t) { return t; }
+template <class T> static inline T &ravenfs_fs_ref(T *t) { return *t; }
+
+#define RAVENFS_READ_8K_NODE(fs, blk, node) \
+    (ravenfs_fs_ref(fs).read_buff((blk), 2, (node)))
+#define RAVENFS_WRITE_8K_NODE(fs, blk, node) \
+    (ravenfs_fs_ref(fs).write_buff((blk), 2, (node)))
+
 /* ═══════════════════════════════════════════════════════
  * RavenSuperblock — 统一结构体
  *
