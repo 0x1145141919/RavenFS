@@ -1,5 +1,7 @@
 #pragma once
 #include "disk_struct_v1.1.hpp"
+#include <shared_mutex>   /* slice_radix_tree::lock — 可睡眠读写锁（允许持锁等 I/O，不烧核） */
+#include "util/tsc.h"    /* x86_64 Invariant TSC：TTL 换算（绑死 x86_64） */
 class Inode_cache_mgr_t;
 class RavenFS_juvenile;
 enum cache_ctrl_state_t{
@@ -20,7 +22,11 @@ struct cut_result_t{
     uint64_t main;
     uint64_t cut_out_section;
 };
-extern cut_result_t cut_high(uint64_t raw_metarial,uint8_t bits_to_cut);//从 raw_metarial的最高非0有效位开始向下切bits_to_cut个bit,切下来的放入cut_out_section，原主干放入main
+extern cut_result_t cut_high(uint64_t raw_metarial,uint8_t bits_to_cut);
+/* cut_high — 位域切割原语（左对齐方案，通用轮子，块缓存等场景可复用）：
+ * raw 须已左对齐（位域最高位 = bit 63）；从位域顶端向下切 bits_to_cut 个 bit：
+ * cut_out_section = 切下的高位段（右对齐），main = 剩余位域（保持左对齐，供递归）。
+ * 实现见 juvenile_god/inode_cache.cpp */
 /**
  * 我们主要根据bits_len_of_inodes_count在1～52的枚举值动态枚举规划，[5,12]是全量上内存，[13,18]是全量缓存行控制器数组(每个都是4k页面16entries)，大于等于19才是需要引入静态基数树分片
  * （statey_19~52 策略表定义已随实现移入 juvenile_god/inode_cache.cpp，此处仅留设计注记）
@@ -67,9 +73,14 @@ struct Inode_cache_cfg_t {
                                            页地址 = base + line（line = inum >> 4） */
 
     /* ── 数据面内存预算（字节） ──
-     * FULL_RAM 判定已在 bits 层完成；预算主要约束 RADIX 分片树的
-     * 可驻留页数（准入/淘汰水位），CTRL_ARRAY 数据面理论上全量 */
+     * 淘汰已改为 TTL 超时（见 ttl_ticks），预算不再参与准入/淘汰水位，
+     * 保留作内存分布统计与后续调优参考 */
     uint64_t memory_budget;
+
+    /* ── 缓存行 TTL（TSC tick） ──
+     * 0 = 默认 2s（ctor 按 Invariant TSC 频率换算）；
+     * 运行期可用 Inode_cache_mgr_t::set_ttl_ticks 调整 */
+    uint64_t ttl_ticks = 0;
 
     /* ── I/O 回调（页粒度：1 页 = 4096B = 16 × raven_Inode_t） ──
      * 回调而非直接调 fs->read_buff：mgr 不依赖宿主类，
@@ -93,15 +104,24 @@ public:
     Inode_cache_mgr_t(const Inode_cache_cfg_t &cfg, result_code_t *rc_out = nullptr);
     ~Inode_cache_mgr_t();//每个片进行折构（脏页回写 + 释放）
 
-    /* ── 统一会话接口（三模式表面一致） ── */
-    raven_Inode_t *get(uint64_t inum);  /* 返回行内原位指针；FULL_RAM 恒命中 */ //很明显，get的时候有必要拿走slice_cache_acces_token_t这个
-    void           put(uint64_t inum);  /* accessor 计数 -1；FULL_RAM 无计数，no-op */ //slice_cache_acces_token_t也得作为参数，缓存占用减一，相应分片的锁也要解开读锁
-    void           mark_dirty(uint64_t inum);
-    result_code_t  flush_all();         /* 全量脏页回写（挂载/卸载同步点用） */
+    /* ── 统一会话接口（三模式表面一致） ──
+     * get 输出会话 token（RADIX 定位分片/释放读锁用），put 必须带回该 token；
+     * out_token 可空（调用方不关心时），FULL_RAM/CTRL_ARRAY 填 slice_idx=0 */
     struct slice_cache_acces_token_t
     {
-        uint16_t slice_idx;
+        uint16_t slice_idx;   /* RADIX：分片序号（per_level_width[0] 高位切分）；其余模式恒 0 */
     };
+    raven_Inode_t *get(uint64_t inum, slice_cache_acces_token_t *out_token = nullptr);
+    void           put(uint64_t inum, const slice_cache_acces_token_t &token);
+    void           mark_dirty(uint64_t inum);
+    result_code_t  flush_all();         /* 全量脏页回写（挂载/卸载同步点用） */
+    /* ── TTL 淘汰（绑死 x86_64 + Invariant TSC） ──
+     * set_ttl_ticks：外部调整缓存行 TTL（默认 2s，ctor 按 TSC 频率换算）；
+     *                调整即时生效（slice 持指针共享同一真相源）
+     * reap_expired：专用淘汰线程周期调用 —— 回收全部「超时 && 无访问者」的行
+     *                （RADIX 逐片扫 + CTRL_ARRAY 全扫；写回脏页 + 释放 + 摘除） */
+    void set_ttl_ticks(uint64_t ticks);
+    void reap_expired();
     bool is_ready() const { return ready_; }
     inode_cache_mode_t mode() const { return mode_; }
     uint8_t bits_len() const { return cfg_.bits_len_of_inodes_count; }
@@ -113,42 +133,101 @@ private:
     Inode_cache_cfg_t  cfg_;
     inode_cache_mode_t mode_;
     bool ready_ = false;
+    uint64_t ttl_ticks_ = 0;   /* 缓存行 TTL（TSC tick）：默认 2s（ctor 换算），set_ttl_ticks 调整；
+                                   slice 持 &ttl_ticks_ 共享，reap 扫描时读最新值 */
 
-    /* ── FULL_RAM 分支 [1,12] ── */
+    /* ── FULL_RAM 分支 [1,12] ── 全量常驻，写回全量一口气（≤1MB，无脏页位图） */
     raven_Inode_t *full_ram_array_ = nullptr;   /* [inodes_count] 全量常驻 */
-    uint8_t       *full_ram_dirty_ = nullptr;   /* 脏页位图 [(pages+7)/8] */  //实际上不需要，可以考虑libnvme的cmp技术，大不了一个page一个page地比较逐个写入，若是怕过度写造成不必要的写入量，但是既然都小到这个全量上内存那就直接全部一口气写完
 
-    /* ── CTRL_ARRAY 分支 [13,18] ── */
+    /* ── CTRL_ARRAY 分支 [13,18] ── 控制器全量常驻，数据页懒分配：
+     *    get 的 io_ing 态内 alloc+read 原子完成，析构 write-back+free */
     Inode_cache_ctrl_t *ctrl_array_ = nullptr;  /* [ctrl_count]，位置即身份：line = inum>>4 */
-    raven_Inode_t      *data_pages_ = nullptr;  /* [ctrl_count][16]，按需载入 */  //反对，linux内核和用户空间就直接state在io_ing的时候不但<读取+分配虚拟内存>地原子性加载即可，且逐出时也是<写回+释放>原子性更新，所以这个成员没必要
 
     /* ── RADIX 分支 [19,52] ── 草稿：策略表已布置（inode_cache.cpp 内），
-     *    global_slice_plan 解析 + 分片树/片 RW 锁/准入淘汰待实装 */
-    struct bits_slice_plan_t{//词不达意，我想表达的是根据bits_len_of_inodes_count的后如何规划位域对应到对应层级的表的引索，这种意思        
+     *    global_slice_plan 解析 + 分片树/片 RW 锁/准入淘汰待实装
+     *
+     * 位域规划（bitfield_decode_plan_t）：按 bits_len_of_inodes_count 从最高位向下
+     * 逐层切分（cut_high 递归），level_bits[0] = mgr 层分片选择宽度（slice 数 = 2^w0），
+     * level_bits[1..] = 基数树逐层宽度，剩余低位 = 缓存行内引索（row_bits）。
+     * row_bits = bits - sum(level_bits)：绝大多数档 4bit(16 entries=4KB=1块)，
+     * 但 bits=25 / bits=33 两档为 5bit(32 entries=8KB=2块) —— 行内宽度由 decode 派生，
+     * 不做独立常量；ROW_BITS 常量仅 FULL_RAM/CTRL_ARRAY 临时可用（RADIX 实装时改成员变量）。
+     * decode 结果 chunks[0..total_levels-1] = 各层索引（[0]=slice 选择），
+     * chunks[total_levels] = 行内索引；plan 为唯一真相源，decode 不依赖 mgr 状态。 */
+    struct bitfield_decode_plan_t{
         /**
-         * total_levels表示这个bits_len_of_inodes_count从最高位开始向下每个多少层，也就是
-         * per_level_width数组从0~total_levels-1的条目是使用的
-         * 而解析位域则是使用对应的cut_high函数，从原始位域递归从0迭代向上切，每切出来一份放入解析成员，最后剩下的就是缓存行内引索
+         * bits_len：inode 号总位宽（= cfg.bits_len_of_inodes_count 的镜像，plan 必须自包含）：
+         *           decode 左对齐 + row_bits 派生的唯一真相源
+         * total_levels：使用的层数（含 mgr 层），level_bits[0..total_levels-1] 有效
+         * level_bits[0]：mgr 层分片选择位宽（slice 数 = 2^level_bits[0]）
+         * level_bits[1..]：分片基数树从上到下的逐层位宽
+         * 剩余低位 = 行内引索：row_bits = bits_len - sum(level_bits)，多数 4，25/33 档 5
          */
-        /**
-         * 不过先硬性定一手，per_level_width[0]是Inode_cache_mgr_t层的引索，后面的从1开始的层级是分片基数树从上到下的位域宽度
-         */
+        uint8_t bits_len;
         uint8_t total_levels;
-        uint8_t*per_level_width;
+        uint8_t*level_bits;
     };
-    bits_slice_plan_t global_slice_plan;
+    bitfield_decode_plan_t global_slice_plan;
+    struct bitfield_decoded_result_t{
+        uint64_t raw;//原始数据（inum）
+        uint8_t total_levels;//从plan处继承：0～total_levels-1 引索中间位域解析结果（层级索引），引索 total_levels 的是缓存行解码引索（行内索引）
+        uint16_t chunks[7];//层级索引容量：现表最大 5 层 + 行内 = 6，留 1 冗余（支撑未来 6 层）；每项位宽 ≤ 11bit ≤ uint16_t
+    };
+    static bitfield_decoded_result_t decode(uint64_t raw,bitfield_decode_plan_t plan);//内部递归调用cut_high；raw 左对齐 + 累积推导 row_bits，plan 为唯一真相源，不依赖 mgr 状态（static：slice 树可直接复用）
+    /* slice_radix_tree_cfg_t — 分片树构造大结构体（组装方：mgr ctor 的 RADIX 分支，按 chunks[0] 逐片组装）
+     * 哲学对齐 Inode_cache_cfg_t：不复制回调、不反向持有宿主；树只依赖 cfg，可脱离 mgr 单测
+     *   host_cfg    ：mgr 的 cfg 直传（I/O 回调 + alloc/free + io_ctx + inode_array_base + 总预算）
+     *   plan        ：位域解码规划。仅 ctor 推树拓扑用（tree_levels = total_levels-1，
+     *                 根表宽 = 2^level_bits[1]）；运行期 get/put 吃解析好的
+     *                 bitfield_decoded_result_t，不再摸 plan
+     *   row_bits    ：行内位宽（= bits_len - sum(level_bits)）；
+     *                 blk = base + (raw>>row_bits) << (row_bits-4)
+     *   budget_bytes：保留作统计；淘汰已改为 TTL 超时，不再做压力水位
+     *   ttl_ticks   ：指向 mgr 的 ttl_ticks_（单一真相源，外部可运行期调整），
+     *                 reap 扫描时读最新值 */
+    struct slice_radix_tree_cfg_t{
+        const Inode_cache_cfg_t *host_cfg;
+        bitfield_decode_plan_t   plan;
+        uint8_t  row_bits;
+        const uint64_t *ttl_ticks;
+    };
+
     class slice_radix_tree{
-        uint64_t decode_base;//负责解码的Inode_base_idx
-        uint64_t decode_limit;
-        spinrwlock_cpp_t lock;//实际上应该是互斥读写锁
-        void* root_table;
-        public:
-        slice_radix_tree();//显然，构造函数需要分享Inode_cache_cfg_t指针以及额外的decode_base，decode_limit以及最重要的global_slice_plan信息
-        ~slice_radix_tree();//全部缓存，D的写回，非D的丢弃
-        raven_Inode_t *get(uint64_t inum);//先读锁假定会一次命中，中间有任何问题就是用写锁RAII把链路打通，而后回头用读锁。写锁用RAII刻意限制临界区，但是读锁刻意泄露
-        void put(uint64_t inum);//这个地方会释放读锁以及对应缓存行访客数目-1,前面泄露的读锁在这里释放
-        //刻意泄露读锁，而自动释放放到InodeSession的RAII层
+        /* ── cfg 快照（构造后只读） ── */
+        const Inode_cache_cfg_t *host_cfg_ = nullptr;  /* 共享 mgr cfg：I/O/alloc/free/几何/预算 */
+        bitfield_decode_plan_t   plan_ = {};           /* 树拓扑真相源（ctor 用，保留备析构/调试） */
+        uint8_t  row_bits_        = 4;                 /* 行内位宽：blk = base + (raw>>row_bits_)<<(row_bits_-4) */
+        uint8_t  tree_levels_     = 0;                 /* 树层数 = plan_.total_levels - 1（ctor 派生） */
+        const uint64_t *ttl_ticks_ = nullptr;          /* 指向 mgr ttl_ticks_（共享真相源，reap 时读） */
+        /* 统计记账（仅写锁内修改；读锁临界区内不变 —— 只有写锁能动缓存行状态与表结构）：
+         * table_size_all_accumulate：根表→中间表→叶子表 全部表结构内存字节（元数据域）
+         * real_cache_accumulate   ：已驻留缓存行字节 = 行数 × (4096 << (row_bits_-4))（数据域）
+         * 用途：统计性能、数据 vs 元数据占比，为后续时空权衡调优提供依据
+         * （元数据域过大时可缩小表项宽度 —— 换来额外 load/store，届时权衡） */
+        uint64_t table_size_all_accumulate = 0;
+        uint64_t real_cache_accumulate    = 0;
+        /* ── 并发与结构 ── */
+        std::shared_mutex lock;                        /* 可睡眠读写锁：读共享/写独占，持锁可等 I/O（不烧核） */
+        void *root_table = nullptr;                    /* 根表：2^level_bits[1] 槽位数组；槽 = 子表 | 行控制器 */
+    public:
+        explicit slice_radix_tree(const slice_radix_tree_cfg_t &cfg);
+        ~slice_radix_tree();                           /* 全部缓存：脏页写回 + 非脏丢弃 + 释放表 */
+        /* get：吃解析好的位域结果（树不解码）。先读锁假定一次命中；miss → 写锁 RAII 打通链路
+         * （建节点/控制器）后回头读锁。写锁刻意限制临界区（无 I/O），读锁刻意泄露到 put 释放 */
+        raven_Inode_t *get(bitfield_decoded_result_t *decoded);
+        /* put：释放 get 泄露的读锁 + 对应缓存行 accessor-1（行不被淘汰由 accessor>0 保证） */
+        void put(bitfield_decoded_result_t *decoded);
+        /* reap_expired：专用淘汰线程经 mgr::reap_expired 调用 —— 写锁内回收本片
+         * 超时（now - accss_stamp > ttl_ticks_）且无访问者的行：脏写回 → 释放 → 摘除 */
+        void reap_expired();
+
+        /* 禁拷贝/移动：shared_mutex 不可搬移，树持锁语义唯一 */
+        slice_radix_tree(const slice_radix_tree &) = delete;
+        slice_radix_tree &operator=(const slice_radix_tree &) = delete;
+        slice_radix_tree(slice_radix_tree &&) = delete;
+        slice_radix_tree &operator=(slice_radix_tree &&) = delete;
     };
+    slice_radix_tree *slices_ = nullptr;   /* [2^level_bits[0]] 分片树（placement new，析构逐个释放） */
     /* ── 几何换算（三模式共用） ── */
     uint64_t ctrl_count() const { return (cfg_.inodes_count + INODES_PER_PAGE - 1) >> ROW_BITS; }
     uint64_t line_of(uint64_t inum) const { return inum >> ROW_BITS; }
@@ -169,24 +248,27 @@ private:
 class InodeSession {
     Inode_cache_mgr_t *mgr_ = nullptr;
     uint64_t inum_ = 0;
-    Inode_cache_mgr_t::slice_cache_acces_token_t token;
+    Inode_cache_mgr_t::slice_cache_acces_token_t token{};
 public:
     raven_Inode_t *inode = nullptr;
 
     InodeSession(Inode_cache_mgr_t *mgr, uint64_t inum)
-        : mgr_(mgr), inum_(inum) { inode = mgr_ ? mgr_->get(inum) : nullptr; }
-    ~InodeSession() { if (inode) { mgr_->put(inum_); inode = nullptr; } }
+        : mgr_(mgr), inum_(inum) {
+        inode = mgr_ ? mgr_->get(inum, &token) : nullptr;
+    }
+    ~InodeSession() { if (inode) { mgr_->put(inum_, token); inode = nullptr; } }
     explicit operator bool() const { return inode != nullptr; }
     void dirty() { if (inode) mgr_->mark_dirty(inum_); }
 
-    /* move-only，禁拷贝 */
-    InodeSession(InodeSession &&o) noexcept : mgr_(o.mgr_), inum_(o.inum_), inode(o.inode) {
+    /* move-only，禁拷贝；token 随会话搬移（RADIX 读锁归属跟随会话） */
+    InodeSession(InodeSession &&o) noexcept
+        : mgr_(o.mgr_), inum_(o.inum_), token(o.token), inode(o.inode) {
         o.inode = nullptr;
     }
     InodeSession &operator=(InodeSession &&o) noexcept {
         if (this != &o) {
-            if (inode) mgr_->put(inum_);
-            mgr_ = o.mgr_; inum_ = o.inum_; inode = o.inode;
+            if (inode) mgr_->put(inum_, token);
+            mgr_ = o.mgr_; inum_ = o.inum_; token = o.token; inode = o.inode;
             o.inode = nullptr;
         }
         return *this;
