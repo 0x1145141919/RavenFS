@@ -165,6 +165,51 @@ int main(int argc, char **argv) {
         (void)sum;
     }
 
+    /* ── 5. 冷路径（CPU 缓存层级）：大访问集 + shuffle，路径结构超 LLC ──
+     *
+     * 全热阶段（64 行循环）把根表/叶表/ctrl_word/数据页全焊在 L1/L2。
+     * 真实稀疏访问下路径结构会掉出 LLC（Meteor Lake 155H LLC = 24MB）：
+     *   100 万行 → 叶表 ~7813 个 × 4KB ≈ 31MB 结构 + 4GB 数据面，双双超 LLC；
+     *   shuffle 保证每行恰好触碰一次，路径无法被复用加热。
+     * 对比：全热 93ns / 直读 26.5µs。 */
+    {
+        const uint64_t NC = 1000000;
+        printf("\n── 冷路径：预热 %lu 行（顺序加载，结构 ~31MB > LLC 24MB） ──\n",
+               (unsigned long)NC);
+        const auto p0 = Clock::now();
+        for (uint64_t l = 1; l <= NC; l++) {
+            InodeSession s(&mgr, l * 16);
+            assert(s.inode);
+        }
+        const auto p1 = Clock::now();
+        printf("  预热 %lu 行: %.2fs（顺序懒加载，盘读 %lu 次 = %lu MB）\n",
+               (unsigned long)NC,
+               std::chrono::duration<double>(p1 - p0).count(),
+               (unsigned long)g_reads, (unsigned long)(g_read_bytes >> 20));
+
+        /* shuffle：每行恰好一次，路径冷 */
+        std::vector<uint64_t> cold_lines(NC);
+        for (uint64_t i = 0; i < NC; i++) cold_lines[i] = i + 1;
+        std::shuffle(cold_lines.begin(), cold_lines.end(), rng);
+
+        const uint64_t reads_before = g_reads;
+        const auto a = Clock::now();
+        uint64_t sum = 0;
+        for (uint64_t i = 0; i < NC; i++) {
+            const uint64_t inum = cold_lines[i] * 16 + (uint64_t)(cold_lines[i] % 16);
+            InodeSession s(&mgr, inum);
+            assert(s.inode);
+            sum += s.inode->link_count;
+        }
+        const auto b = Clock::now();
+        const double sec = std::chrono::duration<double>(b - a).count();
+        printf("  冷路径 session (100万次) : %8.1f ns/op  (%8.0f ops/s)\n",
+               ns_per(a, b, NC), NC / sec);
+        printf("  命中率校验: 盘读增量 %lu（应 ≈0，全部命中缓存）\n",
+               (unsigned long)(g_reads - reads_before));
+        (void)sum;
+    }
+
     printf("\n盘 I/O 统计: 读 %lu 次 (%lu MB) 写 %lu 次 (%lu MB)\n",
            (unsigned long)g_reads, (unsigned long)(g_read_bytes >> 20),
            (unsigned long)g_writes, (unsigned long)(g_write_bytes >> 20));
