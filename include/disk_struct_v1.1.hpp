@@ -34,6 +34,31 @@
  *    readdir 路径合成，不在树内）
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* ═══════════════════════════════════════════════════════════════════
+ * 结果码（全局共享，原居 ravenfs_v1.1.hpp，2026-08-22 下沉：
+ * inode_cache 等独立组件头不依赖上帝类头即可使用 RC_*）
+ * ═══════════════════════════════════════════════════════════════════ */
+typedef uint64_t result_code_t;
+
+/* ── 结果码 ── */
+enum : result_code_t {
+    RC_OK = 0,
+    RC_ERR_OPEN,            /* 设备打开失败 */
+    RC_ERR_MAGIC,           /* Primary SB magic 不符 */
+    RC_ERR_VERSION,         /* 版本 != RAVENFS_VERSION(v1.1=2) */
+    RC_ERR_CRC,             /* Primary SB crc32 校验失败 */
+    RC_ERR_BITMAP_SELF,     /* bitmap 自描述校验失败（尾巴三段非全 1） */
+    RC_ERR_EXIST,           /* 同名 dentry 已存在 */
+    RC_ERR_NOT_FOUND,       /* dentry 未找到 */
+    RC_ERR_NO_BLOCK,        /* FS_block 无空闲 */
+    RC_ERR_NO_INODE,        /* inode 槽无空闲 */
+    RC_ERR_NAME_LEN,        /* 名字 >40B（名字堆未实现） */
+    RC_ERR_IO,              /* pread/pwrite 失败 */
+    RC_ERR_STATE,           /* 内部状态异常（根节点角色不符等） */
+
+    RC_NEED_SPLIT = 0x1000, /* 内部使用：本层分裂，需父层处理 */
+};
+
 constexpr uint8_t INODE_TYPE_REGULAR=0;
 constexpr uint8_t INODE_TYPE_DIR=1;
 constexpr uint8_t INODE_TYPE_SOFT_SYM=2;
