@@ -1,24 +1,42 @@
 #pragma once
 #include "disk_struct_v1.1.hpp"
+#include <atomic>
 #include <shared_mutex>   /* slice_radix_tree::lock — 可睡眠读写锁（允许持锁等 I/O，不烧核） */
 #include "util/tsc.h"    /* x86_64 Invariant TSC：TTL 换算（绑死 x86_64） */
 class Inode_cache_mgr_t;
 class RavenFS_juvenile;
 enum cache_ctrl_state_t{
-    idle,
-    io_ing,
-    working,
+    idle,      /* 未载入（CAS 状态机：idle → io_ing → working） */
+    io_ing,    /* 他人加载中 / 本线程持有加载权 */
+    working,   /* 已就绪，可被占坑 */
     evicting   /* TTL 淘汰接管中：写回+释放进行时，get 忙等，完成后回 idle */
 };
+/* ═══════════════════════════════════════════════════════════════════
+ * ctrl_word 单原子字位域布局（state + flags + accessor 打包）：
+ *   [0,8)   state    —— CAS 状态机（idle/io_ing/working/evicting）
+ *   [8,24)  flags    —— 修饰位（CTRL_FLAG_DIRTY）
+ *   [24,56) accessor —— 会话占坑计数（32 位）
+ *
+ * 为什么打包：reap「accessor==0 才能接管淘汰」与 get「占坑 +accessor」
+ * 必须落在同一个原子操作上，否则存在 TOCTOU：
+ *   旧两字段方案：get 复核 state==working 通过后返回指针，reap 才 CAS
+ *   working→evicting 成功（其 accessor 检查读在 get 占坑之前）→ 页被 free，
+ *   已返回的指针悬垂。
+ * 打包后：占坑 = CAS(word, word + INC)（成功即占坑，无需复核）；
+ *         接管 = CAS(word, evicting)（CAS 前提含 working && accessor==0）
+ *         两个窗口同时关闭。
+ * ═══════════════════════════════════════════════════════════════════ */
+static constexpr uint64_t CTRL_STATE_MASK     = 0xFFull;
+static constexpr uint64_t CTRL_FLAGS_SHIFT    = 8;
+static constexpr uint64_t CTRL_ACCESSOR_SHIFT = 24;
+static constexpr uint64_t CTRL_ACCESSOR_INC   = 1ull << CTRL_ACCESSOR_SHIFT;
+static constexpr uint64_t CTRL_FLAG_DIRTY     = 1u << 0;   /* flags 域内位：页被修改，需回写 */
 struct Inode_cache_ctrl_t{
-    raven_Inode_t*cache_data;
-    uint64_t accss_stamp;
-    uint32_t numof_accessor;
-    uint16_t flags;
-    uint8_t state;//需要以cas状态切换的
+    raven_Inode_t *cache_data;          /* 页基址；working 发布/观察（ctrl_word release/acquire） */
+    std::atomic<uint64_t> accss_stamp;  /* 最近访问 TSC 戳（尽力而为，relaxed 读写） */
+    std::atomic<uint64_t> ctrl_word;    /* 位域见上：state/flags/accessor 单原子字 */
+    uint64_t blk;                       /* 本行块号（加载者 CAS io_ing 成功后写定，reap/flush 读） */
 };
-/* flags 位域（草稿）：state 枚举已接管 V/T 语义（有效/传输中），flags 留修饰位 */
-static constexpr uint16_t CTRL_FLAG_DIRTY = 1u << 0;   /* 页被修改，需回写 */
 struct cut_result_t{
     uint64_t main;
     uint64_t cut_out_section;
@@ -134,8 +152,9 @@ private:
     Inode_cache_cfg_t  cfg_;
     inode_cache_mode_t mode_;
     bool ready_ = false;
-    uint64_t ttl_ticks_ = 0;   /* 缓存行 TTL（TSC tick）：默认 2s（ctor 换算），set_ttl_ticks 调整；
-                                   slice 持 &ttl_ticks_ 共享，reap 扫描时读最新值 */
+    std::atomic<uint64_t> ttl_ticks_ = 0;   /* 缓存行 TTL（TSC tick）：默认 2s（ctor 换算），
+                                               set_ttl_ticks 调整；slice 持 &ttl_ticks_ 共享，
+                                               reap 扫描时读最新值（原子，防数据竞争） */
 
     /* ── FULL_RAM 分支 [1,12] ── 全量常驻，写回全量一口气（≤1MB，无脏页位图） */
     raven_Inode_t *full_ram_array_ = nullptr;   /* [inodes_count] 全量常驻 */
@@ -144,8 +163,9 @@ private:
      *    get 的 io_ing 态内 alloc+read 原子完成，析构 write-back+free */
     Inode_cache_ctrl_t *ctrl_array_ = nullptr;  /* [ctrl_count]，位置即身份：line = inum>>4 */
 
-    /* ── RADIX 分支 [19,52] ── 草稿：策略表已布置（inode_cache.cpp 内），
-     *    global_slice_plan 解析 + 分片树/片 RW 锁/准入淘汰待实装
+    /* ── RADIX 分支 [19,52] ── 分片树已实装：
+     *    global_slice_plan 按 statey 策略表解析（inode_cache.cpp 内），
+     *    slices_ = [2^level_bits[0]] 棵 slice_radix_tree
      *
      * 位域规划（bitfield_decode_plan_t）：按 bits_len_of_inodes_count 从最高位向下
      * 逐层切分（cut_high 递归），level_bits[0] = mgr 层分片选择宽度（slice 数 = 2^w0），
@@ -185,12 +205,12 @@ private:
      *                 blk = base + (raw>>row_bits) << (row_bits-4)
      *   budget_bytes：保留作统计；淘汰已改为 TTL 超时，不再做压力水位
      *   ttl_ticks   ：指向 mgr 的 ttl_ticks_（单一真相源，外部可运行期调整），
-     *                 reap 扫描时读最新值 */
+     *                 reap 扫描时读最新值（原子 load） */
     struct slice_radix_tree_cfg_t{
         const Inode_cache_cfg_t *host_cfg;
         bitfield_decode_plan_t   plan;
         uint8_t  row_bits;
-        const uint64_t *ttl_ticks;
+        const std::atomic<uint64_t> *ttl_ticks;
     };
 
     class slice_radix_tree{
@@ -198,28 +218,41 @@ private:
         const Inode_cache_cfg_t *host_cfg_ = nullptr;  /* 共享 mgr cfg：I/O/alloc/free/几何/预算 */
         bitfield_decode_plan_t   plan_ = {};           /* 树拓扑真相源（ctor 用，保留备析构/调试） */
         uint8_t  row_bits_        = 4;                 /* 行内位宽：blk = base + (raw>>row_bits_)<<(row_bits_-4) */
-        uint8_t  tree_levels_     = 0;                 /* 树层数 = plan_.total_levels - 1（ctor 派生） */
-        const uint64_t *ttl_ticks_ = nullptr;          /* 指向 mgr ttl_ticks_（共享真相源，reap 时读） */
-        /* 统计记账（仅写锁内修改；读锁临界区内不变 —— 只有写锁能动缓存行状态与表结构）：
-         * table_size_all_accumulate：根表→中间表→叶子表 全部表结构内存字节（元数据域）
-         * real_cache_accumulate   ：已驻留缓存行字节 = 行数 × (4096 << (row_bits_-4))（数据域）
+        uint8_t  tree_levels_     = 0;                 /* 树层数 = plan_.total_levels - 1（level_bits[0] 是 mgr 层） */
+        const std::atomic<uint64_t> *ttl_ticks_ = nullptr; /* 指向 mgr ttl_ticks_（共享真相源，reap 时原子读） */
+        /* 统计记账：
+         * table_size_all_accumulate：根表→中间表→叶子表 全部表结构内存字节（元数据域）。
+         *                             建表在建链写锁内进行 → 写锁内累加，普通成员即可。
+         * real_cache_accumulate   ：已驻留缓存行字节 = 行数 × (4096 << (row_bits_-4))（数据域）。
+         *                             页加载/淘汰发生在片读锁内（I/O 不持写锁）→ 原子累加，
+         *                             尽力而为统计，relaxed。
          * 用途：统计性能、数据 vs 元数据占比，为后续时空权衡调优提供依据
          * （元数据域过大时可缩小表项宽度 —— 换来额外 load/store，届时权衡） */
         uint64_t table_size_all_accumulate = 0;
-        uint64_t real_cache_accumulate    = 0;
+        std::atomic<uint64_t> real_cache_accumulate{0};
         /* ── 并发与结构 ── */
-        std::shared_mutex lock;                        /* 可睡眠读写锁：读共享/写独占，持锁可等 I/O（不烧核） */
-        void *root_table = nullptr;                    /* 根表：2^level_bits[1] 槽位数组；槽 = 子表 | 行控制器 */
+        std::shared_mutex lock_;                       /* 可睡眠读写锁：读共享/写独占，持锁可等 I/O（不烧核）
+                                                          * 读锁持有跨越 get→put 整个会话（get 手动 lock_shared，
+                                                          * put 手动 unlock_shared；会话内建链写锁被阻塞 →
+                                                          * 树只增不删，会话内 mark_dirty 可无锁走路径） */
+        void *root_ = nullptr;                         /* 根表：tree_levels_==1 → 叶表（ctrl_t 数组）；
+                                                          * 否则指针槽数组（槽 = 子表指针，nullptr = 未建） */
     public:
         explicit slice_radix_tree(const slice_radix_tree_cfg_t &cfg);
-        ~slice_radix_tree();                           /* 全部缓存：脏页写回 + 非脏丢弃 + 释放表 */
-        /* get：吃解析好的位域结果（树不解码）。先读锁假定一次命中；miss → 写锁 RAII 打通链路
-         * （建节点/控制器）后回头读锁。写锁刻意限制临界区（无 I/O），读锁刻意泄露到 put 释放 */
+        ~slice_radix_tree();                           /* 全部缓存：脏页写回 + 非脏丢弃 + 释放全部表 */
+        /* get：吃解析好的位域结果（树不解码）。先读锁假定一次命中；miss → 写锁打通链路
+         * （建中间表/叶表，无 I/O）后回头读锁。读锁刻意泄露到 put 释放 */
         raven_Inode_t *get(bitfield_decoded_result_t *decoded);
         /* put：释放 get 泄露的读锁 + 对应缓存行 accessor-1（行不被淘汰由 accessor>0 保证） */
         void put(bitfield_decoded_result_t *decoded);
-        /* reap_expired：专用淘汰线程经 mgr::reap_expired 调用 —— 写锁内回收本片
-         * 超时（now - accss_stamp > ttl_ticks_）且无访问者的行：脏写回 → 释放 → 摘除 */
+        /* mark_dirty：会话内调用（调用方已持本片读锁）——无锁走路径置 DIRTY。
+         * 安全前提：树只增不删 + 建链写锁被会话读锁阻塞 */
+        void mark_dirty(bitfield_decoded_result_t *decoded);
+        /* flush_all：读锁内 DFS 全量脏页写回（挂载/卸载同步点；宿主应保证与 reap 不并发） */
+        void flush_all();
+        /* reap_expired：专用淘汰线程经 mgr::reap_expired 调用 —— 读锁内 DFS 回收本片
+         * 超时（now - accss_stamp > ttl）且无访问者的行：脏写回 → 释放 → 回 idle（不摘表）。
+         * 为何不摘表：摘表需写锁，而 get 持读锁忙等 evicting → 写锁等读锁释放 → 死锁。 */
         void reap_expired();
 
         /* 禁拷贝/移动：shared_mutex 不可搬移，树持锁语义唯一 */
@@ -227,8 +260,29 @@ private:
         slice_radix_tree &operator=(const slice_radix_tree &) = delete;
         slice_radix_tree(slice_radix_tree &&) = delete;
         slice_radix_tree &operator=(slice_radix_tree &&) = delete;
+    private:
+        void *alloc_leaf();                            /* 叶表：ctrl_t 数组全 idle（写锁内） */
+        void *alloc_internal(uint8_t level);           /* 中间表：指针槽数组清零（写锁内） */
+        void ensure_path(bitfield_decoded_result_t *d);/* 写锁内：沿 decoded 路径补建缺失表 */
+        Inode_cache_ctrl_t *locate(bitfield_decoded_result_t *d); /* 读路径：无锁/读锁内皆可 */
+        void dfs_flush(void *table, uint8_t level);
+        void dfs_reap(void *table, uint8_t level, uint64_t now, uint64_t ttl);
+        void dfs_destroy(void *table, uint8_t level);
     };
     slice_radix_tree **slices_ = nullptr;   /* [2^level_bits[0]] 分片树（placement new，析构逐个释放） */
+    uint64_t n_slices_ = 0;                 /* = 2^level_bits[0]（RADIX 分支 ctor 派生） */
+
+    /* ── 缓存行级公共原语（CTRL_ARRAY 与 RADIX 共用同一状态机） ──
+     * ctrl_acquire ：懒加载状态机入口。返回 working 且 accessor 已 +1 的页基址；
+     *                I/O/alloc 失败回 idle 并返回 nullptr。out_loaded 置位 = 本调用
+     *                完成页加载（统计用）。忙等 io_ing/evicting（罕见路径）。
+     * ctrl_reap_one：单行 TTL 淘汰尝试。仅 working && accessor==0 && 超时的行可被
+     *                CAS 接管（原子前提）；成功后写回脏页 → 释放 → 回 idle。
+     *                返回 true = 已淘汰（调用方记账）。 */
+    static raven_Inode_t *ctrl_acquire(Inode_cache_ctrl_t *c, uint64_t blk, uint64_t page_bytes,
+                                       const Inode_cache_cfg_t &cfg, bool *out_loaded = nullptr);
+    static bool ctrl_reap_one(Inode_cache_ctrl_t *c, const Inode_cache_cfg_t &cfg,
+                              uint64_t now, uint64_t ttl);
     /* ── 几何换算（三模式共用） ── */
     uint64_t ctrl_count() const { return (cfg_.inodes_count + INODES_PER_PAGE - 1) >> ROW_BITS; }
     uint64_t line_of(uint64_t inum) const { return inum >> ROW_BITS; }
@@ -239,11 +293,14 @@ private:
     result_code_t ctor_ctrl_array();
     void flush_full_ram();
     void flush_ctrl_array();
+
+    /* RADIX：按 bits 查 statey 策略表（inode_cache.cpp 内实现，19~52 档） */
+    static uint8_t *statey_levels_of(uint8_t bits, uint8_t *out_levels);
 };
 
 /* ═══════════════════════════════════════════════════════════════════
  * InodeSession — RAII 会话（接口统一，决策见 209433a）
- * 锁只维护状态原子性，绝不持锁做 I/O；numof_accessor > 0 保证会话
+ * 锁只维护状态原子性，绝不持锁做 I/O；accessor > 0 保证会话
  * 期间行不被淘汰（RADIX 模式下语义，FULL_RAM/CTRL_ARRAY 天然安全）
  * ═══════════════════════════════════════════════════════════════════ */
 class InodeSession {
