@@ -7,7 +7,8 @@ class RavenFS_juvenile;
 enum cache_ctrl_state_t{
     idle,
     io_ing,
-    working
+    working,
+    evicting   /* TTL 淘汰接管中：写回+释放进行时，get 忙等，完成后回 idle */
 };
 struct Inode_cache_ctrl_t{
     raven_Inode_t*cache_data;
@@ -227,7 +228,7 @@ private:
         slice_radix_tree(slice_radix_tree &&) = delete;
         slice_radix_tree &operator=(slice_radix_tree &&) = delete;
     };
-    slice_radix_tree *slices_ = nullptr;   /* [2^level_bits[0]] 分片树（placement new，析构逐个释放） */
+    slice_radix_tree **slices_ = nullptr;   /* [2^level_bits[0]] 分片树（placement new，析构逐个释放） */
     /* ── 几何换算（三模式共用） ── */
     uint64_t ctrl_count() const { return (cfg_.inodes_count + INODES_PER_PAGE - 1) >> ROW_BITS; }
     uint64_t line_of(uint64_t inum) const { return inum >> ROW_BITS; }

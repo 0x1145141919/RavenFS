@@ -118,6 +118,16 @@ Inode_cache_mgr_t::bitfield_decoded_result_t Inode_cache_mgr_t::decode(uint64_t 
  * ═══════════════════════════════════════════════════════════════════ */
 Inode_cache_mgr_t::Inode_cache_mgr_t(const Inode_cache_cfg_t &cfg, result_code_t *rc_out)
     : cfg_(cfg), mode_(inode_cache_mode_of(cfg.bits_len_of_inodes_count)) {
+    /* TTL 初始化：cfg.ttl_ticks 优先；否则按 Invariant TSC 频率换算默认 2s。
+     * TSC 不可靠/无频率 → ttl_ticks_ 保持 0 = TTL 淘汰禁用（reap_expired 空转）。
+     * （绑死 x86_64：换算逻辑见 include/util/tsc.h，对齐 kernel tsc.cpp BARE_METAL 分支） */
+    if (cfg.ttl_ticks) {
+        ttl_ticks_ = cfg.ttl_ticks;
+    } else {
+        tsc_info_t tsc;
+        if (tsc_probe(&tsc)) ttl_ticks_ = tsc_ticks_of_seconds(2, tsc);
+    }
+
     result_code_t rc = RC_OK;
     switch (mode_) {
     case CACHE_MODE_FULL_RAM:   rc = ctor_full_ram();   break;
@@ -129,6 +139,11 @@ Inode_cache_mgr_t::Inode_cache_mgr_t(const Inode_cache_cfg_t &cfg, result_code_t
     }
     ready_ = (rc == RC_OK);
     if (rc_out) *rc_out = rc;
+}
+
+/* set_ttl_ticks：外部调整缓存行 TTL（tick）。slice 持 &ttl_ticks_ 共享，即时生效，无需逐片同步 */
+void Inode_cache_mgr_t::set_ttl_ticks(uint64_t ticks) {
+    ttl_ticks_ = ticks;
 }
 
 /* 析构：全生命周期收口 — 脏页回写 → 释放 */
@@ -194,12 +209,23 @@ raven_Inode_t *Inode_cache_mgr_t::get(uint64_t inum, slice_cache_acces_token_t *
     case CACHE_MODE_CTRL_ARRAY: {
         const uint64_t line = line_of(inum);
         Inode_cache_ctrl_t *c = &ctrl_array_[line];
-        /* 懒加载状态机：idle → io_ing(CAS) → I/O（不持锁）→ working
-         * 控制器全量常驻、数据页加载后常驻不淘汰 → 无 victim、
-         * 无 tag 比较，位置即身份 */
+        /* 懒加载状态机：idle → io_ing(CAS) → I/O（不持锁）→ working；
+         * TTL 淘汰（reap_expired）可能并发：working 行被 CAS 接管为 evicting
+         * （写回+释放进行中）。故命中后必须「先占坑(+accessor) 再复核 state」：
+         * 复核失败说明已被接管，退坑重试；加载完成也统一回顶部走占坑分支。
+         * evicting / io_ing 均忙等（罕见路径，reap 完成即回 idle）。 */
         for (;;) {
             uint8_t s = __atomic_load_n(&c->state, __ATOMIC_ACQUIRE);
-            if (s == working) break;                        /* 已就绪 */
+            if (s == working) {
+                __atomic_add_fetch(&c->numof_accessor, 1, __ATOMIC_RELAXED);
+                if (__atomic_load_n(&c->state, __ATOMIC_ACQUIRE) == working) {
+                    __atomic_store_n(&c->accss_stamp, rdtsc_timestamp(), __ATOMIC_RELAXED);
+                    break;
+                }
+                __atomic_sub_fetch(&c->numof_accessor, 1, __ATOMIC_RELAXED);   /* 退坑 */
+                cpu_relax();
+                continue;
+            }
             if (s == idle) {
                 uint8_t expect = idle;
                 if (__atomic_compare_exchange_n(&c->state, &expect, io_ing, false,
@@ -220,15 +246,13 @@ raven_Inode_t *Inode_cache_mgr_t::get(uint64_t inum, slice_cache_acces_token_t *
                     }
                     c->cache_data = page;   /* working 发布前写定，ACQUIRE 观察方可见 */
                     __atomic_store_n(&c->state, working, __ATOMIC_RELEASE);
-                    break;
+                    continue;               /* 统一回顶部走占坑分支 */
                 }
                 /* CAS 失败 → 他人已接管，回循环顶部看最新状态 */
-            } else {                                        /* io_ing：他人 I/O 中，忙等 */
+            } else {                        /* io_ing：他人加载中；evicting：淘汰接管中 */
                 cpu_relax();
             }
         }
-        __atomic_add_fetch(&c->numof_accessor, 1, __ATOMIC_RELAXED);
-        c->accss_stamp = rdtsc_timestamp();
         return &c->cache_data[row_of(inum)];
     }
 
@@ -297,5 +321,51 @@ void Inode_cache_mgr_t::flush_ctrl_array() {
             cfg_.write_page(cfg_.io_ctx, blk_of(i), c->cache_data);
             __atomic_and_fetch(&c->flags, (uint16_t)~CTRL_FLAG_DIRTY, __ATOMIC_RELEASE);
         }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * reap_expired — 专用淘汰线程周期调用：回收全部「超时 && 无访问者」的行
+ *
+ * TTL 淘汰（非压力淘汰）：inode 缓存行小（4K/8K），真正需要压力淘汰的是
+ * 文件数据缓存；这里只做时间戳超时回收。
+ * 并发安全（与 get 共用 CAS 状态机）：
+ *   - 仅 working && accessor==0 && 超时 的行可被接管（get 已占坑的必不满足）
+ *   - 接管 = CAS working→evicting，之后无锁 I/O（写回+释放），完成后回 idle
+ *   - get 在 evicting 上忙等，回 idle 后重新懒加载
+ * 注意：与 flush_all 不同，reap 不要求与 get 互斥；但宿主应在卸载前先停淘汰线程。
+ * ═══════════════════════════════════════════════════════════════════ */
+void Inode_cache_mgr_t::reap_expired() {
+    if (!ttl_ticks_) return;              /* 无 TTL 时钟（TSC 不可靠）：淘汰禁用 */
+    const uint64_t now = rdtsc_timestamp();
+
+    switch (mode_) {
+    case CACHE_MODE_CTRL_ARRAY: {
+        const uint64_t n = ctrl_count();
+        for (uint64_t i = 0; i < n; i++) {
+            Inode_cache_ctrl_t *c = &ctrl_array_[i];
+            if (__atomic_load_n(&c->state, __ATOMIC_ACQUIRE) != working) continue;
+            if (__atomic_load_n(&c->numof_accessor, __ATOMIC_RELAXED) != 0) continue;
+            if (now - __atomic_load_n(&c->accss_stamp, __ATOMIC_RELAXED) <= ttl_ticks_) continue;
+
+            uint8_t expect = working;
+            if (__atomic_compare_exchange_n(&c->state, &expect, evicting, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                /* 接管成功：无锁 I/O 写回 → 释放 → 回 idle（get 忙等后重载） */
+                if (__atomic_load_n(&c->flags, __ATOMIC_ACQUIRE) & CTRL_FLAG_DIRTY)
+                    cfg_.write_page(cfg_.io_ctx, blk_of(i), c->cache_data);
+                cfg_.free(cfg_.io_ctx, c->cache_data);
+                c->cache_data = nullptr;
+                __atomic_and_fetch(&c->flags, (uint16_t)~CTRL_FLAG_DIRTY, __ATOMIC_RELEASE);
+                __atomic_store_n(&c->state, idle, __ATOMIC_RELEASE);
+            }
+        }
+        break;
+    }
+    case CACHE_MODE_RADIX_SHARD:
+        /* 逐片转发：RADIX 实装后 for 每片 slice->reap_expired()（TODO） */
+        break;
+    default:
+        break;   /* FULL_RAM：全量常驻，无淘汰 */
     }
 }
