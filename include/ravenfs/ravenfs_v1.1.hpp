@@ -47,12 +47,37 @@ struct dentry_bptree_path_t {
     bool  is_finally_hit;
     // bool  is_break_biggest_record;
 };
+enum ravenfs_device_type_t{
+    DEV_LOOP_IMG, DEV_NVME, DEV_SATA_SSD, DEV_SATA_HDD, DEV_UNKNOWN,
+};
+struct ravenfs_mount_device_t{
+    int fd;                 /* 外部打开并负责关闭；类只借不关 */
+    uint8_t lba_size_log2;  /* 设备逻辑块大小 log2（512e→9，4Kn→12） */
+    ravenfs_device_type_t type;
+    bool is_device_direct;  /* 外部是否以 O_DIRECT 打开 */
+};
+struct ravenfs_mount_param_t{
+    bool if_will_use_inode_cache;
+    bool if_will_use_block_cache;
+    bool is_readonly;       /* true=只读挂载（rfs-audit），须配 is_device_direct=false */
+};
+struct linux_userspace_mount_t{
+    ravenfs_mount_device_t dev;
+    ravenfs_mount_param_t param;
+    uint32_t logical_processor_count;//自己想办法，找地方读取
+};
 class RavenFS_juvenile {
 public:
-    /* 构造即挂载：打开设备 → 读 Primary SB → 四连验 → 双位图全量入内存。
+    /* 构造即挂载：fd 由外部打开并提供（生命周期完全归外部，类只借不关）。
+     * 挂载 = 读 Primary SB → 四连验（magic/version/crc32/bitmap 自描述）
+     *      → 双位图全量入内存。
+     * 无状态：设备参数（fd/LBA 大小/类型/直写/readonly）全部来自调用者
+     * 结构体，类不做设备几何的内部推导与校验——设备探测是外部职责。
+     * 契约：param.is_readonly=true 必须搭配 dev.is_device_direct=false
+     * （rfs-audit 静态 mmap 审核专用）；readonly 下析构不 flush 位图。
      * 失败时 *res_code 给出 RC_ERR_*，对象处于未挂载态（fd=-1）。 */
-    RavenFS_juvenile(const char *blk_device_path, uint64_t *res_code);
-    ~RavenFS_juvenile();            /* 析构即卸载：释放位图内存 + 关 fd */
+    RavenFS_juvenile(const linux_userspace_mount_t &mnt, uint64_t *res_code);
+    ~RavenFS_juvenile();            /* 析构即卸载：释放位图内存（readonly 跳过 flush）；fd 归外部，不关 */
 
     RavenFS_juvenile(const RavenFS_juvenile &) = delete;
     RavenFS_juvenile &operator=(const RavenFS_juvenile &) = delete;
@@ -90,13 +115,20 @@ public:
     void dump_info() const;                     /* SB/几何/位图占用率/根节点 */
 
 private:
+    struct file_blk_interval_t{
+        uint64_t logical_blkbase;
+        uint64_t len;
+    };//管辖[logical_blkbase,logical_blkbase+len]的闭区间
     result_code_t dir_insert_dentry(uint64_t inode_idx,const char *name);
 
     result_code_t dir_rm_dentry(uint64_t inode_idx,const char *name);
 
     result_code_t dir_lookup(uint64_t inode_idx,const char *name, uint64_t *out_inum);
     int64_t dir_readdir(uint64_t inode_idx,dentry_out **out_buf);
-/* ══════════════════════════════════════════════════════════
+
+    result_code_t file_interval_acclaim(uint64_t inode_idx,file_blk_interval_t interval);
+    result_code_t file_interval_deacclaim(uint64_t inode_idx,file_blk_interval_t interval);
+    /* ══════════════════════════════════════════════════════════
      * 位图接口组 A：FS_block 分配器（全量内存 bitmap）
      *   内存：block_bits[bitmap_blocks×4096]，bit i ↔ FS_block[i]
      *   元数据尾巴三段在 mkfs 已亮灯，alloc 天然跳过，无需特判。
@@ -165,7 +197,11 @@ private:
     };
 
     /* ── 内部状态 ── */
-    int  fd = -1;                       /* 设备 fd */
+    int  fd = -1;                       /* 设备 fd（外部借入，不负责关闭）；-1=未挂载 */
+    ravenfs_mount_param_t param{};      /* 挂载选项（ctor 无条件从结构体拷贝；{} 防析构读未初始化） */
+    ravenfs_device_type_t dev_type = DEV_UNKNOWN; /* 设备类别（ctor 从结构体拷贝） */
+    uint8_t  lba_size_log2 = 0;         /* 设备逻辑块大小 log2（ctor 从结构体拷贝；0=未设置，无默认假设） */
+    bool     is_device_direct = false;  /* O_DIRECT（ctor 从结构体拷贝） */
     RavenSuperblock sb;                 /* Primary SB（挂载时读入） */
 
     uint64_t total_blocks   = 0;
@@ -240,3 +276,9 @@ bool is_extent_node(Bptree_meta_t*meta);
 bool tmp_name_len_limiter(const char*name);
 /* 节点最大 hash：叶子末项 entry.hash / 内部末项 hint.hash_max */
 uint64_t node_max_hash(const void *node_buf);
+
+/* 8K 对齐临时缓冲轮子：内部节点（Bptree_*_node_t = 8192B）临时分配用。
+ * 8K 对齐双满足：节点整块对齐（结构体直读）+ O_DIRECT 直写对齐（≥逻辑块）。
+ * alloc 失败返回 nullptr；free(nullptr) 安全。 */
+void *node_buf_alloc();
+void  node_buf_free(void *p);

@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <new>
 bool tmp_name_len_limiter(const char*name){
     return strlen(name)<=39;
@@ -36,6 +37,16 @@ bool is_dentry_node(Bptree_meta_t *meta)
     meta->magics[2]==DENTRY_MAGIC3&&
     meta->magics[3]==DENTRY_MAGIC4;
 }
+/* ═══════════════════════════════════════════════════════════════
+ * 8K 节点临时缓冲轮子（node_buf_alloc / node_buf_free）
+ * 内部节点临时分配必须 8K 对齐：结构体直读 + O_DIRECT 直写双满足。
+ * ═══════════════════════════════════════════════════════════════ */
+void *node_buf_alloc() {
+    void *p = nullptr;
+    if (posix_memalign(&p, 8192, 8192) != 0) return nullptr;
+    return p;
+}
+void node_buf_free(void *p) { free(p); }
 /* ═══════════════════════════════════════════════════════════════
  * CRC32（Castagnoli 0xEDB88320，查表）— SB 校验用
  * ═══════════════════════════════════════════════════════════════ */
@@ -173,25 +184,36 @@ uint64_t RavenFS_juvenile::name_hash(const char *name) const {
 }
 /* ── 获取节点最大 hash（叶子末项 hash 或内部末项 hint.hash_max） ── */
 
-RavenFS_juvenile::RavenFS_juvenile(const char *blk_device_path, uint64_t *res_code) {
+RavenFS_juvenile::RavenFS_juvenile(const linux_userspace_mount_t &mnt, uint64_t *res_code) {
     if (res_code) *res_code = RC_ERR_OPEN;   /* 默认失败态 */
 
-    fd = ::open(blk_device_path, O_RDWR);
-    if (fd < 0) { if (res_code) *res_code = RC_ERR_OPEN; return; }
+    /* 无状态消费：全部参数来自调用者结构体，类不做设备几何的内部推导/校验
+     * （设备探测是外部职责）。fd 生命周期归外部：只借不关。 */
+    fd = mnt.dev.fd;
+    param = mnt.param;
+    dev_type = mnt.dev.type;
+    lba_size_log2 = mnt.dev.lba_size_log2;
+    is_device_direct = mnt.dev.is_device_direct;
 
-    /* ── 读 Primary Superblock ── */
+    /* 契约（结构体自述）：readonly（rfs-audit 静态 mmap 审核）不得配 O_DIRECT */
+    if (param.is_readonly && is_device_direct) {
+        if (res_code) *res_code = RC_ERR_STATE;
+        return;
+    }
+
+    /* ── 读 Primary Superblock（fd byte[0,4096)，block_model §4.1）── */
     if (pread(fd, &sb, sizeof(sb), 0) != (ssize_t)sizeof(sb)) {
-        close(fd); fd = -1;
+        fd = -1;
         if (res_code) *res_code = RC_ERR_IO;
         return;
     }
     if (sb.magic != SUPERBLOCK_MAGIC) {
-        close(fd); fd = -1;
+        fd = -1;
         if (res_code) *res_code = RC_ERR_MAGIC;
         return;
     }
     if (sb.version != RAVENFS_VERSION) {
-        close(fd); fd = -1;
+        fd = -1;
         if (res_code) *res_code = RC_ERR_VERSION;
         return;
     }
@@ -199,7 +221,7 @@ RavenFS_juvenile::RavenFS_juvenile(const char *blk_device_path, uint64_t *res_co
         RavenSuperblock sb_copy = sb;
         sb_copy.crc32 = 0;
         if (sb.crc32 != crc32_compute(&sb_copy, sizeof(sb_copy))) {
-            close(fd); fd = -1;
+            fd = -1;
             if (res_code) *res_code = RC_ERR_CRC;
             return;
         }
@@ -217,7 +239,7 @@ RavenFS_juvenile::RavenFS_juvenile(const char *blk_device_path, uint64_t *res_co
 
     /* ── 双位图全量入内存 + 自描述校验 ── */
     if (!bitmaps_load()) {
-        close(fd); fd = -1;
+        fd = -1;
         if (res_code) *res_code = RC_ERR_BITMAP_SELF;
         return;
     }
@@ -229,7 +251,7 @@ RavenFS_juvenile::RavenFS_juvenile(const char *blk_device_path, uint64_t *res_co
     if (root_inode.type != INODE_TYPE_DIR || root_inode.data_root == PTR_INVALID) {
         delete[] block_bits; block_bits = nullptr;
         delete[] inode_bits; inode_bits = nullptr;
-        close(fd); fd = -1;
+        fd = -1;
         if (res_code) *res_code = RC_ERR_STATE;
         return;
     }
@@ -238,13 +260,13 @@ RavenFS_juvenile::RavenFS_juvenile(const char *blk_device_path, uint64_t *res_co
     if (res_code) *res_code = RC_OK;
 }
 
-/* 析构即卸载：双位图全量写回 → 释放内存 → 关 fd */
+/* 析构即卸载：双位图全量写回（readonly 跳过）→ 释放内存。
+ * fd 生命周期归外部（借入不关）。 */
 RavenFS_juvenile::~RavenFS_juvenile() {
-    if (fd >= 0 && block_bits && inode_bits)
+    if (!param.is_readonly && fd >= 0 && block_bits && inode_bits)
         bitmaps_flush();
     delete[] block_bits; block_bits = nullptr;
     delete[] inode_bits; inode_bits = nullptr;
-    if (fd >= 0) { close(fd); fd = -1; }
 }
 
 /* ═══════════════════════════════════════════════════════════════

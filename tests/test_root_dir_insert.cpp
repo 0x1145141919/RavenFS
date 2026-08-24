@@ -26,6 +26,26 @@
 #include <cstring>
 #include <set>
 
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+
+/* 打开设备并填挂载结构体：LBA_size 用 BLKSSZGET 探测（普通文件回退 4096）。
+ * fd 生命周期归调用者（类只借不关）；测试末尾统一 ::close。 */
+static linux_userspace_mount_t make_mount(const char *path) {
+    linux_userspace_mount_t mnt{};
+    mnt.dev.fd = ::open(path, O_RDWR);
+    int lba = 4096;
+    if (::ioctl(mnt.dev.fd, BLKSSZGET, &lba) != 0 || lba <= 0) lba = 4096;
+    mnt.dev.lba_size_log2 = (uint8_t)__builtin_ctz((unsigned)lba);
+    mnt.dev.type = DEV_UNKNOWN;
+    mnt.dev.is_device_direct = false;
+    mnt.param = {};
+    mnt.logical_processor_count = 1;
+    return mnt;
+}
+
 static int g_pass = 0, g_fail = 0;
 
 #define CHECK(cond, fmt, ...)                                                \
@@ -238,9 +258,12 @@ int main(int argc, char **argv) {
     uint64_t rc = 0;
     uint64_t inserted = 0;      /* 成功插入的条目数 */
 
+    linux_userspace_mount_t mnt = make_mount(argv[1]);
+    if (mnt.dev.fd < 0) { printf("open %s failed\n", argv[1]); return 2; }
+
     /* ══ Phase 0~2：挂载 → 边界 → 批量（作用域块，析构时位图全量写回） ══ */
     {
-    RavenFS_juvenile fs(argv[1], &rc);
+    RavenFS_juvenile fs(mnt, &rc);
     CHECK(fs.is_mounted(), "mount rc=%s", rc_name(rc));
     if (!fs.is_mounted()) {
         printf("挂载失败，测试中止（先确认已 mkfs）\n");
@@ -331,13 +354,14 @@ int main(int argc, char **argv) {
     /* ══ Phase 3：持久化（析构 flush → 重挂载；fs 已卸载） ══ */
     printf("\n--- Phase 3: 持久化验证（重挂载） ---\n");
     {
-        RavenFS_juvenile fs2(argv[1], &rc);
+        RavenFS_juvenile fs2(mnt, &rc);
         CHECK(fs2.is_mounted(), "重挂载 rc=%s", rc_name(rc));
         if (fs2.is_mounted()) {
             fs2.dump_info();
             verify_tree(fs2, inserted, "重挂载后");
         }
     }
+    ::close(mnt.dev.fd);
 
     /* ══ 汇总 ══ */
     printf("\n════════════════════════════════════════════════\n"
