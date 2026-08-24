@@ -244,13 +244,23 @@ RavenFS_juvenile::RavenFS_juvenile(const linux_userspace_mount_t &mnt, uint64_t 
         return;
     }
 
+    /* ── 分片初始化：slice_count 计算 + 双组逐片 enable_slice ── */
+    if (!slices_setup(mnt.logical_processor_count)) {
+        free(block_bits); block_bits = nullptr;
+        free(inode_bits); inode_bits = nullptr;
+        fd = -1;
+        if (res_code) *res_code = RC_ERR_STATE;
+        return;
+    }
+
     /* ── root inode：取 dentry 树根块号 ── */
     root_inum = sb.root_inode;
     raven_Inode_t root_inode;
     inode_read(root_inum, &root_inode);
     if (root_inode.type != INODE_TYPE_DIR || root_inode.data_root == PTR_INVALID) {
-        delete[] block_bits; block_bits = nullptr;
-        delete[] inode_bits; inode_bits = nullptr;
+        slices_teardown();
+        free(block_bits); block_bits = nullptr;
+        free(inode_bits); inode_bits = nullptr;
         fd = -1;
         if (res_code) *res_code = RC_ERR_STATE;
         return;
@@ -260,13 +270,14 @@ RavenFS_juvenile::RavenFS_juvenile(const linux_userspace_mount_t &mnt, uint64_t 
     if (res_code) *res_code = RC_OK;
 }
 
-/* 析构即卸载：双位图全量写回（readonly 跳过）→ 释放内存。
+/* 析构即卸载：双位图全量写回（readonly 跳过）→ 拆片 → 释放位图内存。
  * fd 生命周期归外部（借入不关）。 */
 RavenFS_juvenile::~RavenFS_juvenile() {
     if (!param.is_readonly && fd >= 0 && block_bits && inode_bits)
         bitmaps_flush();
-    delete[] block_bits; block_bits = nullptr;
-    delete[] inode_bits; inode_bits = nullptr;
+    slices_teardown();
+    free(block_bits); block_bits = nullptr;
+    free(inode_bits); inode_bits = nullptr;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -317,15 +328,15 @@ void RavenFS_juvenile::inode_write(uint64_t inum, const raven_Inode_t *in) {
  * 位图核心
  * ═══════════════════════════════════════════════════════════════ */
 
-/* mount：读入双位图 + 自描述校验（block_model §6.6）
+/* mount：读入双位图（4K 对齐分配）+ 自描述校验（block_model §6.6）+ 填 descriptor
  * 校验点：bitmap 自身区域 [bitmap_start, total_blocks) 全 1
  *         inode 元数据区域 [inode_bm_base, bitmap_start) 全 1
  *         inode 位图 bit0（root inode）必须为 1 */
 bool RavenFS_juvenile::bitmaps_load() {
-    try {
-        block_bits = new uint8_t[bitmap_blocks * 4096];
-        inode_bits = new uint8_t[inode_bm_blocks * 4096];
-    } catch (const std::bad_alloc &) {
+    if (posix_memalign((void **)&block_bits, 4096, bitmap_blocks * 4096) != 0)
+        return false;
+    if (posix_memalign((void **)&inode_bits, 4096, inode_bm_blocks * 4096) != 0) {
+        free(block_bits); block_bits = nullptr;
         return false;
     }
 
@@ -343,11 +354,19 @@ bool RavenFS_juvenile::bitmaps_load() {
         if (!(block_bits[i / 8] & (1u << (i % 8)))) goto fail;
     if (!(inode_bits[0] & 1u)) goto fail;   /* root inode 亮灯 */
 
+    /* 填 descriptor：bit i ↔ FS_block[i] / inode[i]（FS_blk_base=0） */
+    block_bitsmap_descriptor.FS_blk_base = 0;
+    block_bitsmap_descriptor.bitmap_raw = reinterpret_cast<uint64_t *>(block_bits);
+    block_bitsmap_descriptor.bits_count = bitmap_blocks * 4096 * 8;
+    inode_bitsmap_descriptor.FS_blk_base = 0;
+    inode_bitsmap_descriptor.bitmap_raw = reinterpret_cast<uint64_t *>(inode_bits);
+    inode_bitsmap_descriptor.bits_count = inode_bm_blocks * 4096 * 8;
+
     return true;
 
 fail:
-    delete[] block_bits; block_bits = nullptr;
-    delete[] inode_bits; inode_bits = nullptr;
+    free(block_bits); block_bits = nullptr;
+    free(inode_bits); inode_bits = nullptr;
     return false;
 }
 
@@ -359,90 +378,140 @@ void RavenFS_juvenile::bitmaps_flush() {
            (off_t)fblock_to_byte(inode_bm_base));
 }
 
-/* 置位/清位（内存态） */
-void RavenFS_juvenile::bm_set(uint8_t *bits, uint64_t bit, bool v) {
-    if (v) bits[bit / 8] |=  (uint8_t)(1u << (bit % 8));
-    else   bits[bit / 8] &= (uint8_t)~(1u << (bit % 8));
+/* ═══════════════════════════════════════════════════════════════
+ * 分片初始化 / 拆除
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* 分片初始化：slice_count = min(2^n 上界(cpu), 双位图满片数约束)，
+ * 且保证末片非空（(n-1)*per < nbits 不满足则 n 减半，n 保持 2 幂）。
+ * 每片 slice_bitscount = 名义片长（32768 倍数，末片可短），
+ * slice_base 4K 对齐（begin/8 = 4096 倍数）；逐片 enable_slice。
+ * 失败 → false（内部已清理 slices 数组）。 */
+bool RavenFS_juvenile::slices_setup(uint32_t cpu_count) {
+    const uint64_t blk_nbits = block_bitsmap_descriptor.bits_count;
+    const uint64_t ino_nbits = inode_bitsmap_descriptor.bits_count;
+
+    /* 2^n 上界(cpu) */
+    uint64_t n = 1;
+    while (n < cpu_count && n < (1ULL << 30)) n <<= 1;
+    /* 满片数约束：每片 ≥ 32768 bit（4K 对齐下限） */
+    uint64_t blk_cap = blk_nbits / 32768, ino_cap = ino_nbits / 32768;
+    uint64_t cap = blk_cap < ino_cap ? blk_cap : ino_cap;
+    if (cap == 0) cap = 1;
+    if (n > cap) n = cap;
+    /* 末片非空迭代 */
+    for (;;) {
+        uint64_t per_b = ((blk_nbits + n - 1) / n + 32767) / 32768 * 32768;
+        uint64_t per_i = ((ino_nbits + n - 1) / n + 32767) / 32768 * 32768;
+        if (per_b == 0) per_b = 32768;
+        if (per_i == 0) per_i = 32768;
+        if ((n - 1) * per_b < blk_nbits && (n - 1) * per_i < ino_nbits) break;
+        if (n == 1) break;
+        n >>= 1;
+    }
+    slice_count = (uint32_t)n;
+
+    try {
+        block_bitmap_slices = new bitmap_slice_t[slice_count];
+        inode_bitmap_slices = new bitmap_slice_t[slice_count];
+    } catch (const std::bad_alloc &) {
+        block_bitmap_slices = nullptr;
+        inode_bitmap_slices = nullptr;
+        return false;
+    }
+
+    /* block 组切分 */
+    block_per_slice_bits = ((blk_nbits + slice_count - 1) / slice_count + 32767) / 32768 * 32768;
+    if (block_per_slice_bits == 0) block_per_slice_bits = 32768;
+    for (uint64_t i = 0; i < slice_count; i++) {
+        uint64_t begin = i * block_per_slice_bits;
+        uint64_t cnt = blk_nbits - begin;
+        if (cnt > block_per_slice_bits) cnt = block_per_slice_bits;
+        slice_config_t cfg;
+        cfg.slice_base = block_bits + begin / 8;
+        cfg.slice_bitscount = cnt;
+        if (block_bitmap_slices[i].enable_slice(&block_bitsmap_descriptor, cfg) != RC_OK)
+            goto fail;
+    }
+    /* inode 组切分；片 0 的 hint 跳过 bit 0（root inode 保留） */
+    inode_per_slice_bits = ((ino_nbits + slice_count - 1) / slice_count + 32767) / 32768 * 32768;
+    if (inode_per_slice_bits == 0) inode_per_slice_bits = 32768;
+    for (uint64_t i = 0; i < slice_count; i++) {
+        uint64_t begin = i * inode_per_slice_bits;
+        uint64_t cnt = ino_nbits - begin;
+        if (cnt > inode_per_slice_bits) cnt = inode_per_slice_bits;
+        slice_config_t cfg;
+        cfg.slice_base = inode_bits + begin / 8;
+        cfg.slice_bitscount = cnt;
+        if (inode_bitmap_slices[i].enable_slice(&inode_bitsmap_descriptor, cfg) != RC_OK)
+            goto fail;
+    }
+    if (slice_count > 0) inode_bitmap_slices[0].set_hint(1);   /* 跳过 root */
+    return true;
+
+fail:
+    delete[] block_bitmap_slices; block_bitmap_slices = nullptr;
+    delete[] inode_bitmap_slices; inode_bitmap_slices = nullptr;
+    return false;
 }
 
-/* 单 bit first-fit（inode 组用） */
-uint64_t RavenFS_juvenile::bm_alloc_first(uint8_t *bits, uint64_t nbits, uint64_t start) {
-    for (uint64_t i = start; i < nbits; i++)
-        if (!(bits[i / 8] & (1u << (i % 8)))) return i;
-    return PTR_INVALID;
+void RavenFS_juvenile::slices_teardown() {
+    delete[] block_bitmap_slices; block_bitmap_slices = nullptr;
+    delete[] inode_bitmap_slices; inode_bitmap_slices = nullptr;
 }
 
-/* 区间分配：从 start 起找 count 个连续空闲 bit，起始位 2^align_log2 对齐。
- * 返回起始位号或 PTR_INVALID。 */
-uint64_t RavenFS_juvenile::bm_alloc_range(uint8_t *bits, uint64_t nbits,
-                                          uint64_t count, uint8_t align_log2,
-                                          uint64_t start) {
-    if (count == 0 || count > nbits) return PTR_INVALID;
-    uint64_t align = 1ULL << (align_log2 > 52 ? 52 : align_log2);
-    if (align == 0) return PTR_INVALID;
+/* ═══════════════════════════════════════════════════════════════
+ * 位图接口组 A：FS_block 分配器（分片路由）
+ *
+ * 锁纪律：分配走 try（拿不到锁换片，仿 FPA::alloc spintrylock_try_guard）；
+ * 释放走自旋重试（释放不可丢，仿 FPA::free spintrylock_spin_guard）。
+ * ═══════════════════════════════════════════════════════════════ */
 
-    uint64_t i = start;
-    if (i % align) i = ((i + align - 1) / align) * align;
-    for (; i + count <= nbits; i += align) {
-        bool free_run = true;
-        for (uint64_t j = i; j < i + count; j++) {
-            if (bits[j / 8] & (1u << (j % 8))) { free_run = false; break; }
-        }
-        if (free_run) return i;
+/* 硬分配：count 连续 + 对齐，单片内完成（不跨片）；失败 PTR_INVALID */
+uint64_t RavenFS_juvenile::block_alloc_hard(uint64_t require_count, uint8_t align_log2) {
+    if (require_count == 0 || !block_bitmap_slices || slice_count == 0) return PTR_INVALID;
+    for (uint64_t round = 0; round < slice_count; round++) {
+        uint64_t idx = (block_preferred_slice + round) % slice_count;
+        bitmap_slice_t &s = block_bitmap_slices[idx];
+        if (!s.slice_lock.try_lock_write()) continue;      /* 锁忙换片 */
+        uint64_t out = 0;
+        result_code_t rc = s.alloc_hard(align_log2, require_count, out);
+        s.slice_lock.unlock_write();
+        if (rc == RC_OK) { block_preferred_slice = idx; return out; }
     }
     return PTR_INVALID;
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * 位图接口组 A：FS_block 分配器
- * ═══════════════════════════════════════════════════════════════ */
-
-/* 硬分配：count 连续 + 对齐，原子；失败 PTR_INVALID（不部分分配） */
-uint64_t RavenFS_juvenile::block_alloc_hard(uint64_t require_count, uint8_t align_log2) {
-    if (require_count == 0) return PTR_INVALID;
-
-    uint64_t blk = bm_alloc_range(block_bits, total_blocks, require_count, align_log2, bm_cursor);
-    if (blk == PTR_INVALID)   /* 游标段碎片 → 绕回 2 再试一次 */
-        blk = bm_alloc_range(block_bits, total_blocks, require_count, align_log2, 2);
-    if (blk == PTR_INVALID) return PTR_INVALID;
-
-    for (uint64_t i = 0; i < require_count; i++)
-        bm_set(block_bits, blk + i, true);
-
-    bm_cursor = blk + require_count;   /* 游标推进 */
-    return blk;
-}
-
-/* 软分配：第一个 ≥1 连续区间，实际分配 min(区间长, require)；
- * *remain_count = 缺口数（require − 实际）；一块没有 → PTR_INVALID */
+/* 软分配：一次只从单片取（preferred 优先），实际 = min(区间长, require)；
+ * *remain_count = 缺口数；一块没有 → PTR_INVALID。 */
 uint64_t RavenFS_juvenile::block_alloc_soft(uint64_t require_count, uint64_t *remain_count) {
     if (remain_count) *remain_count = require_count;
-    if (require_count == 0) return PTR_INVALID;
-
-    uint64_t start = bm_alloc_first(block_bits, total_blocks, bm_cursor);
-    if (start == PTR_INVALID)
-        start = bm_alloc_first(block_bits, total_blocks, 2);   /* 绕回 */
-    if (start == PTR_INVALID) return PTR_INVALID;
-
-    uint64_t run = 0;                    /* 连续空闲长度 */
-    while (start + run < total_blocks &&
-           !(block_bits[(start + run) / 8] & (1u << ((start + run) % 8))))
-        run++;
-
-    uint64_t got = run < require_count ? run : require_count;
-    for (uint64_t i = 0; i < got; i++)
-        bm_set(block_bits, start + i, true);
-
-    bm_cursor = start + got;
-    if (remain_count) *remain_count = require_count - got;
-    return start;
+    if (require_count == 0 || !block_bitmap_slices || slice_count == 0) return PTR_INVALID;
+    for (uint64_t round = 0; round < slice_count; round++) {
+        uint64_t idx = (block_preferred_slice + round) % slice_count;
+        bitmap_slice_t &s = block_bitmap_slices[idx];
+        if (!s.slice_lock.try_lock_write()) continue;
+        uint64_t out = 0, left = require_count;
+        result_code_t rc = s.alloc_soft(0, require_count, out, left);
+        s.slice_lock.unlock_write();
+        if (rc == RC_OK) {
+            block_preferred_slice = idx;
+            if (remain_count) *remain_count = left;
+            return out;
+        }
+    }
+    return PTR_INVALID;
 }
 
-/* 区间释放 */
+/* 区间释放：定位所属片（blkbase / 名义片长）→ 自旋拿写锁 → 清位 */
 void RavenFS_juvenile::block_free(uint64_t blkbase, uint64_t count) {
-    if (count == 0) return;
-    for (uint64_t i = 0; i < count; i++)
-        bm_set(block_bits, blkbase + i, false);
+    if (count == 0 || !block_bitmap_slices || slice_count == 0) return;
+    uint64_t idx = blkbase / block_per_slice_bits;
+    if (idx >= slice_count) return;
+    bitmap_slice_t &s = block_bitmap_slices[idx];
+    while (!s.slice_lock.try_lock_write()) { /* 释放不可丢，自旋等 */ }
+    s.free_interval(blkbase, count);
+    s.slice_lock.unlock_write();
 }
 
 bool RavenFS_juvenile::block_test(uint64_t blk) const {
@@ -450,17 +519,30 @@ bool RavenFS_juvenile::block_test(uint64_t blk) const {
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * 位图接口组 B：inode 槽分配器
+ * 位图接口组 B：inode 槽分配器（分片路由）
  * ═══════════════════════════════════════════════════════════════ */
 uint64_t RavenFS_juvenile::inode_alloc() {
-    uint64_t inum = bm_alloc_first(inode_bits, inode_count, 1);   /* 0 = root */
-    if (inum == PTR_INVALID) return PTR_INVALID;
-    bm_set(inode_bits, inum, true);
-    return inum;
+    if (!inode_bitmap_slices || slice_count == 0) return PTR_INVALID;
+    for (uint64_t round = 0; round < slice_count; round++) {
+        uint64_t idx = (inode_preferred_slice + round) % slice_count;
+        bitmap_slice_t &s = inode_bitmap_slices[idx];
+        if (!s.slice_lock.try_lock_write()) continue;
+        uint64_t out = 0, left = 0;
+        result_code_t rc = s.alloc_soft(0, 1, out, left);
+        s.slice_lock.unlock_write();
+        if (rc == RC_OK) { inode_preferred_slice = idx; return out; }
+    }
+    return PTR_INVALID;
 }
 
 void RavenFS_juvenile::inode_free(uint64_t inum) {
-    bm_set(inode_bits, inum, false);
+    if (!inode_bitmap_slices || slice_count == 0) return;
+    uint64_t idx = inum / inode_per_slice_bits;
+    if (idx >= slice_count) return;
+    bitmap_slice_t &s = inode_bitmap_slices[idx];
+    while (!s.slice_lock.try_lock_write()) { /* 释放不可丢，自旋等 */ }
+    s.free_interval(inum, 1);
+    s.slice_lock.unlock_write();
 }
 
 bool RavenFS_juvenile::inode_test(uint64_t inum) const {
@@ -486,7 +568,7 @@ void RavenFS_juvenile::dump_info() const {
            "  inode bm   [%llu, %llu)  %llu blk\n"
            "  blocks used: %llu/%llu (%.2f%%)\n"
            "  inodes used: %llu/%llu (%.2f%%)\n"
-           "  root_dentry_blk=%llu  bm_cursor=%llu\n",
+           "  root_dentry_blk=%llu  slices=%u  blk_pref=%llu\n",
            fd, fd >= 0 ? "yes" : "no",
            (unsigned long long)sb.magic, sb.version,
            sb.uuid[0], sb.uuid[1], sb.uuid[14], sb.uuid[15],
@@ -503,7 +585,8 @@ void RavenFS_juvenile::dump_info() const {
            total_blocks ? 100.0 * (double)used_blocks / (double)total_blocks : 0.0,
            (unsigned long long)used_inodes, (unsigned long long)inode_count,
            inode_count ? 100.0 * (double)used_inodes / (double)inode_count : 0.0,
-           (unsigned long long)root_dentry_blk, (unsigned long long)bm_cursor);
+           (unsigned long long)root_dentry_blk, slice_count,
+           (unsigned long long)block_preferred_slice);
 }
 
 /* ═══════════════════════════════════════════════════════════════

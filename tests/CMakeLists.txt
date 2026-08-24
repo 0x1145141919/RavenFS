@@ -10,6 +10,13 @@ add_executable(ravenfs_juv_delete
 )
 target_link_libraries(ravenfs_juv_delete PRIVATE ravenfs_juvenile)
 
+# v1.1 bitmap_slice_t 分片位图自治单元单测（alloc_hard hint 命中/miss +
+# alloc_soft 全量 gather；free_count / hint 变化校验）
+add_executable(ravenfs_juv_bitmap_slice
+    test_bitmap_slice.cpp
+)
+target_link_libraries(ravenfs_juv_bitmap_slice PRIVATE ravenfs_juvenile)
+
 # v1.1 Inode 缓存控制器真盘大测（RADIX 模式，按超级块链式推导初始化）
 # 用法: ./benchmark_radix [/dev/nvme1n1]
 add_executable(ravenfs_bench_radix
