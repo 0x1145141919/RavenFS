@@ -211,7 +211,7 @@ ptr_in_idx:    free_to_use:12 | ptr:52
 parent_ptr_t:  entry_count:10 | is_inner_node:1 | is_root_node:1 | ptr:52
 ```
 
-- `free_to_use` 语义由上下文定义（Dentry_t: name_len；名字堆 level 1: 粒度 log2）
+- `free_to_use` 语义由上下文定义（当前唯一实例：Dentry_t: name_len；名字堆控制器用裸 52 位指针，不走 `ptr_in_idx`）
 - `parent_ptr_t` 双位解码四态（根/非根 × 内/叶）；根节点 `ptr` = 自身 inode 编号（`.`），非根 = 父节点块号
 - 三个取值空间彼此独立。联合指针的当前语义由上下文位域决定，不得脱离位域单独解读裸值
 
@@ -280,10 +280,9 @@ parent_ptr_t:  entry_count:10 | is_inner_node:1 | is_root_node:1 | ptr:52
 
 | 字段 | 指针类型 | 说明 |
 |------|---------|------|
-| 首 64 位 | — | `type:2 | is_data_root_direct_bit:1 | dir_inode_name_heap_level:2 | other:59`（v1.1 重排，见 `disk_layout_v1.1.md` §3.1；`dir_inode_name_heap_level` 仅 dir 型有效，REGULAR/SOFT_SYM 恒 0） |
-| `data_root` | 联合指针（块指针，带 PTR_INVALID 哨兵） | PTR_INVALID=内联（内容在 inline_data[0..size-1]）；≠INVALID 按 `is_data_root_direct_bit` 解码：=1 直指区间起始（连续 FS_block）；=0 B+tree 根（REGULAR: 区段树；DIR: dentry 树） |
-| `padding[1]` | 联合指针 | DIR level 1：复用为 `ptr_in_idx`（名字堆数据区块基址，free_to_use = 粒度 log2） |
-| `inline_data` | — | 按 type 分档：REGULAR=文件内联数据；DIR level 1=名字堆位图；DIR level 2=控制器数组 |
+| 首 64 位 | — | `raven_Inode_t`（REGULAR/SOFT_SYM）：`type:2 | is_data_root_direct_bit:1 | other:61`；`raven_dir_Inode_t`（DIR）：`type:2 | other:62`（无 direct bit，见 `disk_layout_v1.1.md` §3.1） |
+| `data_root` | 联合指针（块指针，带 PTR_INVALID 哨兵） | REGULAR/SOFT_SYM：PTR_INVALID=内联（内容在 inline_data[0..size-1]）；≠INVALID 按 `is_data_root_direct_bit` 解码：=1 直指区间起始（连续 FS_block）；=0 区段 B+tree 根。DIR：恒 = dentry B+tree 根块号（无内联/直指目录，PTR_INVALID 非法） |
+| `inline_data` | — | 按 type 分型：REGULAR/SOFT_SYM=文件内联数据；DIR=10 个 `name_heap_controller_t`（名字堆描述符，固定数组，见 `disk_layout_v1.1.md` §7.4） |
 
 ---
 
@@ -335,7 +334,7 @@ bit[i] = 0 → FS_block[i] 空闲（可分配）
 | 根 inode | 不占 FS_block（inode array 内） | mkfs |
 | **Backup Superblocks** | **N 个随机 FS_block** | **mkfs** |
 | 文件/目录数据 | 按需分配 | 运行时 |
-| 名字堆位图/数据块（每目录） | 按需分配（level 1 仅数据块外置；level 2 位图+数据全外置，v1.1 §7.3） | 运行时（目录出现首个 >40B 名字时） |
+| 名字堆位图/数据块（每目录） | 按需分配（位图面+数据面各自连续、起点 8K 对齐，v1.1 §7.4） | 运行时（目录首次出现落入该档的名字时） |
 
 **无隐藏预留**：FS_block 世界中不存在在 bitmap 中不亮灯却被占用的块。
 

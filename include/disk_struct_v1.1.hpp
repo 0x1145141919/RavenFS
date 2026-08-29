@@ -24,7 +24,7 @@
  *
  * 4. 长名外置：name 内联 40B；>40 由每目录名字堆（name heap）分配，
  *    full_char_remain_ptr 物理定位（块号[12:63] | 块内偏移[0:11]，12 位 = 4K 块内），
- *    堆只是分配器，解析不依赖堆上下文；文件名硬上限 2047B
+ *    堆只是分配器，解析不依赖堆上下文；文件名上限 RAVENFS_MAX_NAME_LEN = 552B
  *
  * 5. 容量 + 1 瞬时槽：所有节点数组 = 阶数 + 1，[阶数] 槽是插入瞬时
  *    产物（插入先占槽，检查 count > 阶数 再分裂；单趟处理、内外统一）。
@@ -52,7 +52,7 @@ enum : result_code_t {
     RC_ERR_NOT_FOUND,       /* dentry 未找到 */
     RC_ERR_NO_BLOCK,        /* FS_block 无空闲 */
     RC_ERR_NO_INODE,        /* inode 槽无空闲 */
-    RC_ERR_NAME_LEN,        /* 名字 >40B（名字堆未实现） */
+    RC_ERR_NAME_LEN,        /* 名字 > RAVENFS_MAX_NAME_LEN */
     RC_ERR_IO,              /* pread/pwrite 失败 */
     RC_ERR_STATE,           /* 内部状态异常（根节点角色不符等） */
 
@@ -72,12 +72,14 @@ struct ptr_in_idx{
 /* ── 常量 / 哨兵 ── */
 constexpr uint8_t  DENTRY_INLINE_NAME_MAX = 40;   /* name 内联上限：≤40 内联，>40 外置 */
 constexpr uint64_t PTR_INVALID            = (~0ULL); /* 通用无效指针哨兵（v1 惯例沿用） */
-/* 名字堆控制器（每目录至多 11 个，见 inode.dir_inode_name_heap_level）
+/* 名字堆控制器（每目录固定 10 个，见 raven_dir_Inode_t 内联区）
  * 异构堆：各堆粒度(bytes_per_bit_log2)与位图容量(total_bits_count_log2)独立，
- * 按需创建；名字按长度分流到粒度匹配的堆，目标是各堆位图 bit 占用率尽量高。
+ * 按需激活（档位级懒：激活 = 位图面+数据面按容量一次分配）；名字按长度分流到
+ * 粒度匹配的堆，目标是各堆位图 bit 占用率尽量高。
  * 位图 bit[i] 管辖数据区 [i×2^bytes_per_bit_log2, (i+1)×2^bytes_per_bit_log2)。
  * ⚠ 名字数据必须连续：分配 = 找 N 个连续空闲 bit 并置位（非单 bit）。
- * 文件名硬上限 2047B → 外置部分 ≤2007B < 4096B，永不跨块。 */
+ * 文件名上限 RAVENFS_MAX_NAME_LEN = 552B（40 内联 + 512 外置）→ 外置部分
+ * ≤512B；读写按 8K 片两段拷贝（极端偏移跨片 ≤2 片）。 */
 struct name_heap_controller_t{
     uint64_t bytes_per_bit_log2:6;      // 位图 1 bit 管辖的字节数 log2（实际取值 3~11，8B~2KB）
     uint64_t total_bits_count_log2:6;   // 位图总位数 log2（位图占 FS_block 数 = 2^log2 / 32768 向上取整）
@@ -88,17 +90,7 @@ struct name_heap_controller_t{
 struct raven_Inode_t{                                                                                                     
     uint64_t  type:2;                  // INODE_TYPE_REGULAR/DIR/SOFT_LINK
     uint64_t  is_data_root_direct_bit:1;
-    uint64_t  dir_inode_name_heap_level:2;// 仅 dir 型 inode 有效：名字堆级别
-    // level 0: 目录所有名字 ≤40B 全内联（Dentry_t.name），无堆，零开销
-    // level 1: inline_data[160] 充当位图；padding[1] 复用为 ptr_in_idx
-    //          (ptr=数据区块基址, free_to_use=一个 bit 管辖字节数 log2)；
-    //          位图留升级余量（不装满），升 level 2 时新建控制器承接，数据不搬
-    // level 2: padding[2](16B) + inline_data[160] = 11 个 name_heap_controller_t
-    //          位图/数据全外置，异构堆按需扩容
-    // level 3: 预留，未设计
-    // 注意：inline_data 语义按 type 分档 —— REGULAR=文件内联数据；
-    //       DIR level 1=位图；DIR level 2=控制器数组
-    uint64_t  other:59;                                                                                                                                                             
+    uint64_t  other:61;                                                                                                                                                             
     uint32_t  uid;                                                                                                        
     uint32_t  gid; 
     uint32_t  m_ns_stamp;
@@ -115,6 +107,38 @@ struct raven_Inode_t{
     uint8_t inline_data[160];
 }__attribute__((packed));
 static_assert(sizeof(raven_Inode_t)==256,"Inode size must met 256B");
+struct raven_dir_Inode_t{                                                                                                     
+    uint64_t  type:2;                  //DIR
+    uint64_t  other:62;                                                                                                                                                             
+    uint32_t  uid;                                                                                                        
+    uint32_t  gid; 
+    uint32_t  m_ns_stamp;
+    uint32_t  c_ns_stamp;   
+    uint32_t  a_ns_stamp;
+    uint32_t  link_count;  
+    uint64_t  permission_bits;                                                                                                  
+    uint64_t  size;                                                                                                       
+    uint64_t  mtime;                                                                                                      
+    uint64_t  ctime;   
+    uint64_t  atime;                                                                                                    
+    uint64_t  data_root;            // PTR_INVALID = inline       
+    uint64_t padding[2];  
+    //下面这10个堆都描述符都是为了在dentry叶子截断后从下面十个堆的空间分配名字截断后的存储
+    //粒度分为5档，8B,64B,128B,256B,512B,后面的k指代位图大小多少字节，不过由于mdata_piece子系统的硬8k对齐8k单位加载约束，所以下面的位图堆描述符都元数据面和数据面都要连续区间                                                                                                                                                          
+    //8B粒度堆承接0～40B的分配需求，64B位图承接41～64B的分配需求（不算尾巴的0，因为dentry里面已经描述了文件名有效载荷）
+    //128B承接65～128B,256B位图成绩129~256B需求，512B位图承接257~512B需求
+    name_heap_controller_t heaps_8B_8k;
+    name_heap_controller_t heaps_8B_16k;
+    name_heap_controller_t heaps_8B_32k;
+    name_heap_controller_t heaps_64B_8k;
+    name_heap_controller_t heaps_64B_16k;
+    name_heap_controller_t heaps_128B_8k;
+    name_heap_controller_t heaps_128B_16k;
+    name_heap_controller_t heaps_256B_8k;
+    name_heap_controller_t heaps_256B_16k;
+    name_heap_controller_t heaps_512B_8k;
+}__attribute__((packed));
+static_assert(sizeof(raven_dir_Inode_t)==256,"Inode size must met 256B");
 
 
 /* 父指针：双位解码四态（is_inner_node × is_root_node）
@@ -274,3 +298,4 @@ struct RavenSuperblock {
     uint8_t   pad[3960];
 }__attribute__((packed));
 static_assert(sizeof(RavenSuperblock)==4096,"RavenSuperblock size must be 4096B");
+constexpr uint16_t RAVENFS_MAX_NAME_LEN=DENTRY_INLINE_NAME_MAX+512;

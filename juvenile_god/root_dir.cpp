@@ -1,13 +1,15 @@
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"   /* mdata_piece_session：8K 元数据节点会话（头里仅前置声明） */
+#include "../include/ravenfs/inode_cache_radix.hpp"   /* InodeSession：inode 访问统一走缓存（offload 零拷贝指针） */
 #include <cstring>
 
 /* ═══════════════════════════════════════════════════════════════════
- * root_dir.cpp — RavenFS v1.1 目录 dentry 顶层业务（调 dentry 树层）
+ * root_dir.cpp — RavenFS v1.1 目录 dentry 顶层业务（调 dentry 树层 + 名字堆）
  *
  * dir_insert_dentry / dir_rm_dentry / dir_lookup —— 任意目录（inode_idx 指定）
  * root_dir_* —— root 专属薄封装（内部转调 dir_*）
- * 零缓存原则：所有块/inode 访问直接 pread/pwrite，无缓存层。
+ * 零缓存原则：所有块/inode 访问直接 pread/pwrite，无缓存层（名字堆块经
+ * mdata_piece_caches 会话访问，见 name_heap.cpp）。
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -22,57 +24,80 @@
  * ═══════════════════════════════════════════════════════════════════ */
 result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char *name)
 {
-    if (!tmp_name_len_limiter(name))
+    if (!name_len_limiter(name))
         return RC_ERR_NAME_LEN;
     if (!inode_test(inode_idx))
         return RC_ERR_STATE;
 
     name_cmlpx_t cmplx = {
         .name = (char*)name,
-        .hash = name_hash(name)
+        .hash = name_hash(name),
+        .name_len = (uint16_t)strlen(name),
+        .full_char_remain_ptr = PTR_INVALID
     };
 
-    raven_Inode_t ino;
-    inode_read(inode_idx, &ino);
-    if (ino.type != INODE_TYPE_DIR)
-        return RC_ERR_STATE;
+    uint64_t dentry_root_idx;
+    {
+        InodeSession ino_sess(inode_cache_mgr, inode_idx);
+        if (!ino_sess) return RC_ERR_IO;
+        raven_Inode_t *ino = ino_sess.inode;
+        if (ino->type != INODE_TYPE_DIR)
+            return RC_ERR_STATE;
 
-    /* 空目录：先建树根（根叶子） */
-    if (ino.data_root == PTR_INVALID) {
-        uint64_t root_blk = block_alloc_hard(2, 1);
-        if (root_blk == PTR_INVALID) return RC_ERR_NO_BLOCK;
+        /* 空目录：先建树根（根叶子） */
+        if (ino->data_root == PTR_INVALID) {
+            uint64_t root_blk = block_alloc_hard(2, 1);
+            if (root_blk == PTR_INVALID) return RC_ERR_NO_BLOCK;
 
-        /* 新建根叶子：mdata_piece_session 直接覆盖会话页（无栈缓冲/无复制），
-         * 会话页整块清零 + 填 meta，dirty() 后析构写回（no_cache 写盘 /
-         * offload 直改内核页缓存切片）。 */
-        mdata_piece_session root_sess(mdata_piece_mgr, root_blk);
-        if (root_sess.index_error()) return RC_ERR_STATE;
-        if (!root_sess) return RC_ERR_IO;
-        Bptree_dentry_leaf_node_t *rleaf = (Bptree_dentry_leaf_node_t*)root_sess.data;
-        memset(root_sess.data, 0, 8192);
-        rleaf->meta.magics[0] = DENTRY_MAGIC1;
-        rleaf->meta.magics[1] = DENTRY_MAGIC2;
-        rleaf->meta.magics[2] = DENTRY_MAGIC3;
-        rleaf->meta.magics[3] = DENTRY_MAGIC4;
-        rleaf->meta.parent_ptr.entry_count   = 0;
-        rleaf->meta.parent_ptr.is_inner_node = 0;
-        rleaf->meta.parent_ptr.is_root_node  = 1;
-        rleaf->meta.parent_ptr.ptr           = inode_idx;   /* "." */
-        rleaf->meta.ptrs[0].ptr = PTR_INVALID;
-        rleaf->meta.ptrs[1].ptr = inode_idx;                /* ".." 孤儿自指 */
-        rleaf->meta.ptrs[2].ptr = PTR_INVALID;
-        root_sess.dirty();
+            /* 新建根叶子：mdata_piece_session 直接覆盖会话页（无栈缓冲/无复制），
+             * 会话页整块清零 + 填 meta，dirty() 后析构写回（no_cache 写盘 /
+             * offload 直改内核页缓存切片）。 */
+            mdata_piece_session root_sess(mdata_piece_mgr, root_blk);
+            if (root_sess.index_error()) return RC_ERR_STATE;
+            if (!root_sess) return RC_ERR_IO;
+            Bptree_dentry_leaf_node_t *rleaf = (Bptree_dentry_leaf_node_t*)root_sess.data;
+            memset(root_sess.data, 0, 8192);
+            rleaf->meta.magics[0] = DENTRY_MAGIC1;
+            rleaf->meta.magics[1] = DENTRY_MAGIC2;
+            rleaf->meta.magics[2] = DENTRY_MAGIC3;
+            rleaf->meta.magics[3] = DENTRY_MAGIC4;
+            rleaf->meta.parent_ptr.entry_count   = 0;
+            rleaf->meta.parent_ptr.is_inner_node = 0;
+            rleaf->meta.parent_ptr.is_root_node  = 1;
+            rleaf->meta.parent_ptr.ptr           = inode_idx;   /* "." */
+            rleaf->meta.ptrs[0].ptr = PTR_INVALID;
+            rleaf->meta.ptrs[1].ptr = inode_idx;                /* ".." 孤儿自指 */
+            rleaf->meta.ptrs[2].ptr = PTR_INVALID;
+            root_sess.dirty();
 
-        ino.data_root = root_blk;
-        inode_write(inode_idx, &ino);
-    }
-
-    uint64_t dentry_root_idx = ino.data_root;
+            ino->data_root = root_blk;
+            ino_sess.dirty();
+            /* 根目录建根同步内存句柄（root_dentry_blk 只对 root inode 有意义） */
+            if (inode_idx == root_inum) root_dentry_blk = root_blk;
+        }
+        dentry_root_idx = ino->data_root;
+    }   /* ino_sess 析构：no_cache 脏写回 / offload 直改内核页缓存 */
 
     dentry_bptree_path_t trace;
     result_code_t rc = dentry_Bptree_walk(dentry_root_idx, &trace, &cmplx);
     if (rc) return rc;
     if (trace.is_finally_hit) return RC_ERR_EXIST;
+
+    /* ── 长名（>40B）：先分配名字堆外置存储 + 写尾部，再插入 ──
+     * 分配置于 EXIST 检查后（不浪费堆空间）；guard 兜底 insert/分裂
+     * 链路任何失败自动回滚；**所有成功路径必须 disarm**（分裂建新根的
+     * return 路径曾绕过 disarm → 析构误触发 free → 位图被清）。 */
+    name_heap_guard_t heap_guard;
+    if (cmplx.name_len > DENTRY_INLINE_NAME_MAX) {
+        name_heap_loc_t loc;
+        rc = name_heap_alloc(inode_idx, cmplx.name_len - DENTRY_INLINE_NAME_MAX, &loc);
+        if (rc) return rc;
+        cmplx.full_char_remain_ptr = (loc.fblk << 12) | (uint64_t)loc.offset;
+        heap_guard.arm(this, inode_idx, cmplx.name_len, cmplx.full_char_remain_ptr);
+        rc = name_heap_write(cmplx.name_len, cmplx.full_char_remain_ptr,
+                             name + DENTRY_INLINE_NAME_MAX);
+        if (rc) return rc;   /* guard 自动回滚 */
+    }
 
     uint64_t leaf_blk = trace.blocks[trace.depth - 1];
     uint16_t glb = trace.child_idx[trace.depth - 1];
@@ -115,10 +140,13 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
 
         /* 情况 A：根是叶子，需创建新根（内部节点） */
         if (trace.depth == 1) {
-            return dentry_new_root_inner(split_res.low_node_blkidx,
-                                         split_res.low_node_maxhash,
-                                         split_res.high_node_blkidx,
-                                         inode_idx);
+            rc = dentry_new_root_inner(split_res.low_node_blkidx,
+                                       split_res.low_node_maxhash,
+                                       split_res.high_node_blkidx,
+                                       inode_idx);
+            if (rc) return rc;   /* 失败：guard 自动回滚 */
+            heap_guard.disarm();   /* 成功：分裂建新根路径必须转正 */
+            return RC_OK;
         }
 
         /* 情况 B：非根叶子，父节点存在 */
@@ -176,6 +204,7 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
         }
     }
 
+    heap_guard.disarm();   /* 树插入全链路成功，堆分配转正 */
     return RC_OK;
 }
 
@@ -187,24 +216,29 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
  * ═══════════════════════════════════════════════════════════════════ */
 result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *name)
 {
-    if (!tmp_name_len_limiter(name))
+    if (!name_len_limiter(name))
         return RC_ERR_NAME_LEN;
     if (!inode_test(inode_idx))
         return RC_ERR_STATE;
 
     name_cmlpx_t cmplx = {
         .name = (char*)name,
-        .hash = name_hash(name)
+        .hash = name_hash(name),
+        .name_len = (uint16_t)strlen(name),
+        .full_char_remain_ptr = PTR_INVALID
     };
 
-    raven_Inode_t ino;
-    inode_read(inode_idx, &ino);
-    if (ino.type != INODE_TYPE_DIR)
-        return RC_ERR_STATE;
-    if (ino.data_root == PTR_INVALID)
-        return RC_ERR_NOT_FOUND;   /* 空目录，无条目可删 */
-
-    uint64_t dentry_root_idx = ino.data_root;
+    uint64_t dentry_root_idx;
+    {
+        InodeSession ino_sess(inode_cache_mgr, inode_idx);
+        if (!ino_sess) return RC_ERR_IO;
+        raven_Inode_t *ino = ino_sess.inode;
+        if (ino->type != INODE_TYPE_DIR)
+            return RC_ERR_STATE;
+        if (ino->data_root == PTR_INVALID)
+            return RC_ERR_NOT_FOUND;   /* 空目录，无条目可删 */
+        dentry_root_idx = ino->data_root;
+    }
 
     dentry_bptree_path_t trace;
     result_code_t rc = dentry_Bptree_walk(dentry_root_idx, &trace, &cmplx);
@@ -217,13 +251,17 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
     mdata_piece_session leaf_sess(mdata_piece_mgr, leaf_blk);
     if (leaf_sess.index_error()) return RC_ERR_STATE;
     if (!leaf_sess) return RC_ERR_IO;
-    Bptree_dentry_leaf_node_t *leaf = (Bptree_dentry_leaf_node_t*)leaf_sess.data;   /* 只读（取条目 inum） */
+    Bptree_dentry_leaf_node_t *leaf = (Bptree_dentry_leaf_node_t*)leaf_sess.data;   /* 只读（取条目 inum / 名字堆信息） */
     uint64_t inum = leaf->entries[idx].inode_ptr.ptr;
     /* ⚠ 52 位位域读出的 inum 与 PTR_INVALID 比较必须同样截断（64 位比较恒不相等）。
      * insert 尚未接 inode 分配时条目为悬空（PTR_INVALID）：此时只删树条目、
      * 跳过 inode_free —— 幼年期过渡态，insert 接 inode 后自然消除。 */
     const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
     const bool has_inode = (inum != PTR_INVALID_52);
+
+    /* 名字堆信息必须在删除（memmove）**之前**取 */
+    const uint16_t e_name_len = (uint16_t)leaf->entries[idx].inode_ptr.free_to_use;
+    const uint64_t e_remain   = leaf->entries[idx].full_char_remain_ptr;
 
     uint64_t flags = 0;
     rc = dentry_leaf_entry_delete(leaf_blk, idx, flags);
@@ -333,6 +371,9 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
     }
 
     if (has_inode) inode_free(inum);
+    /* 长名：释放名字堆外置存储（树删除已成功；释放失败尽力而为，不覆盖删除结果） */
+    if (e_name_len > DENTRY_INLINE_NAME_MAX)
+        name_heap_free(inode_idx, e_name_len, e_remain);
     return RC_OK;
 }
 
@@ -346,21 +387,28 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
 result_code_t RavenFS_juvenile::dir_lookup(uint64_t inode_idx, const char *name, uint64_t *out_inum)
 {
     if (!out_inum) return RC_ERR_STATE;
-    if (!tmp_name_len_limiter(name)) return RC_ERR_NAME_LEN;
+    if (!name_len_limiter(name)) return RC_ERR_NAME_LEN;
     if (!inode_test(inode_idx)) return RC_ERR_STATE;
 
     name_cmlpx_t cmplx = {
         .name = (char*)name,
-        .hash = name_hash(name)
+        .hash = name_hash(name),
+        .name_len = (uint16_t)strlen(name),
+        .full_char_remain_ptr = PTR_INVALID
     };
 
-    raven_Inode_t ino;
-    inode_read(inode_idx, &ino);
-    if (ino.type != INODE_TYPE_DIR) return RC_ERR_STATE;
-    if (ino.data_root == PTR_INVALID) return RC_ERR_NOT_FOUND;   /* 空目录 */
+    uint64_t dentry_root_idx = 0;
+    {
+        InodeSession ino_sess(inode_cache_mgr, inode_idx);
+        if (!ino_sess) return RC_ERR_IO;
+        raven_Inode_t *ino = ino_sess.inode;
+        if (ino->type != INODE_TYPE_DIR) return RC_ERR_STATE;
+        if (ino->data_root == PTR_INVALID) return RC_ERR_NOT_FOUND;   /* 空目录 */
+        dentry_root_idx = ino->data_root;
+    }
 
     dentry_bptree_path_t trace;
-    result_code_t rc = dentry_Bptree_walk(ino.data_root, &trace, &cmplx);
+    result_code_t rc = dentry_Bptree_walk(dentry_root_idx, &trace, &cmplx);
     if (rc) return rc;
     if (!trace.is_finally_hit) return RC_ERR_NOT_FOUND;
 

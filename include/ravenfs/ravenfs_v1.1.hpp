@@ -30,8 +30,8 @@ class mdata_piece_caches_mgr;   /* 8K 元数据负载片缓存管理器（mdata_
  *    读入内存数组（磁盘布局位序原样映射），alloc/free 只改内存态，
  *    **析构（卸载）时全量写回**（速度优先；幼年期接受掉电丢位图更新，
  *    不追求事务安全）。两组接口：block 组 / inode 组。
- * 3. 名字硬限制 ≤40B：level 0 目录全内联（Dentry_t.name），名字堆
- *    未实现，>40B 一律 RC_ERR_NAME_LEN。后续名字堆接入后解除。
+ * 3. 名字上限 RAVENFS_MAX_NAME_LEN=552B：≤40B 内联（Dentry_t.name），>40B 走
+ *    名字堆（每目录固定 10 描述符，见 disk_layout_v1.1.md §7）。
  * 4. 删除 = 物理删除（v1.1 §6.5）：memmove + 刷父 hash_max（上界路由
  *    对称代价，必走路径）；欠载不合并（min occupancy 待定，幼年期跳过）。
  * 5. hash 用 XXH64（seed=0，v1.1 §9 已定；64 位熵 + 跨挂载稳定，
@@ -45,11 +45,11 @@ class mdata_piece_caches_mgr;   /* 8K 元数据负载片缓存管理器（mdata_
 constexpr uint32_t RAVENFS_VERSION = 2;
 
 /* ── readdir 输出项 ──
- * 幼年期名字 ≤40B，character[256] 留余量（含结尾 '\0'）。 */
+ * 名字 ≤ RAVENFS_MAX_NAME_LEN（552B），character 含结尾 '\0'。 */
 struct dentry_out {
     uint64_t inum;          /* 目标 inode 编号 */
     uint32_t name_len;      /* 名字长度（不含 '\0'） */
-    char     character[256];
+    char     character[RAVENFS_MAX_NAME_LEN];
 };
 struct dentry_bptree_path_t {
     uint64_t blocks[64];
@@ -68,8 +68,8 @@ struct ravenfs_mount_device_t{
     bool is_device_direct;  /* 外部是否以 O_DIRECT 打开 */
 };
 struct ravenfs_mount_param_t{
-    bool if_will_use_inode_cache;
-    bool if_will_use_block_cache;
+    bool if_will_use_inode_cache;//警告：若is_device_direct==false则这个bit最好开着，不开缓存的话，相应的inode_session会一次性读4k,因为nvme盘一次至少一个LBA,也就4k,多线程下UC模式两个访问访问到同一个缓存行不同Inode到时候等着写竞争吧
+    bool if_will_use_mdata_piece_cache;
     bool is_readonly;       /* true=只读挂载（rfs-audit），须配 is_device_direct=false */
 };
 struct linux_userspace_mount_t{
@@ -109,7 +109,7 @@ public:
     /* 创建名为 name 的普通文件：
      *   inode_alloc → 初始化(REGULAR, 0644, link_count=1, data_root=PTR_INVALID
      *   内联空文件) → inode_write → dentry 树插入。
-     * name 已存在 → RC_ERR_EXIST；>40B → RC_ERR_NAME_LEN。 */
+     * name 已存在 → RC_ERR_EXIST；> RAVENFS_MAX_NAME_LEN → RC_ERR_NAME_LEN。 */
     result_code_t root_dir_insert_dentry(const char *name);
 
     /* 物理删除：dentry 树移除（memmove + 刷父 hash_max）→ inode_free。
@@ -208,6 +208,7 @@ class bitmap_slice_t{
 
     result_code_t dir_rm_dentry(uint64_t inode_idx,const char *name);
 
+    result_code_t dir_name_heap_release(uint64_t inode_idx);//作为dir关闭时调用，遍历十个堆，全空则释放
     result_code_t dir_lookup(uint64_t inode_idx,const char *name, uint64_t *out_inum);
     int64_t dir_readdir(uint64_t inode_idx,dentry_out **out_buf);
     /* ══════════════════════════════════════════════════════════
@@ -348,7 +349,44 @@ class bitmap_slice_t{
     struct name_cmlpx_t{
         char*name;
         uint64_t hash;
+        uint16_t name_len;              /* strlen(name) 缓存（≤ RAVENFS_MAX_NAME_LEN） */
+        uint64_t full_char_remain_ptr;  /* 插入时调用方预分配的外置定位；≤40B 恒 PTR_INVALID */
     };
+    /* ── 名字堆（name heap）原语（disk_layout_v1.1.md §7）──
+     * 长名（>40B）外置部分 ≤512B，由每目录名字堆分配；档位级懒激活
+     * （激活 = 位图面+数据面按容量一次分配，alloc_hard 连续区间）。
+     * alloc/free 需 dir inode（控制器在 raven_dir_Inode_t 内联区）；
+     * read/write 只需物理定位（full_char_remain_ptr），可能跨 8K 片
+     * （起点在片内第二块高偏移时），按两段拷贝处理。 */
+    struct name_heap_loc_t {
+        uint64_t fblk;    /* 尾部起点 FS_block（remain_ptr[12:63]） */
+        uint16_t offset;  /* 块内偏移（remain_ptr[0:11]） */
+        uint8_t  slot;    /* 命中堆槽 0~9（调试/审计用；释放不依赖） */
+    };
+    result_code_t name_heap_alloc(uint64_t dir_inode_idx, uint16_t tail_len, name_heap_loc_t *out);
+    result_code_t name_heap_free(uint64_t dir_inode_idx, uint16_t name_len, uint64_t full_char_remain_ptr);
+    result_code_t name_heap_read(uint16_t name_len, uint64_t full_char_remain_ptr, char *out_tail);
+    result_code_t name_heap_write(uint16_t name_len, uint64_t full_char_remain_ptr, const char *tail);
+    /* 名字堆分配回滚守卫（insert 流程 RAII：堆分配成功后的任何失败返回
+     * 都自动释放，成功路径显式 disarm；覆盖 insert/分裂链路全部失败点） */
+    struct name_heap_guard_t {
+        RavenFS_juvenile *fs = nullptr;
+        uint64_t dir_ino = 0;
+        uint16_t name_len = 0;
+        uint64_t remain = PTR_INVALID;
+        bool armed = false;
+        void arm(RavenFS_juvenile *f, uint64_t d, uint16_t n, uint64_t r) {
+            fs = f; dir_ino = d; name_len = n; remain = r; armed = true;
+        }
+        void disarm() { armed = false; }
+        ~name_heap_guard_t() {
+            if (armed && fs) fs->name_heap_free(dir_ino, name_len, remain);
+        }
+    };
+    /* 激活堆槽：位图面+数据面一次分配（各自连续、2^1 对齐）+ 位图清零 + 控制器落盘 */
+    result_code_t name_heap_activate(raven_dir_Inode_t *dino, uint16_t slot, uint64_t dir_inode_idx);
+    /* dentry 完整名字比较（树内条目 vs 目标名；>40B 内部读堆外置部分） */
+    int dentry_name_cmp(const Dentry_t &e, const char *name, uint16_t name_len);
     result_code_t dentry_Bptree_walk(uint64_t root_blk_idx,dentry_bptree_path_t*trace,name_cmlpx_t*name);
     struct leaf_node_result_t{
         uint16_t greates_lower_bound_idx;
@@ -391,8 +429,8 @@ class bitmap_slice_t{
 };
 bool is_dentry_node(Bptree_meta_t*meta);
 bool is_extent_node(Bptree_meta_t*meta);
-/* 名字长度把关：strlen ≤ 39（名字堆未实现，全内联） */
-bool tmp_name_len_limiter(const char*name);
+/* 名字长度把关：strlen ≤ RAVENFS_MAX_NAME_LEN */
+bool name_len_limiter(const char*name);
 /* 节点最大 hash：叶子末项 entry.hash / 内部末项 hint.hash_max */
 uint64_t node_max_hash(const void *node_buf);
 

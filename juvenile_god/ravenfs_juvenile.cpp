@@ -23,8 +23,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <new>
-bool tmp_name_len_limiter(const char*name){
-    return strlen(name)<=39;
+bool name_len_limiter(const char*name){
+    return strlen(name)<=RAVENFS_MAX_NAME_LEN;
 }
 bool is_extent_node(Bptree_meta_t *meta)
 {
@@ -389,7 +389,7 @@ result_code_t RavenFS_juvenile::fs_io_write(void *io_ctx, uint64_t blk, uint64_t
  *     - 数据不落用户态，全由内核页缓存管；位图 ctor 已从窗口切片（不预取）
  *  直写模式：
  *     - inode 缓存：param.if_will_use_inode_cache ? self_reliat : no_cache
- *     - mdata_piece：param.if_will_use_block_cache ? self_reliat : no_cache
+ *     - mdata_piece：param.if_will_use_mdata_piece_cache ? self_reliat : no_cache
  *       （self_reliat 未实装 → ctor 拒 RC_ERR_STATE，挂载失败；TODO 实装后自然可用）
  * 失败：已建子模块清理后返回错误码。
  * ═══════════════════════════════════════════════════════════════ */
@@ -427,7 +427,7 @@ result_code_t RavenFS_juvenile::caches_setup() {
         mcfg.mode = cache_work_mode_t::offload_cache;
         mcfg.offload_specific.virtual_canvas_base =
             (uint64_t)fsblk0_base_;   /* FS_block[0]（数据区 base=0） */
-    } else if (param.if_will_use_block_cache) {
+    } else if (param.if_will_use_mdata_piece_cache) {
         mcfg.mode = cache_work_mode_t::self_reliat_cache;   /* TODO: 未实装，ctor 拒 RC_ERR_STATE */
     } else {
         mcfg.mode = cache_work_mode_t::no_cache;

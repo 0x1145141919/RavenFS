@@ -4,6 +4,7 @@
 # bitmap_slice.cpp    — bitmap_slice_t 分片位图自治单元（Raven 实现）
 # dentry_tree.cpp      — dentry B+tree 全套（Sparrow 手写）
 # root_dir.cpp         — root_dir 顶层业务（Sparrow 手写）
+# name_heap.cpp        — 名字堆：长名外置分配/释放/读写（Raven 实现）
 # inode_cache.cpp      — inode 缓存三模式（FULL_RAM / CTRL_ARRAY 已实现，RADIX 草稿）
 
 add_library(ravenfs_juvenile STATIC
@@ -11,5 +12,6 @@ add_library(ravenfs_juvenile STATIC
     bitmap_slice.cpp
     dentry_tree.cpp
     root_dir.cpp
+    name_heap.cpp
     inode_cache.cpp
 )

@@ -123,10 +123,29 @@ result_code_t RavenFS_juvenile::dentry_Bptree_walk(uint64_t root_blk_idx, dentry
  * hash 冲突处理（§6.3）：同 hash 条目在叶内连续，二分在碰撞区间内自动
  * 落入名字比较，无需先定位 hash 区间再扫名字。
  *
- * 名字比较前提：tmp_name_len_limiter 把关（strlen ≤ 39）→ 全内联
- * name[40] NUL 结尾，full_char_remain_ptr 恒 PTR_INVALID；名字堆未实现，
- * 无需读外置部分。接入名字堆后此处需改为按 name_len 分流比较。
+ * 名字比较：按 (hash, name) 复合序——hash 不等走 hash，相等降级
+ * dentry_name_cmp 完整名字比较（>40B 自动读名字堆外置部分，§7）。
  * ═══════════════════════════════════════════════════════════════ */
+/* ── dentry 完整名字比较 ──
+ * 树内条目 e 的完整名字 = e.name[0..min(40,e_len)) +（e_len>40 时）堆外置尾部。
+ * 与目标名 memcmp 公共前缀，长度裁决；e_len 取 inode_ptr.free_to_use。
+ * 读堆失败保守返回 1（目标 < 条目，不会误判命中）。 */
+int RavenFS_juvenile::dentry_name_cmp(const Dentry_t &e, const char *name, uint16_t name_len)
+{
+    const uint16_t e_len = (uint16_t)e.inode_ptr.free_to_use;
+    char e_buf[RAVENFS_MAX_NAME_LEN];
+    const uint16_t e_inline = (e_len < DENTRY_INLINE_NAME_MAX) ? e_len : DENTRY_INLINE_NAME_MAX;
+    memcpy(e_buf, e.name, e_inline);
+    if (e_len > DENTRY_INLINE_NAME_MAX) {
+        if (name_heap_read(e_len, e.full_char_remain_ptr, e_buf + DENTRY_INLINE_NAME_MAX) != RC_OK)
+            return 1;   /* 保守：视为大于目标 */
+    }
+    const uint16_t cmp_len = (e_len < name_len) ? e_len : name_len;
+    int c = memcmp(e_buf, name, cmp_len);
+    if (c != 0) return c;
+    return (e_len < name_len) ? -1 : (e_len > name_len) ? 1 : 0;
+}
+
 RavenFS_juvenile::leaf_node_result_t RavenFS_juvenile::dentry_leaf_node_lookup(Bptree_dentry_leaf_node_t *leaf, name_cmlpx_t *name)
 {
     leaf_node_result_t res;
@@ -147,7 +166,7 @@ RavenFS_juvenile::leaf_node_result_t RavenFS_juvenile::dentry_leaf_node_lookup(B
         else if (e.hash > target_hash)
             e_le_target = false;
         else
-            e_le_target = strcmp(e.name, name->name) <= 0;   /* 冲突降级字符串比较 */
+            e_le_target = dentry_name_cmp(e, name->name, name->name_len) <= 0;   /* 冲突降级完整名字比较（>40B 读堆） */
 
         if (e_le_target) {
             glb = mid;      /* 候选下界，继续向右找更大的 */
@@ -160,7 +179,7 @@ RavenFS_juvenile::leaf_node_result_t RavenFS_juvenile::dentry_leaf_node_lookup(B
     res.greates_lower_bound_idx = glb;
     if (glb != DENTRY_LEAF_GLB_NONE) {
         const Dentry_t &e = leaf->entries[glb];
-        if (e.hash == target_hash && strcmp(e.name, name->name) == 0)
+        if (e.hash == target_hash && dentry_name_cmp(e, name->name, name->name_len) == 0)
             res.is_idx_hitted = true;
     }
     return res;
@@ -202,8 +221,8 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
     uint64_t &result_flags)
 {
     result_flags = 0;
-    if (!name || !tmp_name_len_limiter(name->name))
-        return RC_ERR_NAME_LEN;   /* 名字堆未实现 */
+    if (!name || !name_len_limiter(name->name))
+        return RC_ERR_NAME_LEN;
 
     /* 会话贯穿：读-改-写同一会话页，无栈缓冲无复制；dirty 后析构写回 */
     mdata_piece_session sess(mdata_piece_mgr, leaf_blk_base_idx);
@@ -224,13 +243,14 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
                 (count - idx) * sizeof(Dentry_t));
     }
 
-    /* 填充新条目（inode_ptr.ptr 留 PTR_INVALID，由调用者赋真实 inum） */
+    /* 填充新条目（inode_ptr.ptr 留 PTR_INVALID，由调用者赋真实 inum；
+     * 外置定位由调用方预分配好传进 name->full_char_remain_ptr） */
     Dentry_t *entry = &leaf->entries[idx];
     entry->hash = name->hash;
-    entry->inode_ptr.free_to_use = (uint64_t)strlen(name->name);
+    entry->inode_ptr.free_to_use = name->name_len;
     entry->inode_ptr.ptr = PTR_INVALID;
-    memcpy(entry->name, name->name, DENTRY_INLINE_NAME_MAX);
-    entry->full_char_remain_ptr = PTR_INVALID;
+    memcpy(entry->name, name->name, DENTRY_INLINE_NAME_MAX);   /* 前 40B（长名尾部在堆） */
+    entry->full_char_remain_ptr = name->full_char_remain_ptr;
 
     count++;
     leaf->meta.parent_ptr.entry_count = count;

@@ -17,6 +17,18 @@ add_executable(ravenfs_juv_bitmap_slice
 )
 target_link_libraries(ravenfs_juv_bitmap_slice PRIVATE ravenfs_juvenile)
 
+# v1.1 名字堆专项测试（长名外置：档位覆盖/完整比较/位图一致性/释放/持久化）
+add_executable(ravenfs_juv_name_heap
+    test_name_heap.cpp
+)
+target_link_libraries(ravenfs_juv_name_heap PRIVATE ravenfs_juvenile)
+
+# v1.1 名字堆极限压测（全档位灌满/加塞失败/全删/堆回收；--full 大魔王）
+add_executable(ravenfs_juv_name_heap_stress
+    test_name_heap_stress.cpp
+)
+target_link_libraries(ravenfs_juv_name_heap_stress PRIVATE ravenfs_juvenile)
+
 # v1.1 Inode 缓存控制器真盘大测（RADIX 模式，按超级块链式推导初始化）
 # 用法: ./benchmark_radix [/dev/nvme1n1]
 add_executable(ravenfs_bench_radix

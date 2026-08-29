@@ -316,14 +316,19 @@ static void build_root_dentry_node(Bptree_dentry_leaf_node_t *node)
 static void build_root_inode(raven_Inode_t *inode, uint64_t root_dentry_block) {
     memset(inode, 0, sizeof(*inode));
     inode->type                    = INODE_TYPE_DIR;
-    inode->is_data_root_direct_bit = 0;
-    inode->dir_inode_name_heap_level = 0;   /* v1.1: 根目录无名字堆（全内联） */
     inode->uid                     = 0;
     inode->gid                     = 0;
     inode->permission_bits         = 0755;
     inode->size                    = 0;
     inode->data_root               = root_dentry_block;
     inode->link_count              = 2;
+    /* 名字堆 10 描述符：未激活哨兵（bitmap/data_base 双指针 52 位全 1） */
+    constexpr uint64_t NAME_HEAP_INACTIVE = (1ULL << 52) - 1;
+    raven_dir_Inode_t *dino = (raven_dir_Inode_t *)inode;
+    for (int i = 0; i < 10; i++) {
+        ((name_heap_controller_t *)&dino->heaps_8B_8k)[i].bitmap_base_block_ptr = NAME_HEAP_INACTIVE;
+        ((name_heap_controller_t *)&dino->heaps_8B_8k)[i].data_base_block_ptr   = NAME_HEAP_INACTIVE;
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════

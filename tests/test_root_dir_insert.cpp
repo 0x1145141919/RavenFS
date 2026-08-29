@@ -273,21 +273,25 @@ int main(int argc, char **argv) {
 
     /* ══ Phase 1：边界 / 异常输入 ══ */
     printf("\n--- Phase 1: 边界与异常 ---\n");
-    char long39[40], long40[41], long41[42];
+    char long39[40], long40[41], long41[42], long552[553], long553[554];
     memset(long39, 'x', 39); long39[39] = 0;
     memset(long40, 'y', 40); long40[40] = 0;
     memset(long41, 'z', 41); long41[41] = 0;
+    memset(long552, 'w', 552); long552[552] = 0;   /* RAVENFS_MAX_NAME_LEN 上限 */
+    memset(long553, 'v', 553); long553[553] = 0;
     static const char ctrl[] = { 0x01, 0x02, 0x03, 0 };
 
     const Case cases[] = {
         { "",            RC_OK,            "空名（长度 0，合法边界）" },
-        { long40,        RC_ERR_NAME_LEN,  "40B 超长名（上限 39）" },
-        { long41,        RC_ERR_NAME_LEN,  "41B 超长名" },
+        { long40,        RC_OK,            "40B 边界（全内联上限，无堆）" },
+        { long41,        RC_OK,            "41B 长名（名字堆 8B 档，1 单元）" },
         { "a",           RC_OK,            "正常单字符" },
         { "a",           RC_ERR_EXIST,     "重复插入同名字" },
         { "A",           RC_OK,            "大小写敏感（a/A 不同）" },
         { "a",           RC_ERR_EXIST,     "再次重复插入" },
-        { long39,        RC_OK,            "39B 正好上限" },
+        { long39,        RC_OK,            "39B 正好内联上限内" },
+        { long552,       RC_OK,            "552B 上限长名（512B 档单单元）" },
+        { long553,       RC_ERR_NAME_LEN,  "553B 超限（RAVENFS_MAX_NAME_LEN=552）" },
         { "foo bar",     RC_OK,            "含空格" },
         { "中文目录项",    RC_OK,            "UTF-8 多字节" },
         { "dir/sub",     RC_OK,            "含斜杠（根目录无路径语义，纯字符）" },
@@ -312,6 +316,15 @@ int main(int argc, char **argv) {
     }
 
     verify_tree(fs, inserted, "Phase 1 后");
+
+    /* 长名重复插入：hash 相同 → 叶子内完整名字比较（dentry_name_cmp 读堆尾部）→ EXIST */
+    {
+        result_code_t r = fs.root_dir_insert_dentry(long41);
+        bool ok = (r == RC_ERR_EXIST);
+        printf("  [%s] insert(41B) 再次 → %s（expect RC_ERR_EXIST，尾部比较命中）\n",
+               ok ? "PASS" : "FAIL", rc_name(r));
+        ok ? g_pass++ : g_fail++;
+    }
 
     /* ══ Phase 2：批量插入触发分裂（叶子分裂 → 根分裂 → 内部节点分裂） ══ */
     printf("\n--- Phase 2: 批量插入 %d 条目（覆盖多层分裂） ---\n", insert_n);
@@ -340,6 +353,38 @@ int main(int argc, char **argv) {
     fs.dump_info();
 
     verify_tree(fs, inserted, "Phase 2 后");
+
+    /* ══ Phase 2b：长名批量（名字堆各档位激活 + lookup 抽查） ══ */
+    printf("\n--- Phase 2b: 长名批量（名字堆 8B/64B/128B/256B/512B 档） ---\n");
+    const char *seed_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    char lname[RAVENFS_MAX_NAME_LEN + 1];
+    bool long_ok = true;
+    uint64_t long_fail_at = 0;
+    result_code_t long_fail_rc = RC_OK;
+    int long_n = 300;
+    for (int i = 0; i < long_n; i++) {
+        /* 长度在 41~552 间分布，覆盖各档位 */
+        int len = 41 + (i * 7) % 512;   /* 41,48,...,552 循环 */
+        for (int j = 0; j < len; j++) lname[j] = seed_chars[(i + j * 3) % 62];
+        lname[len] = 0;
+        result_code_t r = fs.root_dir_insert_dentry(lname);
+        if (r != RC_OK) { long_ok = false; long_fail_at = i; long_fail_rc = r; break; }
+        inserted++;
+        /* 抽查：插入后立即 lookup（完整名字比较读堆） */
+        uint64_t inum = 0;
+        result_code_t lr = fs.root_dir_lookup(lname, &inum);
+        if (lr != RC_OK) { long_ok = false; long_fail_at = i; long_fail_rc = lr; break; }
+    }
+    if (long_ok) {
+        printf("  长名批量 %d 条全部 RC_OK + lookup 命中\n", long_n);
+    } else {
+        printf("  长名批量在 #%llu 失败: %s（树内条目 %llu）\n",
+               (unsigned long long)long_fail_at, rc_name(long_fail_rc),
+               (unsigned long long)inserted);
+    }
+    CHECK(long_ok, "长名批量 %d 全成功且可查", long_n);
+
+    verify_tree(fs, inserted, "Phase 2b 后");
     }   /* ← fs 析构：位图全量写回 */
 
     /* 复播二分模式：到这里就够，直接汇总（不动 Phase 3） */

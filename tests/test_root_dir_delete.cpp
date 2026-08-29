@@ -51,7 +51,7 @@ static linux_userspace_mount_t make_mount(const char *path, bool direct,
     mnt.dev.type = DEV_UNKNOWN;
     mnt.dev.is_device_direct = direct;
     mnt.param.if_will_use_inode_cache = use_inode_cache;
-    mnt.param.if_will_use_block_cache = use_block_cache;
+    mnt.param.if_will_use_mdata_piece_cache = use_block_cache;
     mnt.logical_processor_count = 1;
     return mnt;
 }
@@ -317,16 +317,22 @@ int main(int argc, char **argv) {
         r2 == RC_ERR_NOT_FOUND ? g_pass++ : g_fail++;
     }
 
-    /* 1c. 超长名（长度检查在 walk 之前） */
+    /* 1c. 超长名（长度检查在 walk 之前）：>552B 才 NAME_LEN，40/41B 已合法 */
     {
-        result_code_t r = fs.root_dir_rm_dentry(long40);
-        printf("  [%s] rm(40B) → %s（expect RC_ERR_NAME_LEN）\n",
+        char long553[554];
+        memset(long553, 'v', 553); long553[553] = 0;
+        result_code_t r = fs.root_dir_rm_dentry(long553);
+        printf("  [%s] rm(553B) → %s（expect RC_ERR_NAME_LEN）\n",
                r == RC_ERR_NAME_LEN ? "PASS" : "FAIL", rc_name(r));
         r == RC_ERR_NAME_LEN ? g_pass++ : g_fail++;
-        result_code_t r2 = fs.root_dir_rm_dentry(long41);
-        printf("  [%s] rm(41B) → %s（expect RC_ERR_NAME_LEN）\n",
-               r2 == RC_ERR_NAME_LEN ? "PASS" : "FAIL", rc_name(r2));
-        r2 == RC_ERR_NAME_LEN ? g_pass++ : g_fail++;
+        result_code_t r2 = fs.root_dir_rm_dentry(long40);   /* 合法但不存在 → NOT_FOUND */
+        printf("  [%s] rm(40B) → %s（expect RC_ERR_NOT_FOUND，合法长度不存在）\n",
+               r2 == RC_ERR_NOT_FOUND ? "PASS" : "FAIL", rc_name(r2));
+        r2 == RC_ERR_NOT_FOUND ? g_pass++ : g_fail++;
+        result_code_t r3 = fs.root_dir_rm_dentry(long41);
+        printf("  [%s] rm(41B) → %s（expect RC_ERR_NOT_FOUND）\n",
+               r3 == RC_ERR_NOT_FOUND ? "PASS" : "FAIL", rc_name(r3));
+        r3 == RC_ERR_NOT_FOUND ? g_pass++ : g_fail++;
     }
 
     /* 1d. 39B 上限名：插→删→再删 */
