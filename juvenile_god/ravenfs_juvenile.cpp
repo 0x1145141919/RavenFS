@@ -14,8 +14,11 @@
  * ═══════════════════════════════════════════════════════════════════ */
 
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
+#include "../include/ravenfs/inode_cache_radix.hpp"   /* Inode_cache_cfg_t_v2：编排构造（头里仅前置声明） */
+#include "../include/ravenfs/mdata_piece_caches.hpp"  /* mdata_piece_caches_cfg_t：编排构造 */
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h>   /* mmap/munmap：非直写后端整盘映射 + offload canvas 切片 */
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -201,12 +204,16 @@ RavenFS_juvenile::RavenFS_juvenile(const linux_userspace_mount_t &mnt, uint64_t 
         return;
     }
 
-    /* ── 读 Primary Superblock（fd byte[0,4096)，block_model §4.1）── */
-    if (pread(fd, &sb, sizeof(sb), 0) != (ssize_t)sizeof(sb)) {
+    /* ── 读 Primary Superblock（fd byte[0,4096)，block_model §4.1）──
+     * O_DIRECT 契约：4Kn 设备要求长度/缓冲 4096 对齐 → 整 4K 读入对齐缓冲，
+     * 再拷前 sizeof(sb) 字节（SB 区固定 4096，长度按结构体实际尺寸）。 */
+    alignas(4096) uint8_t sb_raw[4096];
+    if (pread(fd, sb_raw, 4096, 0) != 4096) {
         fd = -1;
         if (res_code) *res_code = RC_ERR_IO;
         return;
     }
+    memcpy(&sb, sb_raw, sizeof(sb));
     if (sb.magic != SUPERBLOCK_MAGIC) {
         fd = -1;
         if (res_code) *res_code = RC_ERR_MAGIC;
@@ -237,20 +244,61 @@ RavenFS_juvenile::RavenFS_juvenile(const linux_userspace_mount_t &mnt, uint64_t 
     inode_bm_blocks  = (inode_count + 32767) / 32768;
     inode_bm_base    = inode_array_base - inode_bm_blocks;
 
-    /* ── 双位图全量入内存 + 自描述校验 ── */
-    if (!bitmaps_load()) {
-        fd = -1;
-        if (res_code) *res_code = RC_ERR_BITMAP_SELF;
-        return;
+    /* ── 决策树第一层：mmap 后端（非直写）/ 直写模式 ──
+     * 非直写（普通文件/回环镜像/rfs-audit）：整盘从 offset 0 mmap（含 SB 区
+     * byte[0,4096)，FS_block[n] = base+4096+n×4096），位图与缓存 canvas
+     * 全部从窗口切片，不刻意预取（内核按需调页）。
+     * readonly 配 MAP_PRIVATE+PROT_READ（写不落盘）；否则 MAP_SHARED 读写。 */
+    if (!is_device_direct) {
+        const off_t sz = lseek(fd, 0, SEEK_END);   /* 文件/块设备均返回尺寸 */
+        if (sz <= 0) {
+            fd = -1;
+            if (res_code) *res_code = RC_ERR_STATE;
+            return;
+        }
+        mmap_size_ = (uint64_t)sz;
+        const int prot  = param.is_readonly ? PROT_READ : (PROT_READ | PROT_WRITE);
+        const int flags = param.is_readonly ? MAP_PRIVATE : MAP_SHARED;
+        mmap_base_ = (uint8_t *)mmap(nullptr, mmap_size_, prot, flags, fd, 0);
+        if (mmap_base_ == MAP_FAILED) {
+            mmap_base_ = nullptr;
+            mmap_size_ = 0;
+            fd = -1;
+            if (res_code) *res_code = RC_ERR_STATE;
+            return;
+        }
+        fsblk0_base_ = mmap_base_ + 4096;   /* FS_block[0] 虚拟基址（Primary SB 占 byte[0,4096)，§3.1） */
     }
 
-    /* ── 分片初始化：slice_count 计算 + 双组逐片 enable_slice ── */
-    if (!slices_setup(mnt.logical_processor_count)) {
-        free(block_bits); block_bits = nullptr;
-        free(inode_bits); inode_bits = nullptr;
+    /* ctor 失败统一清理：按后端释放（mmap munmap / 直写 free）+ 子模块/分片拆除 */
+    auto fail = [&](uint64_t code) {
+        caches_teardown();
+        slices_teardown();
+        if (mmap_base_) {
+            munmap(mmap_base_, mmap_size_);
+            mmap_base_ = nullptr;
+            mmap_size_ = 0;
+            fsblk0_base_ = nullptr;
+        } else {
+            free(block_bits);
+            free(inode_bits);
+        }
+        block_bits = nullptr;
+        inode_bits = nullptr;
         fd = -1;
-        if (res_code) *res_code = RC_ERR_STATE;
-        return;
+        if (res_code) *res_code = code;
+    };
+
+    /* ── 位图：直写=全量 pread 入内存；mmap 后端=窗口切片（不预取） ── */
+    if (!bitmaps_load()) { fail(RC_ERR_BITMAP_SELF); return; }
+
+    /* ── 分片初始化：slice_count 计算 + 双组逐片 enable_slice ── */
+    if (!slices_setup(mnt.logical_processor_count)) { fail(RC_ERR_STATE); return; }
+
+    /* ── 缓存子模块编排（决策树第二层：offload / self_reliat / no_cache） ── */
+    {
+        result_code_t rc = caches_setup();
+        if (rc != RC_OK) { fail(rc); return; }
     }
 
     /* ── root inode：取 dentry 树根块号 ── */
@@ -258,11 +306,7 @@ RavenFS_juvenile::RavenFS_juvenile(const linux_userspace_mount_t &mnt, uint64_t 
     raven_Inode_t root_inode;
     inode_read(root_inum, &root_inode);
     if (root_inode.type != INODE_TYPE_DIR || root_inode.data_root == PTR_INVALID) {
-        slices_teardown();
-        free(block_bits); block_bits = nullptr;
-        free(inode_bits); inode_bits = nullptr;
-        fd = -1;
-        if (res_code) *res_code = RC_ERR_STATE;
+        fail(RC_ERR_STATE);
         return;
     }
     root_dentry_blk = root_inode.data_root;
@@ -270,14 +314,26 @@ RavenFS_juvenile::RavenFS_juvenile(const linux_userspace_mount_t &mnt, uint64_t 
     if (res_code) *res_code = RC_OK;
 }
 
-/* 析构即卸载：双位图全量写回（readonly 跳过）→ 拆片 → 释放位图内存。
+/* 析构即卸载：缓存同步点（flush_all → delete）→ 位图写回（仅直写模式）→
+ * 拆片 → 释放后端（mmap munmap / 直写 free）。
+ * readonly 不 flush（mmap MAP_PRIVATE/PROT_READ 下写回本就禁止）。
  * fd 生命周期归外部（借入不关）。 */
 RavenFS_juvenile::~RavenFS_juvenile() {
+    caches_teardown();
     if (!param.is_readonly && fd >= 0 && block_bits && inode_bits)
         bitmaps_flush();
     slices_teardown();
-    free(block_bits); block_bits = nullptr;
-    free(inode_bits); inode_bits = nullptr;
+    if (mmap_base_) {
+        munmap(mmap_base_, mmap_size_);   /* mmap 后端：位图/缓存全在窗口内，一次释放 */
+        mmap_base_ = nullptr;
+        mmap_size_ = 0;
+        fsblk0_base_ = nullptr;
+    } else {
+        free(block_bits);
+        free(inode_bits);
+    }
+    block_bits = nullptr;
+    inode_bits = nullptr;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -302,7 +358,7 @@ result_code_t RavenFS_juvenile::read_buff(uint64_t blk, uint64_t blk_len, void *
     return RC_OK;
 }
 
-result_code_t RavenFS_juvenile::write_buff(uint64_t blk, uint64_t blk_len, void *buf) {
+result_code_t RavenFS_juvenile::write_buff(uint64_t blk, uint64_t blk_len, const void *buf) {
     if (!buf || blk_len == 0) return RC_ERR_STATE;
     if (blk >= total_blocks || blk_len > total_blocks - blk) return RC_ERR_STATE;
     size_t bytes = blk_len * 4096;
@@ -312,42 +368,161 @@ result_code_t RavenFS_juvenile::write_buff(uint64_t blk, uint64_t blk_len, void 
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * inode I/O（零缓存；inode array 从 inode_array_base 块起线性排布）
+ * 缓存回调适配器（static 成员，可访问私有 read_buff/write_buff）
+ * 两个子模块回调签名一致（(io_ctx, blk, blk_len, buf)），共用一对。
+ * io_ctx = this（ctor 组装 cfg 时传入）。
+ * ═══════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::fs_io_read(void *io_ctx, uint64_t blk, uint64_t blk_len, void *buf) {
+    return static_cast<RavenFS_juvenile *>(io_ctx)->read_buff(blk, blk_len, buf);
+}
+result_code_t RavenFS_juvenile::fs_io_write(void *io_ctx, uint64_t blk, uint64_t blk_len, const void *buf) {
+    return static_cast<RavenFS_juvenile *>(io_ctx)->write_buff(blk, blk_len, buf);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * caches_setup — 缓存子模块初始化编排（决策树第二层）
+ *
+ * 第一层 is_device_direct（ctor 已定）：
+ *   mmap 后端（非直写）：
+ *     - inode 缓存 offload：canvas = inode array 起始 FS_block 的窗口切片
+ *     - mdata_piece 缓存 offload：canvas = FS_block[0] 的窗口切片（数据区 base=0）
+ *     - 数据不落用户态，全由内核页缓存管；位图 ctor 已从窗口切片（不预取）
+ *  直写模式：
+ *     - inode 缓存：param.if_will_use_inode_cache ? self_reliat : no_cache
+ *     - mdata_piece：param.if_will_use_block_cache ? self_reliat : no_cache
+ *       （self_reliat 未实装 → ctor 拒 RC_ERR_STATE，挂载失败；TODO 实装后自然可用）
+ * 失败：已建子模块清理后返回错误码。
+ * ═══════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::caches_setup() {
+    result_code_t rc = RC_OK;
+
+    /* ── inode 缓存子模块 ── */
+    Inode_cache_cfg_t_v2 icfg{};
+    icfg.read_line  = fs_io_read;
+    icfg.write_line = fs_io_write;
+    icfg.io_ctx     = this;
+    icfg.Inode_count = inode_count;
+    icfg.Inode_base_FS_block_idx = inode_array_base;
+    if (!is_device_direct) {
+        icfg.mode = cache_work_mode_t::offload_cache;
+        icfg.offload_specific.virtual_canvas_base =
+            (uint64_t)(fsblk0_base_ + inode_array_base * 4096);   /* FS_block[inode_array_base]（inode array 起点） */
+    } else if (param.if_will_use_inode_cache) {
+        icfg.mode = cache_work_mode_t::self_reliat_cache;
+        icfg.self_reliat_specific.ttl_bare_seconds = 0;   /* 0 = ctor 按 Invariant TSC 换算默认 2s */
+    } else {
+        icfg.mode = cache_work_mode_t::no_cache;
+    }
+    inode_cache_mgr = new Inode_cache_mgr_t(icfg, &rc);
+    if (rc != RC_OK) { delete inode_cache_mgr; inode_cache_mgr = nullptr; return rc; }
+
+    /* ── mdata_piece 缓存子模块（8K 元数据负载片） ── */
+    mdata_piece_caches_cfg_t mcfg{};
+    mcfg.read_block  = fs_io_read;
+    mcfg.write_block = fs_io_write;
+    mcfg.io_ctx      = this;
+    mcfg.Piece_base_FS_block_idx = 0;      /* 数据区起点（元数据全在尾巴，block_model §3.2） */
+    mcfg.Piece_count = inode_bm_base / 2;  /* 覆盖数据区 [0, inode_bm_base)，每片 2 连续块 */
+    if (!is_device_direct) {
+        mcfg.mode = cache_work_mode_t::offload_cache;
+        mcfg.offload_specific.virtual_canvas_base =
+            (uint64_t)fsblk0_base_;   /* FS_block[0]（数据区 base=0） */
+    } else if (param.if_will_use_block_cache) {
+        mcfg.mode = cache_work_mode_t::self_reliat_cache;   /* TODO: 未实装，ctor 拒 RC_ERR_STATE */
+    } else {
+        mcfg.mode = cache_work_mode_t::no_cache;
+    }
+    mdata_piece_mgr = new mdata_piece_caches_mgr(mcfg, &rc);
+    if (rc != RC_OK) {
+        delete mdata_piece_mgr;
+        mdata_piece_mgr = nullptr;
+        delete inode_cache_mgr;   /* 拆已建子模块 */
+        inode_cache_mgr = nullptr;
+        return rc;
+    }
+
+    return RC_OK;
+}
+
+/* caches_teardown — 卸载：同步点（flush_all）→ delete 子模块 → 指针置空。
+ * readonly 不 flush（mmap MAP_PRIVATE/PROT_READ 下 msync 无意义，写回本就禁止）。 */
+void RavenFS_juvenile::caches_teardown() {
+    if (!param.is_readonly) {
+        if (inode_cache_mgr)  inode_cache_mgr->flush_all();
+        if (mdata_piece_mgr)  mdata_piece_mgr->flush_all();
+    }
+    delete inode_cache_mgr;
+    inode_cache_mgr = nullptr;
+    delete mdata_piece_mgr;
+    mdata_piece_mgr = nullptr;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * inode I/O（inode array 从 inode_array_base 块起线性排布，16 inode/块）
+ *
+ * O_DIRECT 契约：256B 直读/直写非法（长度/缓冲须对齐逻辑块）→
+ *   直写模式整块 4K 读-改-写（写时读回整块再改目标 256B）；
+ *   mmap 后端直接读写窗口切片（零拷贝，内核页缓存管）。
  * ═══════════════════════════════════════════════════════════════ */
 void RavenFS_juvenile::inode_read(uint64_t inum, raven_Inode_t *out) const {
-    pread(fd, out, sizeof(raven_Inode_t),
-          (off_t)(fblock_to_byte(inode_array_base) + inum * sizeof(raven_Inode_t)));
+    if (fsblk0_base_) {   /* mmap 后端：直接 memcpy 自窗口（FS_block[inode_array_base] 起） */
+        memcpy(out, fsblk0_base_ + inode_array_base * 4096 + inum * sizeof(raven_Inode_t),
+               sizeof(raven_Inode_t));
+        return;
+    }
+    alignas(4096) uint8_t blk[4096];   /* O_DIRECT：整块 4K 读，再取目标 256B */
+    const uint64_t line = inum >> 4;
+    pread(fd, blk, 4096, (off_t)(fblock_to_byte(inode_array_base) + line * 4096));
+    memcpy(out, blk + (inum & 15) * sizeof(raven_Inode_t), sizeof(raven_Inode_t));
 }
 
 void RavenFS_juvenile::inode_write(uint64_t inum, const raven_Inode_t *in) {
-    pwrite(fd, in, sizeof(raven_Inode_t),
-           (off_t)(fblock_to_byte(inode_array_base) + inum * sizeof(raven_Inode_t)));
+    if (fsblk0_base_) {   /* mmap 后端：直接写窗口切片 */
+        memcpy(fsblk0_base_ + inode_array_base * 4096 + inum * sizeof(raven_Inode_t),
+               in, sizeof(raven_Inode_t));
+        return;
+    }
+    alignas(4096) uint8_t blk[4096];   /* O_DIRECT：整块 4K 读-改-写 */
+    const uint64_t line = inum >> 4;
+    const off_t off = (off_t)(fblock_to_byte(inode_array_base) + line * 4096);
+    pread(fd, blk, 4096, off);
+    memcpy(blk + (inum & 15) * sizeof(raven_Inode_t), in, sizeof(raven_Inode_t));
+    pwrite(fd, blk, 4096, off);
 }
 
 /* ═══════════════════════════════════════════════════════════════
  * 位图核心
  * ═══════════════════════════════════════════════════════════════ */
 
-/* mount：读入双位图（4K 对齐分配）+ 自描述校验（block_model §6.6）+ 填 descriptor
+/* mount：位图入内存/切片 + 自描述校验（block_model §6.6）+ 填 descriptor
+ * 直写模式：全量 pread（4K 对齐分配，O_DIRECT 兼容）
+ * mmap 后端：直接从窗口切片，不预取（内核按需调页）；切片 4K 对齐
+ *   （位图区起始 FS_block × 4096 + SB 区 4096，恒 4096 倍数）
  * 校验点：bitmap 自身区域 [bitmap_start, total_blocks) 全 1
  *         inode 元数据区域 [inode_bm_base, bitmap_start) 全 1
  *         inode 位图 bit0（root inode）必须为 1 */
 bool RavenFS_juvenile::bitmaps_load() {
-    if (posix_memalign((void **)&block_bits, 4096, bitmap_blocks * 4096) != 0)
-        return false;
-    if (posix_memalign((void **)&inode_bits, 4096, inode_bm_blocks * 4096) != 0) {
-        free(block_bits); block_bits = nullptr;
-        return false;
+    if (is_device_direct) {
+        if (posix_memalign((void **)&block_bits, 4096, bitmap_blocks * 4096) != 0)
+            return false;
+        if (posix_memalign((void **)&inode_bits, 4096, inode_bm_blocks * 4096) != 0) {
+            free(block_bits); block_bits = nullptr;
+            return false;
+        }
+        if (pread(fd, block_bits, bitmap_blocks * 4096,
+                  (off_t)fblock_to_byte(bitmap_start)) != (ssize_t)(bitmap_blocks * 4096))
+            goto fail;
+        if (pread(fd, inode_bits, inode_bm_blocks * 4096,
+                  (off_t)fblock_to_byte(inode_bm_base)) != (ssize_t)(inode_bm_blocks * 4096))
+            goto fail;
+    } else {
+        /* mmap 后端：位图直接从窗口切片，不预取（内核按需调页）。
+         * 切片 4K 对齐：位图区起始 FS_block × 4096（fsblk0_base_ 已含 SB 区 4096）。 */
+        block_bits = fsblk0_base_ + bitmap_start * 4096;
+        inode_bits = fsblk0_base_ + inode_bm_base * 4096;
     }
 
-    if (pread(fd, block_bits, bitmap_blocks * 4096,
-              (off_t)fblock_to_byte(bitmap_start)) != (ssize_t)(bitmap_blocks * 4096))
-        goto fail;
-    if (pread(fd, inode_bits, inode_bm_blocks * 4096,
-              (off_t)fblock_to_byte(inode_bm_base)) != (ssize_t)(inode_bm_blocks * 4096))
-        goto fail;
-
-    /* 自描述校验 */
+    /* 自描述校验（两模式共用；mmap 模式直接校验内核页缓存视图） */
     for (uint64_t i = bitmap_start; i < total_blocks; i++)
         if (!(block_bits[i / 8] & (1u << (i % 8)))) goto fail;
     for (uint64_t i = inode_bm_base; i < bitmap_start; i++)
@@ -365,13 +540,20 @@ bool RavenFS_juvenile::bitmaps_load() {
     return true;
 
 fail:
-    free(block_bits); block_bits = nullptr;
-    free(inode_bits); inode_bits = nullptr;
+    /* mmap 模式：指针指向窗口切片，不能 free（munmap 由 ctor 失败路径/dtor 负责） */
+    if (is_device_direct) {
+        free(block_bits);
+        free(inode_bits);
+    }
+    block_bits = nullptr;
+    inode_bits = nullptr;
     return false;
 }
 
-/* 全量写回：双位图各 pwrite 一次（析构时调用；分配/释放只改内存态） */
+/* 全量写回：仅直写模式 pwrite（析构时调用；分配/释放只改内存态）。
+ * mmap 后端由内核页缓存管（MAP_SHARED 自动写回），无需显式 pwrite。 */
 void RavenFS_juvenile::bitmaps_flush() {
+    if (!is_device_direct) return;
     pwrite(fd, block_bits, bitmap_blocks * 4096,
            (off_t)fblock_to_byte(bitmap_start));
     pwrite(fd, inode_bits, inode_bm_blocks * 4096,

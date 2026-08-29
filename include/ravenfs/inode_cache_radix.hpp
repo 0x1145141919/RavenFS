@@ -242,7 +242,7 @@ private:
         /* ── rt 快照 + 拓扑（构造后只读） ── */
         inode_cache_rt_t   rt_ = {};               /* v2 派生快照值拷贝：I/O 回调 + io_ctx + 几何 */
         bitfield_decode_plan_t plan_ = {};           /* 树拓扑真相源（ctor 用，保留备析构/调试） */
-        uint8_t  row_bits_        = 4;                 /* 行内位宽：blk = base + (raw>>row_bits_)<<(row_bits_-4) */
+        uint8_t  row_bits_;                 /* 行内位宽：blk = base + (raw>>row_bits_)<<(row_bits_-4) */
         uint8_t  tree_levels_     = 0;                 /* 树层数 = plan_.total_levels - 1（level_bits[0] 是 mgr 层） */
         const std::atomic<uint64_t> *ttl_ticks_ = nullptr; /* 指向 mgr ttl_ticks_（共享真相源，reap 时原子读） */
         /* 统计记账：
@@ -257,16 +257,18 @@ private:
         std::atomic<uint64_t> real_cache_accumulate{0};
         /* ── 并发与结构 ── */
         std::shared_mutex lock_;                       /* 可睡眠读写锁：读共享/写独占，持锁可等 I/O（不烧核）
-                                                          * 读锁持有跨越 get→put 整个会话（get 手动 lock_shared，
-                                                          * put 手动 unlock_shared；会话内建链写锁被阻塞 →
-                                                          * 树只增不删，会话内 mark_dirty 可无锁走路径） */
+                                                          * 读锁持有跨越 get→put 整个会话：get 内 std::shared_lock
+                                                          * 持有，成功路径 release() 交所有权（非泄露路径析构收口），
+                                                          * put 手动 unlock_shared 释放；会话内建链写锁被阻塞 →
+                                                          * 树只增不删，会话内 mark_dirty 可无锁走路径 */
         void *root_ = nullptr;                         /* 根表：tree_levels_==1 → 叶表（ctrl_t 数组）；
                                                           * 否则指针槽数组（槽 = 子表指针，nullptr = 未建） */
     public:
         explicit slice_radix_tree(const slice_radix_tree_cfg_t &cfg);
         ~slice_radix_tree();                           /* 全部缓存：脏页写回 + 非脏丢弃 + 释放全部表 */
         /* get：吃解析好的位域结果（树不解码）。先读锁假定一次命中；miss → 写锁打通链路
-         * （建中间表/叶表，无 I/O）后回头读锁。读锁刻意泄露到 put 释放 */
+         * （建中间表/叶表，无 I/O）后回头读锁。RAII：非泄露路径 guard 析构收口；
+         * 成功返回前 release() 交出读锁所有权 —— 刻意泄露到 put 释放 */
         raven_Inode_t *get(bitfield_decoded_result_t *decoded);
         /* put：释放 get 泄露的读锁 + 对应缓存行 accessor-1（行不被淘汰由 accessor>0 保证） */
         void put(bitfield_decoded_result_t *decoded);

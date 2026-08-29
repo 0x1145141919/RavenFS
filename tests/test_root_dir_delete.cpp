@@ -28,23 +28,30 @@
 #include <cstdlib>
 #include <cstring>
 #include <set>
+#include <chrono>
 
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 
+using Clock = std::chrono::steady_clock;
+
 /* 打开设备并填挂载结构体：LBA_size 用 BLKSSZGET 探测（普通文件回退 4096）。
- * fd 生命周期归调用者（类只借不关）；测试末尾统一 ::close。 */
-static linux_userspace_mount_t make_mount(const char *path) {
+ * fd 生命周期归调用者（类只借不关）；测试末尾统一 ::close。
+ * direct=false → mmap 后端（缓存全 offload）；direct=true → 位图全量内存，
+ * 缓存按 use_*_cache 开关选 self_reliat/no_cache（编排决策树）。 */
+static linux_userspace_mount_t make_mount(const char *path, bool direct,
+                                          bool use_inode_cache, bool use_block_cache) {
     linux_userspace_mount_t mnt{};
-    mnt.dev.fd = ::open(path, O_RDWR);
+    mnt.dev.fd = ::open(path, direct ? O_RDWR | O_DIRECT : O_RDWR);
     int lba = 4096;
     if (::ioctl(mnt.dev.fd, BLKSSZGET, &lba) != 0 || lba <= 0) lba = 4096;
     mnt.dev.lba_size_log2 = (uint8_t)__builtin_ctz((unsigned)lba);
     mnt.dev.type = DEV_UNKNOWN;
-    mnt.dev.is_device_direct = false;
-    mnt.param = {};
+    mnt.dev.is_device_direct = direct;
+    mnt.param.if_will_use_inode_cache = use_inode_cache;
+    mnt.param.if_will_use_block_cache = use_block_cache;
     mnt.logical_processor_count = 1;
     return mnt;
 }
@@ -235,25 +242,33 @@ static void verify_tree(RavenFS_juvenile &fs, uint64_t expect_entries, const cha
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { printf("usage: %s <device> [batch_count=5000] [del_count=0]\n", argv[0]); return 2; }
+    if (argc < 2) { printf("usage: %s <device> [batch_count=5000] [del_count=0] [mode=offload|nocache]\n", argv[0]); return 2; }
     int batch_n = 5000;
     if (argc >= 3) batch_n = atoi(argv[2]);
     if (batch_n < 1) batch_n = 1;
     int del_count = 0;   /* 0 = 删全部；>0 = 复播二分，只删前 del_count 条 */
     if (argc >= 4) del_count = atoi(argv[3]);
     if (del_count < 0) del_count = 0;
+    /* 后端模式：offload（非直写 → mmap 全 offload）/ nocache（直写 → 双 no_cache） */
+    bool mode_direct = false, mode_use_icache = false, mode_use_bcache = false;
+    if (argc >= 5 && strcmp(argv[4], "nocache") == 0) {
+        mode_direct = true;   /* 直写 + 双 no_cache */
+    } else {
+        mode_direct = false;  /* 非直写 → mmap 后端，缓存全 offload（开关被忽略） */
+    }
 
     printf("════════════════════════════════════════════════\n"
            " RavenFS v1.1 root_dir_rm_dentry 专项测试\n"
-           " device: %s   batch: %d   del: %s\n"
+           " device: %s   batch: %d   del: %s   mode: %s\n"
            "════════════════════════════════════════════════\n",
            argv[1], batch_n,
-           del_count > 0 ? "bisect（只删前若干条）" : "全部删除");
+           del_count > 0 ? "bisect（只删前若干条）" : "全部删除",
+           mode_direct ? "nocache（直写+双no_cache）" : "offload（mmap后端）");
 
     uint64_t rc = 0;
     uint64_t inserted = 0;
 
-    linux_userspace_mount_t mnt = make_mount(argv[1]);
+    linux_userspace_mount_t mnt = make_mount(argv[1], mode_direct, mode_use_icache, mode_use_bcache);
     if (mnt.dev.fd < 0) { printf("open %s failed\n", argv[1]); return 2; }
 
     {
@@ -340,6 +355,7 @@ int main(int argc, char **argv) {
     printf("\n--- Phase 2: 插入 %d 条造数据 ---\n", batch_n);
     char nb[64];
     bool batch_ok = true;
+    const auto t_insert0 = Clock::now();
     int progress = batch_n >= 1000 ? batch_n / 8 : 1;
     for (int i = 0; i < batch_n; i++) {
         snprintf(nb, sizeof(nb), "f%05d", i);
@@ -349,7 +365,10 @@ int main(int argc, char **argv) {
         if (progress >= 1 && (i + 1) % progress == 0)
             printf("  ... %d/%d 已插入（累计 %llu）\n", i + 1, batch_n, (unsigned long long)inserted);
     }
+    const auto t_insert1 = Clock::now();
+    const double insert_sec = std::chrono::duration<double>(t_insert1 - t_insert0).count();
     CHECK(batch_ok, "批量插入 %d 全成功", batch_n);
+    printf("  ⏱ 插入阶段: %.3f s（%.0f ops/s）\n", insert_sec, insert_sec > 0 ? batch_n / insert_sec : 0);
     fs.dump_info();
     verify_tree(fs, inserted, "批量插入后");
 
@@ -363,6 +382,7 @@ int main(int argc, char **argv) {
 
     /* 2a. 正向删（左→右）：欠载时看右邻居 */
     printf("\n--- Phase 2a: 正向删除 %d 条（左→右） ---\n", fwd_target);
+    const auto t_fwd0 = Clock::now();
     progress = fwd_target >= 1000 ? fwd_target / 8 : 1;
     bool del_ok = true;
     int del_done = 0;
@@ -375,7 +395,10 @@ int main(int argc, char **argv) {
         if (progress >= 1 && (del_done) % progress == 0)
             printf("  ... %d/%d 已删（剩余 %llu）\n", del_done, fwd_target, (unsigned long long)inserted);
     }
+    const auto t_fwd1 = Clock::now();
+    const double fwd_sec = std::chrono::duration<double>(t_fwd1 - t_fwd0).count();
     CHECK(del_ok, "正向删除 %d 全成功", del_done);
+    printf("  ⏱ 正向删: %.3f s（%.0f ops/s）\n", fwd_sec, fwd_sec > 0 ? del_done / fwd_sec : 0);
     verify_tree(fs, inserted, "正向删除后");
 
     /* 复播二分模式：到这里就够 */
@@ -390,6 +413,7 @@ int main(int argc, char **argv) {
     /* 2b. 反向删（右→左）：欠载时看左邻居；删空收缩 */
     printf("\n--- Phase 2b: 反向删除 %d 条（右→左） ---\n", batch_n - del_done);
     int rev_target = batch_n - del_done;
+    const auto t_rev0 = Clock::now();
     progress = rev_target >= 1000 ? rev_target / 8 : 1;
     bool rev_ok = true;
     int rev_done = 0;
@@ -402,7 +426,10 @@ int main(int argc, char **argv) {
         if (progress >= 1 && rev_done % progress == 0)
             printf("  ... %d/%d 已删（剩余 %llu）\n", rev_done, rev_target, (unsigned long long)inserted);
     }
+    const auto t_rev1 = Clock::now();
+    const double rev_sec = std::chrono::duration<double>(t_rev1 - t_rev0).count();
     CHECK(rev_ok, "反向删除 %d 全成功", rev_done);
+    printf("  ⏱ 反向删: %.3f s（%.0f ops/s）\n", rev_sec, rev_sec > 0 ? rev_done / rev_sec : 0);
     verify_tree(fs, inserted, "反向删除后");
     printf("  删空后剩余条目: %llu\n", (unsigned long long)inserted);
     CHECK(inserted == 0, "全部删空（剩余 0）");

@@ -22,6 +22,7 @@
 #include <cstring>   /* memset：中间表槽位清零 */
 #include <new>       /* placement new：分片树 */
 #include <cstdlib>   /* malloc/free：v2 cfg 无 alloc 回调，self_reliat 内部统一 libc 分配器 */
+#include <mutex>     /* std::unique_lock：get 建链写锁（RAII） */
 #if defined(__linux__) || defined(__unix__)
 #include <sys/mman.h>   /* msync：offload 后端 flush_all 的内核页缓存同步 syscall */
 #endif
@@ -514,7 +515,7 @@ void Inode_cache_mgr_t::self_reliat_mark_dirty(uint64_t inum) {
 raven_Inode_t *Inode_cache_mgr_t::offload_get(uint64_t inum) {
     if (backed_mode != cache_work_mode_t::offload_cache) return nullptr;
     if (inum >= inodes_count_) return nullptr;
-    return (raven_Inode_t *)(virtual_canvas_base_ + ((inum >> 4) << 12)) + (inum & 15);
+    return &reinterpret_cast<raven_Inode_t*>(virtual_canvas_base_)[inum];
 }
 
 void Inode_cache_mgr_t::offload_put(uint64_t inum) {
@@ -794,19 +795,22 @@ uint64_t Inode_cache_mgr_t::slice_radix_tree::row_blk_len(uint64_t line) const {
     return (v + INODES_PER_PAGE - 1) / INODES_PER_PAGE;         /* 向上取整到 FS_block（16 inode/块） */
 }
 
-/* get：读锁假定一次命中；miss → 写锁建链（无 I/O）→ 回头读锁。读锁泄露到 put 释放 */
+/* get：读锁假定一次命中；miss → 写锁建链（无 I/O）→ 回头读锁。
+ * RAII 约定：非泄露路径全部由 guard 析构收口（miss 重取 / ctrl_acquire 失败），
+ * 仅成功返回前 release() 交出所有权 —— 读锁刻意泄露到 put 释放（会话语义）。 */
 raven_Inode_t *Inode_cache_mgr_t::slice_radix_tree::get(bitfield_decoded_result_t *d) {
-    lock_.lock_shared();
+    std::shared_lock sh(lock_);   /* 读锁：假定一次命中 */
     Inode_cache_ctrl_t *c = locate(d);
     if (!c) {
-        lock_.unlock_shared();
-        lock_.lock();
-        c = locate(d);
-        if (!c) ensure_path(d);
-        c = locate(d);   /* 建链后必命中（OOM 除外） */
-        lock_.unlock();
+        sh.unlock();   /* 让出读锁（所有权保留：sh 析构不再解锁） */
+        {
+            std::unique_lock ex(lock_);   /* 写锁建链（无 I/O，作用域析构释放） */
+            c = locate(d);
+            if (!c) ensure_path(d);
+            c = locate(d);   /* 建链后必命中（OOM 除外） */
+        }
         if (!c) return nullptr;   /* 建链 OOM：上层看到 nullptr，走错误路径 */
-        lock_.lock_shared();
+        sh.lock();   /* 回头读锁 */
     }
     const uint64_t line = d->raw >> row_bits_;
     const uint64_t blk_len = row_blk_len(line);   /* 行有效 FS_block 数：非末行满，末行收窄 ≥1 */
@@ -814,8 +818,9 @@ raven_Inode_t *Inode_cache_mgr_t::slice_radix_tree::get(bitfield_decoded_result_
     const uint64_t blk = rt_.inode_array_base + (line << (row_bits_ - 4));
     bool loaded = false;
     raven_Inode_t *page = Inode_cache_mgr_t::ctrl_acquire(c, blk, blk_len, rt_, &loaded);
-    if (!page) { lock_.unlock_shared(); return nullptr; }
+    if (!page) return nullptr;   /* sh 析构释放读锁 */
     if (loaded) real_cache_accumulate.fetch_add(page_bytes, std::memory_order_relaxed);
+    sh.release();   /* 读锁刻意泄露到 put：release 只交所有权、不解锁（put 端 unlock_shared 收） */
     return page;   /* 读锁保持到 put */
 }
 

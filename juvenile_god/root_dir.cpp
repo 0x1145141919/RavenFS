@@ -1,4 +1,5 @@
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
+#include "../include/ravenfs/mdata_piece_caches.hpp"   /* mdata_piece_session：8K 元数据节点会话（头里仅前置声明） */
 #include <cstring>
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -41,9 +42,14 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
         uint64_t root_blk = block_alloc_hard(2, 1);
         if (root_blk == PTR_INVALID) return RC_ERR_NO_BLOCK;
 
-        alignas(Bptree_dentry_leaf_node_t) uint8_t rbuf[8192];
-        Bptree_dentry_leaf_node_t *rleaf = (Bptree_dentry_leaf_node_t*)rbuf;
-        memset(rbuf, 0, 8192);
+        /* 新建根叶子：mdata_piece_session 直接覆盖会话页（无栈缓冲/无复制），
+         * 会话页整块清零 + 填 meta，dirty() 后析构写回（no_cache 写盘 /
+         * offload 直改内核页缓存切片）。 */
+        mdata_piece_session root_sess(mdata_piece_mgr, root_blk);
+        if (root_sess.index_error()) return RC_ERR_STATE;
+        if (!root_sess) return RC_ERR_IO;
+        Bptree_dentry_leaf_node_t *rleaf = (Bptree_dentry_leaf_node_t*)root_sess.data;
+        memset(root_sess.data, 0, 8192);
         rleaf->meta.magics[0] = DENTRY_MAGIC1;
         rleaf->meta.magics[1] = DENTRY_MAGIC2;
         rleaf->meta.magics[2] = DENTRY_MAGIC3;
@@ -55,8 +61,7 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
         rleaf->meta.ptrs[0].ptr = PTR_INVALID;
         rleaf->meta.ptrs[1].ptr = inode_idx;                /* ".." 孤儿自指 */
         rleaf->meta.ptrs[2].ptr = PTR_INVALID;
-        result_code_t rc = RAVENFS_WRITE_8K_NODE(this, root_blk, rbuf);
-        if (rc) return rc;
+        root_sess.dirty();
 
         ino.data_root = root_blk;
         inode_write(inode_idx, &ino);
@@ -84,21 +89,21 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
             uint64_t parent_blk = trace.blocks[i];
             uint16_t child_idx_in_parent = trace.child_idx[i];
 
-            alignas(Bptree_dentry_inner_node_t) uint8_t parent_buf[8192];
-            Bptree_dentry_inner_node_t *parent = (Bptree_dentry_inner_node_t*)parent_buf;
-            rc = RAVENFS_READ_8K_NODE(this, parent_blk, parent_buf);
-            if (rc) return rc;
+            /* 会话直读：parent 读改（dirty 写回），cur 只读；零栈缓冲零复制 */
+            mdata_piece_session parent_sess(mdata_piece_mgr, parent_blk);
+            if (parent_sess.index_error()) return RC_ERR_STATE;
+            if (!parent_sess) return RC_ERR_IO;
+            Bptree_dentry_inner_node_t *parent = (Bptree_dentry_inner_node_t*)parent_sess.data;
 
-            alignas(Bptree_dentry_leaf_node_t) uint8_t cur_buf[8192];
-            rc = RAVENFS_READ_8K_NODE(this, cur_blk, cur_buf);
-            if (rc) return rc;
-            uint64_t new_max = node_max_hash(cur_buf);
+            mdata_piece_session cur_sess(mdata_piece_mgr, cur_blk);
+            if (cur_sess.index_error()) return RC_ERR_STATE;
+            if (!cur_sess) return RC_ERR_IO;
+            uint64_t new_max = node_max_hash(cur_sess.data);
 
             uint64_t old_max = parent->hints[child_idx_in_parent].hash_max;
             if (new_max == old_max) break;
             parent->hints[child_idx_in_parent].hash_max = new_max;
-            rc = RAVENFS_WRITE_8K_NODE(this, parent_blk, parent_buf);
-            if (rc) return rc;
+            parent_sess.dirty();
             cur_blk = parent_blk;
         }
     }
@@ -126,10 +131,10 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
         /* 递归向上处理内部节点溢出 */
         uint64_t cur_parent_blk = parent_blk;
         while (need_parent_split) {
-            alignas(Bptree_dentry_inner_node_t) uint8_t parent_buf[8192];
-            Bptree_dentry_inner_node_t *parent_node = (Bptree_dentry_inner_node_t*)parent_buf;
-            rc = RAVENFS_READ_8K_NODE(this, cur_parent_blk, parent_buf);
-            if (rc) return rc;
+            mdata_piece_session parent_sess(mdata_piece_mgr, cur_parent_blk);
+            if (parent_sess.index_error()) return RC_ERR_STATE;
+            if (!parent_sess) return RC_ERR_IO;
+            Bptree_dentry_inner_node_t *parent_node = (Bptree_dentry_inner_node_t*)parent_sess.data;   /* 只读 */
 
             bool parent_is_root = parent_node->meta.parent_ptr.is_root_node;
             split_result_t inner_split = dentry_inner_split(cur_parent_blk);
@@ -148,10 +153,10 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
                 // 非根内部节点，向祖父节点应用分裂
                 uint64_t grand_parent_blk = parent_node->meta.parent_ptr.ptr;
                 // 查找 cur_parent_blk 在祖父节点中的索引
-                alignas(Bptree_dentry_inner_node_t) uint8_t grand_buf[8192];
-                Bptree_dentry_inner_node_t *grand = (Bptree_dentry_inner_node_t*)grand_buf;
-                rc = RAVENFS_READ_8K_NODE(this, grand_parent_blk, grand_buf);
-                if (rc) return rc;
+                mdata_piece_session grand_sess(mdata_piece_mgr, grand_parent_blk);
+                if (grand_sess.index_error()) return RC_ERR_STATE;
+                if (!grand_sess) return RC_ERR_IO;
+                Bptree_dentry_inner_node_t *grand = (Bptree_dentry_inner_node_t*)grand_sess.data;   /* 只读 */
                 uint16_t grand_idx = 0;
                 bool found = false;
                 for (uint16_t k = 0; k < grand->meta.parent_ptr.entry_count; ++k) {
@@ -209,10 +214,10 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
     uint64_t leaf_blk = trace.blocks[trace.depth - 1];
     uint16_t idx = trace.child_idx[trace.depth - 1];
 
-    alignas(Bptree_dentry_leaf_node_t) uint8_t leaf_buf[8192];
-    Bptree_dentry_leaf_node_t *leaf = (Bptree_dentry_leaf_node_t*)leaf_buf;
-    rc = RAVENFS_READ_8K_NODE(this, leaf_blk, leaf_buf);
-    if (rc) return rc;
+    mdata_piece_session leaf_sess(mdata_piece_mgr, leaf_blk);
+    if (leaf_sess.index_error()) return RC_ERR_STATE;
+    if (!leaf_sess) return RC_ERR_IO;
+    Bptree_dentry_leaf_node_t *leaf = (Bptree_dentry_leaf_node_t*)leaf_sess.data;   /* 只读（取条目 inum） */
     uint64_t inum = leaf->entries[idx].inode_ptr.ptr;
     /* ⚠ 52 位位域读出的 inum 与 PTR_INVALID 比较必须同样截断（64 位比较恒不相等）。
      * insert 尚未接 inode 分配时条目为悬空（PTR_INVALID）：此时只删树条目、
@@ -231,21 +236,21 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
             uint64_t parent_blk = trace.blocks[i];
             uint16_t child_idx_in_parent = trace.child_idx[i];
 
-            alignas(Bptree_dentry_inner_node_t) uint8_t parent_buf[8192];
-            Bptree_dentry_inner_node_t *parent = (Bptree_dentry_inner_node_t*)parent_buf;
-            rc = RAVENFS_READ_8K_NODE(this, parent_blk, parent_buf);
-            if (rc) return rc;
+            /* 会话直读：parent 读改（dirty 写回），cur 只读；零栈缓冲零复制 */
+            mdata_piece_session parent_sess(mdata_piece_mgr, parent_blk);
+            if (parent_sess.index_error()) return RC_ERR_STATE;
+            if (!parent_sess) return RC_ERR_IO;
+            Bptree_dentry_inner_node_t *parent = (Bptree_dentry_inner_node_t*)parent_sess.data;
 
-            alignas(Bptree_dentry_leaf_node_t) uint8_t cur_buf[8192];
-            rc = RAVENFS_READ_8K_NODE(this, cur_blk, cur_buf);
-            if (rc) return rc;
-            uint64_t new_max = node_max_hash(cur_buf);
+            mdata_piece_session cur_sess(mdata_piece_mgr, cur_blk);
+            if (cur_sess.index_error()) return RC_ERR_STATE;
+            if (!cur_sess) return RC_ERR_IO;
+            uint64_t new_max = node_max_hash(cur_sess.data);
 
             uint64_t old_max = parent->hints[child_idx_in_parent].hash_max;
             if (new_max == old_max) break;
             parent->hints[child_idx_in_parent].hash_max = new_max;
-            rc = RAVENFS_WRITE_8K_NODE(this, parent_blk, parent_buf);
-            if (rc) return rc;
+            parent_sess.dirty();
             cur_blk = parent_blk;
         }
     }
@@ -257,9 +262,10 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
              * 收缩场景（dentry_node_balance 设计上把根收缩交给上层）。
              * 是则收缩并返回 true；否则返回 false（保留原错误）。 */
             auto try_root_shrink = [&](uint64_t blk) -> bool {
-                alignas(Bptree_dentry_inner_node_t) uint8_t tmp[8192];
-                if (RAVENFS_READ_8K_NODE(this, blk, tmp) != RC_OK) return false;
-                Bptree_meta_t *m = (Bptree_meta_t *)tmp;
+                mdata_piece_session tmp_sess(mdata_piece_mgr, blk);
+                if (tmp_sess.index_error()) return false;
+                if (!tmp_sess) return false;
+                Bptree_meta_t *m = (Bptree_meta_t *)tmp_sess.data;
                 if (!is_dentry_node(m)) return false;
                 if (!m->parent_ptr.is_root_node) return false;
                 if (!m->parent_ptr.is_inner_node) return false;
@@ -281,10 +287,10 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
 
             uint64_t cur_parent_blk = parent_blk;
             while (need_parent_balance) {
-                alignas(Bptree_dentry_inner_node_t) uint8_t parent_buf[8192];
-                Bptree_dentry_inner_node_t *parent_node = (Bptree_dentry_inner_node_t*)parent_buf;
-                rc = RAVENFS_READ_8K_NODE(this, cur_parent_blk, parent_buf);
-                if (rc) return rc;
+                mdata_piece_session parent_sess(mdata_piece_mgr, cur_parent_blk);
+                if (parent_sess.index_error()) return RC_ERR_STATE;
+                if (!parent_sess) return RC_ERR_IO;
+                Bptree_dentry_inner_node_t *parent_node = (Bptree_dentry_inner_node_t*)parent_sess.data;   /* 只读 */
 
                 if (parent_node->meta.parent_ptr.is_root_node) {
                     /* 根内部节点只剩 1 孩子（合并残留）→ 收缩 */
@@ -293,10 +299,10 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
                 }
 
                 uint64_t grand_parent_blk = parent_node->meta.parent_ptr.ptr;
-                alignas(Bptree_dentry_inner_node_t) uint8_t grand_buf[8192];
-                Bptree_dentry_inner_node_t *grand = (Bptree_dentry_inner_node_t*)grand_buf;
-                rc = RAVENFS_READ_8K_NODE(this, grand_parent_blk, grand_buf);
-                if (rc) return rc;
+                mdata_piece_session grand_sess(mdata_piece_mgr, grand_parent_blk);
+                if (grand_sess.index_error()) return RC_ERR_STATE;
+                if (!grand_sess) return RC_ERR_IO;
+                Bptree_dentry_inner_node_t *grand = (Bptree_dentry_inner_node_t*)grand_sess.data;   /* 只读 */
                 uint16_t grand_idx = 0;
                 bool found = false;
                 for (uint16_t k = 0; k < grand->meta.parent_ptr.entry_count; ++k) {
@@ -361,10 +367,10 @@ result_code_t RavenFS_juvenile::dir_lookup(uint64_t inode_idx, const char *name,
     uint64_t leaf_blk = trace.blocks[trace.depth - 1];
     uint16_t idx = trace.child_idx[trace.depth - 1];
 
-    alignas(Bptree_dentry_leaf_node_t) uint8_t leaf_buf[8192];
-    Bptree_dentry_leaf_node_t *leaf = (Bptree_dentry_leaf_node_t*)leaf_buf;
-    rc = RAVENFS_READ_8K_NODE(this, leaf_blk, leaf_buf);
-    if (rc) return rc;
+    mdata_piece_session leaf_sess(mdata_piece_mgr, leaf_blk);
+    if (leaf_sess.index_error()) return RC_ERR_STATE;
+    if (!leaf_sess) return RC_ERR_IO;
+    Bptree_dentry_leaf_node_t *leaf = (Bptree_dentry_leaf_node_t*)leaf_sess.data;   /* 只读 */
     if (leaf->meta.parent_ptr.is_inner_node) return RC_ERR_STATE;
 
     *out_inum = leaf->entries[idx].inode_ptr.ptr;

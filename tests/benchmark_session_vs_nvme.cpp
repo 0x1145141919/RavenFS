@@ -34,19 +34,19 @@ int main(int argc, char **argv) {
     while ((1ull << bits) < geo.inodes) bits++;
     printf("bits=%u → RADIX（128 片 2 层树，行内 row_bits=4）\n", bits);
 
-    Inode_cache_cfg_t cfg{};
-    cfg.inodes_count = geo.inodes;
-    cfg.bits_len_of_inodes_count = bits;
-    cfg.inode_array_base = geo.inode_array_base;
-    cfg.ttl_ticks = 0;                 /* ctor 默认 2s，稍后显式禁用淘汰 */
-    cfg.read_page = rd; cfg.write_page = wr;
+    Inode_cache_cfg_t_v2 cfg{};
+    cfg.mode = cache_work_mode_t::self_reliat_cache;
+    cfg.read_line = rd;
+    cfg.write_line = wr;
     cfg.io_ctx = nullptr;
-    cfg.alloc = al; cfg.free = fr;
+    cfg.Inode_count = geo.inodes;
+    cfg.Inode_base_FS_block_idx = geo.inode_array_base;
+    /* self_reliat_specific.ttl_bare_seconds 默认 0 → ctor 走默认 2s；稍后显式禁用淘汰 */
 
     result_code_t rc = RC_ERR_IO;
     Inode_cache_mgr_t mgr(cfg, &rc);
     assert(rc == RC_OK);
-    mgr.set_ttl_ticks(0);              /* 0 = 禁用 TTL 淘汰（set 语义），保证全程命中 */
+    mgr.self_reliat_set_ttl_ticks(0);  /* 0 = 禁用 TTL 淘汰（set 语义），保证全程命中 */
 
     /* ── 预热行集：全范围均匀抽 64 行（跨片跨叶表，体现平均寻址路径） ── */
     std::mt19937_64 rng(0x5EED);
@@ -62,9 +62,9 @@ int main(int argc, char **argv) {
     /* 预热：get/put 一遍 → 全部 working */
     for (uint64_t line : lines) {
         Inode_cache_mgr_t::slice_cache_acces_token_t tok{};
-        raven_Inode_t *p = mgr.get(line * 16, &tok);
+        raven_Inode_t *p = mgr.self_reliat_get(line * 16, &tok);
         assert(p != nullptr);
-        mgr.put(line * 16, tok);
+        mgr.self_reliat_put(line * 16, tok);
     }
     printf("prewarmed %zu lines (%zu inodes)\n\n", lines.size(), lines.size() * 16);
 
@@ -97,11 +97,11 @@ int main(int argc, char **argv) {
         for (uint64_t i = 0; i < N; i++) {
             Inode_cache_mgr_t::slice_cache_acces_token_t tok{};
             const auto a = Clock::now();
-            raven_Inode_t *p = mgr.get(seq[i], &tok);
+            raven_Inode_t *p = mgr.self_reliat_get(seq[i], &tok);
             const auto b = Clock::now();
             acc += std::chrono::duration<double, std::nano>(b - a).count();
             assert(p);
-            mgr.put(seq[i], tok);
+            mgr.self_reliat_put(seq[i], tok);
         }
         printf("get-only (紧包计时)   : %8.1f ns/op\n", acc / (double)N);
     }
@@ -109,9 +109,9 @@ int main(int argc, char **argv) {
         double acc = 0;
         for (uint64_t i = 0; i < N; i++) {
             Inode_cache_mgr_t::slice_cache_acces_token_t tok{};
-            raven_Inode_t *p = mgr.get(seq[i], &tok);
+            raven_Inode_t *p = mgr.self_reliat_get(seq[i], &tok);
             const auto a = Clock::now();
-            mgr.put(seq[i], tok);
+            mgr.self_reliat_put(seq[i], tok);
             const auto b = Clock::now();
             acc += std::chrono::duration<double, std::nano>(b - a).count();
             (void)p;

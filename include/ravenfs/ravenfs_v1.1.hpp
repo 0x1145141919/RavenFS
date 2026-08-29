@@ -1,6 +1,16 @@
 #pragma once
 #include "../disk_struct_v1.1.hpp"
+#include "cache_mgr_mode.hpp"
 #include "../magics.h"
+
+/* 缓存子模块前置声明（仅成员指针用，不拉完整头）：
+ * 完整类型由使用方 cpp 各自 include inode_cache_radix.hpp /
+ * mdata_piece_caches.hpp —— 这两个头会拉 util/tsc.h → <chrono>，
+ * 若在 ravenfs_v1.1.hpp 直接 include，任何用
+ * `#define private public` 包裹本头的测试（test_root_dir_*）会把
+ * 标准库模板头一并污染，gcc16 下 sstream 可访问性检查直接报错。 */
+class Inode_cache_mgr_t;        /* inode 缓存管理器（inode_cache_radix.hpp） */
+class mdata_piece_caches_mgr;   /* 8K 元数据负载片缓存管理器（mdata_piece_caches.hpp） */
 
 #include <cstdint>
 #include <cstddef>
@@ -65,7 +75,13 @@ struct ravenfs_mount_param_t{
 struct linux_userspace_mount_t{
     ravenfs_mount_device_t dev;
     ravenfs_mount_param_t param;
-    uint32_t logical_processor_count;//自己想办法，找地方读取
+    uint32_t logical_processor_count;//自己想办法，找地方读取,测试时可以填任意数，但真上实际机器那就想办法拿真实数据
+};
+namespace ravenfs_juvenile_god_ctrl_words_bits{
+    constexpr uint64_t READ_ONLY_MASK=1;//由read_only_bit控制
+    constexpr uint64_t MMAP_BACKEND_CONTROL_MASK=2;//由ravenfs_mount_device_t.is_device_direct取反无条件设置这个bit,以及那个bit为1时无条件整个盘从0 offset处mmap,后续各段考虑从那个窗口切就行了
+    constexpr uint64_t BLOCK_CACHE_ENABLE_MASK=4;//MMAP_BACKEND_CONTROL_MASK为1时强制这个bit翻1,虽然内核会做缓存但是上层业务的预取，写回,失效是有意义的，MMAP_BACKEND_CONTROL_MASK=0时这个位为1则手动用户态缓存，为0则相应的session直接分配内存，硬读
+    constexpr uint64_t INODE_CACHE_ENABLE_MASK=8;//同上
 };
 class RavenFS_juvenile {
 public:
@@ -148,9 +164,11 @@ public:
         static constexpr uint32_t WRITE_BIT = 0x80000000u;  /* 高 1 位=写锁，低 31 位=读者计数 */
         std::atomic<uint32_t> state_;
     };
-    
-
+    uint64_t get_ctrl_word(){
+        return God_CTRL_WORD;
+    }
 private:
+    uint64_t God_CTRL_WORD;
     struct fs_bitmap_descriptor_t{
         uint64_t FS_blk_base;
         uint64_t*bitmap_raw;//必须保证4k对齐
@@ -229,14 +247,26 @@ class bitmap_slice_t{
     /* 批量块 I/O（零缓存）：blk 起连续 blk_len 个 FS_block 一次读写。
      * RC_OK / RC_ERR_STATE(参数非法) / RC_ERR_IO(短读短写) */
     result_code_t read_buff(uint64_t blk, uint64_t blk_len, void *buf);
-    result_code_t write_buff(uint64_t blk, uint64_t blk_len, void *buf);
+    result_code_t write_buff(uint64_t blk, uint64_t blk_len, const void *buf);
     /* ── inode I/O（零缓存）── */
     void inode_read(uint64_t inum, raven_Inode_t *out) const;
     void inode_write(uint64_t inum, const raven_Inode_t *in);
 
     /* ── 位图核心 ── */
-    bool bitmaps_load();     /* mount 时：读入双位图（4K 对齐分配）+ 自描述校验(§6.6) + 填 descriptor */
-    void bitmaps_flush();    /* 析构时：双位图全量写回（各 pwrite 一次） */
+    bool bitmaps_load();     /* mount 时：直写=全量 pread 入内存；mmap 后端=窗口切片（不预取）。
+                                * 两模式共用自描述校验(§6.6) + 填 descriptor */
+    void bitmaps_flush();    /* 析构时：仅直写模式 pwrite 全量写回（mmap 后端由内核页缓存管） */
+    /* 缓存子模块编排（ctor 调）：决策树第一层 is_device_direct ——
+     *   mmap 后端：inode/mdata_piece 全 offload（canvas 从窗口切）
+     *   直写模式 ：inode/mdata_piece 按 param.if_will_use_*_cache 选
+     *               self_reliat（用户态缓存）/ no_cache（session 直读）
+     * 失败 → 非 RC_OK（已清理已建子模块）。mdata_piece 的 self_reliat
+     * 未实装（ctor 拒绝），直写+开块缓存目前挂载失败，TODO 待实装。 */
+    result_code_t caches_setup();
+    void caches_teardown();  /* 卸载：flush_all（同步点）→ delete 子模块 → 指针置空 */
+    /* 缓存回调适配器：私有 read_buff/write_buff → 子模块函数指针（io_ctx = this） */
+    static result_code_t fs_io_read(void *io_ctx, uint64_t blk, uint64_t blk_len, void *buf);
+    static result_code_t fs_io_write(void *io_ctx, uint64_t blk, uint64_t blk_len, const void *buf);
     /* 分片初始化：slice_count = min(2^n 上界(logical_processor_count),
      * block/inode 位图各能切出的满片数)。每片 slice_bitscount = 32768
      * 的倍数（非末片），slice_base 4K 对齐；逐片 enable_slice。
@@ -279,8 +309,8 @@ class bitmap_slice_t{
 
     fs_bitmap_descriptor_t block_bitsmap_descriptor;
     fs_bitmap_descriptor_t inode_bitsmap_descriptor;
-    bitmap_slice_t*block_bitmap_slices;
-    bitmap_slice_t*inode_bitmap_slices;
+    bitmap_slice_t *block_bitmap_slices = nullptr;   /* 必须默认初始化：挂载失败路径 dtor 会 delete[]（未初始化=垃圾指针崩溃） */
+    bitmap_slice_t *inode_bitmap_slices = nullptr;
     uint32_t slice_count;//约束上面两个的分片的分片数目，取构造时传入的logical_processor_count取最小的2^n上界
     uint8_t *block_bits = nullptr;      /* 全量内存位图（bitmap_blocks×4096），4K 对齐（posix_memalign） */
     uint8_t *inode_bits = nullptr;      /* 全量内存位图（inode_bm_blocks×4096），4K 对齐（posix_memalign） */
@@ -291,6 +321,24 @@ class bitmap_slice_t{
 
     uint64_t root_inum      = 0;        /* 恒 0（根目录 inode 索引） */
     uint64_t root_dentry_blk = 0;       /* root inode.data_root（树根块号） */
+
+    /* ── 缓存子模块（参数决策树编排后接线；暂 nullptr = 未启用） ──
+     * 编排点：ctor 按 is_device_direct + param.if_will_use_*_cache 组装 cfg
+     * 并构造子模块（见 caches_setup）；未接线时各处 mdata_piece_session
+     * 构造恒失败（防御路径），8K 元数据访问全部报错 —— 这是预期
+     * （编排完成前只编译不跑）。 */
+    Inode_cache_mgr_t      *inode_cache_mgr  = nullptr;   /* inode 缓存（inode_cache_radix.hpp） */
+    mdata_piece_caches_mgr *mdata_piece_mgr  = nullptr;   /* 8K 元数据负载片缓存（mdata_piece_caches.hpp） */
+
+    /* ── mmap 后端（非直写挂载；决策树第一层） ──
+     * is_device_direct=false 时整盘从 offset 0 映射（含 SB 区 byte[0,4096)），
+     * 位图/缓存 canvas 全部从窗口切片；析构 munmap。直写模式不用（保持 0）。
+     * 换算基准（block_model.md §3.1）：FS_block[n] 虚拟地址 = fsblk0_base_ + n×4096，
+     * 其中 fsblk0_base_ = mmap_base_ + 4096（Primary SB 占 byte[0,4096)）。
+     * 所有切片（位图 ×2、inode/mdata canvas）一律从 fsblk0_base_ 派生，禁止散写。 */
+    uint8_t  *mmap_base_ = nullptr;   /* mmap 基址（fd offset 0） */
+    uint64_t  mmap_size_ = 0;         /* 映射长度（lseek END；文件/块设备均可用） */
+    uint8_t  *fsblk0_base_ = nullptr; /* FS_block[0] 虚拟基址 = 窗口 + 4096（仅 mmap 后端有效；直写恒 nullptr） */
 
     /* ── CRC32（Castagnoli，SB 校验 + 临时 name hash）── */
     static uint32_t crc32_table[256];
