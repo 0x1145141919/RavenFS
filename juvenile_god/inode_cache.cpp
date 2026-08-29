@@ -6,13 +6,25 @@
  * 分支现状：
  *   - CACHE_MODE_FULL_RAM    [1,12]  已实现：构造全量载入，get 零 I/O 零锁
  *   - CACHE_MODE_CTRL_ARRAY  [13,18] 已实现：控制器全量常驻，页懒加载不淘汰
- *   - CACHE_MODE_RADIX_SHARD [19,52] 草稿：策略表在下方，分片树待实装
+ *   - CACHE_MODE_RADIX_SHARD [19,52] 已实现：分片树（策略表 + 逐片 DFS）
+ * 后端现状（2026-08-29）：
+ *   - 构造/析构/会话已切 v2 配置 + 三后端（no_cache / self_reliat / offload）：
+ *     self_reliat = 上述三内部模式（旧 get/put/... 机械原样保留）；
+ *     offload = mmap canvas 指针直映；no_cache = session 自管缓冲直读
+ *   - flush_all 按后端自适应：no_cache 丢弃 / self_reliat 脏页写回+非脏丢弃 /
+ *     offload msync（见 ctrl_flush_one）
+ *   - 老 Inode_cache_cfg_t 与旧 get/put/mark_dirty/set_ttl_ticks/reap_expired/mode
+ *     已全面淘汰：分片树/行原语直接消费 v2 派生的 inode_cache_rt_t 快照
  * ═══════════════════════════════════════════════════════════════════ */
 #include "ravenfs/inode_cache_radix.hpp"
 #include "util/lock.h"   /* cpu_relax（忙等） / rdtsc_timestamp（LRU 时间戳） */
 
 #include <cstring>   /* memset：中间表槽位清零 */
 #include <new>       /* placement new：分片树 */
+#include <cstdlib>   /* malloc/free：v2 cfg 无 alloc 回调，self_reliat 内部统一 libc 分配器 */
+#if defined(__linux__) || defined(__unix__)
+#include <sys/mman.h>   /* msync：offload 后端 flush_all 的内核页缓存同步 syscall */
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════
  * statey 位域策略表（Sparrow 亲笔，从头文件原样迁入）
@@ -21,6 +33,10 @@
  * 逐层 cut_high 递归切割；行内引索位宽 row_bits = bits - sum(level_bits)，
  * 绝大多数档 4bit(16 entries=4KB=1块)，但 bits=25 / bits=33 两档为
  * 5bit(32 entries=8KB=2块) —— row_bits 由 decode 派生，不做独立常量。
+ * 边界不变量：行 I/O 块数 = 行有效数据 —— 非末行恒满（2^(row_bits-4) 块），
+ * 末行按有效 inode 向上取整到 FS_block 收窄（≥1，见 row_blk_len）。
+ * row_bits 任意（≥4）下末页都不会越出 inode array（不碰 bitmap 首块；
+ * 脏写回同理）。row_bits 域 [4, bits]：<4 时行内 inode < 一块容量，ctor 拒绝。
  * statey_array 尚未接线（RADIX 分支实装时按 bits 查表解析 global_slice_plan）。
  * ═══════════════════════════════════════════════════════════════════ */
 uint8_t **statey_array={
@@ -163,15 +179,48 @@ Inode_cache_mgr_t::bitfield_decoded_result_t Inode_cache_mgr_t::decode(uint64_t 
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * 构造：模式由 bits 推导；FULL_RAM 在此全量载入
+ * 文件级辅助：v2 cfg 的 alloc/free 适配器 + bits 推导
  * ═══════════════════════════════════════════════════════════════════ */
-Inode_cache_mgr_t::Inode_cache_mgr_t(const Inode_cache_cfg_t &cfg, result_code_t *rc_out)
-    : cfg_(cfg), mode_(inode_cache_mode_of(cfg.bits_len_of_inodes_count)) {
-    /* TTL 初始化：cfg.ttl_ticks 优先；否则按 Invariant TSC 频率换算默认 2s。
+/* v2 cfg 无 alloc/free 回调：self_reliat 内部统一走 libc 分配器（host 用户态）。
+ * 缓存行/页一律 4K 对齐 —— 三端 I/O 面常见 O_DIRECT（对齐要求），对齐分配是
+ * 合理默认，顺带省去 host 侧中间缓冲。
+ * 移植（sparrowos / linux 内核）时改这两个适配器即可，mgr 核心零改动。 */
+static void *host_alloc(void *io_ctx, uint64_t size) {
+    (void)io_ctx;
+    return std::aligned_alloc(4096, (size + 4095) & ~4095ull);
+}
+static void  host_free (void *io_ctx, void *ptr)    { (void)io_ctx; std::free(ptr); }
+
+/* ceil(log2(n))：v2 cfg 只给 Inode_count，bits 由它推导（模式判定唯一真相源）。
+ * 与 benchmark 的 while 推导一致；n 上限 2^52（bits 1~52 档）。 */
+static uint8_t bits_len_of(uint64_t count) {
+    uint8_t b = 0;
+    while ((1ull << b) < count) b++;
+    return b;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 内部装配：self_reliat 后端（几何/回调成员已由 v2 ctor 写定）
+ *
+ * 组装 rt_ 快照（v2 派生：I/O 回调 + io_ctx + 几何，分片树持值拷贝），
+ * TTL 换算（ttl_ticks_cfg 非 0 直接用；0 → 按 Invariant TSC 换算默认 2s，
+ * TSC 不可靠/无频率 → 0 = TTL 淘汰禁用，reap 空转），然后按 bits
+ * 跑三内部模式分支（FULL_RAM 在此全量载入）。
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t Inode_cache_mgr_t::ctor_self_reliat(uint64_t ttl_ticks_cfg) {
+    if (!inodes_count_ || inodes_count_ < INODES_PER_PAGE) return RC_ERR_STATE;   /* 防御：mkfs 保证 16 对齐，退化配置直接拒 */
+    rt_.read_line       = read_line;
+    rt_.write_line      = write_line;
+    rt_.io_ctx          = io_ctx;
+    rt_.inodes_count    = inodes_count_;
+    rt_.inode_array_base = inode_array_base_;
+    mode_ = inode_cache_mode_of(bits_len_);
+
+    /* TTL 初始化：显式 tick 优先；否则按 Invariant TSC 频率换算默认 2s。
      * TSC 不可靠/无频率 → ttl_ticks_ 保持 0 = TTL 淘汰禁用（reap_expired 空转）。
      * （绑死 x86_64：换算逻辑见 include/util/tsc.h，对齐 kernel tsc.cpp BARE_METAL 分支） */
-    if (cfg.ttl_ticks) {
-        ttl_ticks_.store(cfg.ttl_ticks, std::memory_order_relaxed);
+    if (ttl_ticks_cfg) {
+        ttl_ticks_.store(ttl_ticks_cfg, std::memory_order_relaxed);
     } else {
         tsc_info_t tsc;
         if (tsc_probe(&tsc)) ttl_ticks_.store(tsc_ticks_of_seconds(2, tsc), std::memory_order_relaxed);
@@ -186,8 +235,8 @@ Inode_cache_mgr_t::Inode_cache_mgr_t(const Inode_cache_cfg_t &cfg, result_code_t
          * level_bits[0] = mgr 层分片选择位宽（slice 数 = 2^w0），level_bits[1..]
          * = 树内逐层位宽；row_bits = bits - Σlevel_bits（行内索引，多数 4，25/33 档 5）。
          * 每片 placement new 一棵 slice_radix_tree（ctor 即建根表）。 */
-        global_slice_plan.bits_len = cfg_.bits_len_of_inodes_count;
-        global_slice_plan.level_bits = statey_levels_of(cfg_.bits_len_of_inodes_count,
+        global_slice_plan.bits_len = bits_len_;
+        global_slice_plan.level_bits = statey_levels_of(bits_len_,
                                                         &global_slice_plan.total_levels);
         if (!global_slice_plan.level_bits || global_slice_plan.total_levels == 0) {
             rc = RC_ERR_NO_BLOCK;
@@ -198,72 +247,150 @@ Inode_cache_mgr_t::Inode_cache_mgr_t(const Inode_cache_cfg_t &cfg, result_code_t
             sum += global_slice_plan.level_bits[i];
         if (sum > global_slice_plan.bits_len) { rc = RC_ERR_NO_BLOCK; break; }  /* 防御：位宽合计越界 */
         const uint8_t row_bits = (uint8_t)(global_slice_plan.bits_len - sum);
+        if (row_bits < 4) { rc = RC_ERR_STATE; break; }  /* 行内 inode < 16（< 1 FS_block）：I/O 单位细于块，禁 */
         n_slices_ = 1ull << global_slice_plan.level_bits[0];
-        slices_ = (slice_radix_tree **)cfg_.alloc(cfg_.io_ctx, n_slices_ * sizeof(slice_radix_tree *));
+        slices_ = (slice_radix_tree **)host_alloc(io_ctx, n_slices_ * sizeof(slice_radix_tree *));
         if (!slices_) { rc = RC_ERR_NO_BLOCK; break; }
         memset(slices_, 0, n_slices_ * sizeof(slice_radix_tree *));
         slice_radix_tree_cfg_t scfg;
-        scfg.host_cfg  = &cfg_;
+        scfg.rt        = rt_;        /* 值拷贝：每片独立持一份快照，无共享指针/悬垂 */
         scfg.plan      = global_slice_plan;
         scfg.row_bits  = row_bits;
         scfg.ttl_ticks = &ttl_ticks_;
         for (uint64_t i = 0; i < n_slices_; i++) {
-            void *mem = cfg_.alloc(cfg_.io_ctx, sizeof(slice_radix_tree));
+            void *mem = host_alloc(io_ctx, sizeof(slice_radix_tree));
             if (!mem) { rc = RC_ERR_NO_BLOCK; break; }
             slices_[i] = new (mem) slice_radix_tree(scfg);
         }
         break;
     }
     }
+    return rc;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 构造（v2）：后端模式 = cfg.mode。
+ *   no_cache      —— 无内部结构，仅记几何（session 自管缓冲直读）
+ *   self_reliat   —— ctor_self_reliat：TTL（裸秒→tick）→ 三内部模式分支
+ *   offload_cache —— 仅记 canvas 地址 + 几何（数据不落用户态）
+ * ═══════════════════════════════════════════════════════════════════ */
+Inode_cache_mgr_t::Inode_cache_mgr_t(const Inode_cache_cfg_t_v2 &cfg, result_code_t *rc_out)
+    : backed_mode(cfg.mode), io_ctx(cfg.io_ctx),
+      read_line(cfg.read_line), write_line(cfg.write_line) {
+    result_code_t rc = RC_OK;
+    switch (backed_mode) {
+    case cache_work_mode_t::no_cache:
+        inode_array_base_ = cfg.Inode_base_FS_block_idx;
+        inodes_count_     = cfg.Inode_count;
+        break;
+    case cache_work_mode_t::self_reliat_cache: {
+        /* TTL：裸秒 → tick（0 = 用默认 2s，交给 ctor_self_reliat 换算） */
+        uint64_t ttl = 0;
+        if (cfg.self_reliat_specific.ttl_bare_seconds) {
+            tsc_info_t tsc;
+            if (tsc_probe(&tsc))
+                ttl = tsc_ticks_of_seconds(cfg.self_reliat_specific.ttl_bare_seconds, tsc);
+        }
+        inodes_count_     = cfg.Inode_count;
+        inode_array_base_ = cfg.Inode_base_FS_block_idx;
+        bits_len_         = bits_len_of(cfg.Inode_count);
+        rc = ctor_self_reliat(ttl);
+        break;
+    }
+    case cache_work_mode_t::offload_cache:
+        virtual_canvas_base_ = cfg.offload_specific.virtual_canvas_base;
+        inode_array_base_    = cfg.Inode_base_FS_block_idx;
+        inodes_count_        = cfg.Inode_count;
+        break;
+    }
     ready_ = (rc == RC_OK);
     if (rc_out) *rc_out = rc;
 }
 
-/* set_ttl_ticks：外部调整缓存行 TTL（tick）。slice 持 &ttl_ticks_ 共享，即时生效，无需逐片同步 */
-void Inode_cache_mgr_t::set_ttl_ticks(uint64_t ticks) {
+/* self_reliat_set_ttl_ticks：外部调整缓存行 TTL（tick）。slice 持 &ttl_ticks_ 共享，
+ * 即时生效，无需逐片同步；0 = 禁用淘汰。 */
+void Inode_cache_mgr_t::self_reliat_set_ttl_ticks(uint64_t ticks) {
     ttl_ticks_.store(ticks, std::memory_order_relaxed);
 }
 
-/* 析构：全生命周期收口 — 脏页回写 → 释放 */
+/* 析构：全生命周期收口 — 脏页回写 → 释放。按后端分派：
+ * no_cache / offload 无内部结构（session 自管 / 内核页缓存管）；
+ * self_reliat 才走三内部模式收尾。 */
 Inode_cache_mgr_t::~Inode_cache_mgr_t() {
-    switch (mode_) {
-    case CACHE_MODE_FULL_RAM:
-        flush_full_ram();
-        cfg_.free(cfg_.io_ctx, full_ram_array_);
+    switch (backed_mode) {
+    case cache_work_mode_t::no_cache:
+    case cache_work_mode_t::offload_cache:
         break;
-    case CACHE_MODE_CTRL_ARRAY:
-        flush_ctrl_array();
-        for (uint64_t i = 0; i < ctrl_count(); i++) {   /* 懒分配页逐个释放 */
-            Inode_cache_ctrl_t *c = &ctrl_array_[i];
-            if (c->cache_data) cfg_.free(cfg_.io_ctx, c->cache_data);
-        }
-        cfg_.free(cfg_.io_ctx, ctrl_array_);
-        break;
-    case CACHE_MODE_RADIX_SHARD:
-        /* 逐片析构（slice dtor 内部：脏页写回 + 释放全部表）。
-         * 宿主须先停淘汰线程（注释见 reap_expired）。 */
-        for (uint64_t i = 0; i < n_slices_; i++) {
-            if (slices_[i]) {
-                slices_[i]->~slice_radix_tree();
-                cfg_.free(cfg_.io_ctx, slices_[i]);
+    case cache_work_mode_t::self_reliat_cache:
+        switch (mode_) {
+        case CACHE_MODE_FULL_RAM:
+            flush_full_ram();
+            host_free(io_ctx, full_ram_array_);
+            break;
+        case CACHE_MODE_CTRL_ARRAY:
+            flush_ctrl_array();   /* 脏写回驻留 + 非脏丢弃；下面统一释放写回后的残留行 */
+            for (uint64_t i = 0; i < ctrl_count(); i++) {
+                Inode_cache_ctrl_t *c = &ctrl_array_[i];
+                if (c->cache_data) host_free(io_ctx, c->cache_data);
             }
+            host_free(io_ctx, ctrl_array_);
+            break;
+        case CACHE_MODE_RADIX_SHARD:
+            /* 逐片析构（slice dtor 内部：脏页写回 + 释放全部表）。
+             * 宿主须先停淘汰线程（注释见 reap_expired）。 */
+            for (uint64_t i = 0; i < n_slices_; i++) {
+                if (slices_[i]) {
+                    slices_[i]->~slice_radix_tree();
+                    host_free(io_ctx, slices_[i]);
+                }
+            }
+            host_free(io_ctx, slices_);
+            break;
+        default:
+            break;
         }
-        cfg_.free(cfg_.io_ctx, slices_);
-        break;
-    default:
         break;
     }
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * ctrl_flush_one — flush_all 单行语义（CTRL_ARRAY / RADIX 共用）
+ *
+ *   脏行：写回 + 清 DIRTY，保持驻留（写回后即干净；卸载路径 dtor 统一释放）；
+ *   非脏行：CAS 接管（working && accessor==0）→ 释放页 → 回 idle（用户态丢弃）。
+ * 与 ctrl_reap_one 的差异：无 TTL 前提；脏行写回后不淘汰。
+ * 并发：宿主保证 flush_all 与 reap 不并发（同旧 flush 契约）；get 并发安全 ——
+ * 会话占坑（accessor>0）的行不丢，忙等 evicting 的行在回 idle 后重新懒加载。
+ * 返回 true = 本行已丢弃（调用方做统计记账；page_blk_len 未被清零，可读）。
+ * ═══════════════════════════════════════════════════════════════════ */
+static bool ctrl_flush_one(Inode_cache_ctrl_t *c, const inode_cache_rt_t &rt) {
+    uint64_t w = c->ctrl_word.load(std::memory_order_acquire);
+    if ((w & CTRL_STATE_MASK) != working) return false;
+    if ((w >> CTRL_FLAGS_SHIFT) & CTRL_FLAG_DIRTY) {
+        rt.write_line(rt.io_ctx, c->blk, c->page_blk_len, c->cache_data);
+        c->ctrl_word.fetch_and(~(CTRL_FLAG_DIRTY << CTRL_FLAGS_SHIFT), std::memory_order_release);
+        return false;   /* 写回后驻留，未丢弃 */
+    }
+    if ((w >> CTRL_ACCESSOR_SHIFT) != 0) return false;   /* 会话占用中：不丢 */
+    const uint64_t evict_w = (w & ~CTRL_STATE_MASK) | evicting;
+    if (!c->ctrl_word.compare_exchange_weak(w, evict_w, std::memory_order_acq_rel,
+                                            std::memory_order_acquire))
+        return false;   /* 被 get 占坑 → 放弃（下轮 flush 再丢） */
+    host_free(rt.io_ctx, c->cache_data);
+    c->cache_data = nullptr;
+    c->ctrl_word.store((evict_w & ~CTRL_STATE_MASK) | idle, std::memory_order_release);
+    return true;
+}
+
 /* ── FULL_RAM 构造：全量载入，之后 get 零 I/O 零锁 ── */
 result_code_t Inode_cache_mgr_t::ctor_full_ram() {
-    const uint64_t n     = cfg_.inodes_count ? cfg_.inodes_count : 1;
+    const uint64_t n     = inodes_count_ ? inodes_count_ : 1;
     const uint64_t pages = ctrl_count();
-    full_ram_array_ = (raven_Inode_t *)cfg_.alloc(cfg_.io_ctx, n * sizeof(raven_Inode_t));
+    full_ram_array_ = (raven_Inode_t *)host_alloc(io_ctx, n * sizeof(raven_Inode_t));
     if (!full_ram_array_) return RC_ERR_NO_BLOCK;
     for (uint64_t i = 0; i < pages; i++) {
-        result_code_t rc = cfg_.read_page(cfg_.io_ctx, blk_of(i),
-                                          &full_ram_array_[i * INODES_PER_PAGE]);
+        result_code_t rc = read_line(io_ctx, blk_of(i), 1,
+                                     &full_ram_array_[i * INODES_PER_PAGE]);
         if (rc != RC_OK) return rc;
     }
     return RC_OK;
@@ -272,21 +399,25 @@ result_code_t Inode_cache_mgr_t::ctor_full_ram() {
 /* ── CTRL_ARRAY 构造：控制器全量建好（状态全 idle），数据页懒加载 ── */
 result_code_t Inode_cache_mgr_t::ctor_ctrl_array() {
     const uint64_t n = ctrl_count();
-    ctrl_array_ = (Inode_cache_ctrl_t *)cfg_.alloc(cfg_.io_ctx, n * sizeof(Inode_cache_ctrl_t));
+    ctrl_array_ = (Inode_cache_ctrl_t *)host_alloc(io_ctx, n * sizeof(Inode_cache_ctrl_t));
     if (!ctrl_array_) return RC_ERR_NO_BLOCK;
     for (uint64_t i = 0; i < n; i++) {
         Inode_cache_ctrl_t *c = &ctrl_array_[i];
         c->cache_data = nullptr;                  /* 懒分配：get 的 io_ing 态内 alloc+read 原子完成 */
         c->accss_stamp.store(0, std::memory_order_relaxed);
+        c->page_blk_len = 0;
         c->ctrl_word.store(idle, std::memory_order_relaxed);   /* 未载入；CAS 状态机见 get() */
     }
     return RC_OK;
 }
 
-/* ── get：三模式统一入口 ── */
-raven_Inode_t *Inode_cache_mgr_t::get(uint64_t inum, slice_cache_acces_token_t *out_token) {
-    if (out_token) out_token->slice_idx = 0;   /* FULL_RAM/CTRL_ARRAY 单分片；RADIX 实装时填真值 */
-    if (inum >= cfg_.inodes_count) return nullptr;   /* 防御：上层保证合法 */
+/* ── self_reliat_get：self_reliat 后端统一入口（FULL_RAM/CTRL_ARRAY/RADIX 三内部模式表面一致） ──
+ * 仅 backed_mode == self_reliat_cache 时有意义；其余后端一律 nullptr
+ * （会话按模式分派，不会走到；守卫纯防御）。 */
+raven_Inode_t *Inode_cache_mgr_t::self_reliat_get(uint64_t inum, slice_cache_acces_token_t *out_token) {
+    if (out_token) out_token->slice_idx = 0;   /* FULL_RAM/CTRL_ARRAY 单分片；RADIX 填真值 */
+    if (backed_mode != cache_work_mode_t::self_reliat_cache) return nullptr;
+    if (inum >= inodes_count_) return nullptr;   /* 防御：上层保证合法 */
 
     switch (mode_) {
     case CACHE_MODE_FULL_RAM:
@@ -301,8 +432,7 @@ raven_Inode_t *Inode_cache_mgr_t::get(uint64_t inum, slice_cache_acces_token_t *
          * evicting / io_ing 均忙等（罕见路径，reap/加载完成即回可占坑态）。 */
         const uint64_t line = line_of(inum);
         Inode_cache_ctrl_t *c = &ctrl_array_[line];
-        raven_Inode_t *page = ctrl_acquire(c, blk_of(line),
-                                           INODES_PER_PAGE * sizeof(raven_Inode_t), cfg_);
+        raven_Inode_t *page = ctrl_acquire(c, blk_of(line), 1, rt_);   /* CTRL_ARRAY 行 = 1 FS_block */
         if (!page) return nullptr;
         return &page[row_of(inum)];
     }
@@ -323,10 +453,11 @@ raven_Inode_t *Inode_cache_mgr_t::get(uint64_t inum, slice_cache_acces_token_t *
     }
 }
 
-/* ── put：accessor 计数 -1（须与 get 配对，上层保证；token 供 RADIX 定位分片释放读锁） ── */
-void Inode_cache_mgr_t::put(uint64_t inum, const slice_cache_acces_token_t &token) {
+/* ── self_reliat_put：accessor 计数 -1（须与 get 配对，上层保证；token 供 RADIX 定位分片释放读锁） ── */
+void Inode_cache_mgr_t::self_reliat_put(uint64_t inum, const slice_cache_acces_token_t &token) {
     (void)token;
-    if (inum >= cfg_.inodes_count) return;
+    if (backed_mode != cache_work_mode_t::self_reliat_cache) return;
+    if (inum >= inodes_count_) return;
     switch (mode_) {
     case CACHE_MODE_FULL_RAM:
         /* 无淘汰无计数：no-op（接口占位，保持三模式一致） */
@@ -346,9 +477,10 @@ void Inode_cache_mgr_t::put(uint64_t inum, const slice_cache_acces_token_t &toke
     }
 }
 
-/* ── mark_dirty：页粒度脏标记（I/O 恒为整页回写） ── */
-void Inode_cache_mgr_t::mark_dirty(uint64_t inum) {
-    if (inum >= cfg_.inodes_count) return;
+/* ── self_reliat_mark_dirty：页粒度脏标记（I/O 恒为整页回写） ── */
+void Inode_cache_mgr_t::self_reliat_mark_dirty(uint64_t inum) {
+    if (backed_mode != cache_work_mode_t::self_reliat_cache) return;
+    if (inum >= inodes_count_) return;
     switch (mode_) {
     case CACHE_MODE_FULL_RAM:
         /* 全量写回方案：无需脏标记，no-op */
@@ -371,40 +503,72 @@ void Inode_cache_mgr_t::mark_dirty(uint64_t inum) {
     }
 }
 
-/* ── flush_all：全量脏页回写（挂载/卸载同步点） ── */
+/* ═══════════════════════════════════════════════════════════════════
+ * offload 后端：内核页缓存直映（mmap canvas）
+ *
+ * get = 指针直算：canvas + (inum>>4)×4096 + 行内索引。磁盘粒度 16 inode/块
+ * （mkfs 保证 16 对齐，Inode_count 整块覆盖 canvas）→ 行字节恒 4096。
+ * put = 无操作：无分片锁/accessor，一致性由内核页缓存管（脏页由 flush_all
+ * 的 msync 落盘）。
+ * ═══════════════════════════════════════════════════════════════════ */
+raven_Inode_t *Inode_cache_mgr_t::offload_get(uint64_t inum) {
+    if (backed_mode != cache_work_mode_t::offload_cache) return nullptr;
+    if (inum >= inodes_count_) return nullptr;
+    return (raven_Inode_t *)(virtual_canvas_base_ + ((inum >> 4) << 12)) + (inum & 15);
+}
+
+void Inode_cache_mgr_t::offload_put(uint64_t inum) {
+    (void)inum;   /* 内核页缓存管一致性，无会话资源可释放 */
+}
+
+/* ── flush_all：同步点（挂载/卸载）。按 backed_mode 自适应：
+ *   no_cache      ：无缓存可同步，丢弃（RC_OK）
+ *   self_reliat   ：脏页写回（驻留）+ 非脏页丢弃（见 ctrl_flush_one）
+ *   offload_cache ：msync 整片 canvas（内核页缓存同步 syscall）
+ * 旧实现（仅写回不丢弃）废弃：卸载同步点后缓存内容无保留价值，
+ * 干净行丢弃省内存；脏行写回后驻留，卸载路径 dtor 统一释放。 */
 result_code_t Inode_cache_mgr_t::flush_all() {
-    switch (mode_) {
-    case CACHE_MODE_FULL_RAM:   flush_full_ram();   break;
-    case CACHE_MODE_CTRL_ARRAY: flush_ctrl_array(); break;
-    case CACHE_MODE_RADIX_SHARD:
-        /* 逐片读锁 DFS 写回（slice::flush_all）。宿主应保证与 reap 不并发
-         * （卸载路径先停淘汰线程）；并发双写同页是良性的（内容一致） */
-        for (uint64_t i = 0; i < n_slices_; i++)
-            if (slices_[i]) slices_[i]->flush_all();
-        break;
-    default: break;
+    switch (backed_mode) {
+    case cache_work_mode_t::no_cache:
+        return RC_OK;   /* 无缓存可同步 */
+    case cache_work_mode_t::self_reliat_cache:
+        switch (mode_) {
+        case CACHE_MODE_FULL_RAM:   flush_full_ram();   break;
+        case CACHE_MODE_CTRL_ARRAY: flush_ctrl_array(); break;
+        case CACHE_MODE_RADIX_SHARD:
+            /* 逐片读锁 DFS（slice::flush_all）。宿主应保证与 reap 不并发
+             * （卸载路径先停淘汰线程）；并发双写同页是良性的（内容一致） */
+            for (uint64_t i = 0; i < n_slices_; i++)
+                if (slices_[i]) slices_[i]->flush_all();
+            break;
+        default: break;
+        }
+        return RC_OK;
+    case cache_work_mode_t::offload_cache: {
+#if defined(__linux__) || defined(__unix__)
+        /* 16 对齐：canvas 覆盖整块 inode array，字节数 = 块数 × 4096 */
+        const uint64_t bytes = (inodes_count_ >> 4) << 12;
+        if (msync((void *)virtual_canvas_base_, bytes, MS_SYNC) != 0) return RC_ERR_IO;
+#else
+        /* 非 POSIX 端口：宿主自管同步（预留） */
+#endif
+        return RC_OK;
     }
-    return RC_OK;   /* 草稿：回写失败暂不聚合，待细化 */
+    }
+    return RC_OK;   /* 不可达 */
 }
 
 void Inode_cache_mgr_t::flush_full_ram() {
     /* FULL_RAM ≤ 2^12 inode = 1MB：无条件全量写回，不要脏页位图 */
     const uint64_t pages = ctrl_count();
     for (uint64_t i = 0; i < pages; i++)
-        cfg_.write_page(cfg_.io_ctx, blk_of(i), &full_ram_array_[i * INODES_PER_PAGE]);
+        rt_.write_line(rt_.io_ctx, blk_of(i), 1, &full_ram_array_[i * INODES_PER_PAGE]);
 }
 
 void Inode_cache_mgr_t::flush_ctrl_array() {
     const uint64_t n = ctrl_count();
-    for (uint64_t i = 0; i < n; i++) {
-        Inode_cache_ctrl_t *c = &ctrl_array_[i];
-        const uint64_t w = c->ctrl_word.load(std::memory_order_acquire);
-        if ((w & CTRL_STATE_MASK) == working &&
-            ((w >> CTRL_FLAGS_SHIFT) & CTRL_FLAG_DIRTY)) {
-            cfg_.write_page(cfg_.io_ctx, blk_of(i), c->cache_data);
-            c->ctrl_word.fetch_and(~(CTRL_FLAG_DIRTY << CTRL_FLAGS_SHIFT), std::memory_order_release);
-        }
-    }
+    for (uint64_t i = 0; i < n; i++)
+        ctrl_flush_one(&ctrl_array_[i], rt_);   /* 脏写回驻留 + 非脏丢弃（行级 CAS） */
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -419,7 +583,8 @@ void Inode_cache_mgr_t::flush_ctrl_array() {
  *   - get 在 evicting 上忙等，回 idle 后重新懒加载
  * 注意：与 flush_all 不同，reap 不要求与 get 互斥；但宿主应在卸载前先停淘汰线程。
  * ═══════════════════════════════════════════════════════════════════ */
-void Inode_cache_mgr_t::reap_expired() {
+void Inode_cache_mgr_t::self_reliat_reap_expired() {
+    if (backed_mode != cache_work_mode_t::self_reliat_cache) return;
     const uint64_t ttl = ttl_ticks_.load(std::memory_order_relaxed);
     if (!ttl) return;             /* 无 TTL 时钟（TSC 不可靠）：淘汰禁用 */
     const uint64_t now = rdtsc_timestamp();
@@ -428,7 +593,7 @@ void Inode_cache_mgr_t::reap_expired() {
     case CACHE_MODE_CTRL_ARRAY: {
         const uint64_t n = ctrl_count();
         for (uint64_t i = 0; i < n; i++)
-            ctrl_reap_one(&ctrl_array_[i], cfg_, now, ttl);
+            ctrl_reap_one(&ctrl_array_[i], rt_, now, ttl);
         break;
     }
     case CACHE_MODE_RADIX_SHARD:
@@ -440,6 +605,12 @@ void Inode_cache_mgr_t::reap_expired() {
     }
 }
 
+/* self_reliat_mode：内部缓存模式（仅 self_reliat 后端有意义；
+ * no_cache/offload 返回占位值，勿依赖） */
+inode_cache_mode_t Inode_cache_mgr_t::self_reliat_mode() {
+    return mode_;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * ctrl_acquire — 缓存行懒加载状态机（CTRL_ARRAY / RADIX 共用）
  *
@@ -449,8 +620,8 @@ void Inode_cache_mgr_t::reap_expired() {
  * c->blk 由加载者在 CAS 成功后写定（read 用；working 发布后 reap/flush 可读）。
  * ═══════════════════════════════════════════════════════════════════ */
 raven_Inode_t *Inode_cache_mgr_t::ctrl_acquire(Inode_cache_ctrl_t *c, uint64_t blk,
-                                               uint64_t page_bytes,
-                                               const Inode_cache_cfg_t &cfg,
+                                               uint64_t blk_len,
+                                               const inode_cache_rt_t &rt,
                                                bool *out_loaded) {
     for (;;) {
         uint64_t w = c->ctrl_word.load(std::memory_order_acquire);
@@ -471,15 +642,17 @@ raven_Inode_t *Inode_cache_mgr_t::ctrl_acquire(Inode_cache_ctrl_t *c, uint64_t b
                                                    std::memory_order_acq_rel,
                                                    std::memory_order_acquire)) {
                 /* 本线程拿到加载权：alloc + read 原子完成，I/O 不持锁 */
-                c->blk = blk;   /* 加载者独占写；working 发布后 reap/flush 读 */
-                raven_Inode_t *page = (raven_Inode_t *)cfg.alloc(cfg.io_ctx, page_bytes);
+                c->blk = blk;           /* 加载者独占写；working 发布后 reap/flush 读 */
+                c->page_blk_len = blk_len;  /* 行有效块数：写回/统计直接读，不重算 */
+                const uint64_t page_bytes = blk_len * 4096;   /* FS_block 4096B（block_model.md §3） */
+                raven_Inode_t *page = (raven_Inode_t *)host_alloc(rt.io_ctx, page_bytes);
                 if (!page) {
                     c->ctrl_word.store((w & ~CTRL_STATE_MASK) | idle, std::memory_order_release);
                     return nullptr;
                 }
-                result_code_t rc = cfg.read_page(cfg.io_ctx, blk, page);
+                result_code_t rc = rt.read_line(rt.io_ctx, blk, blk_len, page);
                 if (rc != RC_OK) {
-                    cfg.free(cfg.io_ctx, page);
+                    host_free(rt.io_ctx, page);
                     c->cache_data = nullptr;
                     c->ctrl_word.store((w & ~CTRL_STATE_MASK) | idle, std::memory_order_release);
                     return nullptr;
@@ -502,7 +675,7 @@ raven_Inode_t *Inode_cache_mgr_t::ctrl_acquire(Inode_cache_ctrl_t *c, uint64_t b
  * 无 get 占坑窗口）；成功后：脏写回 → 释放页 → 回 idle。
  * 返回 true = 本行已被淘汰（调用方做统计记账）。
  * ═══════════════════════════════════════════════════════════════════ */
-bool Inode_cache_mgr_t::ctrl_reap_one(Inode_cache_ctrl_t *c, const Inode_cache_cfg_t &cfg,
+bool Inode_cache_mgr_t::ctrl_reap_one(Inode_cache_ctrl_t *c, const inode_cache_rt_t &rt,
                                       uint64_t now, uint64_t ttl) {
     uint64_t w = c->ctrl_word.load(std::memory_order_acquire);
     if ((w & CTRL_STATE_MASK) != working) return false;
@@ -515,10 +688,10 @@ bool Inode_cache_mgr_t::ctrl_reap_one(Inode_cache_ctrl_t *c, const Inode_cache_c
                                             std::memory_order_acquire))
         return false;   /* 被 get 占坑/他人接管 → 放弃 */
 
-    /* 接管成功：无锁 I/O 写回 → 释放 → 回 idle（get 忙等后重载） */
+    /* 接管成功：无锁 I/O 写回（只写行有效块数，末行不越界）→ 释放 → 回 idle（get 忙等后重载） */
     if ((w >> CTRL_FLAGS_SHIFT) & CTRL_FLAG_DIRTY)
-        cfg.write_page(cfg.io_ctx, c->blk, c->cache_data);
-    cfg.free(cfg.io_ctx, c->cache_data);
+        rt.write_line(rt.io_ctx, c->blk, c->page_blk_len, c->cache_data);
+    host_free(rt.io_ctx, c->cache_data);
     c->cache_data = nullptr;
     const uint64_t back_idle = ((evict_w & ~CTRL_STATE_MASK) &
                                 ~(CTRL_FLAG_DIRTY << CTRL_FLAGS_SHIFT)) | idle;
@@ -541,7 +714,7 @@ bool Inode_cache_mgr_t::ctrl_reap_one(Inode_cache_ctrl_t *c, const Inode_cache_c
  * blk = base + ((inum >> row_bits_) << (row_bits_-4))（25/33 档 row_bits=5 → 8KB 两连块）。
  * ═══════════════════════════════════════════════════════════════════ */
 Inode_cache_mgr_t::slice_radix_tree::slice_radix_tree(const slice_radix_tree_cfg_t &cfg)
-    : host_cfg_(cfg.host_cfg), plan_(cfg.plan), row_bits_(cfg.row_bits),
+    : rt_(cfg.rt), plan_(cfg.plan), row_bits_(cfg.row_bits),
       ttl_ticks_(cfg.ttl_ticks) {
     tree_levels_ = (uint8_t)(plan_.total_levels - 1);   /* level_bits[0] 是 mgr 层，不进树 */
     if (tree_levels_ == 1) {
@@ -559,13 +732,13 @@ Inode_cache_mgr_t::slice_radix_tree::~slice_radix_tree() {
 /* alloc_leaf — 叶表：ctrl_t 数组全 idle（写锁内调用） */
 void *Inode_cache_mgr_t::slice_radix_tree::alloc_leaf() {
     const uint64_t n = 1ull << plan_.level_bits[plan_.total_levels - 1];
-    Inode_cache_ctrl_t *leaf = (Inode_cache_ctrl_t *)host_cfg_->alloc(
-        host_cfg_->io_ctx, n * sizeof(Inode_cache_ctrl_t));
+    Inode_cache_ctrl_t *leaf = (Inode_cache_ctrl_t *)host_alloc(rt_.io_ctx, n * sizeof(Inode_cache_ctrl_t));
     if (!leaf) return nullptr;
     for (uint64_t i = 0; i < n; i++) {
         Inode_cache_ctrl_t *c = &leaf[i];
         c->cache_data = nullptr;
         c->accss_stamp.store(0, std::memory_order_relaxed);
+        c->page_blk_len = 0;
         c->ctrl_word.store(idle, std::memory_order_relaxed);
     }
     table_size_all_accumulate += n * sizeof(Inode_cache_ctrl_t);   /* 写锁内 */
@@ -575,7 +748,7 @@ void *Inode_cache_mgr_t::slice_radix_tree::alloc_leaf() {
 /* alloc_internal — 中间表：指针槽数组清零（写锁内调用） */
 void *Inode_cache_mgr_t::slice_radix_tree::alloc_internal(uint8_t level) {
     const uint64_t n = 1ull << plan_.level_bits[1 + level];
-    void **t = (void **)host_cfg_->alloc(host_cfg_->io_ctx, n * sizeof(void *));
+    void **t = (void **)host_alloc(rt_.io_ctx, n * sizeof(void *));
     if (!t) return nullptr;
     memset(t, 0, n * sizeof(void *));
     table_size_all_accumulate += n * sizeof(void *);   /* 写锁内 */
@@ -611,6 +784,16 @@ Inode_cache_mgr_t::slice_radix_tree::locate(bitfield_decoded_result_t *d) {
     return nullptr;   /* 不可达 */
 }
 
+/* row_blk_len — 行有效 FS_block 数（末行按有效 inode 向上取整收窄，≥1）
+ * 边界不变量：行 I/O 恒等于有效数据 —— 末页永不越出 inode array
+ * （不碰 bitmap 首块；脏写回同理）。非末行恒 = 2^(row_bits-4)（满行）。 */
+uint64_t Inode_cache_mgr_t::slice_radix_tree::row_blk_len(uint64_t line) const {
+    const uint64_t P = 1ull << row_bits_;                       /* 行内 inode 数 */
+    const uint64_t valid = rt_.inodes_count - line * P;         /* 行内有效 inode（line<line_count 恒 >0） */
+    const uint64_t v = (valid < P) ? valid : P;
+    return (v + INODES_PER_PAGE - 1) / INODES_PER_PAGE;         /* 向上取整到 FS_block（16 inode/块） */
+}
+
 /* get：读锁假定一次命中；miss → 写锁建链（无 I/O）→ 回头读锁。读锁泄露到 put 释放 */
 raven_Inode_t *Inode_cache_mgr_t::slice_radix_tree::get(bitfield_decoded_result_t *d) {
     lock_.lock_shared();
@@ -625,11 +808,12 @@ raven_Inode_t *Inode_cache_mgr_t::slice_radix_tree::get(bitfield_decoded_result_
         if (!c) return nullptr;   /* 建链 OOM：上层看到 nullptr，走错误路径 */
         lock_.lock_shared();
     }
-    const uint64_t page_bytes = (1ull << row_bits_) * sizeof(raven_Inode_t);
-    const uint64_t blk = host_cfg_->inode_array_base +
-                         ((d->raw >> row_bits_) << (row_bits_ - 4));
+    const uint64_t line = d->raw >> row_bits_;
+    const uint64_t blk_len = row_blk_len(line);   /* 行有效 FS_block 数：非末行满，末行收窄 ≥1 */
+    const uint64_t page_bytes = blk_len * 4096;
+    const uint64_t blk = rt_.inode_array_base + (line << (row_bits_ - 4));
     bool loaded = false;
-    raven_Inode_t *page = Inode_cache_mgr_t::ctrl_acquire(c, blk, page_bytes, *host_cfg_, &loaded);
+    raven_Inode_t *page = Inode_cache_mgr_t::ctrl_acquire(c, blk, blk_len, rt_, &loaded);
     if (!page) { lock_.unlock_shared(); return nullptr; }
     if (loaded) real_cache_accumulate.fetch_add(page_bytes, std::memory_order_relaxed);
     return page;   /* 读锁保持到 put */
@@ -649,7 +833,9 @@ void Inode_cache_mgr_t::slice_radix_tree::mark_dirty(bitfield_decoded_result_t *
     if (c) c->ctrl_word.fetch_or(CTRL_FLAG_DIRTY << CTRL_FLAGS_SHIFT, std::memory_order_release);
 }
 
-/* flush_all：读锁内 DFS 全量脏页写回（挂载/卸载同步点；宿主保证与 reap 不并发） */
+/* flush_all：读锁内 DFS 全量同步（挂载/卸载同步点；宿主保证与 reap 不并发）——
+ * 脏行写回（驻留）+ 非脏行丢弃（ctrl_flush_one 行级 CAS）；不摘表（表只增不删，
+ * 读锁遍历安全）。 */
 void Inode_cache_mgr_t::slice_radix_tree::flush_all() {
     std::shared_lock lk(lock_);
     if (!root_) return;
@@ -660,16 +846,10 @@ void Inode_cache_mgr_t::slice_radix_tree::dfs_flush(void *table, uint8_t level) 
     if (level == tree_levels_ - 1) {
         Inode_cache_ctrl_t *leaf = (Inode_cache_ctrl_t *)table;
         const uint64_t n = 1ull << plan_.level_bits[plan_.total_levels - 1];
-        for (uint64_t i = 0; i < n; i++) {
-            Inode_cache_ctrl_t *c = &leaf[i];
-            const uint64_t w = c->ctrl_word.load(std::memory_order_acquire);
-            if ((w & CTRL_STATE_MASK) == working &&
-                ((w >> CTRL_FLAGS_SHIFT) & CTRL_FLAG_DIRTY)) {
-                host_cfg_->write_page(host_cfg_->io_ctx, c->blk, c->cache_data);
-                c->ctrl_word.fetch_and(~(CTRL_FLAG_DIRTY << CTRL_FLAGS_SHIFT),
-                                       std::memory_order_release);
-            }
-        }
+        for (uint64_t i = 0; i < n; i++)
+            if (ctrl_flush_one(&leaf[i], rt_))   /* 丢弃非脏行 → 记账 */
+                real_cache_accumulate.fetch_sub(leaf[i].page_blk_len * 4096,
+                                                std::memory_order_relaxed);
     } else {
         void **t = (void **)table;
         const uint64_t w = 1ull << plan_.level_bits[1 + level];
@@ -692,13 +872,12 @@ void Inode_cache_mgr_t::slice_radix_tree::reap_expired() {
 
 void Inode_cache_mgr_t::slice_radix_tree::dfs_reap(void *table, uint8_t level,
                                                    uint64_t now, uint64_t ttl) {
-    const uint64_t page_bytes = (1ull << row_bits_) * sizeof(raven_Inode_t);
     if (level == tree_levels_ - 1) {
         Inode_cache_ctrl_t *leaf = (Inode_cache_ctrl_t *)table;
         const uint64_t n = 1ull << plan_.level_bits[plan_.total_levels - 1];
         for (uint64_t i = 0; i < n; i++) {
-            if (Inode_cache_mgr_t::ctrl_reap_one(&leaf[i], *host_cfg_, now, ttl))
-                real_cache_accumulate.fetch_sub(page_bytes, std::memory_order_relaxed);
+            if (Inode_cache_mgr_t::ctrl_reap_one(&leaf[i], rt_, now, ttl))
+                real_cache_accumulate.fetch_sub(leaf[i].page_blk_len * 4096, std::memory_order_relaxed);
         }
     } else {
         void **t = (void **)table;
@@ -718,17 +897,17 @@ void Inode_cache_mgr_t::slice_radix_tree::dfs_destroy(void *table, uint8_t level
             const uint64_t w = c->ctrl_word.load(std::memory_order_acquire);
             if ((w & CTRL_STATE_MASK) == working && c->cache_data) {
                 if ((w >> CTRL_FLAGS_SHIFT) & CTRL_FLAG_DIRTY)
-                    host_cfg_->write_page(host_cfg_->io_ctx, c->blk, c->cache_data);
-                host_cfg_->free(host_cfg_->io_ctx, c->cache_data);
+                    rt_.write_line(rt_.io_ctx, c->blk, c->page_blk_len, c->cache_data);
+                host_free(rt_.io_ctx, c->cache_data);
             }
             /* io_ing/evicting：无并发析构下不可能残留页（cache_data 应为空），防御跳过 */
         }
-        host_cfg_->free(host_cfg_->io_ctx, leaf);
+        host_free(rt_.io_ctx, leaf);
     } else {
         void **t = (void **)table;
         const uint64_t w = 1ull << plan_.level_bits[1 + level];
         for (uint64_t i = 0; i < w; i++)
             if (t[i]) dfs_destroy(t[i], level + 1);
-        host_cfg_->free(host_cfg_->io_ctx, t);
+        host_free(rt_.io_ctx, t);
     }
 }

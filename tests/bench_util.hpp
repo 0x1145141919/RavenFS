@@ -43,15 +43,17 @@ inline uint32_t crc32_compute(const void *data, size_t len) {
 inline int g_fd = -1;
 inline uint64_t g_reads = 0, g_writes = 0, g_read_bytes = 0, g_write_bytes = 0;
 
-inline result_code_t rd(void *, uint64_t blk, void *buf) {
-    g_reads++; g_read_bytes += 4096;
-    ssize_t r = pread(g_fd, buf, 4096, (off_t)4096 + (off_t)blk * 4096);
-    return (r == 4096) ? RC_OK : RC_ERR_IO;
+inline result_code_t rd(void *, uint64_t blk, uint64_t blk_len, void *buf) {
+    const size_t n = (size_t)blk_len * 4096;
+    g_reads++; g_read_bytes += n;
+    ssize_t r = pread(g_fd, buf, n, (off_t)4096 + (off_t)blk * 4096);
+    return (r == (ssize_t)n) ? RC_OK : RC_ERR_IO;
 }
-inline result_code_t wr(void *, uint64_t blk, const void *buf) {
-    g_writes++; g_write_bytes += 4096;
-    ssize_t r = pwrite(g_fd, buf, 4096, (off_t)4096 + (off_t)blk * 4096);
-    return (r == 4096) ? RC_OK : RC_ERR_IO;
+inline result_code_t wr(void *, uint64_t blk, uint64_t blk_len, const void *buf) {
+    const size_t n = (size_t)blk_len * 4096;
+    g_writes++; g_write_bytes += n;
+    ssize_t r = pwrite(g_fd, buf, n, (off_t)4096 + (off_t)blk * 4096);
+    return (r == (ssize_t)n) ? RC_OK : RC_ERR_IO;
 }
 inline void *al(void *, uint64_t sz) { return aligned_alloc(4096, (sz + 4095) & ~4095ull); }
 inline void fr(void *, void *p) { free(p); }

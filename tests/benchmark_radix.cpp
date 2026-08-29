@@ -57,18 +57,18 @@ static uint32_t crc32_compute(const void *data, size_t len) {
 static int g_fd = -1;
 static uint64_t g_reads = 0, g_writes = 0, g_read_bytes = 0, g_write_bytes = 0;
 
-static result_code_t rd(void *, uint64_t blk, void *buf) {
-    g_reads++; g_read_bytes += 4096;
-    ssize_t r = pread(g_fd, buf, 4096, (off_t)4096 + (off_t)blk * 4096);
-    return (r == 4096) ? RC_OK : RC_ERR_IO;
+static result_code_t rd(void *, uint64_t blk, uint64_t blk_len, void *buf) {
+    const size_t n = (size_t)blk_len * 4096;
+    g_reads++; g_read_bytes += n;
+    ssize_t r = pread(g_fd, buf, n, (off_t)4096 + (off_t)blk * 4096);
+    return (r == (ssize_t)n) ? RC_OK : RC_ERR_IO;
 }
-static result_code_t wr(void *, uint64_t blk, const void *buf) {
-    g_writes++; g_write_bytes += 4096;
-    ssize_t r = pwrite(g_fd, buf, 4096, (off_t)4096 + (off_t)blk * 4096);
-    return (r == 4096) ? RC_OK : RC_ERR_IO;
+static result_code_t wr(void *, uint64_t blk, uint64_t blk_len, const void *buf) {
+    const size_t n = (size_t)blk_len * 4096;
+    g_writes++; g_write_bytes += n;
+    ssize_t r = pwrite(g_fd, buf, n, (off_t)4096 + (off_t)blk * 4096);
+    return (r == (ssize_t)n) ? RC_OK : RC_ERR_IO;
 }
-static void *al(void *, uint64_t sz) { return aligned_alloc(4096, (sz + 4095) & ~4095ull); }
-static void fr(void *, void *p) { free(p); }
 
 /* 直读盘（不经缓存），用于内容对比 */
 static void disk_read_blk(uint64_t blk, void *buf) {
@@ -119,30 +119,29 @@ int main(int argc, char **argv) {
     assert(bits >= 19 && bits <= 52);   /* RADIX 档 */
     printf("bits=%u → statey_%u, row_bits=4\n", bits, bits);
 
-    /* ── 缓存控制器初始化（I/O 直通裸盘，O_DIRECT 4K 对齐） ── */
-    Inode_cache_cfg_t cfg{};
-    cfg.inodes_count = inodes;
-    cfg.bits_len_of_inodes_count = bits;
-    cfg.inode_array_base = inode_array_base;
-    cfg.ttl_ticks = 0;                  /* ctor 按 TSC 换算默认 2s */
-    cfg.read_page = rd; cfg.write_page = wr;
+    /* ── 缓存控制器初始化（I/O 直通裸盘，O_DIRECT 4K 对齐；内部页由 mgr 4K 对齐分配） ── */
+    Inode_cache_cfg_t_v2 cfg{};
+    cfg.mode = cache_work_mode_t::self_reliat_cache;
+    cfg.read_line = rd; cfg.write_line = wr;
     cfg.io_ctx = nullptr;
-    cfg.alloc = al; cfg.free = fr;
+    cfg.Inode_count = inodes;
+    cfg.Inode_base_FS_block_idx = inode_array_base;
+    cfg.self_reliat_specific.ttl_bare_seconds = 0;   /* 0 = 默认 2s */
 
     result_code_t rc = RC_ERR_IO;
     Inode_cache_mgr_t mgr(cfg, &rc);
     assert(rc == RC_OK);
-    assert(mgr.mode() == CACHE_MODE_RADIX_SHARD);
+    assert(mgr.self_reliat_mode() == CACHE_MODE_RADIX_SHARD);
     printf("mgr ready (RADIX, %u slices)\n\n", 1u << 7);
 
     /* ═══ A：正确性 ═══ */
     {
         /* root inode 只读：应为 DIR（光杆司令 /） */
         Inode_cache_mgr_t::slice_cache_acces_token_t tok{};
-        raven_Inode_t *root = mgr.get(0, &tok);
+        raven_Inode_t *root = mgr.self_reliat_get(0, &tok);
         assert(root != nullptr);
         assert(root->type == INODE_TYPE_DIR);
-        mgr.put(0, tok);
+        mgr.self_reliat_put(0, tok);
         printf("A1 root_inode: type=DIR OK\n");
 
         /* 随机 64 行懒加载内容与直读盘逐字节一致 */
@@ -152,12 +151,12 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 64; i++) {
             const uint64_t inum = line_dist(rng) * 16;
             Inode_cache_mgr_t::slice_cache_acces_token_t t{};
-            raven_Inode_t *p = mgr.get(inum, &t);
+            raven_Inode_t *p = mgr.self_reliat_get(inum, &t);
             assert(p != nullptr);
             const uint64_t blk = inode_array_base + (inum >> 4);
             disk_read_blk(blk, disk_page.data());
             assert(memcmp(p, disk_page.data(), 4096) == 0);
-            mgr.put(inum, t);
+            mgr.self_reliat_put(inum, t);
         }
         printf("A2 懒加载 64 行与直读盘一致 OK\n\n");
     }
@@ -179,14 +178,14 @@ int main(int argc, char **argv) {
             : line_dist(rng);
         const uint64_t inum = line * 16 + (uint64_t)(line % 16);   /* 行内偏移随行号，覆盖槽位 */
         Inode_cache_mgr_t::slice_cache_acces_token_t tok{};
-        raven_Inode_t *p = mgr.get(inum, &tok);
+        raven_Inode_t *p = mgr.self_reliat_get(inum, &tok);
         assert(p != nullptr);
         if (pick100(rng) < 1) {              /* 1% 标脏 + 改 link_count（特征 = inum ^ 0x5EED） */
             p->link_count = (uint32_t)(inum ^ 0x5EEDu);
-            mgr.mark_dirty(inum);
+            mgr.self_reliat_mark_dirty(inum);
             dirty_rows++;
         }
-        mgr.put(inum, tok);
+        mgr.self_reliat_put(inum, tok);
     }
     const auto t1 = std::chrono::steady_clock::now();
     const double sec = std::chrono::duration<double>(t1 - t0).count();
@@ -216,33 +215,33 @@ int main(int argc, char **argv) {
             const uint32_t expect = (uint32_t)(inum ^ 0x5EEDu);
             /* 缓存里可能残留旧值：以 mgr 视图为准 —— 重新 get 对比 */
             Inode_cache_mgr_t::slice_cache_acces_token_t tok{};
-            raven_Inode_t *p = mgr.get(inum, &tok);
+            raven_Inode_t *p = mgr.self_reliat_get(inum, &tok);
             assert(p != nullptr);
             if (p->link_count == expect) {
                 assert(di[inum & 15].link_count == expect);   /* 脏页必须已落盘 */
                 checked++;
             }
-            mgr.put(inum, tok);
+            mgr.self_reliat_put(inum, tok);
         }
         printf("C  脏行落盘校验通过 %lu/32（其余行未被标脏）\n", (unsigned long)checked);
     }
 
     /* ═══ D：reap 压测（TTL 调短 → 全扫 + 重载循环） ═══ */
     {
-        mgr.set_ttl_ticks(100000);              /* ~50us @2GHz：基本次次超时 */
+        mgr.self_reliat_set_ttl_ticks(100000);              /* ~50us @2GHz：基本次次超时 */
         const uint64_t r0 = g_reads;
         const auto d0 = std::chrono::steady_clock::now();
         for (int round = 0; round < 50; round++) {
-            mgr.reap_expired();
+            mgr.self_reliat_reap_expired();
             const uint64_t line = pick100(rng) < 70
                 ? hot_lines[hot_pick(rng)] : line_dist(rng);
             const uint64_t inum = line * 16 + (line % 16);
             Inode_cache_mgr_t::slice_cache_acces_token_t tok{};
-            raven_Inode_t *p = mgr.get(inum, &tok);
+            raven_Inode_t *p = mgr.self_reliat_get(inum, &tok);
             assert(p != nullptr);
             if (p->link_count != 0 && p->link_count != (uint32_t)(inum ^ 0x5EEDu))
                 assert(false && "内容损坏");
-            mgr.put(inum, tok);
+            mgr.self_reliat_put(inum, tok);
         }
         const auto d1 = std::chrono::steady_clock::now();
         printf("D  50 轮 reap+重载 %.3fs  盘读增量 %lu\n",

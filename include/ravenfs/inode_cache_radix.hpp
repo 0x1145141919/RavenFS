@@ -3,6 +3,7 @@
 #include <atomic>
 #include <shared_mutex>   /* slice_radix_tree::lock — 可睡眠读写锁（允许持锁等 I/O，不烧核） */
 #include "util/tsc.h"    /* x86_64 Invariant TSC：TTL 换算（绑死 x86_64） */
+#include "cache_mgr_mode.hpp"
 class Inode_cache_mgr_t;
 class RavenFS_juvenile;
 enum cache_ctrl_state_t{
@@ -36,6 +37,9 @@ struct Inode_cache_ctrl_t{
     std::atomic<uint64_t> accss_stamp;  /* 最近访问 TSC 戳（尽力而为，relaxed 读写） */
     std::atomic<uint64_t> ctrl_word;    /* 位域见上：state/flags/accessor 单原子字 */
     uint64_t blk;                       /* 本行块号（加载者 CAS io_ing 成功后写定，reap/flush 读） */
+    uint64_t page_blk_len;              /* 本行有效 FS_block 数（加载者写定 = cache_data 实际字节/4096）。
+                                           非末行 = 2^(row_bits-4)（满行）；末行按有效 inode 收窄 ≥1。
+                                           写回（reap/flush/destroy）与统计一律读它，不重算。 */
 };
 struct cut_result_t{
     uint64_t main;
@@ -52,24 +56,22 @@ extern cut_result_t cut_high(uint64_t raw_metarial,uint8_t bits_to_cut);
  */
 
 /* ═══════════════════════════════════════════════════════════════════
- * ── 2026-08-22 增量：三模式判定 + 配置大结构体（Inode_cache_cfg_t） ──
+ * ── 2026-08-29 增量：v2 配置唯一化 + 三后端自适应（老 cfg 全面淘汰） ──
  *
- * 生命周期整体设计：
- *   - 构造：cfg 整体传入，模式由 bits_len_of_inodes_count 推导
- *     （单真相源，不显式指定模式，避免两处对不上）；
- *     FULL_RAM 在构造时全量载入（构造即常驻）
- *   - 析构：脏页全量回写 + 释放；RADIX 逐片析构
- *   - 会话：get/put/mark_dirty 三模式表面一致（InodeSession 收口，
- *     决策见 209433a），I/O 永不持锁
+ * Inode_cache_cfg_t_v2：宿主侧唯一配置面（v1.1 时代的 Inode_cache_cfg_t
+ * 已整体删除，内部不再有 v1.1 适配层）。设计：
+ *   - mode 显式指定后端（no_cache / self_reliat / offload），不再由 bits
+ *     隐式推导；self_reliat 内部才按 bits_len 推导 FULL_RAM/CTRL_ARRAY/RADIX
+ *   - 回调 read_line/write_line（行 = 磁盘粒度 16 inode/块，blk_len 单位
+ *     FS_block）；分片树/行原语消费 v2 派生的 inode_cache_rt_t 快照
+ *   - 无 alloc/free 字段：self_reliat 内部统一走 libc 分配器（host 用户态），
+ *     移植（sparrowos/linux 内核）时改 inode_cache.cpp 顶部的两个适配器即可
+ *   - per-mode 特化：self_reliat 的 TTL（裸秒，0 = 默认 2s）/ offload 的
+ *     mmap canvas 基址（inode array 起始 FS_block 的内核页缓存切片）
  *
- * 为什么用大结构体而非逐参 / 摸宿主：
- *   1. 避免隐式状态依赖 —— mgr 不反向持有 RavenFS_juvenile，
- *      几何（inode_array_base）与 I/O（read_page/write_page 回调）
- *      全部显式注入；换宿主只改 cfg 组装，mgr 核心零改动
- *   2. 可移植可测试 —— 测试端注入内存缓冲 + 假回调即可跑全生命周期，
- *      不挂真盘、不依赖上帝类
- *
- * 实现位置：juvenile_god/inode_cache.cpp（本头文件仅声明）
+ * 会话侧（InodeSession）按 backed_mode 三路分派：no_cache 自管缓冲直读 /
+ * self_reliat 占坑 token（accessor）/ offload 内核页缓存直映（无 token）。
+ * 旧 get/put/mark_dirty/set_ttl_ticks/reap_expired/mode 已随老 cfg 一并删除。
  * ═══════════════════════════════════════════════════════════════════ */
 enum inode_cache_mode_t : uint8_t {
     CACHE_MODE_FULL_RAM    = 0,  /* [1,12]  全量上内存：数据常驻，构造即载入 */
@@ -83,44 +85,49 @@ static inline inode_cache_mode_t inode_cache_mode_of(uint8_t bits) {
     return CACHE_MODE_RADIX_SHARD;
 }
 
-struct Inode_cache_cfg_t {
-    /* ── 几何（disk_layout_v1.1 继承 v1，见 block_model.md） ── */
-    uint64_t inodes_count;              /* inode array 总 inode 数（含根 inode 0） */
-    uint8_t  bits_len_of_inodes_count;  /* ceil(log2(inodes_count))，1~52；
-                                           模式判定唯一真相源 */
-    uint64_t inode_array_base;          /* inode array 起始 FS_block 号；
-                                           页地址 = base + line（line = inum >> 4） */
-
-    /* ── 数据面内存预算（字节） ──
-     * 淘汰已改为 TTL 超时（见 ttl_ticks），预算不再参与准入/淘汰水位，
-     * 保留作内存分布统计与后续调优参考 */
-    uint64_t memory_budget;
-
-    /* ── 缓存行 TTL（TSC tick） ──
-     * 0 = 默认 2s（ctor 按 Invariant TSC 频率换算）；
-     * 运行期可用 Inode_cache_mgr_t::set_ttl_ticks 调整 */
-    uint64_t ttl_ticks = 0;
-
-    /* ── I/O 回调（页粒度：1 页 = 4096B = 16 × raven_Inode_t） ──
-     * 回调而非直接调 fs->read_buff：mgr 不依赖宿主类，
-     * host 用户态 / sparrowos kmod / linux 模块三端各适配一次 */
-    result_code_t (*read_page)(void *io_ctx, uint64_t blk, void *buf);
-    result_code_t (*write_page)(void *io_ctx, uint64_t blk, const void *buf);
+struct Inode_cache_cfg_t_v2{
+    cache_work_mode_t mode;
+    result_code_t (*read_line)(void *io_ctx, uint64_t blk,uint64_t blk_len, void *buf);
+    result_code_t (*write_line)(void *io_ctx, uint64_t blk,uint64_t blk_len, const void *buf);
     void *io_ctx;                       /* 宿主上下文（通常传 fs this） */
-
-    /* ── 内存分配回调 ──
-     * 三端分配器不同（host malloc / sparrowos FreePagesAllocator /
-     * linux kmalloc），mgr 不直接 new */
-    void *(*alloc)(void *io_ctx, uint64_t size);
-    void  (*free)(void *io_ctx, void *ptr);
+    uint64_t Inode_count;//mkfs保证16对齐，这个也应该落到disk_layout里面
+    uint64_t Inode_base_FS_block_idx;
+    struct {
+        uint64_t ttl_bare_seconds = 0;//构造时分填0则会使用默认值2s
+    }self_reliat_specific;
+    struct {
+        uint64_t virtual_canvas_base;//很明显是FS_block引索为Inode_base_FS_block_idx的地方开始的从mmap切出来的地址切片
+    }offload_specific;
 };
 
+/* ── 内部运行时快照（inode_cache.cpp 消费；宿主无需关心） ──
+ * 老 Inode_cache_cfg_t 淘汰后，分片树/行原语直接吃这份 v2 派生快照：
+ * v2 的 I/O 回调 + io_ctx + 几何，分配器固定 libc（host_alloc/host_free，
+ * 见 cpp 顶部适配器）。slice_radix_tree 每片持一份值拷贝（40B，无共享
+ * 指针/悬垂），mgr 自身持一份 rt_ 供 CTRL_ARRAY 分支与原语调用。 */
+struct inode_cache_rt_t {
+    result_code_t (*read_line)(void *io_ctx, uint64_t blk, uint64_t blk_len, void *buf);
+    result_code_t (*write_line)(void *io_ctx, uint64_t blk, uint64_t blk_len, const void *buf);
+    void *io_ctx;
+    uint64_t inodes_count;      /* = cfg.Inode_count（mkfs 16 对齐） */
+    uint64_t inode_array_base;  /* = cfg.Inode_base_FS_block_idx */
+};
 class Inode_cache_mgr_t{
 public:
-    /* 构造：cfg 大结构体整体传入（不再逐参 / 摸宿主）。
-     * 模式由 bits 推导；FULL_RAM 在此全量载入。
-     * rc_out 非空时收构造结果（RC_OK / RC_ERR_IO / RC_ERR_NO_BLOCK） */
-    Inode_cache_mgr_t(const Inode_cache_cfg_t &cfg, result_code_t *rc_out = nullptr);
+    const cache_work_mode_t backed_mode;//session第一件事情是获得这个
+    void* const io_ctx;
+    /* 回调成员不用 const 修饰：const 放在返回类型前会把函数指针变成
+     * 「指向 const 返回函数」的不兼容类型（与普通回调互不转换）；
+     * 成员由 ctor 一次性赋值，运行期只读。 */
+    result_code_t (*read_line)(void *io_ctx, uint64_t blk,uint64_t blk_len, void *buf);
+    result_code_t (*write_line)(void *io_ctx, uint64_t blk,uint64_t blk_len, const void *buf);
+    /* 构造：v2 大结构体整体传入（不再逐参 / 摸宿主）。
+     * 后端模式 = cfg.mode（单真相源）：
+     *   no_cache      —— 无内部结构，session 自管缓冲直读盘
+     *   self_reliat   —— 用户态缓存，内部按 bits 再推导 FULL_RAM/CTRL_ARRAY/RADIX
+     *   offload_cache —— 内核页缓存直映（mmap canvas），仅记几何 + canvas 地址
+     * rc_out 非空时收构造结果（RC_OK / RC_ERR_IO / RC_ERR_NO_BLOCK / RC_ERR_STATE） */
+    Inode_cache_mgr_t(const Inode_cache_cfg_t_v2 &cfg, result_code_t *rc_out = nullptr);
     ~Inode_cache_mgr_t();//每个片进行折构（脏页回写 + 释放）
 
     /* ── 统一会话接口（三模式表面一致） ──
@@ -130,28 +137,47 @@ public:
     {
         uint16_t slice_idx;   /* RADIX：分片序号（per_level_width[0] 高位切分）；其余模式恒 0 */
     };
-    raven_Inode_t *get(uint64_t inum, slice_cache_acces_token_t *out_token = nullptr);
-    void           put(uint64_t inum, const slice_cache_acces_token_t &token);
-    void           mark_dirty(uint64_t inum);
-    result_code_t  flush_all();         /* 全量脏页回写（挂载/卸载同步点用） */
-    /* ── TTL 淘汰（绑死 x86_64 + Invariant TSC） ──
-     * set_ttl_ticks：外部调整缓存行 TTL（默认 2s，ctor 按 TSC 频率换算）；
-     *                调整即时生效（slice 持指针共享同一真相源）
-     * reap_expired：专用淘汰线程周期调用 —— 回收全部「超时 && 无访问者」的行
-     *                （RADIX 逐片扫 + CTRL_ARRAY 全扫；写回脏页 + 释放 + 摘除） */
-    void set_ttl_ticks(uint64_t ticks);
-    void reap_expired();
+    /* flush_all — 同步点（挂载/卸载用），不淘汰接口；内部按后端模式自适应：
+     *   no_cache      ：无缓存可同步，丢弃（RC_OK）
+     *   self_reliat   ：用户态丢弃非脏页 + 脏页写回（写回后驻留，卸载由 dtor 统一释放）
+     *   offload_cache ：相关 syscall（msync 整片 canvas 回写内核页缓存） */
+    result_code_t  flush_all();
     bool is_ready() const { return ready_; }
-    inode_cache_mode_t mode() const { return mode_; }
-    uint8_t bits_len() const { return cfg_.bits_len_of_inodes_count; }
+    uint8_t bits_len() const { return bits_len_; }
+    /* no_cache 直读用：inum 所在 FS_block = inode array 基址 + (inum>>4)（磁盘粒度 16 inode/块） */
+    uint64_t inode_array_base() const { return inode_array_base_; }
 
+    /* ── self_reliat 会话接口（FULL_RAM/CTRL_ARRAY/RADIX 三内部模式表面一致） ──
+     * get 输出会话 token（RADIX 定位分片/释放读锁用），put 必须带回该 token；
+     * out_token 可空（调用方不关心时），FULL_RAM/CTRL_ARRAY 填 slice_idx=0。 */
+    raven_Inode_t *self_reliat_get(uint64_t inum, slice_cache_acces_token_t *out_token = nullptr);
+    void           self_reliat_put(uint64_t inum, const slice_cache_acces_token_t &token);
+    void           self_reliat_mark_dirty(uint64_t inum);
+    /* TTL 淘汰（绑死 x86_64 + Invariant TSC）：
+     * self_reliat_set_ttl_ticks：外部调整缓存行 TTL（默认 2s，ctor 按 TSC 频率换算），
+     *                            调整即时生效（slice 持指针共享同一真相源），0 = 禁用
+     * self_reliat_reap_expired：专用淘汰线程周期调用 —— 回收全部「超时 && 无访问者」
+     *                            的行（RADIX 逐片扫 + CTRL_ARRAY 全扫；写回脏页 + 释放） */
+    void           self_reliat_set_ttl_ticks(uint64_t ticks);
+    void           self_reliat_reap_expired();
+    inode_cache_mode_t self_reliat_mode();
+
+    /* ── offload 会话接口（内核页缓存直映，无 token/accessor） ── */
+    raven_Inode_t *offload_get(uint64_t inum);
+    void           offload_put(uint64_t inum);
 private:
-    static constexpr uint8_t  ROW_BITS = 4;            /* 行内引索 4bit = 16 inode/页 */ //要不得，我的juvenile_god/inode_cache.cpp里面设计了有些情况是5bit的，当然全量缓存控制器数组是每个缓存行4k,16entries
+    static constexpr uint8_t  ROW_BITS = 4;   /* 仅 FULL_RAM/CTRL_ARRAY 可用：行 = 4K 页 = 16 entries（磁盘粒度 16 inode/块，恒 4bit）。
+                                                 RADIX 行宽由 plan 派生（bits=25/33 档 5bit/32 entries=2 块），禁止用此常量（见 global_slice_plan 注记） */
     static constexpr uint64_t INODES_PER_PAGE = 16;
 
-    Inode_cache_cfg_t  cfg_;
-    inode_cache_mode_t mode_;
+    /* 几何/回调直存成员（老 cfg 适配层已拆，v2 ctor 一次性写定，运行期只读） */
+    uint64_t inodes_count_     = 0;   /* = cfg.Inode_count（mkfs 16 对齐） */
+    uint64_t inode_array_base_ = 0;   /* = cfg.Inode_base_FS_block_idx */
+    uint8_t  bits_len_         = 0;   /* ceil(log2(inodes_count_))，模式判定唯一真相源 */
+    inode_cache_rt_t rt_ = {};        /* v2 派生快照（self_reliat 消费；RADIX 分片树持值拷贝） */
+    inode_cache_mode_t mode_ = CACHE_MODE_FULL_RAM;   /* 占位默认；self_reliat ctor 按 bits 覆写 */
     bool ready_ = false;
+    uint64_t virtual_canvas_base_ = 0;   /* offload 后端：inode array 起始 FS_block 的 mmap 切片地址 */
     std::atomic<uint64_t> ttl_ticks_ = 0;   /* 缓存行 TTL（TSC tick）：默认 2s（ctor 换算），
                                                set_ttl_ticks 调整；slice 持 &ttl_ticks_ 共享，
                                                reap 扫描时读最新值（原子，防数据竞争） */
@@ -196,27 +222,26 @@ private:
     };
     static bitfield_decoded_result_t decode(uint64_t raw,bitfield_decode_plan_t plan);//内部递归调用cut_high；raw 左对齐 + 累积推导 row_bits，plan 为唯一真相源，不依赖 mgr 状态（static：slice 树可直接复用）
     /* slice_radix_tree_cfg_t — 分片树构造大结构体（组装方：mgr ctor 的 RADIX 分支，按 chunks[0] 逐片组装）
-     * 哲学对齐 Inode_cache_cfg_t：不复制回调、不反向持有宿主；树只依赖 cfg，可脱离 mgr 单测
-     *   host_cfg    ：mgr 的 cfg 直传（I/O 回调 + alloc/free + io_ctx + inode_array_base + 总预算）
+     * 不复制宿主、不反向持有 mgr：树只依赖 rt 快照（值拷贝），可脱离 mgr 单测
+     *   rt          ：v2 派生快照（I/O 回调 + io_ctx + 几何），每片一份值拷贝
      *   plan        ：位域解码规划。仅 ctor 推树拓扑用（tree_levels = total_levels-1，
      *                 根表宽 = 2^level_bits[1]）；运行期 get/put 吃解析好的
      *                 bitfield_decoded_result_t，不再摸 plan
      *   row_bits    ：行内位宽（= bits_len - sum(level_bits)）；
      *                 blk = base + (raw>>row_bits) << (row_bits-4)
-     *   budget_bytes：保留作统计；淘汰已改为 TTL 超时，不再做压力水位
      *   ttl_ticks   ：指向 mgr 的 ttl_ticks_（单一真相源，外部可运行期调整），
      *                 reap 扫描时读最新值（原子 load） */
     struct slice_radix_tree_cfg_t{
-        const Inode_cache_cfg_t *host_cfg;
+        inode_cache_rt_t         rt;
         bitfield_decode_plan_t   plan;
         uint8_t  row_bits;
         const std::atomic<uint64_t> *ttl_ticks;
     };
 
     class slice_radix_tree{
-        /* ── cfg 快照（构造后只读） ── */
-        const Inode_cache_cfg_t *host_cfg_ = nullptr;  /* 共享 mgr cfg：I/O/alloc/free/几何/预算 */
-        bitfield_decode_plan_t   plan_ = {};           /* 树拓扑真相源（ctor 用，保留备析构/调试） */
+        /* ── rt 快照 + 拓扑（构造后只读） ── */
+        inode_cache_rt_t   rt_ = {};               /* v2 派生快照值拷贝：I/O 回调 + io_ctx + 几何 */
+        bitfield_decode_plan_t plan_ = {};           /* 树拓扑真相源（ctor 用，保留备析构/调试） */
         uint8_t  row_bits_        = 4;                 /* 行内位宽：blk = base + (raw>>row_bits_)<<(row_bits_-4) */
         uint8_t  tree_levels_     = 0;                 /* 树层数 = plan_.total_levels - 1（level_bits[0] 是 mgr 层） */
         const std::atomic<uint64_t> *ttl_ticks_ = nullptr; /* 指向 mgr ttl_ticks_（共享真相源，reap 时原子读） */
@@ -265,6 +290,7 @@ private:
         void *alloc_internal(uint8_t level);           /* 中间表：指针槽数组清零（写锁内） */
         void ensure_path(bitfield_decoded_result_t *d);/* 写锁内：沿 decoded 路径补建缺失表 */
         Inode_cache_ctrl_t *locate(bitfield_decoded_result_t *d); /* 读路径：无锁/读锁内皆可 */
+        uint64_t row_blk_len(uint64_t line) const;     /* 行有效 FS_block 数（末行按有效 inode 收窄 ≥1） */
         void dfs_flush(void *table, uint8_t level);
         void dfs_reap(void *table, uint8_t level, uint64_t now, uint64_t ttl);
         void dfs_destroy(void *table, uint8_t level);
@@ -279,18 +305,20 @@ private:
      * ctrl_reap_one：单行 TTL 淘汰尝试。仅 working && accessor==0 && 超时的行可被
      *                CAS 接管（原子前提）；成功后写回脏页 → 释放 → 回 idle。
      *                返回 true = 已淘汰（调用方记账）。 */
-    static raven_Inode_t *ctrl_acquire(Inode_cache_ctrl_t *c, uint64_t blk, uint64_t page_bytes,
-                                       const Inode_cache_cfg_t &cfg, bool *out_loaded = nullptr);
-    static bool ctrl_reap_one(Inode_cache_ctrl_t *c, const Inode_cache_cfg_t &cfg,
+    static raven_Inode_t *ctrl_acquire(Inode_cache_ctrl_t *c, uint64_t blk, uint64_t blk_len,
+                                       const inode_cache_rt_t &rt, bool *out_loaded = nullptr);
+    static bool ctrl_reap_one(Inode_cache_ctrl_t *c, const inode_cache_rt_t &rt,
                               uint64_t now, uint64_t ttl);
     /* ── 几何换算（三模式共用） ── */
-    uint64_t ctrl_count() const { return (cfg_.inodes_count + INODES_PER_PAGE - 1) >> ROW_BITS; }
+    uint64_t ctrl_count() const { return (inodes_count_ + INODES_PER_PAGE - 1) >> ROW_BITS; }
     uint64_t line_of(uint64_t inum) const { return inum >> ROW_BITS; }
     uint64_t row_of(uint64_t inum) const { return inum & (INODES_PER_PAGE - 1); }
-    uint64_t blk_of(uint64_t line) const { return cfg_.inode_array_base + line; }
+    uint64_t blk_of(uint64_t line) const { return inode_array_base_ + line; }
 
     result_code_t ctor_full_ram();
     result_code_t ctor_ctrl_array();
+    /* self_reliat 内部装配（几何/回调成员已由 v2 ctor 写定）：组装 rt_ + TTL 换算 + 模式分支 */
+    result_code_t ctor_self_reliat(uint64_t ttl_ticks_cfg);
     void flush_full_ram();
     void flush_ctrl_array();
 
@@ -307,30 +335,101 @@ class InodeSession {
     Inode_cache_mgr_t *mgr_ = nullptr;
     uint64_t inum_ = 0;
     Inode_cache_mgr_t::slice_cache_acces_token_t token{};
+    cache_work_mode_t mgr_backend_mode = cache_work_mode_t::self_reliat_cache;
+    void*   nocache_buff = nullptr;   /* no_cache：session 自管一块（4096B = 16 inode），构造分配、析构释放 */
+    bool    nocache_dirty = false;    /* no_cache：session 级脏标记，析构时脏则 write_line 写回，不脏直接释放 */
 public:
     raven_Inode_t *inode = nullptr;
 
     InodeSession(Inode_cache_mgr_t *mgr, uint64_t inum)
         : mgr_(mgr), inum_(inum) {
-        inode = mgr_ ? mgr_->get(inum, &token) : nullptr;
+        if (!mgr_) return;   /* 防御：无 mgr 不做事（inode 保持 nullptr） */
+        mgr_backend_mode = mgr_->backed_mode;
+        switch (mgr_backend_mode) {
+        case cache_work_mode_t::no_cache: {
+            /* no_cache：session 自管缓冲 + read_line 直读盘（不经过缓存）。
+             * 磁盘天然粒度 16 inode/块（mkfs 16 对齐）→ blk_len 恒 1。
+             * 读失败 → 释放缓冲，inode 保持 nullptr（上层按失败处理）。 */
+            nocache_buff = new uint8_t[4096];   /* 移植时按各自分配轮子量体裁衣（O_DIRECT 需 4K 对齐） */
+            if (!nocache_buff) return;
+            const uint64_t blk = mgr_->inode_array_base() + (inum_ >> 4);
+            if (mgr_->read_line(mgr_->io_ctx, blk, 1, nocache_buff) != RC_OK) {
+                delete[] (uint8_t*)nocache_buff;
+                nocache_buff = nullptr;
+                return;
+            }
+            inode = &((raven_Inode_t*)nocache_buff)[inum_ & 15];
+            break;
+        }
+        case cache_work_mode_t::self_reliat_cache:
+            inode = mgr_->self_reliat_get(inum, &token);
+            break;
+        case cache_work_mode_t::offload_cache:
+            inode = mgr_->offload_get(inum);   /* 无 token：内核页缓存后端，无分片锁/accessor */
+            break;
+        }
     }
-    ~InodeSession() { if (inode) { mgr_->put(inum_, token); inode = nullptr; } }
+    ~InodeSession() { release(); }
     explicit operator bool() const { return inode != nullptr; }
-    void dirty() { if (inode) mgr_->mark_dirty(inum_); }
+    void dirty() {
+        if (!inode) return;
+        switch (mgr_backend_mode) {
+        case cache_work_mode_t::no_cache:
+            nocache_dirty = true;   /* 记 session 级脏：析构时写回 */
+            break;
+        case cache_work_mode_t::self_reliat_cache:
+            mgr_->self_reliat_mark_dirty(inum_);
+            break;
+        case cache_work_mode_t::offload_cache:
+            break;   /* 内核页缓存管一致性，无需脏标记 */
+        }
+    }
 
-    /* move-only，禁拷贝；token 随会话搬移（RADIX 读锁归属跟随会话） */
+    /* move-only，禁拷贝；token 随会话搬移（RADIX 读锁归属跟随会话）；
+     * no_cache 的缓冲与脏标记随搬，源对象置空。 */
     InodeSession(InodeSession &&o) noexcept
-        : mgr_(o.mgr_), inum_(o.inum_), token(o.token), inode(o.inode) {
+        : mgr_(o.mgr_), inum_(o.inum_), token(o.token),
+          mgr_backend_mode(o.mgr_backend_mode), nocache_buff(o.nocache_buff),
+          nocache_dirty(o.nocache_dirty), inode(o.inode) {
+        o.nocache_buff = nullptr;
         o.inode = nullptr;
     }
     InodeSession &operator=(InodeSession &&o) noexcept {
         if (this != &o) {
-            if (inode) mgr_->put(inum_, token);
-            mgr_ = o.mgr_; inum_ = o.inum_; token = o.token; inode = o.inode;
-            o.inode = nullptr;
+            release();   /* 先释放自身持有的后端资源 */
+            mgr_ = o.mgr_; inum_ = o.inum_; token = o.token;
+            mgr_backend_mode = o.mgr_backend_mode;
+            nocache_buff = o.nocache_buff; nocache_dirty = o.nocache_dirty;
+            inode = o.inode;
+            o.nocache_buff = nullptr; o.inode = nullptr;
         }
         return *this;
     }
     InodeSession(const InodeSession &) = delete;
     InodeSession &operator=(const InodeSession &) = delete;
+private:
+    /* 按后端模式释放会话持有：no_cache 脏写回+释放缓冲 / self_reliat_put /
+     * offload_put。析构与 move 赋值共用，三模式语义只此一份。 */
+    void release() {
+        if (!mgr_) {
+            if (nocache_buff) { delete[] (uint8_t*)nocache_buff; nocache_buff = nullptr; }
+            inode = nullptr;
+            return;
+        }
+        switch (mgr_backend_mode) {
+        case cache_work_mode_t::no_cache:
+            if (inode && nocache_dirty)
+                mgr_->write_line(mgr_->io_ctx, mgr_->inode_array_base() + (inum_ >> 4), 1, nocache_buff);
+            delete[] (uint8_t*)nocache_buff;
+            nocache_buff = nullptr;
+            break;
+        case cache_work_mode_t::self_reliat_cache:
+            if (inode) mgr_->self_reliat_put(inum_, token);
+            break;
+        case cache_work_mode_t::offload_cache:
+            if (inode) mgr_->offload_put(inum_);
+            break;
+        }
+        inode = nullptr;
+    }
 };
