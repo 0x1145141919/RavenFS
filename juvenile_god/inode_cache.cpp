@@ -145,7 +145,7 @@ cut_result_t cut_high(uint64_t raw_metarial, uint8_t bits_to_cut) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * decode — 按 plan 逐层切分 inode 号位域
+ * decode — 按 plan 逐层切分索引位域（全局通用轮子：inode 缓存 / mdata_piece 缓存共用）
  *
  * chunks[0..total_levels-1] = 各层索引（chunks[0] = mgr 层 slice 选择），
  * chunks[total_levels]      = 行内索引。
@@ -153,7 +153,7 @@ cut_result_t cut_high(uint64_t raw_metarial, uint8_t bits_to_cut) {
  * plan 为唯一真相源；raw 内部左对齐到位域顶端后递归 cut_high。
  * 约束：plan.total_levels ≤ 6（chunks[7] 容量，现表最大 5 层）。
  * ═══════════════════════════════════════════════════════════════════ */
-Inode_cache_mgr_t::bitfield_decoded_result_t Inode_cache_mgr_t::decode(uint64_t raw, bitfield_decode_plan_t plan) {
+bitfield_decoded_result_t decode(uint64_t raw, bitfield_decode_plan_t plan) {
     bitfield_decoded_result_t r{};
     r.raw         = raw;
     r.total_levels = plan.total_levels;

@@ -22,6 +22,8 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "../include/ravenfs/inode_cache_radix.hpp"   /* verify 同步点：flush_all 需完整类型 */
+#include "../include/ravenfs/mdata_piece_caches.hpp"
 
 #include <cstdio>
 #include <cstdarg>
@@ -218,6 +220,11 @@ static uint64_t verify_node(RavenFS_juvenile &fs, uint64_t blk,
 }
 
 static void verify_tree(RavenFS_juvenile &fs, uint64_t expect_entries, const char *tag) {
+    /* self_reliat 是写回缓存：session 修改未落盘前直读盘会假阳性。
+     * 同步点 flush_all（脏写回驻留 + 非脏丢弃；offload=msync / nocache=无操作，均无害）。
+     */
+    if (fs.inode_cache_mgr) fs.inode_cache_mgr->flush_all();
+    if (fs.mdata_piece_mgr) fs.mdata_piece_mgr->flush_all();
     TreeStat st;
     uint64_t root_max = verify_node(fs, fs.root_dentry_blk, PTR_INVALID, st);
     (void)root_max;
@@ -242,17 +249,22 @@ static void verify_tree(RavenFS_juvenile &fs, uint64_t expect_entries, const cha
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { printf("usage: %s <device> [batch_count=5000] [del_count=0] [mode=offload|nocache]\n", argv[0]); return 2; }
+    if (argc < 2) { printf("usage: %s <device> [batch_count=5000] [del_count=0] [mode=offload|nocache|selfreliat]\n", argv[0]); return 2; }
     int batch_n = 5000;
     if (argc >= 3) batch_n = atoi(argv[2]);
     if (batch_n < 1) batch_n = 1;
     int del_count = 0;   /* 0 = 删全部；>0 = 复播二分，只删前 del_count 条 */
     if (argc >= 4) del_count = atoi(argv[3]);
     if (del_count < 0) del_count = 0;
-    /* 后端模式：offload（非直写 → mmap 全 offload）/ nocache（直写 → 双 no_cache） */
+    /* 后端模式：offload（非直写 → mmap 全 offload）/ nocache（直写 → 双 no_cache）/
+     * selfreliat（直写 → 双 self_reliat 用户态缓存） */
     bool mode_direct = false, mode_use_icache = false, mode_use_bcache = false;
     if (argc >= 5 && strcmp(argv[4], "nocache") == 0) {
         mode_direct = true;   /* 直写 + 双 no_cache */
+    } else if (argc >= 5 && strcmp(argv[4], "selfreliat") == 0) {
+        mode_direct = true;
+        mode_use_icache = true;   /* 直写 + 双 self_reliat（编排决策树落 self_reliat 后端） */
+        mode_use_bcache = true;
     } else {
         mode_direct = false;  /* 非直写 → mmap 后端，缓存全 offload（开关被忽略） */
     }
@@ -263,7 +275,9 @@ int main(int argc, char **argv) {
            "════════════════════════════════════════════════\n",
            argv[1], batch_n,
            del_count > 0 ? "bisect（只删前若干条）" : "全部删除",
-           mode_direct ? "nocache（直写+双no_cache）" : "offload（mmap后端）");
+           mode_direct ? (mode_use_icache ? "selfreliat（直写+双self_reliat）"
+                                          : "nocache（直写+双no_cache）")
+                       : "offload（mmap后端）");
 
     uint64_t rc = 0;
     uint64_t inserted = 0;

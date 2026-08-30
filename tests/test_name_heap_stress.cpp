@@ -33,15 +33,19 @@
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 
-static linux_userspace_mount_t make_mount(const char *path) {
+static linux_userspace_mount_t make_mount(const char *path, bool selfreliat) {
     linux_userspace_mount_t mnt{};
-    mnt.dev.fd = ::open(path, O_RDWR);
+    mnt.dev.fd = ::open(path, selfreliat ? O_RDWR | O_DIRECT : O_RDWR);
     int lba = 4096;
     if (::ioctl(mnt.dev.fd, BLKSSZGET, &lba) != 0 || lba <= 0) lba = 4096;
     mnt.dev.lba_size_log2 = (uint8_t)__builtin_ctz((unsigned)lba);
     mnt.dev.type = DEV_UNKNOWN;
-    mnt.dev.is_device_direct = false;   /* offload：整盘 mmap，元数据走内核页缓存 */
+    mnt.dev.is_device_direct = selfreliat;   /* selfreliat：直写 + 双 self_reliat 缓存；offload：整盘 mmap 元数据走内核页缓存 */
     mnt.param = {};
+    if (selfreliat) {
+        mnt.param.if_will_use_inode_cache = true;
+        mnt.param.if_will_use_mdata_piece_cache = true;
+    }
     mnt.logical_processor_count = 1;
     return mnt;
 }
@@ -93,6 +97,8 @@ static void gen_name(char *buf, const grp_t &g, uint64_t idx) {
 
 /* 全位图置位计数（按控制器实际位图大小读全部片） */
 static uint64_t count_bits_full(RavenFS_juvenile &fs, const name_heap_controller_t &c) {
+    /* self_reliat 写回缓存：位图面修改未落盘前直读盘会假阳性 → 先同步点 */
+    if (fs.mdata_piece_mgr) fs.mdata_piece_mgr->flush_all();
     if (c.bitmap_base_block_ptr == NAME_HEAP_INACTIVE) return 0;
     const uint64_t bmp_blks = 1ULL << ((uint64_t)c.total_bits_count_log2 - 15);
     uint64_t n = 0;
@@ -105,8 +111,9 @@ static uint64_t count_bits_full(RavenFS_juvenile &fs, const name_heap_controller
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { printf("usage: %s <device> [--full]\n", argv[0]); return 2; }
+    if (argc < 2) { printf("usage: %s <device> [--full] [mode=offload|selfreliat]\n", argv[0]); return 2; }
     const bool FULL = (argc >= 3 && strcmp(argv[2], "--full") == 0);
+    const bool SELFRELIAT = (argc >= 4 && strcmp(argv[3], "selfreliat") == 0);
 
     printf("════════════════════════════════════════════════\n"
            " RavenFS v1.1 名字堆极限压测（%s）\n device: %s\n"
@@ -114,7 +121,7 @@ int main(int argc, char **argv) {
            FULL ? "大魔王全量" : "缩水", argv[1]);
 
     uint64_t rc = 0;
-    linux_userspace_mount_t mnt = make_mount(argv[1]);
+    linux_userspace_mount_t mnt = make_mount(argv[1], SELFRELIAT);
     if (mnt.dev.fd < 0) { printf("open %s failed\n", argv[1]); return 2; }
 
     uint64_t total_inserted = 0;

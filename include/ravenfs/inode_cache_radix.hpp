@@ -50,6 +50,42 @@ extern cut_result_t cut_high(uint64_t raw_metarial,uint8_t bits_to_cut);
  * raw 须已左对齐（位域最高位 = bit 63）；从位域顶端向下切 bits_to_cut 个 bit：
  * cut_out_section = 切下的高位段（右对齐），main = 剩余位域（保持左对齐，供递归）。
  * 实现见 juvenile_god/inode_cache.cpp */
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 位域分片规划/解码 —— 通用轮子（inode 缓存与 mdata_piece 缓存共用）
+ *
+ * bitfield_decode_plan_t：按 bits_len 从最高位向下逐层切分（cut_high 递归），
+ *   level_bits[0] = mgr 层分片选择位宽（slice 数 = 2^w0），level_bits[1..]
+ *   = 基数树逐层位宽，剩余低位 = 缓存行内引索（row_bits = bits - Σlevel_bits）。
+ *   行内宽度由 decode 派生，plan 为唯一真相源，decode 不依赖 mgr 状态。
+ * bitfield_decoded_result_t：chunks[0..total_levels-1] = 各层索引（[0]=slice 选择），
+ *   chunks[total_levels] = 行内索引；行内位宽 = 0 时该槽恒 0（整行 = 1 单元）。
+ * decode 实现见 juvenile_god/inode_cache.cpp（static 全局，切片树可直接复用）。
+ * ═══════════════════════════════════════════════════════════════════ */
+struct bitfield_decode_plan_t{
+    /**
+     * bits_len：索引总位宽（= ceil(log2(count))，plan 必须自包含）：
+     *           decode 左对齐 + row_bits 派生的唯一真相源
+     * total_levels：使用的层数（含 mgr 层），level_bits[0..total_levels-1] 有效
+     * level_bits[0]：mgr 层分片选择位宽（slice 数 = 2^level_bits[0]）
+     * level_bits[1..]：分片基数树从上到下的逐层位宽
+     * 剩余低位 = 行内引索：row_bits = bits_len - sum(level_bits)
+     */
+    uint8_t bits_len;
+    uint8_t total_levels;
+    uint8_t*level_bits;
+};
+struct bitfield_decoded_result_t{
+    uint64_t raw;//原始数据（索引）
+    uint8_t total_levels;//从plan处继承：0～total_levels-1 引索中间位域解析结果（层级索引），引索 total_levels 的是缓存行解码引索（行内索引）
+    uint16_t chunks[7];//层级索引容量：现表最大 5 层 + 行内 = 6，留 1 冗余（支撑未来 6 层）；每项位宽 ≤ 11bit ≤ uint16_t
+};
+extern bitfield_decoded_result_t decode(uint64_t raw, bitfield_decode_plan_t plan);
+/* decode — 按 plan 逐层切分索引位域（实现见 inode_cache.cpp）。
+ * chunks[0..total_levels-1] = 各层索引（chunks[0] = mgr 层 slice 选择），
+ * chunks[total_levels] = 行内索引。row_bits 由 plan 累积派生（不依赖外部常量），
+ * plan 为唯一真相源；raw 内部左对齐到位域顶端后递归 cut_high。
+ * 约束：plan.total_levels ≤ 6（chunks[7] 容量，现表最大 5 层）。 */
 /**
  * 我们主要根据bits_len_of_inodes_count在1～52的枚举值动态枚举规划，[5,12]是全量上内存，[13,18]是全量缓存行控制器数组(每个都是4k页面16entries)，大于等于19才是需要引入静态基数树分片
  * （statey_19~52 策略表定义已随实现移入 juvenile_god/inode_cache.cpp，此处仅留设计注记）
@@ -200,27 +236,10 @@ private:
      * 但 bits=25 / bits=33 两档为 5bit(32 entries=8KB=2块) —— 行内宽度由 decode 派生，
      * 不做独立常量；ROW_BITS 常量仅 FULL_RAM/CTRL_ARRAY 临时可用（RADIX 实装时改成员变量）。
      * decode 结果 chunks[0..total_levels-1] = 各层索引（[0]=slice 选择），
-     * chunks[total_levels] = 行内索引；plan 为唯一真相源，decode 不依赖 mgr 状态。 */
-    struct bitfield_decode_plan_t{
-        /**
-         * bits_len：inode 号总位宽（= cfg.bits_len_of_inodes_count 的镜像，plan 必须自包含）：
-         *           decode 左对齐 + row_bits 派生的唯一真相源
-         * total_levels：使用的层数（含 mgr 层），level_bits[0..total_levels-1] 有效
-         * level_bits[0]：mgr 层分片选择位宽（slice 数 = 2^level_bits[0]）
-         * level_bits[1..]：分片基数树从上到下的逐层位宽
-         * 剩余低位 = 行内引索：row_bits = bits_len - sum(level_bits)，多数 4，25/33 档 5
-         */
-        uint8_t bits_len;
-        uint8_t total_levels;
-        uint8_t*level_bits;
-    };
+     * chunks[total_levels] = 行内索引；plan 为唯一真相源，decode 不依赖 mgr 状态。
+     * （bitfield_decode_plan_t / bitfield_decoded_result_t / decode 已提取为全局
+     *   通用轮子，见本文件顶部 —— inode 与 mdata_piece 两缓存共用） */
     bitfield_decode_plan_t global_slice_plan;
-    struct bitfield_decoded_result_t{
-        uint64_t raw;//原始数据（inum）
-        uint8_t total_levels;//从plan处继承：0～total_levels-1 引索中间位域解析结果（层级索引），引索 total_levels 的是缓存行解码引索（行内索引）
-        uint16_t chunks[7];//层级索引容量：现表最大 5 层 + 行内 = 6，留 1 冗余（支撑未来 6 层）；每项位宽 ≤ 11bit ≤ uint16_t
-    };
-    static bitfield_decoded_result_t decode(uint64_t raw,bitfield_decode_plan_t plan);//内部递归调用cut_high；raw 左对齐 + 累积推导 row_bits，plan 为唯一真相源，不依赖 mgr 状态（static：slice 树可直接复用）
     /* slice_radix_tree_cfg_t — 分片树构造大结构体（组装方：mgr ctor 的 RADIX 分支，按 chunks[0] 逐片组装）
      * 不复制宿主、不反向持有 mgr：树只依赖 rt 快照（值拷贝），可脱离 mgr 单测
      *   rt          ：v2 派生快照（I/O 回调 + io_ctx + 几何），每片一份值拷贝

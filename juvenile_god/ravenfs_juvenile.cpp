@@ -428,7 +428,7 @@ result_code_t RavenFS_juvenile::caches_setup() {
         mcfg.offload_specific.virtual_canvas_base =
             (uint64_t)fsblk0_base_;   /* FS_block[0]（数据区 base=0） */
     } else if (param.if_will_use_mdata_piece_cache) {
-        mcfg.mode = cache_work_mode_t::self_reliat_cache;   /* TODO: 未实装，ctor 拒 RC_ERR_STATE */
+        mcfg.mode = cache_work_mode_t::self_reliat_cache;   /* 双档：CTRL_ARRAY ≤13 / RADIX >13（mdata_piece_cache.cpp） */
     } else {
         mcfg.mode = cache_work_mode_t::no_cache;
     }
@@ -465,6 +465,20 @@ void RavenFS_juvenile::caches_teardown() {
  *   mmap 后端直接读写窗口切片（零拷贝，内核页缓存管）。
  * ═══════════════════════════════════════════════════════════════ */
 void RavenFS_juvenile::inode_read(uint64_t inum, raven_Inode_t *out) const {
+    /* self_reliat 后端：读必须走缓存 —— 业务/测试的读-改-写经 InodeSession
+     * 落在用户态私有副本，直读盘会读到旧值（offload 直映页缓存 / no_cache
+     * 直读盘均无此不一致；2026-08-30 分裂建新根 data_root 丢失即此坑）。 */
+    if (inode_cache_mgr &&
+        inode_cache_mgr->backed_mode == cache_work_mode_t::self_reliat_cache) {
+        Inode_cache_mgr_t::slice_cache_acces_token_t tok{};
+        raven_Inode_t *p = inode_cache_mgr->self_reliat_get(inum, &tok);
+        if (p) {
+            *out = *p;
+            inode_cache_mgr->self_reliat_put(inum, tok);
+            return;
+        }
+        /* 缓存读失败（退化配置）：回落到直读 */
+    }
     if (fsblk0_base_) {   /* mmap 后端：直接 memcpy 自窗口（FS_block[inode_array_base] 起） */
         memcpy(out, fsblk0_base_ + inode_array_base * 4096 + inum * sizeof(raven_Inode_t),
                sizeof(raven_Inode_t));
@@ -477,6 +491,19 @@ void RavenFS_juvenile::inode_read(uint64_t inum, raven_Inode_t *out) const {
 }
 
 void RavenFS_juvenile::inode_write(uint64_t inum, const raven_Inode_t *in) {
+    /* self_reliat 后端：写必须走缓存（改缓存副本 + 脏标记，flush/dtor 写回） */
+    if (inode_cache_mgr &&
+        inode_cache_mgr->backed_mode == cache_work_mode_t::self_reliat_cache) {
+        Inode_cache_mgr_t::slice_cache_acces_token_t tok{};
+        raven_Inode_t *p = inode_cache_mgr->self_reliat_get(inum, &tok);
+        if (p) {
+            *p = *in;
+            inode_cache_mgr->self_reliat_mark_dirty(inum);
+            inode_cache_mgr->self_reliat_put(inum, tok);
+            return;
+        }
+        /* 缓存写失败（退化配置）：回落到直写 */
+    }
     if (fsblk0_base_) {   /* mmap 后端：直接写窗口切片 */
         memcpy(fsblk0_base_ + inode_array_base * 4096 + inum * sizeof(raven_Inode_t),
                in, sizeof(raven_Inode_t));

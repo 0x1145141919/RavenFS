@@ -16,6 +16,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "../include/ravenfs/mdata_piece_caches.hpp"   /* verify 同步点：flush_all 需完整类型 */
 
 #include <cstdio>
 #include <cstring>
@@ -26,15 +27,19 @@
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 
-static linux_userspace_mount_t make_mount(const char *path) {
+static linux_userspace_mount_t make_mount(const char *path, bool selfreliat) {
     linux_userspace_mount_t mnt{};
-    mnt.dev.fd = ::open(path, O_RDWR);
+    mnt.dev.fd = ::open(path, selfreliat ? O_RDWR | O_DIRECT : O_RDWR);
     int lba = 4096;
     if (::ioctl(mnt.dev.fd, BLKSSZGET, &lba) != 0 || lba <= 0) lba = 4096;
     mnt.dev.lba_size_log2 = (uint8_t)__builtin_ctz((unsigned)lba);
     mnt.dev.type = DEV_UNKNOWN;
-    mnt.dev.is_device_direct = false;
+    mnt.dev.is_device_direct = selfreliat;   /* selfreliat：直写 + 双 self_reliat 缓存；offload：整盘 mmap */
     mnt.param = {};
+    if (selfreliat) {
+        mnt.param.if_will_use_inode_cache = true;
+        mnt.param.if_will_use_mdata_piece_cache = true;
+    }
     mnt.logical_processor_count = 1;
     return mnt;
 }
@@ -81,6 +86,8 @@ static raven_dir_Inode_t read_dir_inode(RavenFS_juvenile &fs) {
 
 /* 数位图面置位 bit 数（位图面 = 8K 负载片，从 bitmap_base 起） */
 static uint64_t count_bits(RavenFS_juvenile &fs, uint64_t bmp_base) {
+    /* self_reliat 写回缓存：位图面修改未落盘前直读盘会假阳性 → 先同步点 */
+    if (fs.mdata_piece_mgr) fs.mdata_piece_mgr->flush_all();
     alignas(uint8_t) uint8_t bmp[8192];
     if (fs.read_buff(bmp_base, 2, bmp) != RC_OK) return UINT64_MAX;
     uint64_t n = 0;
@@ -91,7 +98,8 @@ static uint64_t count_bits(RavenFS_juvenile &fs, uint64_t bmp_base) {
 static constexpr uint64_t NAME_HEAP_INACTIVE = (1ULL << 52) - 1;
 
 int main(int argc, char **argv) {
-    if (argc < 2) { printf("usage: %s <device>\n", argv[0]); return 2; }
+    if (argc < 2) { printf("usage: %s <device> [mode=offload|selfreliat]\n", argv[0]); return 2; }
+    const bool SELFRELIAT = (argc >= 3 && strcmp(argv[2], "selfreliat") == 0);
 
     printf("════════════════════════════════════════════════\n"
            " RavenFS v1.1 名字堆专项测试\n"
@@ -99,7 +107,7 @@ int main(int argc, char **argv) {
            "════════════════════════════════════════════════\n", argv[1]);
 
     uint64_t rc = 0;
-    linux_userspace_mount_t mnt = make_mount(argv[1]);
+    linux_userspace_mount_t mnt = make_mount(argv[1], SELFRELIAT);
     if (mnt.dev.fd < 0) { printf("open %s failed\n", argv[1]); return 2; }
 
     /* ── 各档位边界名字（长度 → 档位映射见 §7.4） ── */
