@@ -795,9 +795,13 @@ uint64_t Inode_cache_mgr_t::slice_radix_tree::row_blk_len(uint64_t line) const {
     return (v + INODES_PER_PAGE - 1) / INODES_PER_PAGE;         /* 向上取整到 FS_block（16 inode/块） */
 }
 
-/* get：读锁假定一次命中；miss → 写锁建链（无 I/O）→ 回头读锁。
- * RAII 约定：非泄露路径全部由 guard 析构收口（miss 重取 / ctrl_acquire 失败），
- * 仅成功返回前 release() 交出所有权 —— 读锁刻意泄露到 put 释放（会话语义）。 */
+/* get：读锁只在 get 内部（建链窗口），不跨会话。
+ * 为什么可以：树只增不删 —— 表结构建好即永久（直到 dtor），会话内
+ * locate/mark_dirty 无锁安全；页的生命周期由 ctrl_word accessor 计数保护
+ * （与树锁无关）。跨会话持读锁的旧设计（读锁泄露到 put）在业务嵌套
+ * InodeSession 时会自死锁：内层 miss 建链要写锁，外层读锁还没还
+ * （2026-08-30 mdata 版同款 bug 实锤后对齐修复）。
+ * miss → 写锁建链（无 I/O）→ 回头读锁；读锁随 sh 析构释放。 */
 raven_Inode_t *Inode_cache_mgr_t::slice_radix_tree::get(bitfield_decoded_result_t *d) {
     std::shared_lock sh(lock_);   /* 读锁：假定一次命中 */
     Inode_cache_ctrl_t *c = locate(d);
@@ -820,19 +824,16 @@ raven_Inode_t *Inode_cache_mgr_t::slice_radix_tree::get(bitfield_decoded_result_
     raven_Inode_t *page = Inode_cache_mgr_t::ctrl_acquire(c, blk, blk_len, rt_, &loaded);
     if (!page) return nullptr;   /* sh 析构释放读锁 */
     if (loaded) real_cache_accumulate.fetch_add(page_bytes, std::memory_order_relaxed);
-    sh.release();   /* 读锁刻意泄露到 put：release 只交所有权、不解锁（put 端 unlock_shared 收） */
-    return page;   /* 读锁保持到 put */
+    return page;   /* sh 析构即释放读锁（不跨会话）：树只增不删，会话内 locate 无锁安全 */
 }
 
-/* put：accessor-1 + 释放 get 泄露的读锁。
- * 会话内（本线程持读锁）→ 无锁走路径安全：建链写锁被本线程读锁阻塞，树冻结。 */
+/* put：accessor-1（无读锁可释放 —— get 已随返回释放；树只增不删，locate 无锁安全） */
 void Inode_cache_mgr_t::slice_radix_tree::put(bitfield_decoded_result_t *d) {
     Inode_cache_ctrl_t *c = locate(d);
     if (c) c->ctrl_word.fetch_sub(CTRL_ACCESSOR_INC, std::memory_order_relaxed);
-    lock_.unlock_shared();
 }
 
-/* mark_dirty：会话内调用（调用方已持本片读锁）→ 无锁走路径置 DIRTY */
+/* mark_dirty：会话内调用（树只增不删，locate 无锁安全）→ 无锁走路径置 DIRTY */
 void Inode_cache_mgr_t::slice_radix_tree::mark_dirty(bitfield_decoded_result_t *d) {
     Inode_cache_ctrl_t *c = locate(d);
     if (c) c->ctrl_word.fetch_or(CTRL_FLAG_DIRTY << CTRL_FLAGS_SHIFT, std::memory_order_release);

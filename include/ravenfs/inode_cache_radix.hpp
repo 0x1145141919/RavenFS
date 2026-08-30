@@ -167,7 +167,7 @@ public:
     ~Inode_cache_mgr_t();//每个片进行折构（脏页回写 + 释放）
 
     /* ── 统一会话接口（三模式表面一致） ──
-     * get 输出会话 token（RADIX 定位分片/释放读锁用），put 必须带回该 token；
+     * get 输出会话 token（RADIX 定位分片用（读锁已随 get 返回释放，不跨会话）），put 必须带回该 token；
      * out_token 可空（调用方不关心时），FULL_RAM/CTRL_ARRAY 填 slice_idx=0 */
     struct slice_cache_acces_token_t
     {
@@ -184,7 +184,7 @@ public:
     uint64_t inode_array_base() const { return inode_array_base_; }
 
     /* ── self_reliat 会话接口（FULL_RAM/CTRL_ARRAY/RADIX 三内部模式表面一致） ──
-     * get 输出会话 token（RADIX 定位分片/释放读锁用），put 必须带回该 token；
+     * get 输出会话 token（RADIX 定位分片用（读锁已随 get 返回释放，不跨会话）），put 必须带回该 token；
      * out_token 可空（调用方不关心时），FULL_RAM/CTRL_ARRAY 填 slice_idx=0。 */
     raven_Inode_t *self_reliat_get(uint64_t inum, slice_cache_acces_token_t *out_token = nullptr);
     void           self_reliat_put(uint64_t inum, const slice_cache_acces_token_t &token);
@@ -276,23 +276,23 @@ private:
         std::atomic<uint64_t> real_cache_accumulate{0};
         /* ── 并发与结构 ── */
         std::shared_mutex lock_;                       /* 可睡眠读写锁：读共享/写独占，持锁可等 I/O（不烧核）
-                                                          * 读锁持有跨越 get→put 整个会话：get 内 std::shared_lock
-                                                          * 持有，成功路径 release() 交所有权（非泄露路径析构收口），
-                                                          * put 手动 unlock_shared 释放；会话内建链写锁被阻塞 →
-                                                          * 树只增不删，会话内 mark_dirty 可无锁走路径 */
+                                                          * 读锁仅在 get 内建链窗口持有（不跨会话）：树只增不删，
+                                                          * 表建好即永久，会话内 locate/mark_dirty 无锁安全；页由
+                                                          * ctrl_word accessor 计数保护（与树锁无关）。嵌套会话不再
+                                                          * 自死锁（2026-08-30 对齐 mdata 版修复） */
         void *root_ = nullptr;                         /* 根表：tree_levels_==1 → 叶表（ctrl_t 数组）；
                                                           * 否则指针槽数组（槽 = 子表指针，nullptr = 未建） */
     public:
         explicit slice_radix_tree(const slice_radix_tree_cfg_t &cfg);
         ~slice_radix_tree();                           /* 全部缓存：脏页写回 + 非脏丢弃 + 释放全部表 */
         /* get：吃解析好的位域结果（树不解码）。先读锁假定一次命中；miss → 写锁打通链路
-         * （建中间表/叶表，无 I/O）后回头读锁。RAII：非泄露路径 guard 析构收口；
-         * 成功返回前 release() 交出读锁所有权 —— 刻意泄露到 put 释放 */
+         * （建中间表/叶表，无 I/O）后回头读锁。读锁随 guard 析构释放（不跨会话 ——
+         * 树只增不删表建好即永久，会话内 locate 无锁安全；嵌套会话内层 miss 建链不自死锁） */
         raven_Inode_t *get(bitfield_decoded_result_t *decoded);
-        /* put：释放 get 泄露的读锁 + 对应缓存行 accessor-1（行不被淘汰由 accessor>0 保证） */
+        /* put：对应缓存行 accessor-1（行不被淘汰由 accessor>0 保证；无读锁可释放，get 已释） */
         void put(bitfield_decoded_result_t *decoded);
-        /* mark_dirty：会话内调用（调用方已持本片读锁）——无锁走路径置 DIRTY。
-         * 安全前提：树只增不删 + 建链写锁被会话读锁阻塞 */
+        /* mark_dirty：会话内调用 —— 无锁走路径置 DIRTY。
+         * 安全前提：树只增不删（表建好即永久，locate 无锁安全） */
         void mark_dirty(bitfield_decoded_result_t *decoded);
         /* flush_all：读锁内 DFS 全量脏页写回（挂载/卸载同步点；宿主应保证与 reap 不并发） */
         void flush_all();

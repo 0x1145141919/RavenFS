@@ -23,7 +23,8 @@
  * inode 版共用（CTRL_STATE_MASK / CTRL_ACCESSOR_INC / CTRL_FLAG_DIRTY /
  * idle..evicting 见 inode_cache_radix.hpp）；TTL 淘汰绑 x86_64 Invariant TSC
  * （默认 2s，0 = 禁用）。RADIX 分片树：shared_mutex 读写锁 + 树只增不删 +
- * 读锁泄露到 put（get 内 release 交所有权），与 inode 版 slice_radix_tree 同构。
+ * 读锁不跨会话（get 内建链窗口持锁，返回即释；嵌套 session 内层 miss 建链
+ * 不自死锁 —— 2026-08-30 与 inode 版同款修复对齐）。
  * ═══════════════════════════════════════════════════════════════════ */
 #include "ravenfs/mdata_piece_caches.hpp"
 #include "util/lock.h"   /* cpu_relax（忙等） / rdtsc_timestamp（TTL 时间戳） */
