@@ -8,7 +8,7 @@
 
 ## 0. v1 → v1.1 变更动机
 
-v1 的两个结构级教训（详见 `bug_bplus_separator_corruption.md`）：
+v1 的两个结构级教训（v1 排障记录已随 v1 文档归档，git history 可查）：
 
 1. **元数据借用 entry 槽位**：v1 把 node_meta / 兄弟指针 / magic 塞进 entry 的 words[3]，
    名义 256 槽、实际多个槽被挪用 → entry_count 语义要靠纪律维护，
