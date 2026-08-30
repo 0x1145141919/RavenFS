@@ -25,3 +25,6 @@ test_mount_bitmap
 # 系统
 core
 core.*
+
+# 工作日志（Raven 侧维护，不随仓库走）
+ravenfs_log.txt
