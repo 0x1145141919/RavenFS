@@ -412,7 +412,7 @@ int main(int argc, char **argv) {
     printf("\n════════════════════════════════════════════════\n"
            " SUMMARY: %d passed, %d failed\n"
            "════════════════════════════════════════════════\n", g_pass, g_fail);
-    printf("注：当前 insert 未分配 inode（条目 inode_ptr.ptr 恒 PTR_INVALID），\n"
-           "    树验证统计 invalid_inode_ptr 数量供确认。\n");
+    printf("注：insert 已分配真实 inode（条目 inode_ptr.ptr = 新 inode 槽），\n"
+           "    树验证统计 invalid_inode_ptr（应恒为 0）供确认。\n");
     return g_fail ? 1 : 0;
 }

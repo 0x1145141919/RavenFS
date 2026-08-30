@@ -488,7 +488,7 @@ int main(int argc, char **argv) {
     printf("\n════════════════════════════════════════════════\n"
            " SUMMARY: %d passed, %d failed\n"
            "════════════════════════════════════════════════\n", g_pass, g_fail);
-    printf("注：insert 未分配 inode（条目 inode_ptr 恒 PTR_INVALID），\n"
-           "    rm 时 has_inode=false 跳过 inode_free，仅验证树路径。\n");
+    printf("注：insert 已分配真实 inode，rm 时 inode_free 释放 inode 槽；\n"
+           "    删除路径同时验证 inode 位图随插删增减。\n");
     return g_fail ? 1 : 0;
 }

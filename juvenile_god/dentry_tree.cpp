@@ -243,12 +243,12 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
                 (count - idx) * sizeof(Dentry_t));
     }
 
-    /* 填充新条目（inode_ptr.ptr 留 PTR_INVALID，由调用者赋真实 inum；
-     * 外置定位由调用方预分配好传进 name->full_char_remain_ptr） */
+    /* 填充新条目（inode_ptr.ptr = 调用方分配的 inum；外置定位由调用方
+     * 预分配好传进 name->full_char_remain_ptr） */
     Dentry_t *entry = &leaf->entries[idx];
     entry->hash = name->hash;
     entry->inode_ptr.free_to_use = name->name_len;
-    entry->inode_ptr.ptr = PTR_INVALID;
+    entry->inode_ptr.ptr = name->inum;
     memcpy(entry->name, name->name, DENTRY_INLINE_NAME_MAX);   /* 前 40B（长名尾部在堆） */
     entry->full_char_remain_ptr = name->full_char_remain_ptr;
 

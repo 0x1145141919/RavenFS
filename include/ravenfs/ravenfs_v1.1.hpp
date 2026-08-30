@@ -351,6 +351,7 @@ class bitmap_slice_t{
         uint64_t hash;
         uint16_t name_len;              /* strlen(name) 缓存（≤ RAVENFS_MAX_NAME_LEN） */
         uint64_t full_char_remain_ptr;  /* 插入时调用方预分配的外置定位；≤40B 恒 PTR_INVALID */
+        uint64_t inum;                  /* 插入时调用方分配的真实 inode 槽；dentry_leaf_entry_insert 落 inode_ptr.ptr（非插入路径恒 0） */
     };
     /* ── 名字堆（name heap）原语（disk_layout_v1.1.md §7）──
      * 长名（>40B）外置部分 ≤512B，由每目录名字堆分配；档位级懒激活
@@ -381,6 +382,19 @@ class bitmap_slice_t{
         void disarm() { armed = false; }
         ~name_heap_guard_t() {
             if (armed && fs) fs->name_heap_free(dir_ino, name_len, remain);
+        }
+    };
+    /* 新 inode 分配回滚守卫（insert 流程 RAII：inode_alloc 成功后的任何失败
+     * 返回都自动 inode_free，成功路径显式 disarm；与 name_heap_guard 同
+     * 生命周期纪律，覆盖 insert/分裂链路全部失败点） */
+    struct inode_guard_t {
+        RavenFS_juvenile *fs = nullptr;
+        uint64_t inum = 0;
+        bool armed = false;
+        void arm(RavenFS_juvenile *f, uint64_t i) { fs = f; inum = i; armed = true; }
+        void disarm() { armed = false; }
+        ~inode_guard_t() {
+            if (armed && fs) fs->inode_free(inum);
         }
     };
     /* 激活堆槽：位图面+数据面一次分配（各自连续、2^1 对齐）+ 位图清零 + 控制器落盘 */

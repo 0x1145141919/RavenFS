@@ -83,6 +83,29 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
     if (rc) return rc;
     if (trace.is_finally_hit) return RC_ERR_EXIST;
 
+    /* ── 真正 inode 操作：分配 inode 槽 + 初始化 REGULAR 文件 inode ──
+     * 放在 EXIST 检查后（不浪费 inode 槽）。InodeSession 直改缓存页
+     * （no_cache 写回 / offload 直映内核页缓存 / self_reliat 脏标记，
+     * 三后端表面一致；读锁不跨会话，可放心与 mdata_piece_session 嵌套）。
+     * inode_guard RAII 兜底 insert/分裂链路任何失败自动 inode_free；
+     * **所有成功路径必须 disarm**（与 heap_guard 同纪律）。 */
+    uint64_t new_inum = inode_alloc();
+    if (new_inum == PTR_INVALID) return RC_ERR_NO_INODE;
+    inode_guard_t inode_guard;
+    inode_guard.arm(this, new_inum);
+    {
+        InodeSession ino_sess(inode_cache_mgr, new_inum);
+        if (!ino_sess) return RC_ERR_IO;   /* guard 自动回滚 */
+        raven_Inode_t *ino = ino_sess.inode;
+        memset(ino, 0, sizeof(raven_Inode_t));   /* 全零：inline_data = 内联空文件 */
+        ino->type            = INODE_TYPE_REGULAR;
+        ino->link_count      = 1;
+        ino->permission_bits = 0644;
+        ino->data_root       = PTR_INVALID;   /* 内联空文件，无数据块 */
+        ino_sess.dirty();
+    }
+    cmplx.inum = new_inum;   /* dentry 落真实 inum（dentry_leaf_entry_insert 消费） */
+
     /* ── 长名（>40B）：先分配名字堆外置存储 + 写尾部，再插入 ──
      * 分配置于 EXIST 检查后（不浪费堆空间）；guard 兜底 insert/分裂
      * 链路任何失败自动回滚；**所有成功路径必须 disarm**（分裂建新根的
@@ -146,6 +169,7 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
                                        inode_idx);
             if (rc) return rc;   /* 失败：guard 自动回滚 */
             heap_guard.disarm();   /* 成功：分裂建新根路径必须转正 */
+            inode_guard.disarm();  /* inode 同转正 */
             return RC_OK;
         }
 
@@ -205,6 +229,7 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
     }
 
     heap_guard.disarm();   /* 树插入全链路成功，堆分配转正 */
+    inode_guard.disarm();  /* inode 转正 */
     return RC_OK;
 }
 
@@ -254,8 +279,8 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
     Bptree_dentry_leaf_node_t *leaf = (Bptree_dentry_leaf_node_t*)leaf_sess.data;   /* 只读（取条目 inum / 名字堆信息） */
     uint64_t inum = leaf->entries[idx].inode_ptr.ptr;
     /* ⚠ 52 位位域读出的 inum 与 PTR_INVALID 比较必须同样截断（64 位比较恒不相等）。
-     * insert 尚未接 inode 分配时条目为悬空（PTR_INVALID）：此时只删树条目、
-     * 跳过 inode_free —— 幼年期过渡态，insert 接 inode 后自然消除。 */
+     * insert 已落真实 inum；PTR_INVALID 悬空条目 = 历史过渡态/结构异常
+     * （此时只删树条目、跳过 inode_free）。 */
     const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
     const bool has_inode = (inum != PTR_INVALID_52);
 
@@ -370,7 +395,10 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
         }
     }
 
-    if (has_inode) inode_free(inum);
+    /* 真正 inode 操作：释放条目指向的 inode 槽（insert 已落真实 inum）。
+     * inode_test 双保险：位图未亮灯的 inum 视为异常态，不再重复释放
+     * （free_interval 本幂等，此守卫纯防御）。 */
+    if (has_inode && inode_test(inum)) inode_free(inum);
     /* 长名：释放名字堆外置存储（树删除已成功；释放失败尽力而为，不覆盖删除结果） */
     if (e_name_len > DENTRY_INLINE_NAME_MAX)
         name_heap_free(inode_idx, e_name_len, e_remain);
@@ -382,7 +410,7 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
  *
  * 命中 → RC_OK 且 *out_inum 输出条目 inode 编号；
  * 未命中 → RC_ERR_NOT_FOUND；目录无效/非目录 → RC_ERR_STATE。
- * （当前 insert 尚未分配 inode，命中的 out_inum 为 PTR_INVALID 52 位形态）
+ * （insert 已落真实 inum：命中输出即新文件 inode 槽）
  * ═══════════════════════════════════════════════════════════════════ */
 result_code_t RavenFS_juvenile::dir_lookup(uint64_t inode_idx, const char *name, uint64_t *out_inum)
 {
