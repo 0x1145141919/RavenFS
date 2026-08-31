@@ -55,6 +55,7 @@ enum : result_code_t {
     RC_ERR_NAME_LEN,        /* 名字 > RAVENFS_MAX_NAME_LEN */
     RC_ERR_IO,              /* pread/pwrite 失败 */
     RC_ERR_STATE,           /* 内部状态异常（根节点角色不符等） */
+    RC_ERR_NOT_EMPTY,       /* 目录非空：dir 型目标删除前置校验失败（rmdir 语义） */
 
     RC_NEED_SPLIT = 0x1000, /* 内部使用：本层分裂，需父层处理 */
 };
@@ -72,6 +73,10 @@ struct ptr_in_idx{
 /* ── 常量 / 哨兵 ── */
 constexpr uint8_t  DENTRY_INLINE_NAME_MAX = 40;   /* name 内联上限：≤40 内联，>40 外置 */
 constexpr uint64_t PTR_INVALID            = (~0ULL); /* 通用无效指针哨兵（v1 惯例沿用） */
+/* 名字堆未激活哨兵：52 位全 1（bitmap/data_base 双指针位域截断形态）。
+ * mkfs 建根目录、dir 型 inode 初始化、name_heap 激活/回收三方共用 ——
+ * 误用 0 是雷（0 = 合法块号，dir_name_heap_release 会误释放根 dentry 块）。 */
+constexpr uint64_t NAME_HEAP_INACTIVE     = (1ULL << 52) - 1;
 /* 名字堆控制器（每目录固定 10 个，见 raven_dir_Inode_t 内联区）
  * 异构堆：各堆粒度(bytes_per_bit_log2)与位图容量(total_bits_count_log2)独立，
  * 按需激活（档位级懒：激活 = 位图面+数据面按容量一次分配）；名字按长度分流到

@@ -95,8 +95,6 @@ static uint64_t count_bits(RavenFS_juvenile &fs, uint64_t bmp_base) {
     return n;
 }
 
-static constexpr uint64_t NAME_HEAP_INACTIVE = (1ULL << 52) - 1;
-
 int main(int argc, char **argv) {
     if (argc < 2) { printf("usage: %s <device> [mode=offload|selfreliat]\n", argv[0]); return 2; }
     const bool SELFRELIAT = (argc >= 3 && strcmp(argv[2], "selfreliat") == 0);

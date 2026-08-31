@@ -106,13 +106,27 @@ public:
      * 全部以根目录为唯一操作对象，path 概念不存在。
      * ══════════════════════════════════════════════════════════ */
 
-    /* 创建名为 name 的普通文件：
+    /* 创建名为 name 的普通文件（便捷封装，等价于
+     * root_dir_insert_dentry(name, INODE_TYPE_REGULAR)）：
      *   inode_alloc → 初始化(REGULAR, 0644, link_count=1, data_root=PTR_INVALID
      *   内联空文件) → inode_write → dentry 树插入。
      * name 已存在 → RC_ERR_EXIST；> RAVENFS_MAX_NAME_LEN → RC_ERR_NAME_LEN。 */
     result_code_t root_dir_insert_dentry(const char *name);
+    /* 正版入口：按 inode_type 初始化新 inode ——
+     *   INODE_TYPE_DIR    : 新建 dir inode（0755/link_count=2/名字堆哨兵）+
+     *                       急建其 dentry 树根（根叶子 2 块，magic + . / .. 指针）；
+     *   REGULAR/SOFT_SYM  : 内联空 inode（0644/link_count=1/data_root=PTR_INVALID）
+     * 之后统一插入 dentry 树。name 已存在 → RC_ERR_EXIST；
+     * > RAVENFS_MAX_NAME_LEN → RC_ERR_NAME_LEN；inode_type 非法 → RC_ERR_STATE。 */
+    result_code_t root_dir_insert_dentry(const char *name,uint8_t inode_type);
 
+    result_code_t root_dir_direct_file_pwrite(const char *name,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
+    result_code_t root_dir_direct_file_punch_hole(const char *name,uint64_t offset,uint64_t len);
+    result_code_t root_dir_direct_file_trunacate(const char *name,uint64_t len_new);
+    result_code_t root_dir_direct_file_pread(const char *name,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
     /* 物理删除：dentry 树移除（memmove + 刷父 hash_max）→ inode_free。
+     * dir 型目标：删除前置校验目录必须全空（树根叶子 entry_count==0），
+     * 非空 → RC_ERR_NOT_EMPTY；空目录连带回收名字堆 + 释放树根 2 块。
      * 未找到 → RC_ERR_NOT_FOUND。 */
     result_code_t root_dir_rm_dentry(const char *name);
 
@@ -126,7 +140,7 @@ public:
      * 调用者负责释放：delete[] *out_buf。 */
     int64_t root_dir_readdir(dentry_out **out_buf);
 
-    
+    result_code_t root_dir_readdir_interval(uint64_t base,uint64_t entry_count,dentry_out*buf);//改成这种接口外部自己准备内存
 
     /* ── 调试 ── */
     void dump_info() const;                     /* SB/几何/位图占用率/根节点 */
@@ -204,10 +218,13 @@ class bitmap_slice_t{
         uint64_t logical_blkbase;
         uint64_t len;
     };//管辖[logical_blkbase,logical_blkbase+len]的闭区间
-    result_code_t dir_insert_dentry(uint64_t inode_idx,const char *name);
-
+    result_code_t dir_insert_dentry(uint64_t inode_idx,const char *name);   /* 便捷封装：REGULAR（旧懒建根逻辑已退役，见三参核心版） */
+    /* 核心版本：按 inode_type 初始化 + 插入。dir 型急建树根（magic + . / ..）；
+     * 目标目录 inode_idx 的 data_root 恒有效（v1.1 §10 不变量 11），
+     * 遇 PTR_INVALID = 严重内部磁盘契约违反 → RC_ERR_STATE。 */
+    result_code_t dir_insert_dentry(uint64_t inode_idx,const char *name,uint8_t inode_type);
     result_code_t dir_rm_dentry(uint64_t inode_idx,const char *name);
-
+    result_code_t dir_readdir_interval(uint64_t inode_idx,uint64_t base,uint64_t entry_count,dentry_out*buf);
     result_code_t dir_name_heap_release(uint64_t inode_idx);//作为dir关闭时调用，遍历十个堆，全空则释放
     result_code_t dir_lookup(uint64_t inode_idx,const char *name, uint64_t *out_inum);
     int64_t dir_readdir(uint64_t inode_idx,dentry_out **out_buf);
@@ -395,6 +412,20 @@ class bitmap_slice_t{
         void disarm() { armed = false; }
         ~inode_guard_t() {
             if (armed && fs) fs->inode_free(inum);
+        }
+    };
+    /* 块分配回滚守卫（dir 型新建树根专用：block_alloc_hard 成功后的任何失败
+     * 返回都自动 block_free 回滚，成功路径显式 disarm；与 inode_guard 同
+     * 生命周期纪律，覆盖 insert/分裂链路全部失败点） */
+    struct block_guard_t {
+        RavenFS_juvenile *fs = nullptr;
+        uint64_t blk = 0;
+        uint64_t count = 0;
+        bool armed = false;
+        void arm(RavenFS_juvenile *f, uint64_t b, uint64_t c) { fs = f; blk = b; count = c; armed = true; }
+        void disarm() { armed = false; }
+        ~block_guard_t() {
+            if (armed && fs) fs->block_free(blk, count);
         }
     };
     /* 激活堆槽：位图面+数据面一次分配（各自连续、2^1 对齐）+ 位图清零 + 控制器落盘 */

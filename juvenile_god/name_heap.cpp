@@ -36,9 +36,6 @@ namespace {
 constexpr uint8_t kGranLog2[10] = { 3,3,3,  6,6,  7,7,  8,8,  9 };  /* 8B/64B/128B/256B/512B */
 constexpr uint8_t kBitsLog2[10] = { 16,17,18, 16,17, 16,17, 16,17, 16 };  /* 8k/16k/32k 位图 */
 
-/* 未激活哨兵：52 位全 1（PTR_INVALID 惯例；log2 字段 63 = 非法值，不歧义） */
-constexpr uint64_t NAME_HEAP_INACTIVE = (1ULL << 52) - 1;
-
 /* 粒度组边界（槽号区间 [lo, hi)）：8B / 64B / 128B / 256B / 512B */
 constexpr uint16_t kGroupSlotLo[5]  = { 0, 3, 5, 7, 9 };
 constexpr uint16_t kGroupSlotHi[5]  = { 3, 5, 7, 9, 10 };

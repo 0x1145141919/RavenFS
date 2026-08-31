@@ -13,16 +13,22 @@
  *       → 加塞失败路径 → 位图满校验 → 全删 → 空树验证
  *       → dir_name_heap_release 全部堆归还 → 重挂载可写验证。
  *
+ * mix 模式（第 5 参 "mix"）：插入类型按 (组,序号) 确定性三型循环
+ *   （DIR / SOFT_SYM / REGULAR，组间错开防扎堆）—— 规模化覆盖 dir 型
+ *   建根（block_alloc_hard 2 块）与空目录删除（block_free 2 块）路径；
+ *   插删同一生成器，rm 不需要类型参数（读 inode 自判）。
+ *
  * 名字确定性生成（gen_name：组前缀 + 10 位序号 + 定长填充），插入/删除
  * 同一生成器，零内存存储。填充字符依赖 idx → 尾部字节随 idx 变化，
  * 重复分配（共享单元）会破坏尾部数据并被 lookup 验证暴露。
  *
- * 用法：ravenfs_juv_name_heap_stress <device> [--full]
+ * 用法：ravenfs_juv_name_heap_stress <device> [--full] [mode=offload|selfreliat] [mix]
  * ═══════════════════════════════════════════════════════════════════ */
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
 #include "../include/ravenfs/mdata_piece_caches.hpp"   /* mdata_piece_session：与名字堆同视角读位图 */
+#include "../include/ravenfs/inode_cache_radix.hpp"   /* mix 模式类型抽查：InodeSession 走缓存读 */
 
 #include <cstdio>
 #include <cstring>
@@ -66,11 +72,19 @@ static const char *rc_name(result_code_t rc) {
     case RC_ERR_NAME_LEN: return "RC_ERR_NAME_LEN";
     case RC_ERR_IO: return "RC_ERR_IO";
     case RC_ERR_STATE: return "RC_ERR_STATE";
+    case RC_ERR_NOT_EMPTY: return "RC_ERR_NOT_EMPTY";
     default: return "RC_???";
     }
 }
 
-static constexpr uint64_t NAME_HEAP_INACTIVE = (1ULL << 52) - 1;
+/* mix 模式：确定性三型循环（DIR/SOFT_SYM/REGULAR），组间错开防同型扎堆。
+ * 插删同一生成器：删除阶段按 (g,i) 重算同型（rm 不依赖类型，此处仅供插）。 */
+static uint8_t mix_type(uint64_t g, uint64_t i) {
+    const uint64_t x = (g * 3 + i) % 3;
+    return x == 0 ? INODE_TYPE_DIR : (x == 1 ? INODE_TYPE_SOFT_SYM : INODE_TYPE_REGULAR);
+}
+
+/* 未激活哨兵 NAME_HEAP_INACTIVE（52 位全 1）由 disk_struct_v1.1.hpp 提供 */
 
 /* 组定义：len=名字长度（→档位），full=全量目标数，lite=缩水目标数 */
 struct grp_t {
@@ -112,13 +126,19 @@ static uint64_t count_bits_full(RavenFS_juvenile &fs, const name_heap_controller
 
 int main(int argc, char **argv) {
     if (argc < 2) { printf("usage: %s <device> [--full] [mode=offload|selfreliat]\n", argv[0]); return 2; }
-    const bool FULL = (argc >= 3 && strcmp(argv[2], "--full") == 0);
-    const bool SELFRELIAT = (argc >= 4 && strcmp(argv[3], "selfreliat") == 0);
+    /* 任意位置识别开关（兼容历史位置式调用） */
+    auto has_arg = [&](const char *tok) -> bool {
+        for (int i = 2; i < argc; i++) if (!strcmp(argv[i], tok)) return true;
+        return false;
+    };
+    const bool FULL = has_arg("--full");
+    const bool SELFRELIAT = has_arg("selfreliat");
+    const bool MIX = has_arg("mix");
 
     printf("════════════════════════════════════════════════\n"
-           " RavenFS v1.1 名字堆极限压测（%s）\n device: %s\n"
+           " RavenFS v1.1 名字堆极限压测（%s%s）\n device: %s\n"
            "════════════════════════════════════════════════\n",
-           FULL ? "大魔王全量" : "缩水", argv[1]);
+           FULL ? "大魔王全量" : "缩水", MIX ? " · mix 三型" : "", argv[1]);
 
     uint64_t rc = 0;
     linux_userspace_mount_t mnt = make_mount(argv[1], SELFRELIAT);
@@ -142,7 +162,8 @@ int main(int argc, char **argv) {
         result_code_t fail_rc = RC_OK;
         for (uint64_t i = 0; i < count; i++) {
             gen_name(nm, GROUPS[g], i);
-            result_code_t r = fs.root_dir_insert_dentry(nm);
+            result_code_t r = MIX ? fs.root_dir_insert_dentry(nm, mix_type(g, i))
+                                  : fs.root_dir_insert_dentry(nm);
             if (r != RC_OK) { fail_at = i; fail_rc = r; break; }
             total_inserted++;
             if (prog >= 1 && (i + 1) % prog == 0)
@@ -178,6 +199,29 @@ int main(int argc, char **argv) {
             break;
         }
         printf("  %s 灌入后全量 lookup 命中 ✓\n", GROUPS[g].tag);
+
+        /* mix 模式：类型抽查（每组前 100 条，InodeSession 走缓存 ——
+         * self_reliat 下 inode_read 直读盘会读到未回写脏页，必须走缓存） */
+        if (MIX) {
+            const uint64_t n = count < 100 ? count : 100;
+            uint64_t bad = 0;
+            for (uint64_t i = 0; i < n; i++) {
+                gen_name(nm, GROUPS[g], i);
+                uint64_t inum = 0;
+                if (fs.root_dir_lookup(nm, &inum) != RC_OK) { bad++; continue; }
+                InodeSession s(fs.inode_cache_mgr, inum);
+                if (!s) { bad++; continue; }
+                if (s.inode->type != mix_type(g, i)) bad++;
+            }
+            if (bad) {
+                p1_ok = false;
+                printf("  [FAIL] %s mix 类型抽查 %llu/%llu 不符\n", GROUPS[g].tag,
+                       (unsigned long long)bad, (unsigned long long)n);
+                g_fail++;
+                break;
+            }
+            printf("  %s mix 类型抽查 ✓（%llu 条）\n", GROUPS[g].tag, (unsigned long long)n);
+        }
     }
     CHECK(p1_ok, "Phase 1 全档位灌入（%llu 条）", (unsigned long long)total_inserted);
 
