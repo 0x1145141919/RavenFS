@@ -45,6 +45,7 @@ inline void bit_clear(uint64_t *words, uint64_t idx) {
 /* 找从 from 起的下一个空闲段 [*out_start, *out_end)（字粒度，整字
  * 占用直接跳过；末字按 nbits 截位）。无空闲段 → false。 */
 bool next_free_seg(const uint64_t *words, uint64_t nbits, uint64_t from,
+                   uint64_t max_extend,
                    uint64_t *out_start, uint64_t *out_end) {
     uint64_t nwords = (nbits + 63) >> 6;
     uint64_t w = from >> 6;
@@ -66,10 +67,15 @@ bool next_free_seg(const uint64_t *words, uint64_t nbits, uint64_t from,
     /* 段尾延伸：找从 start 起第一个占用位（eword 1=空闲，0=占用）。
      * 字粒度：free_mask = 本字从 end 起的空闲位（低位对齐），全 0 →
      * 段结束；否则连续空闲长 = 第一个 0 位偏移 ctzll(~free_mask)
-     * （free_mask 全 1 = 整字全空闲 → 64）；到字边界续下一字。 */
+     * （free_mask 全 1 = 整字全空闲 → 64）；到字边界续下一字。
+     * ⚠ max_extend>0：段长够 max_extend 即截断 —— 稀疏大位图（如
+     * 122M bits inode 图）下 1-bit 分配若延伸到底，每次分配把整片
+     * 剩余空间走完（15MB×N 次 = O(n²)，大魔王压测 99.55% CPU 热
+     * 点即此）；调用方只需保证截断后的段尾不影响其判定（见调用处）。 */
     uint64_t end = start;
     for (;;) {
         if (end >= nbits) { end = nbits; break; }
+        if (max_extend && (end - start) >= max_extend) break;   /* 够用即止 */
         uint64_t ew = end >> 6;
         uint64_t eword = ~words[ew];
         if (ew == nwords - 1 && (nbits & 63)) eword &= (1ULL << (nbits & 63)) - 1;
@@ -93,9 +99,13 @@ bool next_free_seg(const uint64_t *words, uint64_t nbits, uint64_t from,
 uint64_t find_free_run(const uint64_t *words, uint64_t nbits, uint64_t from,
                        uint64_t count, uint64_t align) {
     if (count == 0 || count > nbits) return SLICE_NO_HIT;
+    /* 截断上界 count+align：候选起点 = align_up(seg_s,align) ≤ seg_s+align−1，
+     * 段长 ≥ count+align 时必有候选可容纳 count —— 截断不丢有效候选，
+     * 且避免稀疏大位图下每次 alloc_hard 把整片剩余空间走完（同 O(n²) 坑）。 */
+    const uint64_t cap = count + align;
     uint64_t seg_s, seg_e;
     uint64_t probe = from;
-    while (next_free_seg(words, nbits, probe, &seg_s, &seg_e)) {
+    while (next_free_seg(words, nbits, probe, cap, &seg_s, &seg_e)) {
         uint64_t cand = slice_align_up(seg_s, align);
         if (cand < seg_e && cand + count <= seg_e) return cand;
         probe = seg_e;
@@ -189,14 +199,19 @@ result_code_t RavenFS_juvenile::bitmap_slice_t::alloc_soft(
     if (bitscount == 0) return RC_ERR_STATE;
     uint64_t align = 1ULL << (align_log2 > 16 ? 16 : align_log2);
     uint64_t *words = reinterpret_cast<uint64_t *>(slice_base);
+    /* 截断上界 max(bitscount, align)：候选 = align_up(seg_s,align) ≤ seg_s+align−1，
+     * 段长 ≥ 上界时必有 ≥bitscount 空闲且候选在段内 —— 够用即止，
+     * 避免稀疏大位图（122M bits inode 图）下 1-bit 分配每次走完整片
+     * 剩余空间的 O(n²) 灾难。 */
+    const uint64_t cap = bitscount > align ? bitscount : align;
 
     uint64_t seg_s, seg_e, hit = SLICE_NO_HIT;
-    if (next_free_seg(words, slice_bitscount, last_finish_hint, &seg_s, &seg_e)) {
+    if (next_free_seg(words, slice_bitscount, last_finish_hint, cap, &seg_s, &seg_e)) {
         uint64_t cand = slice_align_up(seg_s, align);
         if (cand < seg_e) hit = cand;
     }
     if (hit == SLICE_NO_HIT) {                          /* 绕回 */
-        if (next_free_seg(words, slice_bitscount, 0, &seg_s, &seg_e)) {
+        if (next_free_seg(words, slice_bitscount, 0, cap, &seg_s, &seg_e)) {
             uint64_t cand = slice_align_up(seg_s, align);
             if (cand < seg_e) hit = cand;
         }
