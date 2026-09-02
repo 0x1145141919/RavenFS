@@ -442,7 +442,7 @@ Backup 校验:
 ```
 B+tree 叶子 entry 记录（v1.1 extent_t，指针标注见 §5）:
   block_base.ptr = 1024  ← FS_block 号（物理起点）
-  length = 3             ← 闭区间，覆盖 4 个 FS_block
+  length = 3             ← 左闭右开 [fblkbase, fblkbase+3)，覆盖 3 个 FS_block
   fblkbase = 0           ← 文件逻辑块起点（本例不参与换算）
 
 设备 LBA_size = 512

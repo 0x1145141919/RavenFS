@@ -1,6 +1,6 @@
 # RavenFS — 磁盘布局 v1.1
 
-> 2026-08-19 对齐定稿；2026-08-29 修订（dir inode 直指 dentry 树 + 固定 10 堆描述符，据 `disk_struct_v1.1.hpp` 反向维护）。
+> 2026-08-19 对齐定稿；2026-08-29 修订（dir inode 直指 dentry 树 + 固定 10 堆描述符，据 `disk_struct_v1.1.hpp` 反向维护）；2026-09-01 修订（区段树区间语义半开化 + link_count 契约补全）。
 > v1（`disk_layout_v1.md` + `block_model.md`）的继承与修正。
 > 结构定义见 `include/disk_struct_v1.1.hpp`，本文是它的设计意图与不变量契约。
 
@@ -35,6 +35,9 @@ v1.1 的结构级修正：
 | 8 | 160B 内联区固定为 **10 个 `name_heap_controller_t`**（5 粒度 × 位图容量档） | 消灭三档 level 升级路径，描述符结构恒定、按堆独立激活 |
 | 9 | 名字堆**懒加载懒分配（档位级）**：未激活档位零开销（mkfs 不预留）；激活 = 位图面 + 数据面按位图容量一次分配（各自 block_alloc_hard 连续区间）；某档位位图全部分配干净才激活下一档（2026-08-29 决策，alloc_at 定点认领驳回） | 激活成本 = 该档容量（如 8B_8k 共 130 块），数据面连续性由单次分配保证 |
 | 10 | 名字上限定 `RAVENFS_MAX_NAME_LEN = 552`（=40 内联 + 512，对齐 512B 档单单元）；名字堆位图面/数据面统一走 mdata_piece_caches（8K 负载片，位图≥8K 即为此上调）；`tmp_name_len_limiter` → `name_len_limiter`（2026-08-29 决策） | POSIX NAME_MAX=255 是实际约束，552 为向上拓展一层的兜底；堆块访问复用元数据缓存 |
+| 11 | **区段树区间语义半开化**（2026-09-01 决策，代码未动、零迁移成本窗口内拍板）：extent_t 左闭右开 `[fblkbase, fblkbase+length)`，`length` = 块数（弃 v1 闭区间 `len=末端偏移/块数=len+1`）；路由 `key` = 子树最大**开边界**、查找 `target < key`；`fblk_cmp` 相邻判定同步半开化（完全在前 ⇔ `fblkbase_i+length_i ≤ fblkbase_{i+1}`） | 消灭全部 off-by-one 转换点（长度换算/相邻合并/分裂/截断），对齐 ext4/XFS 的 start+len 惯例，LLM 生成代码正确性优先；字段结构零变化，仅语义解读 |
+| 12 | **link_count 契约补全**（2026-09-01 决策）：字段自 v1 就在（uint32_t，前 96B 一致）但 v1/v1.1 均无语义解释——REG/SOFT_SYM = 指向该 inode 的 dentry 总数（含创建者，硬链接计数，归零即回收，软链接允许被硬链接）；DIR 初定恒 = 1（见 #13 当日修订）；link(2)/unlink 前置与崩溃顺序、孤儿检测（§3.3 + 不变量 17~21） | 多 dentry 同 inode（硬链接）+ SOFT_SYM 已设计，无契约则 unlink/link/回收语义悬空，LLM 生成代码无依据 |
+| 13 | **DIR link_count 语义再修订**（2026-09-01 当日，弃恒 1）：改 `link_count = size + 2`（2 = `.`/`..` 合成引用约定），**以 size 为真值随写**。动机：恒 1 反 POSIX 直觉（LLM 本能写 2+子目录数，mkdir 代码 `link_count=2` 即实锤），对抗本能的注释不可靠；`size+2` 把维护降为同 inode 内代数关系——无类型判断、无跨目录维护（POSIX 2+子目录数需 mkdir/rmdir/rename 维护父目录，是 LLM 最大漏写点），犯错窗口最小；size 从摆设转为真值，插入/删除/rename 路径开始实际维护 | 代价：ls 显示目录 nlink = 2+条目数（非 POSIX 2+子目录数），自研 FS 接受；fsck 校验升级为 `link_count == size+2` 三重 |
 
 坐标系与块模型（FS_block 世界、Primary/Backup Superblock、bitmap 尾巴布局、
 inode array/inode bitmap 推导）**全部继承 v1，无变化**，见 `block_model.md`。
@@ -105,6 +108,51 @@ DIR（`raven_dir_Inode_t`，单态）：
 - `data_root` **恒 = 块指针，直指 dentry B+tree 根节点**（目录数据唯一组织方式）
 - 无内联目录、无直指区间目录；`PTR_INVALID` 是非法状态（mkfs 后不应出现）
 - `size` = 非 `.` `..` 的 dentry 条目数（继承 v1）
+- `link_count` = `size` + 2（2 = `.` `..` 合成引用约定；§3.3）
+
+---
+
+### 3.3 link_count（链接计数）—— 2026-09-01 补契约
+
+字段：`uint32_t`；REGULAR/SOFT_SYM/DIR 三型 inode 同一 offset（`a_ns_stamp` 后、`permission_bits` 前，前 96B 一致）。
+
+**REGULAR / SOFT_SYM（`raven_Inode_t`）**
+
+- `link_count` = 指向该 inode 的 **dentry 条目总数（含创建者第一个）**，即硬链接总数
+- 创建（create / symlink）：初始 = 1
+- 硬链接 `link(2)`：`link_count++`；前置检查全过才生效（失败无副作用）：
+  1. 源 inode 存在且已分配
+  2. 源 type ≠ DIR（目录禁硬链接，防目录环）
+  3. `link_count < UINT32_MAX`（溢出防护）
+  4. 目标名在目标目录不存在（不覆盖，返回 EEXIST）
+  5. 目标目录可插入（dentry 树分裂空间）
+  跨目录硬链接允许（同 FS 内）；成功 = 插 dentry + `link_count++`
+- unlink：`link_count--`；归 0 → 回收 inode（清 inode bitmap）+ 数据（extent 树 / 直指区间 / 内联；软链接 target 存储同按 data_root 三态释放）
+- **崩溃顺序：先删 dentry（落盘）→ 后 `link_count--`**。窗口内 = 计数虚高泄漏，fsck 以 dentry 扫描为准修正；永不产生悬挂引用（反序会先出现 `link_count=0` 而 dentry 仍在的悬挂窗口）
+- SOFT_SYM **允许被硬链接**（结构统一零特判）；软链接 target 文本不参与计数；解析失败（ENOENT/ELOOP/EACCES）为纯读错误，零副作用
+- 磁盘计数**不感知打开句柄**：物理回收延迟到内存 inode 引用归零（VFS 层 refcount），磁盘只定义"归零可回收"状态
+
+**DIR（`raven_dir_Inode_t`）**
+
+- 禁止硬链接（`link(2)` 对 DIR 报错，防目录环）
+- `link_count` = **`size` + 2**（2026-09-01 决策，弃恒 1）：2 = `.` / `..` 合成引用约定（dentry 树根 `parent_ptr.ptr` = "."、`ptrs[1]` = ".."，不在树内计条目）；`size` = 非 `.` `..` 的实际 dentry 条目数
+- **以 size 为真值，link_count 恒按 size+2 写入**（两个字段同 inode 同写，防漂移）；无类型判断、无跨目录维护
+- 创建（mkdir）：size = 0、link_count = 2；根目录同（约定，无父引用仍按 2）
+- 维护点（全在同 inode 内，插入/删除/rename 条目时 size ±1、link_count ±1）：
+  - 插入条目 → `size++`、`link_count++`
+  - 删除条目 → `size--`、`link_count--`
+  - rename 条目跨目录 → 源目录 size--/lc--，目标目录 size++/lc++
+  - rmdir 空目录 → size=0、link_count=2 约定归零，直接全量回收
+- 溢出：size 受 52 位块空间约束恒远小于 2^32，link_count = size+2 溢出不可达，不设防护
+
+**与 size 的分工（DIR）**
+
+| 字段 | 数什么 | 维护点 |
+|------|--------|--------|
+| `size` | 目录内实际 dentry 条目数 | 插入/删除/rename 条目时 ±1（真值） |
+| `link_count` | size + 2（含 `.` `..` 合成引用约定） | 随 size 同步写（无独立维护） |
+
+fsck 三重校验：`link_count == size + 2` 恒成立；`size == 0` ⇔ `link_count == 2`（空目录，rmdir 前提）；dentry 树扫描条目数核对 size。
 
 ---
 
@@ -157,21 +205,23 @@ Dentry 树（126 阶）:
 
 ```
 extent_t:        length:64 | fblkbase:64 | block_base: ptr_in_idx
-                 闭区间 [fblkbase, fblkbase+length]，块数 = length+1（继承 v1）
+                 左闭右开 [fblkbase, fblkbase+length)，块数 = length
+                 （2026-09-01 半开化，弃 v1 闭区间 len=末端偏移/块数=len+1）
 extent_hint_t:   key:64 | sub_node_ptr: ptr_in_idx
 ```
 
-### 5.2 路由（上界，v1 max_R 继承）
+### 5.2 路由（上界）
 
-- 叶子 invariant：相邻 extent 满足 `fblk_cmp(entries[i], entries[i+1]) == 1`
-  （无重叠、无逆序，fblk_cmp 定义继承 v1）
-- 内部：`key[i] = 子树 i 最大右端点 max(fblkbase+length)`
-- 查找：`target ≤ key[i] → sub_node_ptr[i]`
+- 叶子 invariant：相邻 extent 满足 `fblk_cmp(entries[i], entries[i+1]) == 1`（无重叠、无逆序）
+  fblk_cmp 半开化定义（2026-09-01，v1 闭区间版为 `I.R+1 ≤ J.L`，此处 `<` 同步为 `≤`）：
+  `I 完全在 J 前 ⇔ fblkbase_i + length_i ≤ fblkbase_{i+1}`（length = 块数，开边界 = fblkbase+length）
+- 内部：`key[i] = 子树 i 最大开边界 max(fblkbase+length)`
+- 查找：`target < key[i] → sub_node_ptr[i]`（key 是开边界，`target == key` 时不属于该子树）
 
 ### 5.3 分裂 / 删除
 
-- 分裂：叶子满（count > 337）→ 新块装右半，**左半最大右端点提升**为父 separator
-- 删除：删叶子最大右端点项 → 刷父 `key`（上界路由对称代价，必走路径）
+- 分裂：叶子满（count > 337）→ 新块装右半，**左半最大开边界提升**为父 separator
+- 删除：删叶子最大开边界项 → 刷父 `key`（上界路由对称代价，必走路径）
 
 ---
 
@@ -319,7 +369,7 @@ bitmap 亮灯；数据面容量 = 2^total_bits_count_log2 × 粒度，见下表�
 | 指针 | 裸 u64 + MASK 宏 | ptr_in_idx / parent_ptr_t 位域 |
 | 节点数组 | 恰好容量（256/63） | 容量 + 1 瞬时槽（338/127） |
 | Dentry 排序 | strcmp 字典序 | (hash, name) 复合序 |
-| 内部路由 | 下界（子树最小名） | 上界（hash_max / max_R） |
+| 内部路由 | 下界（子树最小名） | 上界（hash_max / max 开边界） |
 | Dentry 大小 | 128B（name[120]） | 64B（name[40] + hash + 外置指针） |
 | 长名 | 无策略（120B 截断风险） | 名字堆 + 物理定位外置（上限 RAVENFS_MAX_NAME_LEN=552B） |
 | 删除 | tombstone | 物理删除（欠载策略待定） |
@@ -353,9 +403,9 @@ bitmap 亮灯；数据面容量 = 2^total_bits_count_log2 × 粒度，见下表�
 
 ### 区段树
 
-8. 叶子相邻 extent `fblk_cmp == 1`（无重叠无逆序）
-9. `hints[i].key = 子树 i 最大右端点`；`target ≤ key[i]` → 路由
-10. 分裂提升左半最大右端点；删最大项刷父 key
+8. 叶子相邻 extent `fblk_cmp == 1`（无重叠无逆序；半开语义：`fblkbase_i + length_i ≤ fblkbase_{i+1}`，length = 块数）
+9. `hints[i].key = 子树 i 最大开边界 (fblkbase+length)`；`target < key[i]` → 路由（key 为开边界，等于时不入）
+10. 分裂提升左半最大开边界；删最大项刷父 key
 
 ### Inode
 
@@ -369,6 +419,14 @@ bitmap 亮灯；数据面容量 = 2^total_bits_count_log2 × 粒度，见下表�
 15. 堆的位图块/数据块全局 bitmap 常亮；删名字清位、删目录回收
 16. 未激活堆双指针全 1 哨兵；激活堆位图面/数据面各为连续区间、起点 8K 对齐、按容量一次分配；
     位图满才激活同粒度下一档；堆块访问走 mdata_piece_caches
+
+### link_count
+
+17. REGULAR/SOFT_SYM：`link_count` = 指向该 inode 的 dentry 总数（含创建者）；已分配 inode 恒 ≥ 1；归 0 = 孤儿，fsck 回收（inode + 数据）
+18. DIR：`link_count` = `size` + 2（2 = `.` `..` 合成引用约定）；size = 实际 dentry 条目数；违反 = 不一致
+19. `link(2)` 前置：源已分配、type ≠ DIR、`link_count < UINT32_MAX`、目标名不存在；全过才 `++`，失败无副作用
+20. unlink 顺序：先删 dentry（落盘）→ 后 `link_count--`；磁盘回收延迟到 VFS 内存引用归零
+21. fsck：以 dentry 树扫描引用数为准重建 REG/SOFT_SYM 计数；dentry 指向的 inode 必须已分配（禁悬挂）；DIR 校验 `link_count == size+2` 与 `size==0 ⇔ link_count==2`（空目录）
 
 ---
 

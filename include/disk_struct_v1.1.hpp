@@ -56,6 +56,7 @@ enum : result_code_t {
     RC_ERR_IO,              /* pread/pwrite 失败 */
     RC_ERR_STATE,           /* 内部状态异常（根节点角色不符等） */
     RC_ERR_NOT_EMPTY,       /* 目录非空：dir 型目标删除前置校验失败（rmdir 语义） */
+    RC_ERR_NOT_SUPPORTED,   /* 功能暂不支持：REG/SOFT_SYM 归零全量空间回收未实现哨兵（inode 暂挂孤儿，fsck 可回收） */
 
     RC_NEED_SPLIT = 0x1000, /* 内部使用：本层分裂，需父层处理 */
 };
@@ -101,7 +102,8 @@ struct raven_Inode_t{
     uint32_t  m_ns_stamp;
     uint32_t  c_ns_stamp;   
     uint32_t  a_ns_stamp;
-    uint32_t  link_count;  
+    uint32_t  link_count;      // 硬链接计数：REG/SOFT_SYM = 指向本 inode 的 dentry 总数（含创建者，归零即回收）；
+                               // DIR = size + 2（2 = . .. 合成引用约定，随 size 同步写）。语义见 disk_layout_v1.1.md §3.3
     uint64_t  permission_bits;                                                                                                  
     uint64_t  size;                                                                                                       
     uint64_t  mtime;                                                                                                      
@@ -120,7 +122,8 @@ struct raven_dir_Inode_t{
     uint32_t  m_ns_stamp;
     uint32_t  c_ns_stamp;   
     uint32_t  a_ns_stamp;
-    uint32_t  link_count;  
+    uint32_t  link_count;      // = size + 2（2 = . .. 合成引用约定；以 size 为真值，随 size 同步写）
+                               // 插入/删除/rename 条目时与 size 同 ±1。语义见 disk_layout_v1.1.md §3.3
     uint64_t  permission_bits;                                                                                                  
     uint64_t  size;                                                                                                       
     uint64_t  mtime;                                                                                                      
@@ -172,9 +175,10 @@ struct Bptree_meta_t{
     ptr_in_idx ptrs[3];          // 角色解码见上
 };
 
-/* 文件块区间：闭区间 [fblkbase, fblkbase+len]，len=末端偏移，块数=len+1 */
+/* 文件块区间：左闭右开 [fblkbase, fblkbase+len)，len=块数
+ * （2026-09-01 半开化决策：弃 v1 闭区间 len=末端偏移/块数=len+1） */
 struct extent_t{
-    uint64_t length;             // 区间长度（末端偏移，闭区间语义继承 v1）
+    uint64_t length;             // 区间长度 = 块数（覆盖 fblkbase .. fblkbase+len-1）
     uint64_t fblkbase;           // 文件逻辑块号起点
     ptr_in_idx block_base;       // 物理 FS_block 起点
 };
@@ -200,8 +204,8 @@ struct Dentry_hint_t{
     uint64_t hash_max;
 };
 
-/* 区段树内部节点路由 hint：上界语义 —— key = 子树最大右端点 (fblkbase+len)
- * （v1 max_R 语义继承，查找 target ≤ key → sub_node） */
+/* 区段树内部节点路由 hint：上界语义 —— key = 子树最大开边界 (fblkbase+len)
+ * （半开区间，查找 target < key → sub_node） */
 struct extent_hint_t{
     uint64_t key;
     ptr_in_idx sub_node_ptr;

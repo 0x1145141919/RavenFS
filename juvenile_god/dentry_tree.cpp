@@ -47,12 +47,12 @@ static void dentry_node_meta_init(void *node_buf, uint16_t entry_count,
  *   → 双位图全量入内存 + 自描述校验 → 读 root inode（取树根块号）
  * 任一失败：清理资源、fd=-1、*res_code = RC_ERR_*
  * ═══════════════════════════════════════════════════════════════ */
-
-result_code_t RavenFS_juvenile::dentry_Bptree_walk(uint64_t root_blk_idx, dentry_bptree_path_t *trace, name_cmlpx_t *name)
+//等等，这个函数怎么处理最左边的边界条件的
+result_code_t RavenFS_juvenile::dentry_Bptree_walk(uint64_t root_blk_idx, bptree_path_t *trace, name_cmlpx_t *name)
 {
     if (!trace || !name) return RC_ERR_STATE;
     trace->depth = 0;
-    trace->is_finally_hit = false;
+    trace->is_leaf_hit = false;
 
     uint64_t cur_blk = root_blk_idx;
 
@@ -75,7 +75,7 @@ result_code_t RavenFS_juvenile::dentry_Bptree_walk(uint64_t root_blk_idx, dentry
             auto *leaf = (Bptree_dentry_leaf_node_t *)sess.data;
             leaf_node_result_t res = dentry_leaf_node_lookup(leaf, name);
             trace->depth = depth + 1;
-            trace->is_finally_hit = res.is_idx_hitted;
+            trace->is_leaf_hit = res.is_idx_hitted;
             trace->child_idx[depth] = res.greates_lower_bound_idx;
             return RC_OK;
         }
@@ -203,12 +203,19 @@ uint16_t RavenFS_juvenile::dentry_inner_node_lookup(Bptree_dentry_inner_node_t *
     return lo < count ? lo : 0xFFFF;
 }
 /* ═══════════════════════════════════════════════════════════════════
- * dentry_leaf_entry_insert — 叶子条目插入（瞬时槽允许 count=127）
+ * dentry_leaf_entry_insert — 叶子条目插入 + 下游资产创建（下沉版 2026-09-01）
  *
  * 前置条件：idx 由 dentry_Bptree_walk 的 GLB 语义推导：
- *   glb == DENTRY_LEAF_GLB_NONE → idx=0
- *   否则 idx=glb+1
- * 此函数只做 memmove 插入，不关心 inode_ptr 的具体值（调用者须填充）。
+ *   glb == DENTRY_LEAF_GLB_NONE → idx=0；否则 idx=glb+1。
+ * 调用前须已查重（EXIST 由上层 walk 判，避免浪费 inode/堆/树根）。
+ *
+ * 下游资产创建（宗旨：插条目即建下游，与 delete 对称）：
+ *   1. 分配 + 初始化目标 inode：DIR 急建空根叶子 + dir inode（size=0/
+ *      link_count=2）；REG/SOFT_SYM 内联空 inode（link_count=1）
+ *   2. 长名（>40B）：owner 目录名字堆分配外置存储 + 写尾部
+ *   3. memmove 树插（消费 name->inum / full_char_remain_ptr）
+ *   4. owner 目录计数维护：size++、link_count = size+2（§3.3）
+ *   失败：inode_guard / block_guard / heap_guard 全自动回滚。
  *
  * result_flags：
  *   bit0 = 1 → 需分裂（count 入后 >126）
@@ -218,13 +225,97 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
     uint64_t leaf_blk_base_idx,
     name_cmlpx_t *name,
     uint16_t idx,
-    uint64_t &result_flags)
+    uint64_t &result_flags,
+    uint8_t inode_type,
+    uint64_t owner_dir_inode)
 {
     result_flags = 0;
     if (!name || !name_len_limiter(name->name))
         return RC_ERR_NAME_LEN;
+    if (inode_type != INODE_TYPE_REGULAR &&
+        inode_type != INODE_TYPE_DIR &&
+        inode_type != INODE_TYPE_SOFT_SYM)
+        return RC_ERR_STATE;
 
-    /* 会话贯穿：读-改-写同一会话页，无栈缓冲无复制；dirty 后析构写回 */
+    /* ── 1. 分配 + 初始化目标 inode（guard 兜底全回滚） ── */
+    uint64_t new_inum = inode_alloc();
+    if (new_inum == PTR_INVALID) return RC_ERR_NO_INODE;
+    inode_guard_t inode_guard;
+    inode_guard.arm(this, new_inum);
+    block_guard_t dir_root_guard;   /* dir 型专用：新建树根 2 块回滚 */
+
+    if (inode_type == INODE_TYPE_DIR) {
+        /* dir 型：先建根叶子（2 块），再初始化 dir inode。
+         * 会话页整块清零 + 填 meta，dirty() 后析构写回。 */
+        uint64_t root_blk = block_alloc_hard(2, 1);
+        if (root_blk == PTR_INVALID) return RC_ERR_NO_BLOCK;   /* guard 自动回滚 inode */
+        dir_root_guard.arm(this, root_blk, 2);
+
+        mdata_piece_session root_sess(mdata_piece_mgr, root_blk);
+        if (root_sess.index_error()) return RC_ERR_STATE;
+        if (!root_sess) return RC_ERR_IO;
+        Bptree_dentry_leaf_node_t *rleaf = (Bptree_dentry_leaf_node_t*)root_sess.data;
+        memset(root_sess.data, 0, 8192);
+        rleaf->meta.magics[0] = DENTRY_MAGIC1;
+        rleaf->meta.magics[1] = DENTRY_MAGIC2;
+        rleaf->meta.magics[2] = DENTRY_MAGIC3;
+        rleaf->meta.magics[3] = DENTRY_MAGIC4;
+        rleaf->meta.parent_ptr.entry_count   = 0;
+        rleaf->meta.parent_ptr.is_inner_node = 0;
+        rleaf->meta.parent_ptr.is_root_node  = 1;
+        rleaf->meta.parent_ptr.ptr           = new_inum;   /* "." = 自身 inode */
+        rleaf->meta.ptrs[0].ptr = PTR_INVALID;
+        rleaf->meta.ptrs[1].ptr = owner_dir_inode;         /* ".." = 父目录 inode */
+        rleaf->meta.ptrs[2].ptr = PTR_INVALID;
+        root_sess.dirty();
+
+        {
+            InodeSession ino_sess(inode_cache_mgr, new_inum);
+            if (!ino_sess) return RC_ERR_IO;   /* guard 自动回滚 */
+            raven_dir_Inode_t *dino = (raven_dir_Inode_t*)ino_sess.inode;
+            memset(dino, 0, sizeof(raven_dir_Inode_t));
+            dino->type            = INODE_TYPE_DIR;
+            dino->link_count      = 2;         /* = size + 2（size=0，§3.3） */
+            dino->permission_bits = 0755;
+            dino->size            = 0;         /* 新目录无条目 */
+            dino->data_root       = root_blk;  /* 恒有效（不变量 11） */
+            /* 名字堆 10 描述符：未激活哨兵（memset 0 是雷 —— 0 是合法块号，
+             * dir_name_heap_release 会误当激活堆释放 block 0/1 根块） */
+            for (int i = 0; i < 10; i++) {
+                ((name_heap_controller_t *)&dino->heaps_8B_8k)[i].bitmap_base_block_ptr = NAME_HEAP_INACTIVE;
+                ((name_heap_controller_t *)&dino->heaps_8B_8k)[i].data_base_block_ptr   = NAME_HEAP_INACTIVE;
+            }
+            ino_sess.dirty();
+        }
+    } else {
+        /* REGULAR / SOFT_SYM：内联空 inode（全零 inline_data） */
+        InodeSession ino_sess(inode_cache_mgr, new_inum);
+        if (!ino_sess) return RC_ERR_IO;   /* guard 自动回滚 */
+        raven_Inode_t *ino = ino_sess.inode;
+        memset(ino, 0, sizeof(raven_Inode_t));   /* 全零：inline_data = 内联空文件 */
+        ino->type            = inode_type;
+        ino->link_count      = 1;
+        ino->permission_bits = 0644;
+        ino->data_root       = PTR_INVALID;   /* 内联空文件/软链，无数据块 */
+        ino_sess.dirty();
+    }
+    name->inum = new_inum;   /* dentry 落真实 inum */
+
+    /* ── 2. 长名（>40B）：owner 目录名字堆分配外置存储 + 写尾部 ── */
+    name_heap_guard_t heap_guard;
+    if (name->name_len > DENTRY_INLINE_NAME_MAX) {
+        name_heap_loc_t loc;
+        result_code_t rc = name_heap_alloc(owner_dir_inode,
+                                           name->name_len - DENTRY_INLINE_NAME_MAX, &loc);
+        if (rc) return rc;   /* guard 自动回滚 */
+        name->full_char_remain_ptr = (loc.fblk << 12) | (uint64_t)loc.offset;
+        heap_guard.arm(this, owner_dir_inode, name->name_len, name->full_char_remain_ptr);
+        rc = name_heap_write(name->name_len, name->full_char_remain_ptr,
+                             name->name + DENTRY_INLINE_NAME_MAX);
+        if (rc) return rc;   /* guard 自动回滚 */
+    }
+
+    /* ── 3. 树插（memmove + 写条目，消费 name->inum / full_char_remain_ptr） ── */
     mdata_piece_session sess(mdata_piece_mgr, leaf_blk_base_idx);
     if (sess.index_error()) return RC_ERR_STATE;
     if (!sess) return RC_ERR_IO;
@@ -243,8 +334,7 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
                 (count - idx) * sizeof(Dentry_t));
     }
 
-    /* 填充新条目（inode_ptr.ptr = 调用方分配的 inum；外置定位由调用方
-     * 预分配好传进 name->full_char_remain_ptr） */
+    /* 填充新条目 */
     Dentry_t *entry = &leaf->entries[idx];
     entry->hash = name->hash;
     entry->inode_ptr.free_to_use = name->name_len;
@@ -271,13 +361,34 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
     }
 
     sess.dirty();
+
+    /* ── 4. owner 目录计数维护：size++、link_count = size+2（§3.3） ── */
+    {
+        InodeSession dir_sess(inode_cache_mgr, owner_dir_inode);
+        if (!dir_sess) return RC_ERR_IO;
+        dir_sess.inode->size++;
+        dir_sess.inode->link_count = (uint32_t)dir_sess.inode->size + 2;
+        dir_sess.dirty();
+    }
+
+    /* ── 5. 成功：全部转正 ── */
+    heap_guard.disarm();
+    inode_guard.disarm();
+    dir_root_guard.disarm();
     return RC_OK;
 }
 /* ═══════════════════════════════════════════════════════════════════
- * dentry_leaf_entry_delete — 叶子条目物理删除
+ * dentry_leaf_entry_delete — 叶子条目物理删除 + 下游资产维护（DELETE_FULL）
  *
  * idx 由 dentry_leaf_node_lookup 命中时返回的 greates_lower_bound_idx。
  * 物理删除 = memmove 左移 + 清空末槽。
+ *
+ * 下游资产维护（2026-09-01 下沉，宗旨：删条目即维护下游）：
+ *   - dir 型目标：树删**前**校验空（NOT_EMPTY 零副作用），删后全量回收
+ *     （名字堆 → 树根 2 块 → inode 槽）；
+ *   - REG/SOFT_SYM 目标：link_count--，归零触发全量空间回收
+ *     （暂 RC_ERR_NOT_SUPPORTED 哨兵，inode 暂挂孤儿，fsck 可回收）；
+ *   - 悬空条目（inum = PTR_INVALID / 位图未亮）：只删树条目，跳过资产维护。
  *
  * result_flags：
  *   bit0 = 1 → 欠载（count < 63 且非根），需合并/再平衡
@@ -301,6 +412,36 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_delete(
     uint16_t count = (uint16_t)leaf->meta.parent_ptr.entry_count;
     if (idx >= count) return RC_ERR_STATE;
 
+    /* ── 树删前：读下游资产信息（memmove 后条目移位不可再读） ──
+     * ⚠ 52 位位域读出的 inum 与 PTR_INVALID 比较必须同样截断（64 位比较恒不相等）。
+     * PTR_INVALID 悬空条目 = 历史过渡态/结构异常（只删树条目、跳过资产维护）。 */
+    const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+    const uint64_t inum = leaf->entries[idx].inode_ptr.ptr;
+    const bool has_inode = (inum != PTR_INVALID_52) && inode_test(inum);
+
+    /* ── dir 型目标：删除前置校验（目录必须全空），零副作用 ──
+     * 校验必须在树删**之前**：失败不产生任何树/位图变更（rmdir 语义）。
+     * 空判定：树根是叶子 && entry_count==0（. / .. 由 parent_ptr/ptrs[1]
+     * 合成，不在树内计条目）。树根为内部节点 ⇒ 至少 2 子树各有条目 ⇒ 非空。 */
+    uint64_t dir_tree_root = PTR_INVALID;
+    uint8_t tgt_type = 0xFF;   /* 0xFF = 无有效目标（跳过资产维护） */
+    if (has_inode) {
+        InodeSession tgt_sess(inode_cache_mgr, inum);
+        if (!tgt_sess) return RC_ERR_IO;
+        tgt_type = tgt_sess.inode->type;
+        if (tgt_type == INODE_TYPE_DIR) {
+            dir_tree_root = tgt_sess.inode->data_root;
+            if (dir_tree_root == PTR_INVALID) return RC_ERR_STATE;   /* 契约违反：dir 必有树根（不变量 11） */
+            mdata_piece_session root_sess(mdata_piece_mgr, dir_tree_root);
+            if (root_sess.index_error()) return RC_ERR_STATE;
+            if (!root_sess) return RC_ERR_IO;
+            Bptree_meta_t *m = (Bptree_meta_t *)root_sess.data;
+            if (!is_dentry_node(m)) return RC_ERR_STATE;
+            if (m->parent_ptr.is_inner_node)  return RC_ERR_NOT_EMPTY;
+            if (m->parent_ptr.entry_count != 0) return RC_ERR_NOT_EMPTY;
+        }
+    }
+
     bool is_last = (idx == count - 1);
     uint64_t old_max_hash = leaf->entries[count - 1].hash;
 
@@ -323,6 +464,34 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_delete(
         result_flags |= 2u;
 
     sess.dirty();
+
+    /* ── 树删后：下游 inode 资产维护（DELETE_FULL）──
+     * 树删已落盘：此处失败仅上报错误，孤儿/计数偏差由 fsck 修正。 */
+    if (has_inode) {
+        InodeSession tgt_sess(inode_cache_mgr, inum);
+        if (!tgt_sess) return RC_ERR_IO;
+        if (tgt_type == INODE_TYPE_DIR) {
+            /* 空目录全量回收（rmdir 语义）：名字堆 → 树根 2 块 → inode 槽。
+             * 尽力而为：失败不覆盖删除结果（树删已成功）。 */
+            dir_name_heap_release(inum);
+            if (dir_tree_root != PTR_INVALID)
+                block_free(dir_tree_root, 2);
+            inode_free(inum);
+        } else {
+            /* REGULAR / SOFT_SYM：link_count--；归零 → 全量空间回收 */
+            uint32_t lc = tgt_sess.inode->link_count;
+            if (lc == 0) return RC_ERR_STATE;   /* 契约违反：已分配 inode link_count 恒 ≥ 1（不变量 17） */
+            lc--;
+            tgt_sess.inode->link_count = lc;
+            tgt_sess.dirty();
+            if (lc == 0) {
+                /* 全量空间回收（extent 树 / 直指区间 / 内联 + inode 槽）暂未实现：
+                 * 哨兵拒绝 —— inode 暂挂孤儿（位图亮 + link_count=0），
+                 * 不静默泄漏、不悬挂；fsck 可识别回收。 */
+                return RC_ERR_NOT_SUPPORTED;
+            }
+        }
+    }
     return RC_OK;
 }
 /* ═══════════════════════════════════════════════════════════════════

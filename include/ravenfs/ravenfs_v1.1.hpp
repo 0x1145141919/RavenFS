@@ -51,12 +51,11 @@ struct dentry_out {
     uint32_t name_len;      /* 名字长度（不含 '\0'） */
     char     character[RAVENFS_MAX_NAME_LEN];
 };
-struct dentry_bptree_path_t {
+struct bptree_path_t {
     uint64_t blocks[64];
     uint16_t  child_idx[64];
     int      depth;
-    bool  is_finally_hit;
-    // bool  is_break_biggest_record;
+    bool  is_leaf_hit;//若这里为假说明leaf层右边紧邻的下一个
 };
 enum ravenfs_device_type_t{
     DEV_LOOP_IMG, DEV_NVME, DEV_SATA_SSD, DEV_SATA_HDD, DEV_UNKNOWN,
@@ -105,13 +104,6 @@ public:
      * root_dir 操纵接口（dentry B+tree 原型构建区）
      * 全部以根目录为唯一操作对象，path 概念不存在。
      * ══════════════════════════════════════════════════════════ */
-
-    /* 创建名为 name 的普通文件（便捷封装，等价于
-     * root_dir_insert_dentry(name, INODE_TYPE_REGULAR)）：
-     *   inode_alloc → 初始化(REGULAR, 0644, link_count=1, data_root=PTR_INVALID
-     *   内联空文件) → inode_write → dentry 树插入。
-     * name 已存在 → RC_ERR_EXIST；> RAVENFS_MAX_NAME_LEN → RC_ERR_NAME_LEN。 */
-    result_code_t root_dir_insert_dentry(const char *name);
     /* 正版入口：按 inode_type 初始化新 inode ——
      *   INODE_TYPE_DIR    : 新建 dir inode（0755/link_count=2/名字堆哨兵）+
      *                       急建其 dentry 树根（根叶子 2 块，magic + . / .. 指针）；
@@ -214,17 +206,16 @@ class bitmap_slice_t{
         void disable_slice();
         //为了内存规整而刻意不搞构造折构函数，往64B缓存行对齐而设计
     };
-    struct file_blk_interval_t{
-        uint64_t logical_blkbase;
-        uint64_t len;
-    };//管辖[logical_blkbase,logical_blkbase+len]的闭区间
-    result_code_t dir_insert_dentry(uint64_t inode_idx,const char *name);   /* 便捷封装：REGULAR（旧懒建根逻辑已退役，见三参核心版） */
     /* 核心版本：按 inode_type 初始化 + 插入。dir 型急建树根（magic + . / ..）；
      * 目标目录 inode_idx 的 data_root 恒有效（v1.1 §10 不变量 11），
      * 遇 PTR_INVALID = 严重内部磁盘契约违反 → RC_ERR_STATE。 */
     result_code_t dir_insert_dentry(uint64_t inode_idx,const char *name,uint8_t inode_type);
     result_code_t dir_rm_dentry(uint64_t inode_idx,const char *name);
     result_code_t dir_readdir_interval(uint64_t inode_idx,uint64_t base,uint64_t entry_count,dentry_out*buf);
+    result_code_t direct_file_pwrite(uint64_t inode_idx,const char *name,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
+    result_code_t direct_file_punch_hole(uint64_t inode_idx,const char *name,uint64_t offset,uint64_t len);
+    result_code_t direct_file_trunacate(uint64_t inode_idx,const char *name,uint64_t len_new);
+    result_code_t direct_file_pread(uint64_t inode_idx,const char *name,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
     result_code_t dir_name_heap_release(uint64_t inode_idx);//作为dir关闭时调用，遍历十个堆，全空则释放
     result_code_t dir_lookup(uint64_t inode_idx,const char *name, uint64_t *out_inum);
     int64_t dir_readdir(uint64_t inode_idx,dentry_out **out_buf);
@@ -432,14 +423,95 @@ class bitmap_slice_t{
     result_code_t name_heap_activate(raven_dir_Inode_t *dino, uint16_t slot, uint64_t dir_inode_idx);
     /* dentry 完整名字比较（树内条目 vs 目标名；>40B 内部读堆外置部分） */
     int dentry_name_cmp(const Dentry_t &e, const char *name, uint16_t name_len);
-    result_code_t dentry_Bptree_walk(uint64_t root_blk_idx,dentry_bptree_path_t*trace,name_cmlpx_t*name);
+    result_code_t dentry_Bptree_walk(uint64_t root_blk_idx,bptree_path_t*trace,name_cmlpx_t*name);
+    result_code_t extent_Bptree_walk(uint64_t root_blk_idx,bptree_path_t*trace,uint64_t logical_block_idx);
     struct leaf_node_result_t{
         uint16_t greates_lower_bound_idx;
         bool is_idx_hitted;
     };
+    /* ══════════════════════════════════════════════════════════
+     * extent 空洞描述符 — 文件逻辑块域中无映射的区间
+     *
+     * 三种 type 把“真实空洞”与“树边界”显式区分（左闭右开）：
+     *   normal        : 两 extent 之间的真实空洞 [base, base+gap_len)。
+     *                    gap_len==0 = 两 extent 紧邻（无洞，是前向/后向
+     *                    合并的直接信号，调用方不得优化掉）
+     *   tail_infinite : 树最右叶子末尾之后的空洞。interval_base = 最右
+     *                    extent 开边界（该叶子末项 fblkbase+length）；
+     *                    gap_len 无意义——真实上界是 inode.size 或本次
+     *                    操作区间终点，由调用方裁剪（pwrite 追加主场景）
+     *   prev_noexist  : 树最左叶子开头之前无前驱 extent。base/gap_len 无
+     *                    意义——头部空洞 [0, 首 extent.fblkbase) 由调用方
+     *                    自理（树不承诺文件逻辑起点为 0）
+     * ══════════════════════════════════════════════════════════ */
+    enum gap_desicritor_type_t{
+        normal,tail_infinite,prev_noexist
+    };
+    struct gap_desicritor_t{//左闭右开
+        uint64_t interval_base_logical_block;  /* normal: 空洞起点；tail_infinite: 最右 extent 开边界 */
+        uint64_t gap_len;                      /* normal: 空洞长度（块数）；其余无意义 */
+        gap_desicritor_type_t type;
+    };
+    /* ══════════════════════════════════════════════════════════
+     * extent_iterator — 稀疏文件空洞/区间游走器
+     *
+     * 定位：extent_Bptree_walk 落点（叶子 + GLB）之后的游走底座，
+     * 为 direct_file_pwrite / punch_hole / truncate / pread 提供
+     * “逐 extent + 逐空洞推进”的公共骨架。
+     *
+     * 位置模型：
+     *   - idx ∈ [0, count) 指向叶子内一个真实 extent（当前 extent）；
+     *     所有 gap 查询与 ++/-- 均基于它。
+     *   - idx == EXTENT_LEAF_GLB_NONE(0xFFFF) = 虚拟前位（GLB=NONE 的
+     *     walk 落点，target 在落点叶子所有 extent 之前）：只允许
+     *     operator++（进入 idx=0）；其余操作置 erro_flag。
+     *     路由不变量保证此位之前绝无 extent 覆盖 target（前驱子树末项
+     *     开边界 ≤ target，半开不覆盖），故调用方 ++ 后以
+     *     prev_gap() 取头部/跨界空洞即可完整描述落点。
+     *
+     * 空洞查询（紧邻当前 extent）：
+     *   - next_gap(): [cur_end, 下一 extent.fblkbase)；当前为叶子末项时
+     *     跨界读后继叶子首项；树最右叶子末项 → tail_infinite
+     *   - prev_gap(): [上一 extent 开边界, cur.fblkbase)；当前为叶子首项
+     *     时跨界读前驱叶子末项；树最左叶子首项 → prev_noexist
+     *
+     * 游走（++/--，前缀/后缀）：叶子内槽位步进；越界沿叶子兄弟链表
+     * （ptrs[2]=后继 / ptrs[1]=前驱）跳相邻叶子；树边界再越界 →
+     * iterator_erro_flag = true 且位置保持不变（不产生悬垂移动）。
+     *
+     * iterator_erro_flag：构造清零；任何成功操作后为 false，跨界失败
+     * （兄弟指针 PTR_INVALID / 链表损坏）/ 越界 / 非法操作置 true。
+     * 调用方每次操作后必须检查。
+     *
+     * 注：迭代器只读不写。需要原地修改 extent（合并/拆分/改 block_base）
+     * 时，用 leaf_blk()/idx() 自行开 mdata_piece_session 读改写。
+     * ══════════════════════════════════════════════════════════ */
+    class extent_iterator{
+        RavenFS_juvenile *fs;       /* 盘访问：跨界 gap 需读兄弟叶子首/末项 */
+        uint64_t leaf_node_blkbase; /* 当前叶子块号 */
+        uint16_t idx;               /* 当前槽位：extent 索引或 0xFFFF 虚拟前位 */
+        public:
+        bool iterator_erro_flag;
+        extent_iterator(RavenFS_juvenile *fs,uint64_t leaf_node_blkbase,uint16_t idx);
+        /* 紧邻空洞查询（基于当前 extent）；idx==0xFFFF → erro */
+        gap_desicritor_t prev_gap();
+        gap_desicritor_t next_gap();
+        /* extent 游走：叶子内步进，越界跨界跳兄弟叶子 */
+        extent_iterator& operator++();    /* 前缀 */
+        extent_iterator operator++(int);  /* 后缀 */
+        extent_iterator& operator--();    /* 前缀 */
+        extent_iterator operator--(int);  /* 后缀 */
+        /* 位置访问：供调用方自行开 session 读/改当前 extent */
+        uint64_t leaf_blk() const { return leaf_node_blkbase; }
+        uint16_t index() const { return idx; }
+        /* 当前 extent 只读副本；idx==0xFFFF → false（非错误）；IO/越界 → erro+false */
+        bool current_extent(extent_t &out);
+    };
     /* 叶子查找无下界哨兵：greates_lower_bound_idx == 此值 → 无下界，
      * 插入位置 = 0（最左插入）。有效索引范围 [0, 126]，0xFFFF 永不冲突。 */
     static constexpr uint16_t DENTRY_LEAF_GLB_NONE = 0xFFFF;
+    /* 区段树叶子 GLB 无下界哨兵（有效索引 [0,336]，0xFFFF 永不冲突） */
+    static constexpr uint16_t EXTENT_LEAF_GLB_NONE = 0xFFFF;
     struct split_result_t{
         result_code_t rc;
         uint64_t low_node_blkidx;
@@ -448,8 +520,23 @@ class bitmap_slice_t{
     };
     leaf_node_result_t dentry_leaf_node_lookup(Bptree_dentry_leaf_node_t*leaf,name_cmlpx_t*name);/* is_idx_hitted=精准命中 */
     uint16_t dentry_inner_node_lookup(Bptree_dentry_inner_node_t*node,uint64_t hash);
-    result_code_t dentry_leaf_entry_insert(uint64_t leaf_blk_base_idx,name_cmlpx_t* name,uint16_t idx,uint64_t&result_flags);//成功时result_flags有效，bits[0]代表内部探测是否需要分裂，bits[1]表示是否要改变父节点的对应entry的最大值
-    result_code_t dentry_leaf_entry_delete(uint64_t leaf_blk_base_idx,uint16_t idx,uint64_t&result_flags);//成功时result_flags有效，bits[0]代表内部探测是否需要合并，bits[1]表示是否要改变父节点的对应entry的最大值
+    /* 区段树叶子 GLB 查找：GLB = 最后一个 fblkbase ≤ target 的 extent；
+     * is_idx_hitted = GLB **覆盖** target（target-fblkbase < length，半开区间），
+     * 与 dentry 精准命中语义不同——区间键无相等，只有被覆盖/落空洞。
+     * GLB == EXTENT_LEAF_GLB_NONE → 无下界（最左插入，idx=0）。 */
+    leaf_node_result_t extent_leaf_node_lookup(Bptree_extent_leaf_node_t*leaf,uint64_t logical_block_idx);
+    /* 区段树内部节点严格上界路由：找第一个 key > target 的 hint（最小上界）。
+     * key = 子树最大开边界 (fblkbase+length)；半开区间语义 target == key 属
+     * 下一子树（恰为其最小块），故与 dentry 的 ≥ 不同，必须用 >。
+     * 全部 key ≤ target（右击穿）→ 0xFFFF。 */
+    uint16_t extent_inner_node_lookup(Bptree_extent_inner_node_t*node,uint64_t target);
+    /* 删除策略：dentry_leaf_entry_delete 下游资产维护开关（2026-09-01）
+     * DELETE_FULL      = unlink/rmdir/rename 覆盖：维护目标 inode 资产
+     *                     （dir 型空校验+全量回收；REG/SOFT_SYM link_count--，归零触发全量空间回收）
+     * DELETE_TREE_ONLY = fsck 清理悬挂条目：inode 可能无效，只删树条目（预留，暂未使用） */
+    enum delete_policy_t : uint8_t { DELETE_FULL = 0, DELETE_TREE_ONLY = 1 };
+    result_code_t dentry_leaf_entry_insert(uint64_t leaf_blk_base_idx,name_cmlpx_t* name,uint16_t idx,uint64_t&result_flags,uint8_t inode_type,uint64_t owner_dir_inode);//下沉版（2026-09-01）：分配+初始化目标 inode（DIR 急建树根/REG/SOFT_SYM 内联）+ 长名外置分配 + 树插 + owner 目录 size++/link_count=size+2；失败 guard 全回滚。result_flags: bit0=需分裂, bit1=父层max需刷新
+    result_code_t dentry_leaf_entry_delete(uint64_t leaf_blk_base_idx,uint16_t idx,uint64_t&result_flags);//删条目+维护下游资产（DELETE_FULL 语义）：dir 型目标先校验空（NOT_EMPTY 零副作用）再删，删后全量回收（名字堆/树根 2 块/inode 槽）；REG/SOFT_SYM 目标 link_count--，归零触发全量空间回收（暂 RC_ERR_NOT_SUPPORTED 哨兵，inode 暂挂孤儿）。成功时result_flags有效，bits[0]=欠载需合并，bits[1]=父层对应entry的max需刷新
     split_result_t dentry_leaf_split(uint64_t victim_node_blkbase);//会内部进行叶子链表的维护，不会进行父节点的修改
     split_result_t dentry_inner_split(uint64_t victim_node_blkbase);//不会进行父节点的修改
     result_code_t dentry_spilt_parent_apply(uint64_t parent_node_blkbase,uint16_t victim_in_node_id,split_result_t result,bool&is_parent_spilt_acquire);

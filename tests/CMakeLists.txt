@@ -4,6 +4,12 @@ add_executable(ravenfs_juv_insert
 )
 target_link_libraries(ravenfs_juv_insert PRIVATE ravenfs_juvenile)
 
+# v1.1 extent_Bptree_walk 左闭右开语义专项测试（手工铺双层树打边界）
+add_executable(ravenfs_juv_extent_walk
+    test_extent_walk.cpp
+)
+target_link_libraries(ravenfs_juv_extent_walk PRIVATE ravenfs_juvenile)
+
 # v1.1 幼年期上帝类：root_dir_rm_dentry 接口专项测试
 add_executable(ravenfs_juv_delete
     test_root_dir_delete.cpp
