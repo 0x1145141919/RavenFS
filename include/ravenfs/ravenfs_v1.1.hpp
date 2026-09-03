@@ -223,7 +223,8 @@ class bitmap_slice_t{
      * 位图接口组 A：FS_block 分配器（分片路由）
      *   内存：block_bits[bitmap_blocks×4096]（4K 对齐，posix_memalign）
      *   分片：block_bitmap_slices[slice_count]，每片自治（锁+游标）
-     *   路由：preferred 片优先 → 逐片 try 锁扫描（仿 FPA::alloc）；
+     *   路由：本 CPU preferred 片优先 → 逐片 try 锁扫描（preferred 按
+     *     get_processor_id() 索引 [logical_processor_count] 数组，仿 FPA::alloc）；
      *   失败哨兵：PTR_INVALID（0 是合法块号）
      *   对齐约束：align_log2 ∈ [0,16]（片内 bit 索引对齐，见 bitmap_slice_t）
      * ══════════════════════════════════════════════════════════ */
@@ -244,6 +245,7 @@ class bitmap_slice_t{
      * 位图接口组 B：inode 槽分配器（分片路由）
      *   内存：inode_bits[inode_bitmap_blocks×4096]（4K 对齐）
      *   分片：inode_bitmap_slices[slice_count]，同 slice_count 分片数
+     *   路由：同 block 组——get_processor_id() 索引 per-CPU preferred 数组
      *   失败哨兵：PTR_INVALID（inode 0 = root，alloc 从 1 起扫）
      * ══════════════════════════════════════════════════════════ */
     uint64_t inode_alloc();
@@ -329,8 +331,9 @@ class bitmap_slice_t{
     uint8_t *inode_bits = nullptr;      /* 全量内存位图（inode_bm_blocks×4096），4K 对齐（posix_memalign） */
     uint64_t block_per_slice_bits = 0;  /* block 组名义片长（非末片 32768 倍数；定位片用） */
     uint64_t inode_per_slice_bits = 0;  /* inode 组名义片长 */
-    uint64_t block_preferred_slice = 0; /* block 组亲和片（分配成功回写，仿 FPA preferred） */
-    uint64_t inode_preferred_slice = 0; /* inode 组亲和片 */
+    uint32_t cpu_preferred_slots = 0;   /* per-CPU preferred 数组长 = 构造传入 logical_processor_count（≥1） */
+    uint32_t *block_preferred_slice = nullptr; /* [cpu_preferred_slots]：每"CPU"(get_processor_id) 的 block 组亲和片游标 */
+    uint32_t *inode_preferred_slice = nullptr; /* [cpu_preferred_slots]：inode 组亲和片游标 */
 
     uint64_t root_inum      = 0;        /* 恒 0（根目录 inode 索引） */
     uint64_t root_dentry_blk = 0;       /* root inode.data_root（树根块号） */

@@ -14,7 +14,12 @@
  * 假性分配：数据 phys 全部编造（不经 block_alloc）——原语对不碰数据侧
  * 位图，天然支持"纯记录不落实分配契约"；树节点块（2 块一组）真分配。
  *
- * 用法：ravenfs_juv_extent_ops <device>   （已 mkfs 的 ravenfs v1.1 盘/镜像）
+ * 用法：ravenfs_juv_extent_ops <device>            （A/B/C/D 串行语义组）
+ *       ravenfs_juv_extent_ops <device> par [workers] （E 组：并行压测）
+ *       E 组：workers（默认 8）个线程各持伪造 processor_id，各对独立文件跑
+ *       12 万级极端增删——并发竞争面 = block/inode 分片分配器 per-CPU 路由
+ *       + 缓存锁 + 盘；死锁由看门狗盯（30s 无推进 → abort 留现场）。
+ *       要求盘是 mkfs --inode-count≥262144（8 片需要）且每次 par 前重 mkfs。
  * ═══════════════════════════════════════════════════════════════════ */
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
@@ -28,26 +33,28 @@
 #include <algorithm>
 #include <random>
 #include <chrono>
+#include <thread>
+#include <atomic>
 
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 
-static linux_userspace_mount_t make_mount(const char *path) {
+static linux_userspace_mount_t make_mount(const char *path, uint32_t cpu_count = 1) {
     linux_userspace_mount_t mnt{};
-    mnt.dev.fd = ::open(path, O_RDWR);
+    mnt.dev.fd = ::open(path, O_RDWR|O_DIRECT);
     int lba = 4096;
     if (::ioctl(mnt.dev.fd, BLKSSZGET, &lba) != 0 || lba <= 0) lba = 4096;
     mnt.dev.lba_size_log2 = (uint8_t)__builtin_ctz((unsigned)lba);
-    mnt.dev.type = DEV_UNKNOWN;
-    mnt.dev.is_device_direct = false;
-    mnt.param = {};
-    mnt.logical_processor_count = 1;
+    mnt.dev.type = DEV_NVME;
+    mnt.dev.is_device_direct = true;
+    mnt.param = {.if_will_use_inode_cache=true,.if_will_use_mdata_piece_cache=true};
+    mnt.logical_processor_count = cpu_count;   /* 假 CPU 数 = 并行 worker 数（切片几何按它展开） */
     return mnt;
 }
 
-static int g_pass = 0, g_fail = 0;
+static std::atomic<int> g_pass{0}, g_fail{0};
 #define CHECK(cond, fmt, ...)                                                \
     do {                                                                     \
         if (cond) { g_pass++; printf("  [PASS] " fmt "\n", ##__VA_ARGS__); } \
@@ -254,14 +261,324 @@ static void audit_run(RavenFS_juvenile &fs, uint64_t inum, const char *tag, audi
     CHECK(a.bad == 0, "%s", msg);
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * E 组：并行压测（真盘直写，W 假 CPU × 每文件 12 万级极端增删）
+ *
+ * 模型：单个共享 fs 实例（一份位图/缓存/盘），W 个 worker 线程；每个 worker
+ * 持有伪造 processor_id ∈ [0,W)（thread_local 强定义覆盖 cpu_id_stub 的 weak
+ * 桩，等价用户态每线程 GS 假 id 的轻量版），各自对**独立文件**跑 D 组同款
+ * 12 万条打穿内部层增删——per-file 树互不共享 → 并发竞争面精确收敛在：
+ *   block_alloc_hard/soft/inode_alloc 的 per-CPU preferred 分片路由 + try/自旋
+ *   锁、mdata/inode 缓存 RADIX 锁、盘本身。
+ *
+ * 正确性：每 worker 相位间全树审计（键序/父子/hint/兄弟链/canonical）；
+ * 性能：每相位计时 + 总壁钟；
+ * 死锁预案：看门狗 2s 轮询各 worker 推进（ops+stage），30s 全局无推进 →
+ * 打印各 worker 现场并 abort()（SIGABRT + core，留证据）。
+ * ═══════════════════════════════════════════════════════════════════ */
+static constexpr uint64_t PAR_NA = 120000;    /* 每 worker A 空间条数（>113569，打穿内部层） */
+static constexpr uint64_t PAR_NB = 60000;     /* 每 worker B 空间条数 */
+static constexpr uint64_t PAR_B_BASE = 400000;/* B 空间 fblkbase 起点（与 A 的 [0,240000) 不重叠） */
+
+/* 伪造 processor_id：每线程一份（等价内核 GS per-cpu slot 的用户态替身） */
+static thread_local uint32_t t_fake_proc_id = 0;
+extern "C" uint32_t get_processor_id() { return t_fake_proc_id; }  /* 强定义，覆盖 weak 桩 */
+
+struct par_worker_t {
+    RavenFS_juvenile *fs = nullptr;
+    uint64_t inum = 0;
+    uint32_t fake_id = 0;
+    uint64_t seed = 0;
+    std::atomic<uint64_t> ops{0};      /* 看门狗：已完成原语数 */
+    std::atomic<int> stage{0};         /* 看门狗：当前相位 */
+    uint64_t ms_insA = 0, ms_delH = 0, ms_insB = 0, ms_delA = 0, ms_churn = 0;
+    uint64_t not_found = 0;
+    bool ok = true;
+    uint32_t fail_k = 0;
+    result_code_t fail_rc = RC_OK;
+    char fail_ph[24] = {0};
+};
+
+static const char *par_stage_name(int s) {
+    switch (s) {
+    case 1: return "insA";        case 2: return "audit-full";
+    case 3: return "delHalf";     case 4: return "audit-half";
+    case 5: return "insB";        case 6: return "audit-refill";
+    case 7: return "delAll";      case 8: return "audit-final";
+    case 9: return "inode-churn"; default: return "idle";
+    }
+}
+
+#define PAR_FAIL(ph_, k_, rc_)                                             \
+    do { W->ok = false; W->fail_k = (uint32_t)(k_); W->fail_rc = (rc_);    \
+         snprintf(W->fail_ph, sizeof(W->fail_ph), "%s", (ph_)); return; }  \
+    while (0)
+
+static void par_worker_run(par_worker_t *W) {
+    t_fake_proc_id = W->fake_id;   /* 本线程伪造 processor_id（挂到本线程身份） */
+    RavenFS_juvenile &fs = *W->fs;
+    const uint64_t inum = W->inum;
+    const uint64_t PHY_BASE = 0x200000ull + (uint64_t)W->fake_id * 0x1000000ull;
+    const uint64_t NA = PAR_NA, NB = PAR_NB, B_BASE = PAR_B_BASE;
+    using clk = std::chrono::steady_clock;
+    auto t0 = clk::now();
+    auto ms_el = [&]() {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                   clk::now() - t0).count();
+    };
+    result_code_t r;
+    std::mt19937 rng(W->seed);
+    std::vector<uint64_t> ord;
+
+    /* ── 阶段 1：随机序插 A 空间 12 万（同 D 组：fb=k*2，永不合并） ── */
+    W->stage = 1;
+    {
+        ord.resize(NA);
+        for (uint64_t i = 0; i < NA; i++) ord[i] = i;
+        std::shuffle(ord.begin(), ord.end(), rng);
+        uint64_t ta = ms_el();
+        for (uint64_t k = 0; k < NA; k++) {
+            uint64_t fb = ord[k] * 2;
+            r = fs.extent_map_range(inum, mk_ext(fb, 1, PHY_BASE + fb));
+            W->ops.fetch_add(1, std::memory_order_relaxed);
+            if (r != RC_OK) PAR_FAIL("insA", k, r);
+        }
+        W->ms_insA = ms_el() - ta;
+    }
+
+    /* ── 阶段 2：满树审计（打穿内部层形态） ── */
+    W->stage = 2;
+    {
+        audit_t a;
+        char tag[32]; snprintf(tag, sizeof(tag), "E#%u-full", W->fake_id);
+        audit_run(fs, inum, tag, &a);
+        CHECK(a.records == NA && a.inner >= 2 && a.leaves > 338 && a.bad == 0,
+              "par#%u 满树 records=%lu inner=%lu leaves=%lu",
+              W->fake_id, a.records, a.inner, a.leaves);
+        if (a.records != NA || a.bad != 0) PAR_FAIL("audit-full", 0, RC_ERR_STATE);
+    }
+
+    /* ── 阶段 3：随机序删 A 空间 6 万（欠载平衡在随机叶触发） ── */
+    W->stage = 3;
+    {
+        uint64_t ta = ms_el();
+        for (uint64_t k = 0; k < NA / 2; k++) {
+            uint64_t fb = ord[k] * 2;
+            r = fs.extent_unmap_range(inum, mk_ext(fb, 1, PHY_BASE + fb));
+            W->ops.fetch_add(1, std::memory_order_relaxed);
+            if (r != RC_OK) PAR_FAIL("delHalf", k, r);
+        }
+        W->ms_delH = ms_el() - ta;
+    }
+
+    /* ── 阶段 4：半树审计（内部层合并/收缩路径） ── */
+    W->stage = 4;
+    {
+        audit_t a;
+        char tag[32]; snprintf(tag, sizeof(tag), "E#%u-half", W->fake_id);
+        audit_run(fs, inum, tag, &a);
+        CHECK(a.records == NA / 2 && a.bad == 0,
+              "par#%u 半树 records=%lu", W->fake_id, a.records);
+        if (a.records != NA / 2 || a.bad != 0) PAR_FAIL("audit-half", 0, RC_ERR_STATE);
+    }
+
+    /* ── 阶段 5：随机序插 B 空间 6 万（穿插回既有树，二次打穿） ── */
+    W->stage = 5;
+    {
+        ord.resize(NB);
+        for (uint64_t i = 0; i < NB; i++) ord[i] = i;
+        std::shuffle(ord.begin(), ord.end(), rng);
+        uint64_t ta = ms_el();
+        for (uint64_t k = 0; k < NB; k++) {
+            uint64_t fb = B_BASE + ord[k] * 2;
+            r = fs.extent_map_range(inum, mk_ext(fb, 1, PHY_BASE + fb));
+            W->ops.fetch_add(1, std::memory_order_relaxed);
+            if (r != RC_OK) PAR_FAIL("insB", k, r);
+        }
+        W->ms_insB = ms_el() - ta;
+    }
+
+    /* ── 阶段 6：回满审计 ── */
+    W->stage = 6;
+    {
+        audit_t a;
+        char tag[32]; snprintf(tag, sizeof(tag), "E#%u-refill", W->fake_id);
+        audit_run(fs, inum, tag, &a);
+        CHECK(a.records == NA && a.bad == 0,
+              "par#%u 回满 records=%lu", W->fake_id, a.records);
+        if (a.records != NA || a.bad != 0) PAR_FAIL("audit-refill", 0, RC_ERR_STATE);
+    }
+
+    /* ── 阶段 7：随机序全删（A 全 12 万 + B 6 万；一半 A 本不在树 → NOT_FOUND） ── */
+    W->stage = 7;
+    {
+        ord.resize(NA + NB);
+        for (uint64_t i = 0; i < NA; i++) ord[i] = i * 2;
+        for (uint64_t i = 0; i < NB; i++) ord[NA + i] = B_BASE + i * 2;
+        std::shuffle(ord.begin(), ord.end(), rng);
+        uint64_t ta = ms_el();
+        for (uint64_t k = 0; k < ord.size(); k++) {
+            r = fs.extent_unmap_range(inum, mk_ext(ord[k], 1, PHY_BASE + ord[k]));
+            if (r == RC_ERR_NOT_FOUND) { W->not_found++; continue; }
+            W->ops.fetch_add(1, std::memory_order_relaxed);
+            if (r != RC_OK) PAR_FAIL("delAll", k, r);
+        }
+        W->ms_delA = ms_el() - ta;
+    }
+
+    /* ── 阶段 8：终态审计（收缩链走完 → 空根叶） ── */
+    W->stage = 8;
+    {
+        audit_t a;
+        char tag[32]; snprintf(tag, sizeof(tag), "E#%u-final", W->fake_id);
+        audit_run(fs, inum, tag, &a);
+        CHECK(a.records == 0 && a.leaves == 1 && a.nodes == 1 && a.bad == 0,
+              "par#%u 终态 records=%lu leaves=%lu nodes=%lu",
+              W->fake_id, a.records, a.leaves, a.nodes);
+        if (a.records != 0 || a.leaves != 1 || a.nodes != 1 || a.bad != 0)
+            PAR_FAIL("audit-final", 0, RC_ERR_STATE);
+    }
+
+    /* ── 阶段 9：inode 分片并行冒烟（每 worker 2048 对 alloc/free，碰 inode 侧锁） ── */
+    W->stage = 9;
+    {
+        uint64_t ta = ms_el();
+        for (uint64_t k = 0; k < 2048; k++) {
+            uint64_t ino = fs.inode_alloc();
+            if (ino == PTR_INVALID) PAR_FAIL("churn", k, RC_ERR_NO_INODE);
+            fs.inode_free(ino);   /* 释放自旋：并发下真枪实弹打 inode 片锁 */
+            W->ops.fetch_add(1, std::memory_order_relaxed);
+        }
+        W->ms_churn = ms_el() - ta;
+    }
+}
+
+/* 看门狗：2s 轮询；30s 无任何推进（ops/stage 全静止）→ 打印现场 + abort */
+static void par_watchdog(std::vector<par_worker_t> &args, std::atomic<bool> &all_done) {
+    std::vector<uint64_t> last_ops(args.size(), 0);
+    std::vector<int> last_stage(args.size(), 0);
+    int stall = 0, tick = 0;
+    while (!all_done.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        uint64_t adv = 0, live = 0;
+        for (size_t i = 0; i < args.size(); i++) {
+            uint64_t o = args[i].ops.load(std::memory_order_relaxed);
+            int s = args[i].stage.load(std::memory_order_relaxed);
+            adv += (o - last_ops[i]) + (uint64_t)(s != last_stage[i]);
+            live += o;
+            last_ops[i] = o; last_stage[i] = s;
+        }
+        if (adv == 0) {
+            if (++stall >= 15) {
+                fprintf(stderr,
+                        "\n[WATCHDOG] 30s 全局零推进 —— 疑似死锁/活锁！各 worker 现场：\n");
+                for (size_t i = 0; i < args.size(); i++)
+                    fprintf(stderr, "  fake_cpu=%u  stage=%s  ops=%lu\n",
+                            args[i].fake_id,
+                            par_stage_name(args[i].stage.load(std::memory_order_relaxed)),
+                            args[i].ops.load(std::memory_order_relaxed));
+                fflush(stderr);
+                std::abort();   /* SIGABRT + core 抓现场 */
+            }
+        } else {
+            stall = 0;
+        }
+        if ((++tick % 7) == 0)
+            printf("  [E] 看门狗心跳 %lus：累计原语 %lu\n", (unsigned long)(tick * 2),
+                   (unsigned long)live);
+    }
+}
+
+static void run_parallel_group(RavenFS_juvenile &fs, uint32_t workers) {
+    printf("\n-- E：并行压测（%u 假 CPU/worker × 每文件 12 万记录增删，真盘直写） --\n",
+           workers);
+    /* 准备：串行建 W 个独立文件（正门拿 inode + 跃迁建树根） */
+    std::vector<uint64_t> inums(workers, 0);
+    for (uint32_t w = 0; w < workers; w++) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "par%u.bin", w);
+        result_code_t r = fs.root_dir_insert_dentry(nm, INODE_TYPE_REGULAR);
+        if (r != RC_OK) {
+            CHECK(false, "建 %s → %s（E 组需全新 mkfs：--inode-count≥%u 供 %u 片）",
+                  nm, rc_name(r), workers * 32768u, workers);
+            return;
+        }
+        uint64_t inum = 0;
+        fs.root_dir_lookup(nm, &inum);
+        if (file_to_extent_mode(fs, inum) == PTR_INVALID) {
+            CHECK(false, "%s 跃迁建树根失败", nm);
+            return;
+        }
+        inums[w] = inum;
+    }
+    printf("  已建 %u 个独立文件（par0..par%u），线程就绪\n", workers, workers - 1);
+
+    std::vector<par_worker_t> args(workers);
+    std::vector<std::thread> ths;
+    ths.reserve(workers);
+    for (uint32_t w = 0; w < workers; w++) {
+        args[w].fs = &fs;
+        args[w].inum = inums[w];
+        args[w].fake_id = w;
+        args[w].seed = 0x9E3779B97F4A7C15ull ^ (0x9E3779B1ull * (w + 1));
+    }
+
+    std::atomic<bool> all_done{false};
+    std::thread watchdog(par_watchdog, std::ref(args), std::ref(all_done));
+    auto twall = std::chrono::steady_clock::now();
+    for (uint32_t w = 0; w < workers; w++) ths.emplace_back(par_worker_run, &args[w]);
+    for (uint32_t w = 0; w < workers; w++) ths[w].join();
+    uint64_t wall_ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - twall).count();
+    all_done = true;
+    watchdog.join();
+
+    printf("\nE 结果表（每 worker 独立文件 / 独立 fake processor_id）：\n");
+    printf("  %-4s %8s %8s %8s %8s %8s %8s %6s  %s\n", "cpu", "insA_ms",
+           "delH_ms", "insB_ms", "delA_ms", "churn_ms", "sum_ms", "NF", "状态");
+    bool all_ok = true;
+    uint64_t tot_nf = 0, tot_ms = 0;
+    for (uint32_t w = 0; w < workers; w++) {
+        par_worker_t &a = args[w];
+        uint64_t sum = a.ms_insA + a.ms_delH + a.ms_insB + a.ms_delA + a.ms_churn;
+        tot_ms += sum; tot_nf += a.not_found;
+        if (!a.ok) all_ok = false;
+        printf("  %-4u %8lu %8lu %8lu %8lu %8lu %8lu %6lu  %s%s\n",
+               a.fake_id, a.ms_insA, a.ms_delH, a.ms_insB, a.ms_delA, a.ms_churn,
+               sum, a.not_found, a.ok ? "OK" : "FAIL",
+               a.ok ? "" : "");
+        if (!a.ok)
+            printf("        └─ fail@%s k=%u rc=%s\n", a.fail_ph, a.fail_k, rc_name(a.fail_rc));
+    }
+    uint64_t total_ops = workers * (PAR_NA + PAR_NA / 2 + PAR_NB + PAR_NA + PAR_NB);
+    double ops_s = (double)total_ops * 1000.0 / (double)(wall_ms ? wall_ms : 1);
+    printf("  总壁钟 %lu ms；原语 %lu 个（不含 NOT_FOUND 与 churn）；聚合 %lu ops/s\n",
+           wall_ms, total_ops, (unsigned long)ops_s);
+    CHECK(all_ok, "E 全部 worker 无预期外 RC");
+    CHECK(tot_nf == workers * (PAR_NA / 2),
+          "E 总 NOT_FOUND=%lu（期望 %lu，A 半空间本不在树）",
+          tot_nf, workers * (PAR_NA / 2));
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2) { printf("usage: %s <device>\n", argv[0]); return 2; }
+    if (argc < 2) { printf("usage: %s <device> [par [workers]]\n", argv[0]); return 2; }
+    uint32_t par_workers = 0;
+    if (argc >= 3 && strcmp(argv[2], "par") == 0) {
+        par_workers = (argc >= 4) ? (uint32_t)strtoul(argv[3], nullptr, 10) : 8;
+        if (par_workers == 0 || par_workers > 64) {
+            printf("workers ∈ [1,64]\n");
+            return 2;
+        }
+    }
 
     uint64_t rc;
-    linux_userspace_mount_t mnt = make_mount(argv[1]);
+    linux_userspace_mount_t mnt = make_mount(argv[1], par_workers ? par_workers : 1);
     RavenFS_juvenile fs(mnt, &rc);
     if (!fs.is_mounted()) { printf("mount failed rc=%s\n", rc_name(rc)); return 1; }
 
+    if (par_workers > 0) {
+        run_parallel_group(fs, par_workers);
+    } else {
     /* ── 1. root_dir 正门创建真 REG 文件 ── */
     printf("-- 准备：root_dir 建文件 + inline→extent 跃迁 --\n");
     rc = fs.root_dir_insert_dentry("a.bin", INODE_TYPE_REGULAR);
@@ -493,7 +810,8 @@ int main(int argc, char **argv) {
     audit_run(fs, sinum, "D 终态", &d4);
     CHECK(d4.records == 0 && d4.leaves == 1 && d4.nodes == 1,
           "D 终态：空根叶 records=%lu leaves=%lu", d4.records, d4.leaves);
+    }   /* 非 par 模式：A/B/C/D 串行语义组 */
 
-    printf("\n%d passed, %d failed\n", g_pass, g_fail);
-    return g_fail ? 1 : 0;
+    printf("\n%d passed, %d failed\n", g_pass.load(), g_fail.load());
+    return g_fail.load() ? 1 : 0;
 }

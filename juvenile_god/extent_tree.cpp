@@ -744,11 +744,11 @@ result_code_t RavenFS_juvenile::extent_new_root_inner(uint64_t low_blk, uint64_t
 
     root_sess.dirty();
 
-    /* 根更替：回写文件 inode.data_root（文件树无全局句柄） */
-    raven_Inode_t ino;
-    inode_read(inode_idx, &ino);
-    ino.data_root = new_root_blk;
-    inode_write(inode_idx, &ino);
+    /* 根更替：回写文件 inode.data_root（文件树无全局句柄；统一 InodeSession） */
+    InodeSession ino_sess(inode_cache_mgr, inode_idx);
+    if (!ino_sess) return RC_ERR_IO;
+    ino_sess.inode->data_root = new_root_blk;
+    ino_sess.dirty();
     return RC_OK;
 }
 
@@ -1024,10 +1024,11 @@ result_code_t RavenFS_juvenile::extent_root_shrink(uint64_t root_blk, uint64_t i
     }
     child_sess.dirty();
 
-    raven_Inode_t ino;
-    inode_read(inode_idx, &ino);
-    ino.data_root = child_blk;
-    inode_write(inode_idx, &ino);
+    /* 根更替：回写文件 inode.data_root（统一 InodeSession） */
+    InodeSession ino_sess(inode_cache_mgr, inode_idx);
+    if (!ino_sess) return RC_ERR_IO;
+    ino_sess.inode->data_root = child_blk;
+    ino_sess.dirty();
 
     block_free(root_blk, 2);
     return RC_OK;
@@ -1126,15 +1127,20 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t inode_idx, const exten
     if (ext.length == 0) return RC_OK;   /* 空映射：无操作 */
     if (!inode_test(inode_idx)) return RC_ERR_STATE;
 
-    raven_Inode_t ino;
-    inode_read(inode_idx, &ino);
-    if (ino.type != INODE_TYPE_REGULAR && ino.type != INODE_TYPE_SOFT_SYM)
-        return RC_ERR_STATE;   /* 文件数据树专用 */
-    if (ino.data_root == PTR_INVALID || ino.is_data_root_direct_bit)
-        return RC_ERR_STATE;   /* 须已在 extent-tree 模式 */
+    uint64_t data_root;
+    {
+        InodeSession ino_sess(inode_cache_mgr, inode_idx);
+        if (!ino_sess) return RC_ERR_IO;
+        raven_Inode_t *ino = ino_sess.inode;
+        if (ino->type != INODE_TYPE_REGULAR && ino->type != INODE_TYPE_SOFT_SYM)
+            return RC_ERR_STATE;   /* 文件数据树专用 */
+        if (ino->data_root == PTR_INVALID || ino->is_data_root_direct_bit)
+            return RC_ERR_STATE;   /* 须已在 extent-tree 模式 */
+        data_root = ino->data_root;
+    }
 
     bptree_path_t trace;
-    result_code_t rc = extent_Bptree_walk(ino.data_root, &trace, ext.fblkbase);
+    result_code_t rc = extent_Bptree_walk(data_root, &trace, ext.fblkbase);
     if (rc) return rc;
     const uint64_t leaf_blk = trace.blocks[trace.depth - 1];
     const uint16_t glb = trace.child_idx[trace.depth - 1];
@@ -1327,15 +1333,20 @@ result_code_t RavenFS_juvenile::extent_unmap_range(uint64_t inode_idx, const ext
     if (ext.length == 0) return RC_OK;   /* 空区间：无操作 */
     if (!inode_test(inode_idx)) return RC_ERR_STATE;
 
-    raven_Inode_t ino;
-    inode_read(inode_idx, &ino);
-    if (ino.type != INODE_TYPE_REGULAR && ino.type != INODE_TYPE_SOFT_SYM)
-        return RC_ERR_STATE;
-    if (ino.data_root == PTR_INVALID || ino.is_data_root_direct_bit)
-        return RC_ERR_STATE;
+    uint64_t data_root;
+    {
+        InodeSession ino_sess(inode_cache_mgr, inode_idx);
+        if (!ino_sess) return RC_ERR_IO;
+        raven_Inode_t *ino = ino_sess.inode;
+        if (ino->type != INODE_TYPE_REGULAR && ino->type != INODE_TYPE_SOFT_SYM)
+            return RC_ERR_STATE;
+        if (ino->data_root == PTR_INVALID || ino->is_data_root_direct_bit)
+            return RC_ERR_STATE;
+        data_root = ino->data_root;
+    }
 
     bptree_path_t trace;
-    result_code_t rc = extent_Bptree_walk(ino.data_root, &trace, ext.fblkbase);
+    result_code_t rc = extent_Bptree_walk(data_root, &trace, ext.fblkbase);
     if (rc) return rc;
     if (!trace.is_leaf_hit) return RC_ERR_NOT_FOUND;   /* 起点无记录覆盖：目标不存在 */
     const uint64_t leaf_blk = trace.blocks[trace.depth - 1];

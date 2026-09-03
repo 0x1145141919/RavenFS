@@ -23,6 +23,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <new>
+extern "C" uint32_t get_processor_id();
+
 bool name_len_limiter(const char*name){
     return strlen(name)<=RAVENFS_MAX_NAME_LEN;
 }
@@ -620,13 +622,29 @@ bool RavenFS_juvenile::slices_setup(uint32_t cpu_count) {
     }
     slice_count = (uint32_t)n;
 
+    /* per-CPU preferred 数组：长度 = 传入 logical_processor_count（外部身份域），
+     * 分配器按 get_processor_id() 索引——每"CPU"各自记住上次成功的亲和片，
+     * 消除共享游标竞争（仿 FPA 每 CPU preferred；身份获取见文件头 extern 合约）。
+     * cpu_count==0（挂载方未提供）→ 退化单槽。 */
+    cpu_preferred_slots = cpu_count ? cpu_count : 1;
+
     try {
         block_bitmap_slices = new bitmap_slice_t[slice_count];
         inode_bitmap_slices = new bitmap_slice_t[slice_count];
+        block_preferred_slice = new uint32_t[cpu_preferred_slots];
+        inode_preferred_slice = new uint32_t[cpu_preferred_slots];
     } catch (const std::bad_alloc &) {
         block_bitmap_slices = nullptr;
         inode_bitmap_slices = nullptr;
+        block_preferred_slice = nullptr;
+        inode_preferred_slice = nullptr;
         return false;
+    }
+    /* 初始亲和：CPU i 的家乡片 = i % slice_count（两片组同分布；
+     * 单槽（logical_processor_count=1）→ 恒 0，与旧全局游标行为一致） */
+    for (uint32_t i = 0; i < cpu_preferred_slots; i++) {
+        block_preferred_slice[i] = (uint32_t)(i % slice_count);
+        inode_preferred_slice[i] = (uint32_t)(i % slice_count);
     }
 
     /* block 组切分 */
@@ -661,12 +679,16 @@ bool RavenFS_juvenile::slices_setup(uint32_t cpu_count) {
 fail:
     delete[] block_bitmap_slices; block_bitmap_slices = nullptr;
     delete[] inode_bitmap_slices; inode_bitmap_slices = nullptr;
+    delete[] block_preferred_slice; block_preferred_slice = nullptr;
+    delete[] inode_preferred_slice; inode_preferred_slice = nullptr;
     return false;
 }
 
 void RavenFS_juvenile::slices_teardown() {
     delete[] block_bitmap_slices; block_bitmap_slices = nullptr;
     delete[] inode_bitmap_slices; inode_bitmap_slices = nullptr;
+    delete[] block_preferred_slice; block_preferred_slice = nullptr;
+    delete[] inode_preferred_slice; inode_preferred_slice = nullptr;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -676,17 +698,20 @@ void RavenFS_juvenile::slices_teardown() {
  * 释放走自旋重试（释放不可丢，仿 FPA::free spintrylock_spin_guard）。
  * ═══════════════════════════════════════════════════════════════ */
 
-/* 硬分配：count 连续 + 对齐，单片内完成（不跨片）；失败 PTR_INVALID */
+/* 硬分配：count 连续 + 对齐，单片内完成（不跨片）；失败 PTR_INVALID
+ * 路由：本 CPU（get_processor_id()）preferred 片优先 → try 锁失败逐片扫描 */
 uint64_t RavenFS_juvenile::block_alloc_hard(uint64_t require_count, uint8_t align_log2) {
-    if (require_count == 0 || !block_bitmap_slices || slice_count == 0) return PTR_INVALID;
+    if (require_count == 0 || !block_bitmap_slices || slice_count == 0 ||
+        cpu_preferred_slots == 0 || !block_preferred_slice) return PTR_INVALID;
+    const uint32_t cpu = get_processor_id() % cpu_preferred_slots;   /* 外部身份合约：平台必实现 */
     for (uint64_t round = 0; round < slice_count; round++) {
-        uint64_t idx = (block_preferred_slice + round) % slice_count;
+        uint64_t idx = (block_preferred_slice[cpu] + round) % slice_count;
         bitmap_slice_t &s = block_bitmap_slices[idx];
         if (!s.slice_lock.try_lock_write()) continue;      /* 锁忙换片 */
         uint64_t out = 0;
         result_code_t rc = s.alloc_hard(align_log2, require_count, out);
         s.slice_lock.unlock_write();
-        if (rc == RC_OK) { block_preferred_slice = idx; return out; }
+        if (rc == RC_OK) { block_preferred_slice[cpu] = (uint32_t)idx; return out; }
     }
     return PTR_INVALID;
 }
@@ -695,16 +720,18 @@ uint64_t RavenFS_juvenile::block_alloc_hard(uint64_t require_count, uint8_t alig
  * *remain_count = 缺口数；一块没有 → PTR_INVALID。 */
 uint64_t RavenFS_juvenile::block_alloc_soft(uint64_t require_count, uint64_t *remain_count) {
     if (remain_count) *remain_count = require_count;
-    if (require_count == 0 || !block_bitmap_slices || slice_count == 0) return PTR_INVALID;
+    if (require_count == 0 || !block_bitmap_slices || slice_count == 0 ||
+        cpu_preferred_slots == 0 || !block_preferred_slice) return PTR_INVALID;
+    const uint32_t cpu = get_processor_id() % cpu_preferred_slots;   /* 外部身份合约：平台必实现 */
     for (uint64_t round = 0; round < slice_count; round++) {
-        uint64_t idx = (block_preferred_slice + round) % slice_count;
+        uint64_t idx = (block_preferred_slice[cpu] + round) % slice_count;
         bitmap_slice_t &s = block_bitmap_slices[idx];
         if (!s.slice_lock.try_lock_write()) continue;
         uint64_t out = 0, left = require_count;
         result_code_t rc = s.alloc_soft(0, require_count, out, left);
         s.slice_lock.unlock_write();
         if (rc == RC_OK) {
-            block_preferred_slice = idx;
+            block_preferred_slice[cpu] = (uint32_t)idx;
             if (remain_count) *remain_count = left;
             return out;
         }
@@ -731,15 +758,17 @@ bool RavenFS_juvenile::block_test(uint64_t blk) const {
  * 位图接口组 B：inode 槽分配器（分片路由）
  * ═══════════════════════════════════════════════════════════════ */
 uint64_t RavenFS_juvenile::inode_alloc() {
-    if (!inode_bitmap_slices || slice_count == 0) return PTR_INVALID;
+    if (!inode_bitmap_slices || slice_count == 0 ||
+        cpu_preferred_slots == 0 || !inode_preferred_slice) return PTR_INVALID;
+    const uint32_t cpu = get_processor_id() % cpu_preferred_slots;   /* 外部身份合约：平台必实现 */
     for (uint64_t round = 0; round < slice_count; round++) {
-        uint64_t idx = (inode_preferred_slice + round) % slice_count;
+        uint64_t idx = (inode_preferred_slice[cpu] + round) % slice_count;
         bitmap_slice_t &s = inode_bitmap_slices[idx];
         if (!s.slice_lock.try_lock_write()) continue;
         uint64_t out = 0, left = 0;
         result_code_t rc = s.alloc_soft(0, 1, out, left);
         s.slice_lock.unlock_write();
-        if (rc == RC_OK) { inode_preferred_slice = idx; return out; }
+        if (rc == RC_OK) { inode_preferred_slice[cpu] = (uint32_t)idx; return out; }
     }
     return PTR_INVALID;
 }
@@ -777,7 +806,7 @@ void RavenFS_juvenile::dump_info() const {
            "  inode bm   [%llu, %llu)  %llu blk\n"
            "  blocks used: %llu/%llu (%.2f%%)\n"
            "  inodes used: %llu/%llu (%.2f%%)\n"
-           "  root_dentry_blk=%llu  slices=%u  blk_pref=%llu\n",
+           "  root_dentry_blk=%llu  slices=%u  cpu_slots=%u  blk_pref0=%llu\n",
            fd, fd >= 0 ? "yes" : "no",
            (unsigned long long)sb.magic, sb.version,
            sb.uuid[0], sb.uuid[1], sb.uuid[14], sb.uuid[15],
@@ -794,8 +823,9 @@ void RavenFS_juvenile::dump_info() const {
            total_blocks ? 100.0 * (double)used_blocks / (double)total_blocks : 0.0,
            (unsigned long long)used_inodes, (unsigned long long)inode_count,
            inode_count ? 100.0 * (double)used_inodes / (double)inode_count : 0.0,
-           (unsigned long long)root_dentry_blk, slice_count,
-           (unsigned long long)block_preferred_slice);
+           (unsigned long long)root_dentry_blk, slice_count, cpu_preferred_slots,
+           (unsigned long long)(cpu_preferred_slots && block_preferred_slice
+                                ? block_preferred_slice[0] : 0));
 }
 
 /* ═══════════════════════════════════════════════════════════════
