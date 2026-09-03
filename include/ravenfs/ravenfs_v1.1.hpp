@@ -11,6 +11,7 @@
  * 标准库模板头一并污染，gcc16 下 sstream 可访问性检查直接报错。 */
 class Inode_cache_mgr_t;        /* inode 缓存管理器（inode_cache_radix.hpp） */
 class mdata_piece_caches_mgr;   /* 8K 元数据负载片缓存管理器（mdata_piece_caches.hpp） */
+class bitmap_slices_mgr_t;      /* 双位图分片分配器（bitmap_slices.hpp；2026-09-03 从上帝类顶出） */class mdata_piece_caches_mgr;   /* 8K 元数据负载片缓存管理器（mdata_piece_caches.hpp） */
 
 #include <cstdint>
 #include <cstddef>
@@ -136,76 +137,11 @@ public:
 
     /* ── 调试 ── */
     void dump_info() const;                     /* SB/几何/位图占用率/根节点 */
-    /* 读写尝试自旋锁：读共享 / 写独占，全部 try 语义（拿不到立即返回
-     * false，不阻塞自旋）。调用方拿不到锁时自行决定重试或换片。
-     * 用户态实现用 std::atomic；sparrowos 内核端移植时替换为 arch
-     * 原子原语（xchg/cmpxchg），接口语义不变。
-     * 无公平性保证：try 语义下饥饿由调用方路由策略承担。 */
-    class rw_try_spinlock_t {
-    public:
-        rw_try_spinlock_t() : state_(0) {}
-        rw_try_spinlock_t(const rw_try_spinlock_t &) = delete;
-        rw_try_spinlock_t &operator=(const rw_try_spinlock_t &) = delete;
-
-        bool try_lock_read() {
-            uint32_t s = state_.load(std::memory_order_relaxed);
-            do {
-                if (s & WRITE_BIT) return false;        /* 写者持有 → 放弃 */
-            } while (!state_.compare_exchange_weak(s, s + 1,
-                         std::memory_order_acquire, std::memory_order_relaxed));
-            return true;                                /* 读者计数 +1 */
-        }
-        void unlock_read() {
-            state_.fetch_sub(1, std::memory_order_release);
-        }
-        bool try_lock_write() {
-            uint32_t expect = 0;
-            return state_.compare_exchange_strong(expect, WRITE_BIT,
-                         std::memory_order_acquire, std::memory_order_relaxed);
-        }
-        void unlock_write() {
-            state_.store(0, std::memory_order_release);
-        }
-    private:
-        static constexpr uint32_t WRITE_BIT = 0x80000000u;  /* 高 1 位=写锁，低 31 位=读者计数 */
-        std::atomic<uint32_t> state_;
-    };
     uint64_t get_ctrl_word(){
         return God_CTRL_WORD;
     }
 private:
     uint64_t God_CTRL_WORD;
-    struct fs_bitmap_descriptor_t{
-        uint64_t FS_blk_base;
-        uint64_t*bitmap_raw;//必须保证4k对齐
-        uint64_t bits_count;
-    };
-    struct slice_config_t{
-        uint8_t*slice_base;//也是必须保证4k对齐，根据
-        uint64_t slice_bitscount;
-    };
-class bitmap_slice_t{
-        private:
-        uint8_t*slice_base;//也是必须保证4k对齐，根据
-        uint64_t base_idx;//根据(slice_base-parent_descriptor->bitmap_raw)<<3推断
-        uint64_t slice_bitscount;
-        fs_bitmap_descriptor_t*parent_descriptor;
-        uint64_t free_count;
-        uint64_t last_finish_hint;
-        public:
-        rw_try_spinlock_t slice_lock;
-        uint64_t get_free_count();
-        uint64_t get_hint();
-        void set_hint(uint64_t new_hint);
-        //很明显下面是全局位图区间，传入的参数以及传出的引索基址，不过内部路由换算
-        result_code_t enable_slice(fs_bitmap_descriptor_t*global_descriptor,slice_config_t config);
-        result_code_t alloc_hard(uint8_t align_log2,uint64_t bitscount,uint64_t&out_base_idx);
-        result_code_t alloc_soft(uint8_t align_log2,uint64_t bitscount,uint64_t&out_base_idx,uint64_t&bits_left_to_be_allocated);
-        result_code_t test_interval(bool val,uint64_t base,uint64_t len);//看根据parent_descriptor的[base,base+len]区间的所有bit是否完全同val的bool值
-        result_code_t free_interval(uint64_t base,uint64_t len);
-        void disable_slice();
-        //为了内存规整而刻意不搞构造折构函数，往64B缓存行对齐而设计
-    };
     /* 核心版本：按 inode_type 初始化 + 插入。dir 型急建树根（magic + . / ..）；
      * 目标目录 inode_idx 的 data_root 恒有效（v1.1 §10 不变量 11），
      * 遇 PTR_INVALID = 严重内部磁盘契约违反 → RC_ERR_STATE。 */
@@ -220,34 +156,16 @@ class bitmap_slice_t{
     result_code_t dir_lookup(uint64_t inode_idx,const char *name, uint64_t *out_inum);
     int64_t dir_readdir(uint64_t inode_idx,dentry_out **out_buf);
     /* ══════════════════════════════════════════════════════════
-     * 位图接口组 A：FS_block 分配器（分片路由）
-     *   内存：block_bits[bitmap_blocks×4096]（4K 对齐，posix_memalign）
-     *   分片：block_bitmap_slices[slice_count]，每片自治（锁+游标）
-     *   路由：本 CPU preferred 片优先 → 逐片 try 锁扫描（preferred 按
-     *     get_processor_id() 索引 [logical_processor_count] 数组，仿 FPA::alloc）；
-     *   失败哨兵：PTR_INVALID（0 是合法块号）
-     *   对齐约束：align_log2 ∈ [0,16]（片内 bit 索引对齐，见 bitmap_slice_t）
-     * ══════════════════════════════════════════════════════════ */
-    /* 硬分配：必须 require_count 块连续 + 起始块号 2^align_log2 对齐。
-     * 单片内完成（不跨片拼接）；所有片失败 → PTR_INVALID（原子，不部分分配）。 */
+     * 位图接口组 A/B：薄转发 → bitmap_slices_mgr_t（独立模块）
+     * 2026-09-03 顶出：完整契约 / 锁纪律 / 几何推导见
+     * include/ravenfs/bitmap_slices.hpp（bitmap_slices_mgr_t）。
+     * 本层仅保留签名不变的转发壳——调用点（dentry/extent/name_heap/
+     * root_dir）零改动。失败哨兵 PTR_INVALID（0 是合法块号/槽号）。 */
     uint64_t block_alloc_hard(uint64_t require_count, uint8_t align_log2);
-    /* 软分配：一次只从单片取（preferred 优先），实际 = min(区间长, require_count)。
-     * *remain_count 输出缺口数 = require_count − 实际分配（0 = 全满足，
-     * 调用者可据此再调一次补足）；一块都拿不到 → PTR_INVALID
-     * 且 *remain_count = require_count。 */
     uint64_t block_alloc_soft(uint64_t require_count, uint64_t *remain_count);
-    /* 区间释放：定位所属片（blkbase / block_per_slice_bits）→ 持该片写锁 → 清位 */
+    uint64_t block_occupy_soft(uint64_t blkbase, uint64_t require_count, uint64_t *rest_count);
     void     block_free(uint64_t blkbase, uint64_t count);
-    /* 测试：直读位图内存（无锁；调用方保证并发安全） */
     bool     block_test(uint64_t blk) const;
-
-    /* ══════════════════════════════════════════════════════════
-     * 位图接口组 B：inode 槽分配器（分片路由）
-     *   内存：inode_bits[inode_bitmap_blocks×4096]（4K 对齐）
-     *   分片：inode_bitmap_slices[slice_count]，同 slice_count 分片数
-     *   路由：同 block 组——get_processor_id() 索引 per-CPU preferred 数组
-     *   失败哨兵：PTR_INVALID（inode 0 = root，alloc 从 1 起扫）
-     * ══════════════════════════════════════════════════════════ */
     uint64_t inode_alloc();
     void     inode_free(uint64_t inum);
     bool     inode_test(uint64_t inum) const;
@@ -269,7 +187,7 @@ class bitmap_slice_t{
 
     /* ── 位图核心 ── */
     bool bitmaps_load();     /* mount 时：直写=全量 pread 入内存；mmap 后端=窗口切片（不预取）。
-                                * 两模式共用自描述校验(§6.6) + 填 descriptor */
+                                * 两模式共用自描述校验(§6.6)；原始内存喂给 bitmap_slices_mgr_t 装配 */
     void bitmaps_flush();    /* 析构时：仅直写模式 pwrite 全量写回（mmap 后端由内核页缓存管） */
     /* 缓存子模块编排（ctor 调）：决策树第一层 is_device_direct ——
      *   mmap 后端：inode/mdata_piece 全 offload（canvas 从窗口切）
@@ -282,12 +200,6 @@ class bitmap_slice_t{
     /* 缓存回调适配器：私有 read_buff/write_buff → 子模块函数指针（io_ctx = this） */
     static result_code_t fs_io_read(void *io_ctx, uint64_t blk, uint64_t blk_len, void *buf);
     static result_code_t fs_io_write(void *io_ctx, uint64_t blk, uint64_t blk_len, const void *buf);
-    /* 分片初始化：slice_count = min(2^n 上界(logical_processor_count),
-     * block/inode 位图各能切出的满片数)。每片 slice_bitscount = 32768
-     * 的倍数（非末片），slice_base 4K 对齐；逐片 enable_slice。
-     * 失败 → false（构造返回 RC_ERR_STATE）。 */
-    bool slices_setup(uint32_t logical_processor_count);
-    void slices_teardown();  /* delete[] 两个 slices 数组 */
 
     /* ── 名字 hash（XXH64 seed=0，v1.1 §9 已定；跨挂载稳定）── */
     uint64_t name_hash(const char *name) const;
@@ -322,19 +234,8 @@ class bitmap_slice_t{
     uint64_t inode_bm_base      = 0;   /* inode_array_bitmap_base */
     uint64_t inode_bm_blocks    = 0;
 
-    fs_bitmap_descriptor_t block_bitsmap_descriptor;
-    fs_bitmap_descriptor_t inode_bitsmap_descriptor;
-    bitmap_slice_t *block_bitmap_slices = nullptr;   /* 必须默认初始化：挂载失败路径 dtor 会 delete[]（未初始化=垃圾指针崩溃） */
-    bitmap_slice_t *inode_bitmap_slices = nullptr;
-    uint32_t slice_count;//约束上面两个的分片的分片数目，取构造时传入的logical_processor_count取最小的2^n上界
     uint8_t *block_bits = nullptr;      /* 全量内存位图（bitmap_blocks×4096），4K 对齐（posix_memalign） */
     uint8_t *inode_bits = nullptr;      /* 全量内存位图（inode_bm_blocks×4096），4K 对齐（posix_memalign） */
-    uint64_t block_per_slice_bits = 0;  /* block 组名义片长（非末片 32768 倍数；定位片用） */
-    uint64_t inode_per_slice_bits = 0;  /* inode 组名义片长 */
-    uint32_t cpu_preferred_slots = 0;   /* per-CPU preferred 数组长 = 构造传入 logical_processor_count（≥1） */
-    uint32_t *block_preferred_slice = nullptr; /* [cpu_preferred_slots]：每"CPU"(get_processor_id) 的 block 组亲和片游标 */
-    uint32_t *inode_preferred_slice = nullptr; /* [cpu_preferred_slots]：inode 组亲和片游标 */
-
     uint64_t root_inum      = 0;        /* 恒 0（根目录 inode 索引） */
     uint64_t root_dentry_blk = 0;       /* root inode.data_root（树根块号） */
 
@@ -345,6 +246,7 @@ class bitmap_slice_t{
      * （编排完成前只编译不跑）。 */
     Inode_cache_mgr_t      *inode_cache_mgr  = nullptr;   /* inode 缓存（inode_cache_radix.hpp） */
     mdata_piece_caches_mgr *mdata_piece_mgr  = nullptr;   /* 8K 元数据负载片缓存（mdata_piece_caches.hpp） */
+    bitmap_slices_mgr_t    *bitmap_mgr       = nullptr;   /* 双位图分片分配器（bitmap_slices.hpp；2026-09-03 顶出，ctor 装配/dtor 拆除） */
 
     /* ── mmap 后端（非直写挂载；决策树第一层） ──
      * is_device_direct=false 时整盘从 offset 0 映射（含 SB 区 byte[0,4096)），

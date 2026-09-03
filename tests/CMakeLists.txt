@@ -34,12 +34,19 @@ add_executable(ravenfs_juv_delete
 target_link_libraries(ravenfs_juv_delete PRIVATE ravenfs_juvenile)
 
 # v1.1 bitmap_slice_t 分片位图自治单元单测（alloc_hard hint 命中/miss +
-# alloc_soft 全量 gather；free_count / hint 变化校验）
+# alloc_soft 全量 gather；free_count / hint 变化校验；soft_occupy 锚定软占领）
 add_executable(ravenfs_juv_bitmap_slice
     test_bitmap_slice.cpp
     ${CPU_ID_STUB}
 )
 target_link_libraries(ravenfs_juv_bitmap_slice PRIVATE ravenfs_juvenile)
+
+# v1.1 block_occupy_soft 定点占领路由测试（自旋强制抢 + 片尾跨界续圈 + 跨片释放）
+add_executable(ravenfs_juv_block_occupy
+    test_block_occupy.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_block_occupy PRIVATE ravenfs_juvenile)
 
 # v1.1 名字堆专项测试（长名外置：档位覆盖/完整比较/位图一致性/释放/持久化）
 add_executable(ravenfs_juv_name_heap

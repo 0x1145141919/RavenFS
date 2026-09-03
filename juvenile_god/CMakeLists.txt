@@ -1,7 +1,8 @@
 # RavenFS v1.1 幼年期上帝类
 #
-# ravenfs_juvenile.cpp — 挂载/卸载 + 双位图分配器 + CRC32/name_hash（Raven 实现）
-# bitmap_slice.cpp    — bitmap_slice_t 分片位图自治单元（Raven 实现）
+# ravenfs_juvenile.cpp — 挂载/卸载 + 块/inode I/O + 上帝类编排（Raven 实现）
+# bitmap_slices.cpp — 双位图分片分配器独立模块：slice 自治单元 + mgr 几何推导/路由
+#                    （2026-09-03 从上帝类顶出；原 bitmap_slice.cpp 退役）
 # dentry_tree.cpp      — dentry B+tree 全套（Sparrow 手写）
 # extent_tree.cpp      — extent B+tree 轮子区：walk / inner+leaf lookup（Raven 起草）
 # root_dir.cpp         — root_dir 顶层业务（Sparrow 手写）
@@ -11,7 +12,7 @@
 
 add_library(ravenfs_juvenile STATIC
     ravenfs_juvenile.cpp
-    bitmap_slice.cpp
+    bitmap_slices.cpp
     dentry_tree.cpp
     extent_tree.cpp
     root_dir.cpp

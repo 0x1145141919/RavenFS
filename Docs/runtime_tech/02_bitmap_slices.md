@@ -3,8 +3,12 @@
 > 2026-08-30
 > 主题：block / inode 双位图 mount 全量进内存；按 CPU 数切分成自治片；
 > 片内字粒度位操作 + hint 游标；顶层仿 FPA 亲和路由（分配 try / 释放自旋）。
-> 代码映射：`juvenile_god/bitmap_slice.cpp`（片自治单元）＋
-> `juvenile_god/ravenfs_juvenile.cpp`（bitmaps_load/flush、slices_setup、顶层路由）。
+> 代码映射：`juvenile_god/bitmap_slices.cpp`（slice 自治单元 + mgr 几何推导/路由）＋
+> `include/ravenfs/bitmap_slices.hpp`（模块契约：类型顶出 + bitmap_slices_mgr_t）＋
+> `juvenile_god/ravenfs_juvenile.cpp`（bitmaps_load/flush、位图原始内存、薄转发壳）。
+> 2026-09-03 修订：位图模块从上帝类顶出（对齐 inode_cache/mdata_piece 的 cfg 大结构体
+> 范式；原 bitmap_slice.cpp + 上帝类内嵌类型退役），本文明中的"顶层路由"现为
+> bitmap_slices_mgr_t 成员，上帝类只留签名不变的转发。
 
 ---
 
