@@ -260,6 +260,10 @@ class bitmap_slice_t{
     /* ── inode I/O（零缓存）── */
     void inode_read(uint64_t inum, raven_Inode_t *out) const;
     void inode_write(uint64_t inum, const raven_Inode_t *in);
+    
+    result_code_t extent_map_range(uint64_t inode_idx, const extent_t &ext); //内部有任何区间有交集会报错
+    
+    result_code_t extent_unmap_range(uint64_t inode_idx, const extent_t &ext);//外部有侦查，这里是精确匹配删除extent_t叶子节点的记录
 
     /* ── 位图核心 ── */
     bool bitmaps_load();     /* mount 时：直写=全量 pread 入内存；mmap 后端=窗口切片（不预取）。
@@ -558,6 +562,24 @@ class bitmap_slice_t{
      * high_blk 为右子块号（其最大 hash 由本函数读节点现算）。 */
     result_code_t dentry_new_root_inner(uint64_t low_blk, uint64_t low_max,
                                         uint64_t high_blk, uint64_t root_inode_idx);
+    /* ══════════════════════════════════════════════════════════
+     * extent 原语对内部机械（2026-09-03；extent_map_range/unmap_range 支撑）
+     * 镜像 dentry 六件套，差异：key = 子树最大开边界 (fblkbase+length)；
+     * 根更替回写文件 inode.data_root（无全局句柄）；文件树根无 ".."
+     * （ptrs[1] 恒 PTR_INVALID）；阶 337：欠载阈值 168（非根）／合并上界
+     * total ≤ 337 ／分裂左 168 右 count−168。split_result_t 复用，其
+     * low_node_maxhash 字段在 extent 侧承载“左半最大开边界 key”。
+     * ══════════════════════════════════════════════════════════ */
+    split_result_t extent_leaf_split(uint64_t victim_blk);   /* 叶裂：链表维护，不动父 */
+    split_result_t extent_inner_split(uint64_t victim_blk);  /* 内裂：右半孩子 reparent 新块 */
+    result_code_t extent_spilt_parent_apply(uint64_t parent_blk, uint16_t victim_idx,
+                                            split_result_t r, bool &parent_spilt);
+    result_code_t extent_new_root_inner(uint64_t low_blk, uint64_t low_key,
+                                        uint64_t high_blk, uint64_t inode_idx);
+    result_code_t extent_node_balance(uint64_t parent_blk, uint16_t idx, bool &need_balance);
+    result_code_t extent_root_shrink(uint64_t root_blk, uint64_t inode_idx);
+    result_code_t extent_balance_from(uint64_t child_blk, uint64_t inode_idx); /* 欠载链修复（自下而上，含收尾根收缩） */
+    result_code_t extent_refresh_key_chain(uint64_t blk);    /* 节点 max key 变更后沿父链上溯刷新 */
 };
 bool is_dentry_node(Bptree_meta_t*meta);
 bool is_extent_node(Bptree_meta_t*meta);

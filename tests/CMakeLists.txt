@@ -10,6 +10,12 @@ add_executable(ravenfs_juv_extent_walk
 )
 target_link_libraries(ravenfs_juv_extent_walk PRIVATE ravenfs_juvenile)
 
+# v1.1 extent_map_range / extent_unmap_range 原语对专项测试（root_dir 建真文件 + 跃迁建树根）
+add_executable(ravenfs_juv_extent_ops
+    test_extent_ops.cpp
+)
+target_link_libraries(ravenfs_juv_extent_ops PRIVATE ravenfs_juvenile)
+
 # v1.1 幼年期上帝类：root_dir_rm_dentry 接口专项测试
 add_executable(ravenfs_juv_delete
     test_root_dir_delete.cpp
