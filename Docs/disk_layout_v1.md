@@ -304,15 +304,49 @@ byte[0..7] = { type:2 | is_data_root_direct_bit:1 | other:61 }
 
 #### type == REGULAR / SOFT_LINK（文件/软链接）
 
-按 `is_data_root_direct_bit` 分岔：
+数据区三态（内联 / 直指区间 / 区段树）。**解码判据只依赖 `size` 与 `is_data_root_direct_bit` 两个字段，`data_root` 的取值不参与判定**——它是各态下的载荷（哨兵只作状态规范标记，不是判据入口）。判定顺序敏感（size 优先）：
 
-| `data_root` | 指针类型 | `is_data_root_direct_bit` | 含义 | `size` 语义 |
-|-------------|---------|---------------------------|------|------------|
-| ~0ull | — (哨兵) | don't care | **内联**：内容在 `inline_data[0..size-1]`，size=0~160 | 文件字节数 |
-| ≠ ~0ull | 块指针 | = 1 | **直指区间**：`data_root` 起始，`ceil(size/4096)` 个连续 FS_block，数据从 `data_root` 的 byte[0] 开始 | 文件字节数（无尺寸上限） |
-| ≠ ~0ull | 块指针 | = 0 | **B+tree**：`data_root` → 区段 B+tree 根节点 | 文件字节数 |
+```c
+/* 判据：假设受审对象是正常 inode（下表不变量成立），以引用访问 i */
+if (i.size <= 160) {                    // 内联：内容在 inline_data[0..size-1]
+    // inline —— data_root 规范 = ~0ull；is_data_root_direct_bit 无解码意义（规范置 0）
+} else if (i.is_data_root_direct_bit) { // 直指区间
+    // i.data_root = base_blk（连续区首 FS_block）
+    // 物理覆盖 = 以 base 起始的 ceil(size/4096) 个连续 FS_block，数据从 base 的 byte[0] 开始
+    // 逻辑字节 o → FS_block[base + o/4096] 内偏移 o % 4096
+} else {                                // 区段树
+    // i.data_root = 区段 B+tree 根节点块号
+    // size = 逻辑占用大小（含空洞；未映射逻辑块读 0）
+}
+```
 
-直指区间是最优路径：一次间接（data_root → 连续数据块），零 B+tree 节点读取。任何文件（不论大小）只要其数据块在磁盘上连续即可用直指区间。只有当文件碎片化到无法用一个连续区间描述时（如中间块被释放/空洞），才回退为 B+tree 区段树。v1 实现：creat/write 在连续分配时优先走直指区间，遇到空洞时自动升级为 B+tree。
+关键语义：
+
+- **size 优先**：size ≤ 160 一律按内联解读，内容在 `inline_data[0..size-1]`，此时 data_root / direct_bit 无解码意义。规范要求内联态 data_root = ~0ull、direct_bit = 0；外置残留（data_root ≠ ~0ull）视为不一致——fsck 以 size 为真值，清残留并告警。读路径不允许先看 data_root 再定态，三态互斥完全由 size + direct_bit 组合保证。
+- **直指区间是最优路径**：一次间接（data_root → 连续数据块），零 B+tree 节点读取。前提 = size > 160（≤160 恒内联，无外置块可言）且全文件无**块级空洞**：逻辑块 [0, ceil(size/4096)) 全部有物理块且物理连续。任何块级空洞 / 碎片（稀疏写、打洞、尾部扩展拿不到相邻块）→ 整文件转区段树（迁移见下，数据零搬移）。
+- **size 语义三态统一** = 文件逻辑字节长度（最高写入字节 + 1 / truncate 设定）。三态差别只在空洞表达：extent 允许块级空洞；inline / direct 不允许（direct 只有“块内未写部分”，与空洞同读 0）。
+- **未写部分读 0**：块级空洞天然读 0（无物理块）；新分配数据块被**部分**写入时，块内未写区间必须清零（实现任选：分配即清 / 首次部分写补零）——mmap 直写后端下分配块残留旧数据，不清零会读到垃圾。
+
+**三态不变量（正常 inode 恒成立）**
+
+| 态 | 充要判据 | `data_root` | 映射 |
+|----|---------|-------------|------|
+| 内联 | size ≤ 160 | ~0ull（规范） | inline_data[0..size-1] |
+| 直指 | size > 160 且 direct_bit = 1 | 合法块号 base | 逻辑字节 o → FS_block[base + o/4096] 偏移 o%4096；物理占块 = ceil(size/4096) 连续 |
+| 区段树 | size > 160 且 direct_bit = 0 | 合法块号（树根） | 逻辑块 → 树查物理块；空洞读 0 |
+
+**状态迁移（写路径）**
+
+- inline → 外置：写使 size 跨过 160 即离开内联——先把 inline_data（≤160B）拷入新分配首块，再写新数据；分配器一次能拿连续区 → direct，拿不到（碎片）→ extent（建树）。迁移后 inline_data 作废（判据不再读它，不必清）。
+- direct 增长（append）：扩展必须拿到与现有连续区相邻的块（base + ceil(size/4096)）；拿不到 → **整文件迁 extent**。direct → extent 数据零搬移：旧连续区在树里就是一条 extent（逻辑 [0, old_size) → base），建树节点 + 新扩展段作另一条 extent 插入 + 翻 inode 两字段即可。
+- 打洞（hole punch，size 不变）：洞覆盖整块 → 释放整块；覆盖不满一块 → 块保留、区间清零。任何块级洞产生（中间或尾部）→ 文件须能表达空洞：size > 160 → 整文件迁 extent（零搬移，洞两侧各成一条 extent）。inline 文件（≤160）无外置块，打洞 = 洞内清零，态不变。
+- truncate 缩至仍 >160：direct 释放尾块（前缀仍连续，态不变）；extent 删尾部 extent。
+- truncate 缩至 ≤160（含 0）：**强制回迁内联**（size 优先判据的必然推论）——把 [0, newsize) 内容读回 inline_data → 释放全部数据块与树节点 → data_root = ~0ull、direct_bit = 0。禁止只打尾洞不搬回：会造成 “size ≤ 160 却外置映射” 的不一致态，读路径会按内联读 inline_data（数据丢失 + 块泄漏）。
+- extent → direct：v1 不做（无在线规整）；恢复直指 = truncate(0) 重写 / 离线工具。
+
+**翻转写序（崩溃安全）**：外置分配、态迁移、回迁统一落盘顺序 = ① 位图亮灯 → ② 数据块 / 树节点落盘 → ③ inode 字段翻转（data_root、direct_bit、size 同一次写）。inode 更新即提交点：此前崩溃 = 旧态自洽（内容仍为旧值），新块成孤儿由 fsck 回收；禁止先翻 inode 再落数据（会造出指向垃圾的悬挂映射）。
+
+**SOFT_LINK 特化**：target 文本走同判据同迁移（≤160B 内联，超出外置；路径文本无空洞概念，统一语义即可）。size = target 字节数，**不含 NUL**——读回以 size 定界，不依赖结尾符（写路径不写 NUL，统一“长度即载荷”约定）。
 
 ### 4.2 Inode 数组
 

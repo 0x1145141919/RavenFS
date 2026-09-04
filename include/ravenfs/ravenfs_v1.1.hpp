@@ -2,7 +2,7 @@
 #include "../disk_struct_v1.1.hpp"
 #include "cache_mgr_mode.hpp"
 #include "../magics.h"
-
+#include <list>
 /* 缓存子模块前置声明（仅成员指针用，不拉完整头）：
  * 完整类型由使用方 cpp 各自 include inode_cache_radix.hpp /
  * mdata_piece_caches.hpp —— 这两个头会拉 util/tsc.h → <chrono>，
@@ -142,19 +142,28 @@ public:
     }
 private:
     uint64_t God_CTRL_WORD;
+    enum regular_file_type_t{
+    inline_file,direct,extent
+    };
+    regular_file_type_t ftype(raven_Inode_t*inode);
     /* 核心版本：按 inode_type 初始化 + 插入。dir 型急建树根（magic + . / ..）；
      * 目标目录 inode_idx 的 data_root 恒有效（v1.1 §10 不变量 11），
      * 遇 PTR_INVALID = 严重内部磁盘契约违反 → RC_ERR_STATE。 */
     result_code_t dir_insert_dentry(uint64_t inode_idx,const char *name,uint8_t inode_type);
     result_code_t dir_rm_dentry(uint64_t inode_idx,const char *name);
     result_code_t dir_readdir_interval(uint64_t inode_idx,uint64_t base,uint64_t entry_count,dentry_out*buf);
-    result_code_t direct_file_pwrite(uint64_t inode_idx,const char *name,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
-    result_code_t direct_file_punch_hole(uint64_t inode_idx,const char *name,uint64_t offset,uint64_t len);
-    result_code_t direct_file_trunacate(uint64_t inode_idx,const char *name,uint64_t len_new);
-    result_code_t direct_file_pread(uint64_t inode_idx,const char *name,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
+    result_code_t direct_file_pwrite(uint64_t inode_idx,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
+    result_code_t direct_file_punch_hole(uint64_t inode_idx,uint64_t offset,uint64_t len);
+    result_code_t direct_file_trunacate(uint64_t inode_idx,uint64_t len_new);//增大忽略，缩小内部编译为punch_hole的尾巴打洞条件
+    result_code_t direct_file_pread(uint64_t inode_idx,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
     result_code_t dir_name_heap_release(uint64_t inode_idx);//作为dir关闭时调用，遍历十个堆，全空则释放
     result_code_t dir_lookup(uint64_t inode_idx,const char *name, uint64_t *out_inum);
     int64_t dir_readdir(uint64_t inode_idx,dentry_out **out_buf);
+    result_code_t dfprealloc_and_plan(uint64_t inode_idx,uint64_t offset,uint64_t len,std::list<extent_t>&affect_extents);//pwrite的phase1的预分配以及区间规划阶段
+    //这个接口是pwrite的第一步的根据预先写入进行规划的接口，根据写入需求去吐出相应的给写入需求规划的extents里面，放在affect_extents里面之中，很明显是afftect_extents里面是有序单调递增链表
+    //很明显，inline->inline不在这个函数的受理范围之内
+    //外部根据原来的B+树判断是改了，增加了还是什么，下游再根据affect_extents实际对照编译出map/unmap序列
+    result_code_t df_extentify(uint64_t inode_idx);//把REGULAR/INODE型的
     /* ══════════════════════════════════════════════════════════
      * 位图接口组 A/B：薄转发 → bitmap_slices_mgr_t（独立模块）
      * 2026-09-03 顶出：完整契约 / 锁纪律 / 几何推导见

@@ -1,6 +1,6 @@
 # RavenFS — 磁盘布局 v1.1
 
-> 2026-08-19 对齐定稿；2026-08-29 修订（dir inode 直指 dentry 树 + 固定 10 堆描述符，据 `disk_struct_v1.1.hpp` 反向维护）；2026-09-01 修订（区段树区间语义半开化 + link_count 契约补全）。
+> 2026-08-19 对齐定稿；2026-08-29 修订（dir inode 直指 dentry 树 + 固定 10 堆描述符，据 `disk_struct_v1.1.hpp` 反向维护）；2026-09-01 修订（区段树区间语义半开化 + link_count 契约补全）；2026-09-04 修订（REG/SYM 数据区解码判据伪代码化、弃哨兵主判；文件数据区状态机契约落 v1 §4.1，v1.1 收编 §10 不变量 22~25）。
 > v1（`disk_layout_v1.md` + `block_model.md`）的继承与修正。
 > 结构定义见 `include/disk_struct_v1.1.hpp`，本文是它的设计意图与不变量契约。
 
@@ -27,7 +27,7 @@ v1.1 的结构级修正：
 | 5 | 长名外置 → 每目录名字堆（位图分配） | 替代散装块内偏移，分配/回收统一 |
 | 6 | readdir 按 hash 乱序 | 路径解析高频、ls 低频，接受 |
 
-### 0.1 v1.1 内修订（2026-08-29，据 `disk_struct_v1.1.hpp` 反向维护）
+### 0.1 v1.1 内修订（2026-08-29 起，据 `disk_struct_v1.1.hpp` 反向维护）
 
 | # | 修订 | 效果 |
 |---|------|------|
@@ -38,6 +38,7 @@ v1.1 的结构级修正：
 | 11 | **区段树区间语义半开化**（2026-09-01 决策，代码未动、零迁移成本窗口内拍板）：extent_t 左闭右开 `[fblkbase, fblkbase+length)`，`length` = 块数（弃 v1 闭区间 `len=末端偏移/块数=len+1`）；路由 `key` = 子树最大**开边界**、查找 `target < key`；`fblk_cmp` 相邻判定同步半开化（完全在前 ⇔ `fblkbase_i+length_i ≤ fblkbase_{i+1}`） | 消灭全部 off-by-one 转换点（长度换算/相邻合并/分裂/截断），对齐 ext4/XFS 的 start+len 惯例，LLM 生成代码正确性优先；字段结构零变化，仅语义解读 |
 | 12 | **link_count 契约补全**（2026-09-01 决策）：字段自 v1 就在（uint32_t，前 96B 一致）但 v1/v1.1 均无语义解释——REG/SOFT_SYM = 指向该 inode 的 dentry 总数（含创建者，硬链接计数，归零即回收，软链接允许被硬链接）；DIR 初定恒 = 1（见 #13 当日修订）；link(2)/unlink 前置与崩溃顺序、孤儿检测（§3.3 + 不变量 17~21） | 多 dentry 同 inode（硬链接）+ SOFT_SYM 已设计，无契约则 unlink/link/回收语义悬空，LLM 生成代码无依据 |
 | 13 | **DIR link_count 语义再修订**（2026-09-01 当日，弃恒 1）：改 `link_count = size + 2`（2 = `.`/`..` 合成引用约定），**以 size 为真值随写**。动机：恒 1 反 POSIX 直觉（LLM 本能写 2+子目录数，mkdir 代码 `link_count=2` 即实锤），对抗本能的注释不可靠；`size+2` 把维护降为同 inode 内代数关系——无类型判断、无跨目录维护（POSIX 2+子目录数需 mkdir/rmdir/rename 维护父目录，是 LLM 最大漏写点），犯错窗口最小；size 从摆设转为真值，插入/删除/rename 路径开始实际维护 | 代价：ls 显示目录 nlink = 2+条目数（非 POSIX 2+子目录数），自研 FS 接受；fsck 校验升级为 `link_count == size+2` 三重 |
+| 14 | **REG/SYM 数据区解码判据伪代码化**（2026-09-04）：弃表格式“data_root 哨兵主判”，改 v1 §4.1 伪代码判据——**size 优先、`data_root` 取值退出判定**（哨兵退为内联态规范标记）；三态不变量 / 状态迁移 / 翻转写序契约补齐落 v1 §4.1（v1.1 继承未改动），要点收编 §10 不变量 22~25 | 消除“哨兵判据 vs size 判据”双轨歧义（读路径 / fsck 一律以 size 为真值，外置残留 ≠ PTR_INVALID 而 size≤160 = 不一致）；与 v1 判据文本同构，ftype() 与读写路径实现无二义 |
 
 坐标系与块模型（FS_block 世界、Primary/Backup Superblock、bitmap 尾巴布局、
 inode array/inode bitmap 推导）**全部继承 v1，无变化**，见 `block_model.md`。
@@ -97,11 +98,25 @@ raven_dir_Inode_t (DIR):                 type:2 | other:62
 
 REGULAR / SOFT_SYM（`raven_Inode_t`，`is_data_root_direct_bit` 有效，三态继承 v1）：
 
-| `data_root` | `is_data_root_direct_bit` | 含义 |
-|-------------|---------------------------|------|
-| PTR_INVALID | don't care | 内联：内容在 inline_data[0..size-1] |
-| ≠ INVALID | = 1 | 直指区间：连续 FS_block |
-| ≠ INVALID | = 0 | 区段 B+tree 根节点 |
+解码判据 **只依赖 `size` 与 `is_data_root_direct_bit`**（2026-09-04 起用 v1 伪代码形式，弃表格式“data_root 哨兵主判”——`data_root` 取值不参与判定，哨兵退为内联态规范标记；size 优先，判定顺序敏感）：
+
+```c
+/* 判据：假设受审对象是正常 inode（§10 不变量 22~23），以引用访问 i */
+if (i.size <= 160) {                    // 内联：内容在 inline_data[0..size-1]
+    // inline —— data_root 规范 = PTR_INVALID；is_data_root_direct_bit 无解码意义（规范置 0）
+} else if (i.is_data_root_direct_bit) { // 直指区间
+    // i.data_root = base_blk（连续区首 FS_block）
+    // 物理覆盖 = 以 base 起始的 ceil(size/4096) 个连续 FS_block；
+    // 逻辑字节 o → FS_block[base + o/4096] 内偏移 o % 4096（无块级空洞）
+} else {                                // 区段树
+    // i.data_root = 区段 B+tree 根节点块号
+    // size = 逻辑占用大小（含空洞；未映射逻辑块读 0）
+}
+```
+
+- size ≤ 160 一律按内联解读：data_root / direct_bit 无解码意义；外置残留（data_root ≠ PTR_INVALID 而 size ≤ 160）= 不一致，fsck 以 size 为真值清理（不变量 23）
+- 直指 = 全文件无块级空洞（逻辑块 [0, ceil(size/4096)) 全映射且物理连续）的最优路径：一次间接、零树节点 I/O；任何块级空洞 / 碎片 → 整文件迁区段树（数据零搬移）
+- 三态不变量表、状态迁移（inline 跨 160 升级、direct ↔ extent 零搬移、truncate ≤160 强制回迁内联）、翻转写序、SOFT_SYM 载荷约定（**size = target 字节数，不含结尾 NUL**，读回以 size 定界）：**完整契约 = v1 §4.1**（v1.1 继承未改动），要点收编为 §10 不变量 22~25
 
 DIR（`raven_dir_Inode_t`，单态）：
 
@@ -427,6 +442,13 @@ bitmap 亮灯；数据面容量 = 2^total_bits_count_log2 × 粒度，见下表�
 19. `link(2)` 前置：源已分配、type ≠ DIR、`link_count < UINT32_MAX`、目标名不存在；全过才 `++`，失败无副作用
 20. unlink 顺序：先删 dentry（落盘）→ 后 `link_count--`；磁盘回收延迟到 VFS 内存引用归零
 21. fsck：以 dentry 树扫描引用数为准重建 REG/SOFT_SYM 计数；dentry 指向的 inode 必须已分配（禁悬挂）；DIR 校验 `link_count == size+2` 与 `size==0 ⇔ link_count==2`（空目录）
+
+### 文件数据区（REGULAR / SOFT_SYM）
+
+22. 解码判据只依 `size` 与 `is_data_root_direct_bit`（size 优先；`data_root` 取值不参与判定）：size ≤ 160 → 内联（内容 inline_data[0..size-1]，规范 data_root = PTR_INVALID）；size > 160 ∧ direct_bit = 1 → 直指（data_root = 连续区首块，物理占块 = ceil(size/4096)，逻辑字节 o → data_root + o/4096 块内 o%4096，无块级空洞）；size > 160 ∧ direct_bit = 0 → 区段树（data_root = 根块号，空洞读 0）
+23. 三态互斥由 size 保证：外置两态只在 size > 160 出现；size ≤ 160 而 data_root ≠ PTR_INVALID = 不一致（fsck 以 size 为准清理残留并告警）
+24. 迁移：inline → direct/extent（写跨 160，内容拷入首块）；direct 增长需相邻块可续，不可得 → 整文件迁 extent（数据零搬移，旧连续区 = 单条 extent）；写洞 / 打洞（size 不变，整块释放、残块清零）产生块级洞 → extent；truncate 缩至 >160 态不变（direct 释放尾块 / extent 删尾部 extent）；truncate 缩至 ≤160 → 强制回迁内联（读回 inline_data + 释放数据块与树 + 复位 data_root）；extent → direct 不做
+25. 翻转写序（外置分配 / 迁移 / 回迁统一）：位图亮灯 → 数据块 / 树节点落盘 → inode 字段翻转（data_root / direct_bit / size 同一次写 = 提交点）；崩溃窗口 = 孤儿块，fsck 回收；禁止先翻 inode（会造出悬挂映射）
 
 ---
 
