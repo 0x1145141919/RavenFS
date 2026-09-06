@@ -1037,7 +1037,8 @@ result_code_t RavenFS_juvenile::extent_root_shrink(uint64_t &root_blk, uint64_t 
  *         非根欠载（count<168）→ 父中定位 → extent_node_balance
  *         （RC_ERR_STATE = 父为根单孩 → 收缩提升）→ 父 key 上溯刷新
  *         → need 则子=父继续，否则查父是否根内单孩残留并收尾。
- * 供 unmap 删记录欠载、map 跨界右并致邻叶欠载两条路径共用。
+ * 供 unmap 删记录欠载路径使用（map 2026-09-06 降级为纯插不融合后，
+ * 无"跨界右并致邻叶欠载"路径；未来 merge_range 收敛致欠载亦复用本链）。
  * detach（2026-09-06）：root_blk& in/out 穿透 —— 根收缩发生时把新根带回调用方；
  * owner_inode_idx 仅传给收缩侧写 "." 锚。
  * ═══════════════════════════════════════════════════════════════════ */
@@ -1106,21 +1107,28 @@ result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * extent_map_range — 声明式映射原语（原语对·插侧）
+ * extent_map_range — 声明式映射原语（插侧 · 降级版：只插入，不融合）
  *
- * 语义：声明 [ext.fblkbase, ext.fblkbase+ext.length) 由 ext.block_base
- * 起 length 个连续 FS_block 背书。防御自检：落点 GLB 覆盖 fblkbase
- * （区间与既有映射有任何重叠）→ RC_ERR_OVERLAP（紧贴合法，半开无交集）。
+ * 2026-09-06 降级决策（F 组融合测试实证 map 内建融合不完备——跨界左并
+ * 缺失、融合致欠载叶不回收，见 tests/test_extent_fusion.cpp F1d/F2）：
+ *   融合义务从 map 剥离 → 归显式收敛原语 extent_merge_range（单独实现/测试）。
+ *   map 语义收缩为：插入 ext 记录 + 重叠防御 + 超满分裂。树内可并残留由
+ *   调用方显式 merge 收敛（pwrite 五步管线 phase3 的职责）。
  *
- * 内部：邻接合并（左并：GLB fblk 紧贴 && phys 连续 → 扩 GLB；右并：目标
- * 记录右侧紧邻记录同条件 → 吞并删记录，同叶/跨界两态）→ 纯插溢出
- * （count>337）分裂级联（叶裂 → 父 apply → 内裂递归 → 根裂建新根）→
- * 跨界吞并致邻叶欠载 → extent_balance_from。父 key 上溯刷新兜底。
+ * 语义：声明 [ext.fblkbase, ext.fblkbase+ext.length) 由 ext.block_base 起
+ * length 个连续 FS_block 背书（纯记录层，不碰数据侧位图）。重叠防御双向：
+ *   - 落点 GLB 覆盖 ext.fblkbase（起点落入既有区间）→ RC_ERR_OVERLAP；
+ *   - 插入段覆盖右邻起点（ext.end > 右邻.fblkbase）→ RC_ERR_OVERLAP。
+ * 紧贴合法（半开区间无交集），但**不自动融合**——相邻可并记录保持分离，
+ * canonical 收敛（可并即并）是 extent_merge_range 的职责。
  *
- * 外显契约：ext.block_base 已由外部分配（测试可假性）；本函数不碰数据
- * 侧位图，也不碰 inode（detach，2026-09-06）——root_blk in/out，根裂建新根
- * 经引用带出；owner_inode_idx 仅在建新根时写根 meta "." 锚。调用方保证
- * root_blk 指向合法 extent 树根（inline→extent 跃迁归 direct_file_* 层）。
+ * 内部：纯插（GLB 后 memmove 腾槽）→ count+1 → 超满（>337）分裂级联
+ * （叶裂 → 父 apply → 内裂递归 → 根裂建新根）→ 父 key 上溯刷新。
+ * 无融合 → 无"融合致邻叶欠载"路径 → 无 other_underflow 平衡段。
+ *
+ * 外显契约（detach，2026-09-06）：root_blk in/out（根裂建新根经引用带出）；
+ * owner_inode_idx 纯审计锚（根 meta "."）；不碰 inode。调用方保证 root_blk
+ * 指向合法 extent 树根（inline→extent 跃迁归 direct_file_* 层）。
  * ═══════════════════════════════════════════════════════════════════ */
 result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t owner_inode_idx,
                                                  const extent_t &ext)
@@ -1138,8 +1146,6 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
     bool need_split = false;
     bool did_split = false;
     uint64_t split_high_leaf = 0;
-    bool other_underflow = false;
-    uint64_t other_blk = 0;
 
     {
         mdata_piece_session sess(mdata_piece_mgr, leaf_blk);
@@ -1150,85 +1156,29 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
             return RC_ERR_STATE;
         uint16_t count = (uint16_t)leaf->meta.parent_ptr.entry_count;
 
-        if (hit) return RC_ERR_OVERLAP;   /* 防御：任何区间重叠即报错 */
+        if (hit) return RC_ERR_OVERLAP;   /* 起点被 GLB 覆盖（区间重叠） */
 
-        /* ── 左并：GLB 紧贴 + phys 连续 → 扩展 GLB（无新记录） ── */
-        bool left_merge = false;
-        if (glb != EXTENT_LEAF_GLB_NONE) {
-            const extent_t le = leaf->extents[glb];   /* packed 成员禁引用绑定 → 拷贝 */
-            left_merge = (le.fblkbase + le.length == ext.fblkbase) &&
-                         (le.block_base.ptr + le.length == ext.block_base.ptr);
+        /* ── 纯插（不融合）：GLB 后腾槽插入 ── */
+        const uint16_t pos = (glb == EXTENT_LEAF_GLB_NONE) ? 0 : (uint16_t)(glb + 1);
+        if (pos < count) {
+            /* 防御：插入段不得覆盖右邻起点（半开合法 = ext.end <= 右邻.fblkbase） */
+            const extent_t r = leaf->extents[pos];
+            if (ext.fblkbase + ext.length > r.fblkbase)
+                return RC_ERR_OVERLAP;
         }
-        uint16_t pos;
-        if (left_merge) {
-            leaf->extents[glb].length += ext.length;
-            pos = glb;
-        } else {
-            pos = (glb == EXTENT_LEAF_GLB_NONE) ? 0 : (uint16_t)(glb + 1);
-            if (pos < count) {
-                memmove(&leaf->extents[pos + 1], &leaf->extents[pos],
-                        (size_t)(count - pos) * sizeof(extent_t));
-            }
-            leaf->extents[pos] = ext;
-            count++;
-            leaf->meta.parent_ptr.entry_count = count;
+        if (pos < count) {
+            memmove(&leaf->extents[pos + 1], &leaf->extents[pos],
+                    (size_t)(count - pos) * sizeof(extent_t));
         }
-
-        /* ── 右并：目标记录右邻（同叶/跨界）fblk 紧贴 + phys 连续 → 吞并 ──
-         * 路由不变量：纯插到叶末只发生在树最右叶；跨界态仅"左并扩展叶末项"
-         * 可达（目标成为叶末项且叶非最右）。 */
-        extent_t tgt = leaf->extents[pos];   /* 局部拷贝（packed 禁引用） */
-        const uint64_t tgt_end = tgt.fblkbase + tgt.length;
-        const uint64_t tgt_phys_end = tgt.block_base.ptr + tgt.length;
-
-        if (pos + 1 < count) {
-            const extent_t r = leaf->extents[pos + 1];
-            if (r.fblkbase == tgt_end && r.block_base.ptr == tgt_phys_end) {
-                const uint64_t rlen = r.length;
-                memmove(&leaf->extents[pos + 1], &leaf->extents[pos + 2],
-                        (size_t)(count - pos - 2) * sizeof(extent_t));
-                memset(&leaf->extents[count - 1], 0, sizeof(extent_t));
-                count--;
-                leaf->meta.parent_ptr.entry_count = count;
-                tgt.length += rlen;
-                leaf->extents[pos] = tgt;   /* 写回 */
-            }
-        } else if (!leaf->meta.parent_ptr.is_root_node) {
-            const uint64_t nb = leaf->meta.ptrs[2].ptr;
-            if (nb != PTR_INVALID_52) {
-                mdata_piece_session ns(mdata_piece_mgr, nb);
-                if (ns.index_error()) return RC_ERR_STATE;
-                if (!ns) return RC_ERR_IO;
-                Bptree_extent_leaf_node_t *nleaf = (Bptree_extent_leaf_node_t *)ns.data;
-                if (!is_extent_node(&nleaf->meta) || nleaf->meta.parent_ptr.is_inner_node)
-                    return RC_ERR_STATE;
-                uint16_t ncnt = (uint16_t)nleaf->meta.parent_ptr.entry_count;
-                if (ncnt > 0) {
-                    const extent_t r = nleaf->extents[0];
-                    if (r.fblkbase == tgt_end && r.block_base.ptr == tgt_phys_end) {
-                        const uint64_t rlen = r.length;
-                        memmove(&nleaf->extents[0], &nleaf->extents[1],
-                                (size_t)(ncnt - 1) * sizeof(extent_t));
-                        memset(&nleaf->extents[ncnt - 1], 0, sizeof(extent_t));
-                        ncnt--;
-                        nleaf->meta.parent_ptr.entry_count = ncnt;
-                        ns.dirty();
-                        tgt.length += rlen;
-                        leaf->extents[pos] = tgt;   /* 写回（本叶目标记录扩展） */
-                        if (!nleaf->meta.parent_ptr.is_root_node && ncnt < 168) {
-                            other_underflow = true;   /* 跨界叶欠载/空 → 事后平衡 */
-                            other_blk = nb;
-                        }
-                    }
-                }
-            }
-        }
+        leaf->extents[pos] = ext;
+        count++;
+        leaf->meta.parent_ptr.entry_count = count;
 
         need_split = count > 337;
         sess.dirty();
-    }   /* 叶会话析构写回；分裂/平衡前必须关（同块双会话不互见修改） */
+    }   /* 叶会话析构写回；分裂前必须关（同块双会话不互见修改） */
 
-    /* ── 分裂级联（镜像 dir_insert_dentry 阶段二） ── */
+    /* ── 分裂级联（叶裂 → 父 apply → 内裂递归 → 根裂建新根） ── */
     if (need_split) {
         split_result_t sr = extent_leaf_split(leaf_blk);
         if (sr.rc != RC_OK) return sr.rc;
@@ -1255,7 +1205,6 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
                 if (!is_extent_node(&pn->meta) || !pn->meta.parent_ptr.is_inner_node)
                     return RC_ERR_STATE;
                 const bool parent_is_root = pn->meta.parent_ptr.is_root_node;
-                /* 分裂前取祖父：自身 parent_ptr 不受分裂影响 */
                 const uint64_t grand_blk = pn->meta.parent_ptr.ptr;
                 split_result_t isr = extent_inner_split(cur_parent);
                 if (isr.rc != RC_OK) return isr.rc;
@@ -1289,18 +1238,12 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
         }
     }
 
-    /* ── 父 key 刷新：分裂后从两半叶上溯、未分裂从本叶上溯。
-     * 必须先于 balance_from：彼时合并可能吞掉本叶/兄弟叶（避免刷已释放块）。 ── */
+    /* ── 父 key 刷新：从本叶上溯；分裂后两半叶都刷。
+     * 降级版无 balance 路径（融合剥离），顺序纪律保留（防未来加回）。 ── */
     rc = extent_refresh_key_chain(leaf_blk);
     if (rc) return rc;
     if (did_split) {
         rc = extent_refresh_key_chain(split_high_leaf);
-        if (rc) return rc;
-    }
-
-    /* ── 跨界右并引发的邻叶欠载（含空叶）→ 自下而上平衡 ── */
-    if (other_underflow) {
-        rc = extent_balance_from(other_blk, owner_inode_idx, root_blk);
         if (rc) return rc;
     }
     return RC_OK;

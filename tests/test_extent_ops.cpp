@@ -16,7 +16,8 @@
  *      A. 基础语义：纯插/左并/右并桥接/重叠报错/三字段全等校验/NOT_FOUND
  *      B. 分裂级联：340 条记录打穿根叶裂 → 根内部（depth2）→ 全删触发
  *         欠载合并/根收缩 → 回到空根叶
- *   全程树完整性审计（DFS：键序/父子指针/max key/兄弟链/canonical 邻接）。
+ *   全程树完整性审计（DFS：键序/父子指针/max key/兄弟链；canonical 邻接检查
+ *   已随 map 降级移除——纯插世界观可并残留合法，收敛归 extent_merge_range）。
  *
  * 假性分配：数据 phys 全部编造（不经 block_alloc）——原语对不碰数据侧
  * 位图，天然支持"纯记录不落实分配契约"；树节点块（2 块一组）真分配。
@@ -183,8 +184,7 @@ static uint64_t audit_node(RavenFS_juvenile &fs, audit_t &a, uint64_t blk,
             if (i > 0) {
                 const extent_t p = leaf->extents[i - 1];
                 if (p.fblkbase + p.length > e.fblkbase) a.bad++;            /* 重叠/逆序 */
-                if (p.fblkbase + p.length == e.fblkbase &&
-                    p.block_base.ptr + p.length == e.block_base.ptr) a.bad++; /* 可合并未合并 */
+                /* 可合并未合并检查已移除：map 降级纯插后合法，收敛归 merge_range */
             }
         }
         a.leaf_blk.push_back(blk);
@@ -221,8 +221,7 @@ static uint64_t audit_node(RavenFS_juvenile &fs, audit_t &a, uint64_t blk,
     return prev_key;
 }
 
-/* 兄弟链校验：从最左叶沿 ptrs[2] 走到尾，须与 DFS 叶序完全一致；
- * 跨叶 canonical：前叶末项与后叶首项不得可合并。 */
+/* 兄弟链校验：从最左叶沿 ptrs[2] 走到尾，须与 DFS 叶序完全一致。 */
 static void audit_chain(RavenFS_juvenile &fs, audit_t &a, uint64_t root_blk) {
     /* 下钻最左叶 */
     uint64_t blk = root_blk;
@@ -243,13 +242,7 @@ static void audit_chain(RavenFS_juvenile &fs, audit_t &a, uint64_t root_blk) {
         if (idx >= a.leaf_blk.size()) { a.bad++; return; }   /* 链比 DFS 长 */
         if (blk != a.leaf_blk[idx]) { a.bad++; return; }      /* 链序 != DFS 序 */
         if (a.leaf_cnt[idx] > 0 && have_prev) {
-            /* 跨叶 canonical：gap==0 && phys 连续 → 应已合并 */
-            uint64_t end0 = a.leaf_end[idx - 1], ph0 = a.leaf_phys_end[idx - 1];
-            mdata_piece_session s(fs.mdata_piece_mgr, blk);
-            if (s.index_error() || !s) { a.bad++; return; }
-            auto *leaf = (Bptree_extent_leaf_node_t *)s.data;
-            const extent_t f = leaf->extents[0];
-            if (end0 == f.fblkbase && ph0 == f.block_base.ptr) a.bad++;
+            /* 跨叶可并残留检查已移除（map 降级纯插后合法，收敛归 merge_range） */
         }
         have_prev = true;
         prev_end = a.leaf_end[idx];
@@ -628,39 +621,41 @@ int main(int argc, char **argv) {
     CHECK(root_blk != PTR_INVALID, "inline→extent 跃迁建树根 blk=%lu", root_blk);
     const uint64_t ROOT0 = root_blk;   /* 初始根叶（detach：此后 live 根只在 root_blk 里） */
 
-    /* ── 2. A 组：基础语义 ── */
-    printf("\n-- A：基础 map/unmap 语义（单叶根树） --\n");
+    /* ── 2. A 组：基础语义（map 降级 2026-09-06：纯插不融合） ── */
+    printf("\n-- A：基础 map/unmap 语义（纯插不融合，单叶根树） --\n");
     audit_run(fs, root_blk, inum, "empty", nullptr);
 
     CHECK(fs.extent_map_range(root_blk, inum, mk_ext(0, 4, 100)) == RC_OK, "map [0,4)p100");
     audit_run(fs, root_blk, inum, "A1", nullptr);
 
-    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(4, 2, 104)) == RC_OK, "map [4,6)p104 → 左并");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(4, 2, 104)) == RC_OK, "map [4,6)p104（紧贴不并）");
     CHECK(fs.extent_map_range(root_blk, inum, mk_ext(10, 3, 200)) == RC_OK, "map [10,13)p200（留洞 [6,10)）");
-
     audit_t a2;
     audit_run(fs, root_blk, inum, "A2", &a2);
-    CHECK(a2.records == 2, "A2 records=2（[0,6)p100 与 [10,13)p200）got %lu", a2.records);
+    CHECK(a2.records == 3, "A2 records=3（纯插：紧贴/phys 连续也不并，融合归 merge_range）got %lu", a2.records);
 
-    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(6, 4, 106)) == RC_OK, "map [6,10)p106 → 双并桥接");
+    /* 填洞纯插（原"双并桥接自动合并"语义已剥离 → 现在只是又一条独立记录） */
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(6, 4, 106)) == RC_OK, "map [6,10)p106（填洞，不并）");
     audit_t a3;
     audit_run(fs, root_blk, inum, "A3", &a3);
-    CHECK(a3.records == 2, "A3 records=2（[0,10)p100 与 [10,13)p200）got %lu", a3.records);
+    CHECK(a3.records == 4, "A3 records=4（[0,4)[4,6)[6,10)[10,13) 四条紧贴分离）got %lu", a3.records);
 
-    /* 重叠防御 */
+    /* 重叠防御（双向：起点覆盖 + 插入段覆盖右邻起点） */
     CHECK(fs.extent_map_range(root_blk, inum, mk_ext(1, 1, 0)) == RC_ERR_OVERLAP, "overlap [1,2) 内嵌 → OVERLAP");
-    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(5, 3, 0)) == RC_ERR_OVERLAP, "overlap [5,8) 覆盖 → OVERLAP");
-    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(9, 2, 7)) == RC_ERR_OVERLAP, "overlap [9,11) 跨记录 → OVERLAP");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(5, 3, 0)) == RC_ERR_OVERLAP, "overlap [5,8) 起点被 [4,6) 覆盖 → OVERLAP");
     CHECK(fs.extent_map_range(root_blk, inum, mk_ext(0, 13, 1)) == RC_ERR_OVERLAP, "overlap [0,13) 全包 → OVERLAP");
+    /* 右邻防御：起点在洞 [6,10)，但段覆盖 [10,13) 起点 → 双向防御的右半边 */
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(7, 4, 777)) == RC_ERR_OVERLAP, "overlap [7,11) 起点洞内但覆盖右邻 → OVERLAP");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(9, 2, 7)) == RC_ERR_OVERLAP, "overlap [9,11) 同 → OVERLAP");
     audit_t a4;
     audit_run(fs, root_blk, inum, "A4(overlap 后无副作用)", &a4);
-    CHECK(a4.records == 2 && a4.bad == 0, "overlap 失败零副作用 records=2");
+    CHECK(a4.records == 4 && a4.bad == 0, "overlap 失败零副作用 records=4");
 
     /* unmap：三字段全等校验 */
     CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(10, 3, 200)) == RC_OK, "unmap 精确 [10,13)p200");
     audit_t a5;
     audit_run(fs, root_blk, inum, "A5", &a5);
-    CHECK(a5.records == 1, "A5 records=1 got %lu", a5.records);
+    CHECK(a5.records == 3, "A5 records=3 got %lu", a5.records);
 
     CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 10, 999)) == RC_ERR_STATE, "unmap phys 失配 → STATE");
     CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 9, 100)) == RC_ERR_STATE,  "unmap length 失配 → STATE");
@@ -668,17 +663,21 @@ int main(int argc, char **argv) {
     CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(20, 1, 50)) == RC_ERR_NOT_FOUND, "unmap 空洞 → NOT_FOUND");
     audit_run(fs, root_blk, inum, "A6(失配后无副作用)", nullptr);
 
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 10, 100)) == RC_OK, "unmap [0,10)p100 → 空树");
+    /* 紧贴分离记录的独立可撤销性（降级核心收益：不融合 → 每条记录三字段全等
+     * 可被精确 unmap——pwrite 回滚不再需要区间撤销/裁切 hack） */
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 4, 100)) == RC_OK, "unmap 紧贴记录 [0,4)p100 → 独立可撤");
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(4, 2, 104)) == RC_OK, "unmap [4,6)p104 → 独立可撤");
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(6, 4, 106)) == RC_OK, "unmap [6,10)p106 → 独立可撤");
     audit_t a7;
     audit_run(fs, root_blk, inum, "A7", &a7);
     CHECK(a7.records == 0 && a7.leaves == 1, "A7 空根叶 records=0 got %lu", a7.records);
     CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 10, 100)) == RC_ERR_NOT_FOUND, "空树再 unmap → NOT_FOUND");
 
-    /* detach 断言：A 组全程单叶（≤2 记录）→ 根未更迭，live 根 == 初值；
+    /* detach 断言：A 组全程单叶（≤4 记录）→ 根未更迭，live 根 == 初值；
      * inode.data_root 自 phase5 初提交后从未被原语改写。 */
     CHECK(root_blk == ROOT0, "A 组无分裂无收缩 → root_blk 恒为初值 blk=%lu", root_blk);
     CHECK(inode_data_root(fs, inum) == ROOT0, "detach：原语未写 inode（data_root 仍为 phase5 初提交值）");
-    phase5_commit(fs, inum, root_blk);   /* 模拟提交点收口（根未变，写回同值） */
+
 
     /* ── 3. B 组：分裂级联（根叶 337 满 → 338 裂 → 根内部） ── */
     printf("\n-- B：分裂级联 + 欠载合并/根收缩 --\n");
@@ -725,14 +724,15 @@ int main(int argc, char **argv) {
     phase5_commit(fs, inum, root_blk);   /* 提交点：把收缩后的空根叶收口进 inode */
     CHECK(inode_data_root(fs, inum) == root_blk, "C phase5 收口：inode.data_root == 收缩后空根叶");
     CHECK(fs.extent_map_range(root_blk, inum, mk_ext(0, 8, 500)) == RC_OK, "收缩后 map [0,8)p500");
-    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(8, 4, 508)) == RC_OK, "map [8,12)p508 → 左并");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(8, 4, 508)) == RC_OK, "map [8,12)p508（紧贴不并）");
     audit_t c1;
     audit_run(fs, root_blk, inum, "C", &c1);
-    CHECK(c1.records == 1, "C records=1（合并 [0,12)p500）got %lu", c1.records);
+    CHECK(c1.records == 2, "C records=2（纯插：紧贴 [0,8)+[8,12) 分离）got %lu", c1.records);
     phase5_commit(fs, inum, root_blk);
     CHECK(inode_data_root(fs, inum) == root_blk, "C 二次收口后 inode.data_root == live 根");
-    /* 收尾清空，留干净盘给 D 组统计（可选） */
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 12, 500)) == RC_OK, "C 清空 [0,12)p500");
+    /* 收尾清空（两条紧贴记录各自精确 unmap），留干净盘给 D 组统计（可选） */
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 8, 500)) == RC_OK, "C 清空 [0,8)p500");
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(8, 4, 508)) == RC_OK, "C 清空 [8,12)p508");
     audit_run(fs, root_blk, inum, "C 清空后", nullptr);
     phase5_commit(fs, inum, root_blk);
 

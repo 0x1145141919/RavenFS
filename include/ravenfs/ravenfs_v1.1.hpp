@@ -197,7 +197,7 @@ private:
      * 五步管线 phase5）。顶层 inode 态校验（type/direct_bit/data_root 有效性）删除：
      * 调用方负责传入合法文件树根（本原语仅保 RC_ERR_OVERLAP/NOT_FOUND 等树内语义）。 */
     result_code_t extent_map_range(uint64_t &root_blk, uint64_t owner_inode_idx, const extent_t &ext); //内部有任何区间有交集会报错
-    
+    result_code_t extent_discard_range(uint64_t &root_blk, uint64_t owner_inode_idx, uint64_t logical_base_blk,uint64_t len);
     result_code_t extent_unmap_range(uint64_t &root_blk, uint64_t owner_inode_idx, const extent_t &ext);//外部有侦查，这里是精确匹配删除extent_t叶子节点的记录
 
     result_code_t extent_merge_range(uint64_t &root_blk, uint64_t owner_inode_idx, uint64_t logical_block_interval_base,uint64_t blk_len);//查看区间B+树的[logical_block_interval_base,logical_block_interval_base+blk_len)的对应逻辑且物理连续的extent在这个接口里面原子性融合
