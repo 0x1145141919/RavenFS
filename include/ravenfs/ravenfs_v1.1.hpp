@@ -189,11 +189,19 @@ private:
     /* ── inode I/O（零缓存）── */
     void inode_read(uint64_t inum, raven_Inode_t *out) const;
     void inode_write(uint64_t inum, const raven_Inode_t *in);
-    
-    result_code_t extent_map_range(uint64_t inode_idx, const extent_t &ext); //内部有任何区间有交集会报错
-    
-    result_code_t extent_unmap_range(uint64_t inode_idx, const extent_t &ext);//外部有侦查，这里是精确匹配删除extent_t叶子节点的记录
 
+    /* detach 原语对（2026-09-06，pwrite_pipeline.md §9）：
+     * root_blk in/out —— 入 = 当前树根，出 = 操作后根（根裂建新根 / 根收缩更迭经引用带出）；
+     * owner_inode_idx 降级为纯审计锚（根 meta parent_ptr.ptr = "."，只写不读），
+     * 不触发任何 inode I/O —— inode.data_root 回写权收归调用方提交点（direct_file
+     * 五步管线 phase5）。顶层 inode 态校验（type/direct_bit/data_root 有效性）删除：
+     * 调用方负责传入合法文件树根（本原语仅保 RC_ERR_OVERLAP/NOT_FOUND 等树内语义）。 */
+    result_code_t extent_map_range(uint64_t &root_blk, uint64_t owner_inode_idx, const extent_t &ext); //内部有任何区间有交集会报错
+    
+    result_code_t extent_unmap_range(uint64_t &root_blk, uint64_t owner_inode_idx, const extent_t &ext);//外部有侦查，这里是精确匹配删除extent_t叶子节点的记录
+
+    result_code_t extent_merge_range(uint64_t &root_blk, uint64_t owner_inode_idx, uint64_t logical_block_interval_base,uint64_t blk_len);//查看区间B+树的[logical_block_interval_base,logical_block_interval_base+blk_len)的对应逻辑且物理连续的extent在这个接口里面原子性融合
+    //很明显此接口不关心是否外部位图上是否实际占用只是记录耦合
     /* ── 位图核心 ── */
     bool bitmaps_load();     /* mount 时：直写=全量 pread 入内存；mmap 后端=窗口切片（不预取）。
                                 * 两模式共用自描述校验(§6.6)；原始内存喂给 bitmap_slices_mgr_t 装配 */
@@ -479,8 +487,8 @@ private:
     /* ══════════════════════════════════════════════════════════
      * extent 原语对内部机械（2026-09-03；extent_map_range/unmap_range 支撑）
      * 镜像 dentry 六件套，差异：key = 子树最大开边界 (fblkbase+length)；
-     * 根更替回写文件 inode.data_root（无全局句柄）；文件树根无 ".."
-     * （ptrs[1] 恒 PTR_INVALID）；阶 337：欠载阈值 168（非根）／合并上界
+     * 根更迭经 root_blk& 引用上抛（2026-09-06 detach，不再回写 inode）；文件树根无
+     * ".."（ptrs[1] 恒 PTR_INVALID）；阶 337：欠载阈值 168（非根）／合并上界
      * total ≤ 337 ／分裂左 168 右 count−168。split_result_t 复用，其
      * low_node_maxhash 字段在 extent 侧承载“左半最大开边界 key”。
      * ══════════════════════════════════════════════════════════ */
@@ -488,11 +496,15 @@ private:
     split_result_t extent_inner_split(uint64_t victim_blk);  /* 内裂：右半孩子 reparent 新块 */
     result_code_t extent_spilt_parent_apply(uint64_t parent_blk, uint16_t victim_idx,
                                             split_result_t r, bool &parent_spilt);
+    /* 根更迭沿引用链穿透（detach，2026-09-06）：三者收 root_blk& in/out；
+     * owner_inode_idx 仅写根 meta "." 审计锚，零 inode I/O。 */
     result_code_t extent_new_root_inner(uint64_t low_blk, uint64_t low_key,
-                                        uint64_t high_blk, uint64_t inode_idx);
+                                        uint64_t high_blk, uint64_t owner_inode_idx,
+                                        uint64_t &root_blk);
     result_code_t extent_node_balance(uint64_t parent_blk, uint16_t idx, bool &need_balance);
-    result_code_t extent_root_shrink(uint64_t root_blk, uint64_t inode_idx);
-    result_code_t extent_balance_from(uint64_t child_blk, uint64_t inode_idx); /* 欠载链修复（自下而上，含收尾根收缩） */
+    result_code_t extent_root_shrink(uint64_t &root_blk, uint64_t owner_inode_idx);
+    result_code_t extent_balance_from(uint64_t child_blk, uint64_t owner_inode_idx,
+                                      uint64_t &root_blk); /* 欠载链修复（自下而上，含收尾根收缩） */
     result_code_t extent_refresh_key_chain(uint64_t blk);    /* 节点 max key 变更后沿父链上溯刷新 */
 };
 bool is_dentry_node(Bptree_meta_t*meta);

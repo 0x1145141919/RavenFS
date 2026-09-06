@@ -699,11 +699,13 @@ result_code_t RavenFS_juvenile::extent_spilt_parent_apply(
 /* ═══════════════════════════════════════════════════════════════════
  * extent_new_root_inner — 分裂后建新根内部节点（文件树专用）
  * 低/高两子提升为新根 hints[0]/[1]；两子 parent_ptr 收敛到新根；
- * 回写文件 inode.data_root。根 meta：parent_ptr.ptr = 文件自身 inode
- * （"." 审计锚），ptrs[1] 恒 PTR_INVALID（文件树无 ".."）。
+ * 新根块号经 root_blk& 带出（detach，2026-09-06：不再回写 inode.data_root，
+ * 提交权归调用方）。根 meta：parent_ptr.ptr = owner_inode_idx（"." 审计锚），ptrs[1] 恒 PTR_INVALID（文件树无 ".."）。
  * ═══════════════════════════════════════════════════════════════════ */
 result_code_t RavenFS_juvenile::extent_new_root_inner(uint64_t low_blk, uint64_t low_key,
-                                                      uint64_t high_blk, uint64_t inode_idx)
+                                                      uint64_t high_blk,
+                                                      uint64_t owner_inode_idx,
+                                                      uint64_t &root_blk)
 {
     uint64_t new_root_blk = block_alloc_hard(2, 1);
     if (new_root_blk == PTR_INVALID) return RC_ERR_NO_BLOCK;
@@ -712,7 +714,7 @@ result_code_t RavenFS_juvenile::extent_new_root_inner(uint64_t low_blk, uint64_t
     if (root_sess.index_error()) return RC_ERR_STATE;
     if (!root_sess) return RC_ERR_IO;
     Bptree_extent_inner_node_t *new_root = (Bptree_extent_inner_node_t *)root_sess.data;
-    extent_node_meta_init(root_sess.data, 2, true, true, inode_idx);   /* "." */
+    extent_node_meta_init(root_sess.data, 2, true, true, owner_inode_idx);   /* "." 审计锚 */
     new_root->meta.ptrs[1].ptr = PTR_INVALID;   /* 无 ".." */
 
     new_root->extents[0].key = low_key;
@@ -744,11 +746,8 @@ result_code_t RavenFS_juvenile::extent_new_root_inner(uint64_t low_blk, uint64_t
 
     root_sess.dirty();
 
-    /* 根更替：回写文件 inode.data_root（文件树无全局句柄；统一 InodeSession） */
-    InodeSession ino_sess(inode_cache_mgr, inode_idx);
-    if (!ino_sess) return RC_ERR_IO;
-    ino_sess.inode->data_root = new_root_blk;
-    ino_sess.dirty();
+    /* 根更迭：新根块号沿引用带出（不碰 inode；提交 = 调用方写 data_root） */
+    root_blk = new_root_blk;
     return RC_OK;
 }
 
@@ -987,13 +986,15 @@ result_code_t RavenFS_juvenile::extent_node_balance(
 
 /* ═══════════════════════════════════════════════════════════════════
  * extent_root_shrink — 根收缩：根内部只剩 1 孩时提升该孩为新根
- * 孩子 is_root=1、parent_ptr.ptr = 文件 inode（"."）；叶子清兄弟链
- * （文件树根无 ".." → ptrs 全 INVALID）；回写 data_root；释放旧根 2 块。
+ * root_blk& in/out：入 = 旧根，收缩成功时出 = 提升后的新根（detach，2026-09-06，
+ * 不写 inode）。孩子 is_root=1、parent_ptr.ptr = owner_inode_idx（"." 审计锚）；
+ * 叶子清兄弟链（文件树根无 ".." → ptrs 全 INVALID）；释放旧根 2 块。
  * 返回：RC_OK（成功或无需收缩：非内部/entry_count≠1）/ RC_ERR_STATE（非根）。
  * ═══════════════════════════════════════════════════════════════════ */
-result_code_t RavenFS_juvenile::extent_root_shrink(uint64_t root_blk, uint64_t inode_idx)
+result_code_t RavenFS_juvenile::extent_root_shrink(uint64_t &root_blk, uint64_t owner_inode_idx)
 {
-    mdata_piece_session root_sess(mdata_piece_mgr, root_blk);
+    const uint64_t old_root = root_blk;   /* 引用入参：收缩前先捕获旧根块号 */
+    mdata_piece_session root_sess(mdata_piece_mgr, old_root);
     if (root_sess.index_error()) return RC_ERR_STATE;
     if (!root_sess) return RC_ERR_IO;
     Bptree_extent_inner_node_t *root = (Bptree_extent_inner_node_t *)root_sess.data;
@@ -1012,7 +1013,7 @@ result_code_t RavenFS_juvenile::extent_root_shrink(uint64_t root_blk, uint64_t i
     if (cm->parent_ptr.is_root_node) return RC_ERR_STATE;   /* 孩子已是根：结构损坏 */
 
     cm->parent_ptr.is_root_node = 1;
-    cm->parent_ptr.ptr = inode_idx;   /* "." 审计锚 */
+    cm->parent_ptr.ptr = owner_inode_idx;   /* "." 审计锚 */
     if (!cm->parent_ptr.is_inner_node) {
         Bptree_extent_leaf_node_t *cl = (Bptree_extent_leaf_node_t *)child_sess.data;
         cl->meta.ptrs[0].ptr = PTR_INVALID;   /* 清前驱（根无链表） */
@@ -1024,13 +1025,9 @@ result_code_t RavenFS_juvenile::extent_root_shrink(uint64_t root_blk, uint64_t i
     }
     child_sess.dirty();
 
-    /* 根更替：回写文件 inode.data_root（统一 InodeSession） */
-    InodeSession ino_sess(inode_cache_mgr, inode_idx);
-    if (!ino_sess) return RC_ERR_IO;
-    ino_sess.inode->data_root = child_blk;
-    ino_sess.dirty();
-
-    block_free(root_blk, 2);
+    /* 根更迭：新根（原孩）块号沿引用带出（不碰 inode；提交 = 调用方写 data_root） */
+    root_blk = child_blk;
+    block_free(old_root, 2);
     return RC_OK;
 }
 
@@ -1041,8 +1038,11 @@ result_code_t RavenFS_juvenile::extent_root_shrink(uint64_t root_blk, uint64_t i
  *         （RC_ERR_STATE = 父为根单孩 → 收缩提升）→ 父 key 上溯刷新
  *         → need 则子=父继续，否则查父是否根内单孩残留并收尾。
  * 供 unmap 删记录欠载、map 跨界右并致邻叶欠载两条路径共用。
+ * detach（2026-09-06）：root_blk& in/out 穿透 —— 根收缩发生时把新根带回调用方；
+ * owner_inode_idx 仅传给收缩侧写 "." 锚。
  * ═══════════════════════════════════════════════════════════════════ */
-result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t inode_idx)
+result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t owner_inode_idx,
+                                                    uint64_t &root_blk)
 {
     const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
     uint64_t cur = child_blk;
@@ -1056,7 +1056,7 @@ result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t
 
         if (cm->parent_ptr.is_root_node) {
             if (cm->parent_ptr.is_inner_node && cnt == 1)
-                return extent_root_shrink(cur, inode_idx);   /* 合并残留收尾 */
+                return extent_root_shrink(root_blk, owner_inode_idx);   /* 合并残留收尾（cur 即根） */
             return RC_OK;                                    /* 根叶/健康根内：链止 */
         }
         if (cnt >= 168) return RC_OK;                        /* 已健康 */
@@ -1082,7 +1082,7 @@ result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t
         result_code_t rc = extent_node_balance(parent_blk, idx, need);
         if (rc == RC_ERR_STATE) {
             /* 父是根内部且只剩此一孩 → 无邻居可平衡，收缩提升（含空叶升根） */
-            return extent_root_shrink(parent_blk, inode_idx);
+            return extent_root_shrink(root_blk, owner_inode_idx);
         }
         if (rc) return rc;
 
@@ -1097,7 +1097,7 @@ result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t
             Bptree_meta_t *rm = (Bptree_meta_t *)rps.data;
             if (rm->parent_ptr.is_root_node && rm->parent_ptr.is_inner_node &&
                 rm->parent_ptr.entry_count == 1)
-                return extent_root_shrink(parent_blk, inode_idx);
+                return extent_root_shrink(root_blk, owner_inode_idx);
             return RC_OK;
         }
         cur = parent_blk;   /* 父欠载 → 继续上溯 */
@@ -1118,29 +1118,18 @@ result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t
  * 跨界吞并致邻叶欠载 → extent_balance_from。父 key 上溯刷新兜底。
  *
  * 外显契约：ext.block_base 已由外部分配（测试可假性）；本函数不碰数据
- * 侧位图。文件须已在 extent-tree 模式（data_root≠PTR_INVALID 且
- * direct_bit=0）——inline→extent 跃迁归 direct_file_* 层。
+ * 侧位图，也不碰 inode（detach，2026-09-06）——root_blk in/out，根裂建新根
+ * 经引用带出；owner_inode_idx 仅在建新根时写根 meta "." 锚。调用方保证
+ * root_blk 指向合法 extent 树根（inline→extent 跃迁归 direct_file_* 层）。
  * ═══════════════════════════════════════════════════════════════════ */
-result_code_t RavenFS_juvenile::extent_map_range(uint64_t inode_idx, const extent_t &ext)
+result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t owner_inode_idx,
+                                                 const extent_t &ext)
 {
     const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
     if (ext.length == 0) return RC_OK;   /* 空映射：无操作 */
-    if (!inode_test(inode_idx)) return RC_ERR_STATE;
-
-    uint64_t data_root;
-    {
-        InodeSession ino_sess(inode_cache_mgr, inode_idx);
-        if (!ino_sess) return RC_ERR_IO;
-        raven_Inode_t *ino = ino_sess.inode;
-        if (ino->type != INODE_TYPE_REGULAR && ino->type != INODE_TYPE_SOFT_SYM)
-            return RC_ERR_STATE;   /* 文件数据树专用 */
-        if (ino->data_root == PTR_INVALID || ino->is_data_root_direct_bit)
-            return RC_ERR_STATE;   /* 须已在 extent-tree 模式 */
-        data_root = ino->data_root;
-    }
 
     bptree_path_t trace;
-    result_code_t rc = extent_Bptree_walk(data_root, &trace, ext.fblkbase);
+    result_code_t rc = extent_Bptree_walk(root_blk, &trace, ext.fblkbase);
     if (rc) return rc;
     const uint64_t leaf_blk = trace.blocks[trace.depth - 1];
     const uint16_t glb = trace.child_idx[trace.depth - 1];
@@ -1247,7 +1236,7 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t inode_idx, const exten
         split_high_leaf = sr.high_node_blkidx;
         if (trace.depth == 1) {
             rc = extent_new_root_inner(sr.low_node_blkidx, sr.low_node_maxhash,
-                                       sr.high_node_blkidx, inode_idx);
+                                       sr.high_node_blkidx, owner_inode_idx, root_blk);
             if (rc) return rc;
         } else {
             uint64_t parent_blk = trace.blocks[trace.depth - 2];
@@ -1272,7 +1261,8 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t inode_idx, const exten
                 if (isr.rc != RC_OK) return isr.rc;
                 if (parent_is_root) {
                     rc = extent_new_root_inner(isr.low_node_blkidx, isr.low_node_maxhash,
-                                               isr.high_node_blkidx, inode_idx);
+                                               isr.high_node_blkidx, owner_inode_idx,
+                                               root_blk);
                     if (rc) return rc;
                     break;
                 }
@@ -1310,7 +1300,7 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t inode_idx, const exten
 
     /* ── 跨界右并引发的邻叶欠载（含空叶）→ 自下而上平衡 ── */
     if (other_underflow) {
-        rc = extent_balance_from(other_blk, inode_idx);
+        rc = extent_balance_from(other_blk, owner_inode_idx, root_blk);
         if (rc) return rc;
     }
     return RC_OK;
@@ -1327,26 +1317,16 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t inode_idx, const exten
  * 内部：叶内 memmove 删除 → 欠载（非根 count<168）→ extent_balance_from
  * （含根收缩链）；否则父 key 上溯刷新（删末项 max 变时）。
  * 外显：记录删除后数据块 free 归外部（测试可假性跳过）。
+ * detach（2026-09-06）：root_blk in/out —— 欠载链根收缩经引用带出新根；
+ * 不碰 inode；owner_inode_idx 仅传给平衡侧写 "." 锚。
  * ═══════════════════════════════════════════════════════════════════ */
-result_code_t RavenFS_juvenile::extent_unmap_range(uint64_t inode_idx, const extent_t &ext)
+result_code_t RavenFS_juvenile::extent_unmap_range(uint64_t &root_blk, uint64_t owner_inode_idx,
+                                                   const extent_t &ext)
 {
     if (ext.length == 0) return RC_OK;   /* 空区间：无操作 */
-    if (!inode_test(inode_idx)) return RC_ERR_STATE;
-
-    uint64_t data_root;
-    {
-        InodeSession ino_sess(inode_cache_mgr, inode_idx);
-        if (!ino_sess) return RC_ERR_IO;
-        raven_Inode_t *ino = ino_sess.inode;
-        if (ino->type != INODE_TYPE_REGULAR && ino->type != INODE_TYPE_SOFT_SYM)
-            return RC_ERR_STATE;
-        if (ino->data_root == PTR_INVALID || ino->is_data_root_direct_bit)
-            return RC_ERR_STATE;
-        data_root = ino->data_root;
-    }
 
     bptree_path_t trace;
-    result_code_t rc = extent_Bptree_walk(data_root, &trace, ext.fblkbase);
+    result_code_t rc = extent_Bptree_walk(root_blk, &trace, ext.fblkbase);
     if (rc) return rc;
     if (!trace.is_leaf_hit) return RC_ERR_NOT_FOUND;   /* 起点无记录覆盖：目标不存在 */
     const uint64_t leaf_blk = trace.blocks[trace.depth - 1];
@@ -1383,6 +1363,6 @@ result_code_t RavenFS_juvenile::extent_unmap_range(uint64_t inode_idx, const ext
     }   /* 会话析构写回；平衡/刷新前必须关（同块双会话不互见修改） */
 
     if (is_root) return RC_OK;   /* 根叶欠载/空均合法，且无父 key */
-    if (underflow) return extent_balance_from(leaf_blk, inode_idx);
+    if (underflow) return extent_balance_from(leaf_blk, owner_inode_idx, root_blk);
     return extent_refresh_key_chain(leaf_blk);   /* 仅叶 max 变时上溯（删末项/删空） */
 }

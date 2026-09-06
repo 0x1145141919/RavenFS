@@ -1,6 +1,13 @@
 /* ═══════════════════════════════════════════════════════════════════
  * test_extent_ops.cpp — extent_map_range / extent_unmap_range 原语对专项
  *
+ * 2026-09-06 detach 后版本：原语 arg0 = root_blk&（in/out），owner_inode_idx
+ * 纯审计锚（根 meta "."，零 inode I/O）。测试因此：
+ *   1. 调用侧持 root_blk 变量，根裂/根收缩更迭由引用自动带出；
+ *   2. 显式断言"原语不碰 inode"：根更迭后 inode.data_root 保持旧值（stale
+ *      是 detach 的预期行为），随后用 phase5_commit() 一次回写模拟提交点收口；
+ *   3. 全树审计（audit_run）从 live root_blk 出发，锚校验仍验证 owner 穿透。
+ *
  * 按 Sparrow 2026-09-03 建议的测试路线：
  *   1. root_dir_insert_dentry 建真 REG 文件（正门拿 inode，不伪造槽）
  *   2. 测试内做 inline→extent 跃迁（alloc 树根 2 块 + 根叶 meta +
@@ -43,13 +50,13 @@
 
 static linux_userspace_mount_t make_mount(const char *path, uint32_t cpu_count = 1) {
     linux_userspace_mount_t mnt{};
-    mnt.dev.fd = ::open(path, O_RDWR|O_DIRECT);
+    mnt.dev.fd = ::open(path, O_RDWR);
     int lba = 4096;
     if (::ioctl(mnt.dev.fd, BLKSSZGET, &lba) != 0 || lba <= 0) lba = 4096;
     mnt.dev.lba_size_log2 = (uint8_t)__builtin_ctz((unsigned)lba);
     mnt.dev.type = DEV_NVME;
-    mnt.dev.is_device_direct = true;
-    mnt.param = {.if_will_use_inode_cache=true,.if_will_use_mdata_piece_cache=true};
+    mnt.dev.is_device_direct = false;
+    //mnt.param = {.if_will_use_inode_cache=true,.if_will_use_mdata_piece_cache=true};
     mnt.logical_processor_count = cpu_count;   /* 假 CPU 数 = 并行 worker 数（切片几何按它展开） */
     return mnt;
 }
@@ -92,7 +99,9 @@ static extent_t mk_ext(uint64_t fb, uint64_t len, uint64_t phys) {
     return e;
 }
 
-/* ── inline → extent-tree 跃迁（模拟 direct_file 层未来 helper）── */
+/* ── inline → extent-tree 跃迁（模拟 direct_file 层未来 helper）──
+ * 建根叶 2 块 + 写 inode 一次（= 管线 phase5 初提交；此后 data_root 的
+ * 每次收口都走 phase5_commit，模拟"提交点唯一一次写"）。 */
 static uint64_t file_to_extent_mode(RavenFS_juvenile &fs, uint64_t inum) {
     uint64_t root_blk = fs.block_alloc_hard(2, 1);
     if (root_blk == PTR_INVALID) return PTR_INVALID;
@@ -121,6 +130,21 @@ static uint64_t file_to_extent_mode(RavenFS_juvenile &fs, uint64_t inum) {
     return root_blk;
 }
 
+/* ── phase5 提交点模拟：一次 inode 回写，把 live root_blk 收口进 inode ── */
+static void phase5_commit(RavenFS_juvenile &fs, uint64_t inum, uint64_t root_blk) {
+    raven_Inode_t ino;
+    fs.inode_read(inum, &ino);
+    ino.data_root = root_blk;
+    fs.inode_write(inum, &ino);
+}
+
+/* 读 inode 现 data_root（断言 stale 用） */
+static uint64_t inode_data_root(RavenFS_juvenile &fs, uint64_t inum) {
+    raven_Inode_t ino;
+    fs.inode_read(inum, &ino);
+    return ino.data_root;
+}
+
 /* ═══════════════════ 树完整性审计（DFS）═══════════════════ */
 struct audit_t {
     uint64_t nodes = 0, inner = 0, leaves = 0, records = 0;
@@ -141,7 +165,7 @@ static uint64_t audit_node(RavenFS_juvenile &fs, audit_t &a, uint64_t blk,
     if (!is_extent_node(meta)) { a.bad++; return 0; }
     if (meta->parent_ptr.is_root_node != expect_root) { a.bad++; return 0; }
     if (expect_root) {
-        if (meta->parent_ptr.ptr != inum) a.bad++;   /* 根 "." 锚 */
+        if (meta->parent_ptr.ptr != inum) a.bad++;   /* 根 "." 锚（owner 穿透） */
     } else {
         if (meta->parent_ptr.ptr != expect_parent) a.bad++;   /* 子父指针一致 */
     }
@@ -245,11 +269,11 @@ static void audit_chain(RavenFS_juvenile &fs, audit_t &a, uint64_t root_blk) {
     if (idx != a.leaf_blk.size()) a.bad++;   /* 链比 DFS 短 */
 }
 
-static void audit_run(RavenFS_juvenile &fs, uint64_t inum, const char *tag, audit_t *out) {
+/* detach 后：审计从 live root_blk 出发（不再经 inode 取根）；
+ * 根 "." 锚仍须 == inum（owner_inode_idx 穿透到根 meta）。 */
+static void audit_run(RavenFS_juvenile &fs, uint64_t root, uint64_t inum,
+                      const char *tag, audit_t *out) {
     audit_t a;
-    raven_Inode_t ino;
-    fs.inode_read(inum, &ino);
-    uint64_t root = ino.data_root;
     uint64_t sm = audit_node(fs, a, root, 0, true, inum, 0);
     (void)sm;
     if (a.leaves > 0) audit_chain(fs, a, root);
@@ -270,6 +294,8 @@ static void audit_run(RavenFS_juvenile &fs, uint64_t inum, const char *tag, audi
  * 12 万条打穿内部层增删——per-file 树互不共享 → 并发竞争面精确收敛在：
  *   block_alloc_hard/soft/inode_alloc 的 per-CPU preferred 分片路由 + try/自旋
  *   锁、mdata/inode 缓存 RADIX 锁、盘本身。
+ *   每个 worker 独立持自己的 root_blk（detach 后根更迭只动本地引用，
+ *   树互不相交 → root_blk 无跨线程共享）。
  *
  * 正确性：每 worker 相位间全树审计（键序/父子/hint/兄弟链/canonical）；
  * 性能：每相位计时 + 总壁钟；
@@ -287,6 +313,7 @@ extern "C" uint32_t get_processor_id() { return t_fake_proc_id; }  /* 强定义�
 struct par_worker_t {
     RavenFS_juvenile *fs = nullptr;
     uint64_t inum = 0;
+    uint64_t root_blk = 0;         /* live 树根（detach 后调用方持有；根更迭随引用变） */
     uint32_t fake_id = 0;
     uint64_t seed = 0;
     std::atomic<uint64_t> ops{0};      /* 看门狗：已完成原语数 */
@@ -318,6 +345,7 @@ static void par_worker_run(par_worker_t *W) {
     t_fake_proc_id = W->fake_id;   /* 本线程伪造 processor_id（挂到本线程身份） */
     RavenFS_juvenile &fs = *W->fs;
     const uint64_t inum = W->inum;
+    uint64_t &root_blk = W->root_blk;   /* 本 worker 私有树根（detach 持有） */
     const uint64_t PHY_BASE = 0x200000ull + (uint64_t)W->fake_id * 0x1000000ull;
     const uint64_t NA = PAR_NA, NB = PAR_NB, B_BASE = PAR_B_BASE;
     using clk = std::chrono::steady_clock;
@@ -339,7 +367,7 @@ static void par_worker_run(par_worker_t *W) {
         uint64_t ta = ms_el();
         for (uint64_t k = 0; k < NA; k++) {
             uint64_t fb = ord[k] * 2;
-            r = fs.extent_map_range(inum, mk_ext(fb, 1, PHY_BASE + fb));
+            r = fs.extent_map_range(root_blk, inum, mk_ext(fb, 1, PHY_BASE + fb));
             W->ops.fetch_add(1, std::memory_order_relaxed);
             if (r != RC_OK) PAR_FAIL("insA", k, r);
         }
@@ -351,7 +379,7 @@ static void par_worker_run(par_worker_t *W) {
     {
         audit_t a;
         char tag[32]; snprintf(tag, sizeof(tag), "E#%u-full", W->fake_id);
-        audit_run(fs, inum, tag, &a);
+        audit_run(fs, root_blk, inum, tag, &a);
         CHECK(a.records == NA && a.inner >= 2 && a.leaves > 338 && a.bad == 0,
               "par#%u 满树 records=%lu inner=%lu leaves=%lu",
               W->fake_id, a.records, a.inner, a.leaves);
@@ -364,7 +392,7 @@ static void par_worker_run(par_worker_t *W) {
         uint64_t ta = ms_el();
         for (uint64_t k = 0; k < NA / 2; k++) {
             uint64_t fb = ord[k] * 2;
-            r = fs.extent_unmap_range(inum, mk_ext(fb, 1, PHY_BASE + fb));
+            r = fs.extent_unmap_range(root_blk, inum, mk_ext(fb, 1, PHY_BASE + fb));
             W->ops.fetch_add(1, std::memory_order_relaxed);
             if (r != RC_OK) PAR_FAIL("delHalf", k, r);
         }
@@ -376,7 +404,7 @@ static void par_worker_run(par_worker_t *W) {
     {
         audit_t a;
         char tag[32]; snprintf(tag, sizeof(tag), "E#%u-half", W->fake_id);
-        audit_run(fs, inum, tag, &a);
+        audit_run(fs, root_blk, inum, tag, &a);
         CHECK(a.records == NA / 2 && a.bad == 0,
               "par#%u 半树 records=%lu", W->fake_id, a.records);
         if (a.records != NA / 2 || a.bad != 0) PAR_FAIL("audit-half", 0, RC_ERR_STATE);
@@ -391,7 +419,7 @@ static void par_worker_run(par_worker_t *W) {
         uint64_t ta = ms_el();
         for (uint64_t k = 0; k < NB; k++) {
             uint64_t fb = B_BASE + ord[k] * 2;
-            r = fs.extent_map_range(inum, mk_ext(fb, 1, PHY_BASE + fb));
+            r = fs.extent_map_range(root_blk, inum, mk_ext(fb, 1, PHY_BASE + fb));
             W->ops.fetch_add(1, std::memory_order_relaxed);
             if (r != RC_OK) PAR_FAIL("insB", k, r);
         }
@@ -403,7 +431,7 @@ static void par_worker_run(par_worker_t *W) {
     {
         audit_t a;
         char tag[32]; snprintf(tag, sizeof(tag), "E#%u-refill", W->fake_id);
-        audit_run(fs, inum, tag, &a);
+        audit_run(fs, root_blk, inum, tag, &a);
         CHECK(a.records == NA && a.bad == 0,
               "par#%u 回满 records=%lu", W->fake_id, a.records);
         if (a.records != NA || a.bad != 0) PAR_FAIL("audit-refill", 0, RC_ERR_STATE);
@@ -418,7 +446,7 @@ static void par_worker_run(par_worker_t *W) {
         std::shuffle(ord.begin(), ord.end(), rng);
         uint64_t ta = ms_el();
         for (uint64_t k = 0; k < ord.size(); k++) {
-            r = fs.extent_unmap_range(inum, mk_ext(ord[k], 1, PHY_BASE + ord[k]));
+            r = fs.extent_unmap_range(root_blk, inum, mk_ext(ord[k], 1, PHY_BASE + ord[k]));
             if (r == RC_ERR_NOT_FOUND) { W->not_found++; continue; }
             W->ops.fetch_add(1, std::memory_order_relaxed);
             if (r != RC_OK) PAR_FAIL("delAll", k, r);
@@ -431,7 +459,7 @@ static void par_worker_run(par_worker_t *W) {
     {
         audit_t a;
         char tag[32]; snprintf(tag, sizeof(tag), "E#%u-final", W->fake_id);
-        audit_run(fs, inum, tag, &a);
+        audit_run(fs, root_blk, inum, tag, &a);
         CHECK(a.records == 0 && a.leaves == 1 && a.nodes == 1 && a.bad == 0,
               "par#%u 终态 records=%lu leaves=%lu nodes=%lu",
               W->fake_id, a.records, a.leaves, a.nodes);
@@ -505,11 +533,13 @@ static void run_parallel_group(RavenFS_juvenile &fs, uint32_t workers) {
         }
         uint64_t inum = 0;
         fs.root_dir_lookup(nm, &inum);
-        if (file_to_extent_mode(fs, inum) == PTR_INVALID) {
+        uint64_t root_blk = file_to_extent_mode(fs, inum);
+        if (root_blk == PTR_INVALID) {
             CHECK(false, "%s 跃迁建树根失败", nm);
             return;
         }
         inums[w] = inum;
+        /* 建树期已完成 phase5 初提交；root_blk 此后只活在 worker 本地 */
     }
     printf("  已建 %u 个独立文件（par0..par%u），线程就绪\n", workers, workers - 1);
 
@@ -519,6 +549,14 @@ static void run_parallel_group(RavenFS_juvenile &fs, uint32_t workers) {
     for (uint32_t w = 0; w < workers; w++) {
         args[w].fs = &fs;
         args[w].inum = inums[w];
+        uint64_t root_blk = 0;
+        {
+            /* 从 inode 取回建树期提交的根（phase5 初提交后 data_root == live 根） */
+            raven_Inode_t ino;
+            fs.inode_read(inums[w], &ino);
+            root_blk = ino.data_root;
+        }
+        args[w].root_blk = root_blk;
         args[w].fake_id = w;
         args[w].seed = 0x9E3779B97F4A7C15ull ^ (0x9E3779B1ull * (w + 1));
     }
@@ -588,88 +626,115 @@ int main(int argc, char **argv) {
     CHECK(rc == RC_OK && inum != 0, "lookup a.bin → inum=%lu", inum);
     uint64_t root_blk = file_to_extent_mode(fs, inum);
     CHECK(root_blk != PTR_INVALID, "inline→extent 跃迁建树根 blk=%lu", root_blk);
+    const uint64_t ROOT0 = root_blk;   /* 初始根叶（detach：此后 live 根只在 root_blk 里） */
 
     /* ── 2. A 组：基础语义 ── */
     printf("\n-- A：基础 map/unmap 语义（单叶根树） --\n");
-    audit_run(fs, inum, "empty", nullptr);
+    audit_run(fs, root_blk, inum, "empty", nullptr);
 
-    CHECK(fs.extent_map_range(inum, mk_ext(0, 4, 100)) == RC_OK, "map [0,4)p100");
-    audit_run(fs, inum, "A1", nullptr);
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(0, 4, 100)) == RC_OK, "map [0,4)p100");
+    audit_run(fs, root_blk, inum, "A1", nullptr);
 
-    CHECK(fs.extent_map_range(inum, mk_ext(4, 2, 104)) == RC_OK, "map [4,6)p104 → 左并");
-    CHECK(fs.extent_map_range(inum, mk_ext(10, 3, 200)) == RC_OK, "map [10,13)p200（留洞 [6,10)）");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(4, 2, 104)) == RC_OK, "map [4,6)p104 → 左并");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(10, 3, 200)) == RC_OK, "map [10,13)p200（留洞 [6,10)）");
 
     audit_t a2;
-    audit_run(fs, inum, "A2", &a2);
+    audit_run(fs, root_blk, inum, "A2", &a2);
     CHECK(a2.records == 2, "A2 records=2（[0,6)p100 与 [10,13)p200）got %lu", a2.records);
 
-    CHECK(fs.extent_map_range(inum, mk_ext(6, 4, 106)) == RC_OK, "map [6,10)p106 → 双并桥接");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(6, 4, 106)) == RC_OK, "map [6,10)p106 → 双并桥接");
     audit_t a3;
-    audit_run(fs, inum, "A3", &a3);
+    audit_run(fs, root_blk, inum, "A3", &a3);
     CHECK(a3.records == 2, "A3 records=2（[0,10)p100 与 [10,13)p200）got %lu", a3.records);
 
     /* 重叠防御 */
-    CHECK(fs.extent_map_range(inum, mk_ext(1, 1, 0)) == RC_ERR_OVERLAP, "overlap [1,2) 内嵌 → OVERLAP");
-    CHECK(fs.extent_map_range(inum, mk_ext(5, 3, 0)) == RC_ERR_OVERLAP, "overlap [5,8) 覆盖 → OVERLAP");
-    CHECK(fs.extent_map_range(inum, mk_ext(9, 2, 7)) == RC_ERR_OVERLAP, "overlap [9,11) 跨记录 → OVERLAP");
-    CHECK(fs.extent_map_range(inum, mk_ext(0, 13, 1)) == RC_ERR_OVERLAP, "overlap [0,13) 全包 → OVERLAP");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(1, 1, 0)) == RC_ERR_OVERLAP, "overlap [1,2) 内嵌 → OVERLAP");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(5, 3, 0)) == RC_ERR_OVERLAP, "overlap [5,8) 覆盖 → OVERLAP");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(9, 2, 7)) == RC_ERR_OVERLAP, "overlap [9,11) 跨记录 → OVERLAP");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(0, 13, 1)) == RC_ERR_OVERLAP, "overlap [0,13) 全包 → OVERLAP");
     audit_t a4;
-    audit_run(fs, inum, "A4(overlap 后无副作用)", &a4);
+    audit_run(fs, root_blk, inum, "A4(overlap 后无副作用)", &a4);
     CHECK(a4.records == 2 && a4.bad == 0, "overlap 失败零副作用 records=2");
 
     /* unmap：三字段全等校验 */
-    CHECK(fs.extent_unmap_range(inum, mk_ext(10, 3, 200)) == RC_OK, "unmap 精确 [10,13)p200");
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(10, 3, 200)) == RC_OK, "unmap 精确 [10,13)p200");
     audit_t a5;
-    audit_run(fs, inum, "A5", &a5);
+    audit_run(fs, root_blk, inum, "A5", &a5);
     CHECK(a5.records == 1, "A5 records=1 got %lu", a5.records);
 
-    CHECK(fs.extent_unmap_range(inum, mk_ext(0, 10, 999)) == RC_ERR_STATE, "unmap phys 失配 → STATE");
-    CHECK(fs.extent_unmap_range(inum, mk_ext(0, 9, 100)) == RC_ERR_STATE,  "unmap length 失配 → STATE");
-    CHECK(fs.extent_unmap_range(inum, mk_ext(1, 9, 100)) == RC_ERR_STATE,  "unmap fblkbase 失配 → STATE");
-    CHECK(fs.extent_unmap_range(inum, mk_ext(20, 1, 50)) == RC_ERR_NOT_FOUND, "unmap 空洞 → NOT_FOUND");
-    audit_run(fs, inum, "A6(失配后无副作用)", nullptr);
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 10, 999)) == RC_ERR_STATE, "unmap phys 失配 → STATE");
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 9, 100)) == RC_ERR_STATE,  "unmap length 失配 → STATE");
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(1, 9, 100)) == RC_ERR_STATE,  "unmap fblkbase 失配 → STATE");
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(20, 1, 50)) == RC_ERR_NOT_FOUND, "unmap 空洞 → NOT_FOUND");
+    audit_run(fs, root_blk, inum, "A6(失配后无副作用)", nullptr);
 
-    CHECK(fs.extent_unmap_range(inum, mk_ext(0, 10, 100)) == RC_OK, "unmap [0,10)p100 → 空树");
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 10, 100)) == RC_OK, "unmap [0,10)p100 → 空树");
     audit_t a7;
-    audit_run(fs, inum, "A7", &a7);
+    audit_run(fs, root_blk, inum, "A7", &a7);
     CHECK(a7.records == 0 && a7.leaves == 1, "A7 空根叶 records=0 got %lu", a7.records);
-    CHECK(fs.extent_unmap_range(inum, mk_ext(0, 10, 100)) == RC_ERR_NOT_FOUND, "空树再 unmap → NOT_FOUND");
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 10, 100)) == RC_ERR_NOT_FOUND, "空树再 unmap → NOT_FOUND");
+
+    /* detach 断言：A 组全程单叶（≤2 记录）→ 根未更迭，live 根 == 初值；
+     * inode.data_root 自 phase5 初提交后从未被原语改写。 */
+    CHECK(root_blk == ROOT0, "A 组无分裂无收缩 → root_blk 恒为初值 blk=%lu", root_blk);
+    CHECK(inode_data_root(fs, inum) == ROOT0, "detach：原语未写 inode（data_root 仍为 phase5 初提交值）");
+    phase5_commit(fs, inum, root_blk);   /* 模拟提交点收口（根未变，写回同值） */
 
     /* ── 3. B 组：分裂级联（根叶 337 满 → 338 裂 → 根内部） ── */
     printf("\n-- B：分裂级联 + 欠载合并/根收缩 --\n");
     const uint64_t N = 340;
     for (uint64_t i = 0; i < N; i++) {
-        result_code_t r = fs.extent_map_range(inum, mk_ext(i * 2, 1, 1000 + i));
+        result_code_t r = fs.extent_map_range(root_blk, inum, mk_ext(i * 2, 1, 1000 + i));
         if (r != RC_OK) { CHECK(false, "map #%lu → %s", i, rc_name(r)); break; }
     }
     audit_t b1;
-    audit_run(fs, inum, "B 340 记录", &b1);
+    audit_run(fs, root_blk, inum, "B 340 记录", &b1);
     CHECK(b1.records == N, "B records=%lu got %lu", N, b1.records);
     CHECK(b1.leaves == 2 && b1.inner == 1, "B 根内部 + 2 叶（根叶已裂）leaves=%lu inner=%lu",
           b1.leaves, b1.inner);
 
-    /* 全删：逐条 unmap，触发欠载合并/抹匀/根收缩，回到空根叶 */
+    /* detach 断言：根裂建新根 → live root_blk 已随引用更迭；inode 未被触碰
+     * （data_root 仍是 phase5 初提交的 ROOT0 = 旧根叶块号 —— stale 是预期）。 */
+    CHECK(root_blk != ROOT0, "根裂 → root_blk 引用带出新根（%lu → %lu）", ROOT0, root_blk);
+    CHECK(inode_data_root(fs, inum) == ROOT0,
+          "detach：根裂全程原语未写 inode（data_root 保持旧根，stale 即正确）");
+    phase5_commit(fs, inum, root_blk);   /* phase5：一次收口写新根 */
+    CHECK(inode_data_root(fs, inum) == root_blk, "phase5 收口后 inode.data_root == live 根");
+    const uint64_t ROOT_MID = root_blk;   /* 本次收口的中间根（全删后 inode 应停留于此） */
+
+    /* 全删：逐条 unmap，触发欠载合并/抹匀/根收缩，回到空根叶
+     * （根收缩更迭同样经 root_blk& 自动带出，中途审计用 live 根） */
     bool all_ok = true;
     for (uint64_t i = 0; i < N; i++) {
-        result_code_t r = fs.extent_unmap_range(inum, mk_ext(i * 2, 1, 1000 + i));
+        result_code_t r = fs.extent_unmap_range(root_blk, inum, mk_ext(i * 2, 1, 1000 + i));
         if (r != RC_OK) { CHECK(false, "unmap #%lu → %s", i, rc_name(r)); all_ok = false; break; }
-        if ((i + 1) % 100 == 0) audit_run(fs, inum, "B 删除中", nullptr);
+        if ((i + 1) % 100 == 0) audit_run(fs, root_blk, inum, "B 删除中", nullptr);
     }
     if (all_ok) {
         audit_t b2;
-        audit_run(fs, inum, "B 全删后", &b2);
+        audit_run(fs, root_blk, inum, "B 全删后", &b2);
         CHECK(b2.records == 0 && b2.leaves == 1 && b2.inner == 0 && b2.nodes == 1,
               "B 终态：空根叶（收缩链走完）records=%lu leaves=%lu inner=%lu",
               b2.records, b2.leaves, b2.inner);
+        CHECK(inode_data_root(fs, inum) == ROOT_MID,
+              "detach：全删收缩后 inode 仍指收口的中间根（stale，待收口）");
     }
 
-    /* ── 4. 二次增长：收缩后的树还能继续 map（根收缩后 data_root 一致性） ── */
-    printf("\n-- C：收缩后复用（data_root 一致性回归） --\n");
-    CHECK(fs.extent_map_range(inum, mk_ext(0, 8, 500)) == RC_OK, "收缩后 map [0,8)p500");
-    CHECK(fs.extent_map_range(inum, mk_ext(8, 4, 508)) == RC_OK, "map [8,12)p508 → 左并");
+    /* ── 4. 二次增长：收缩后的树还能继续 map（phase5 收口后 live 根一致性回归） ── */
+    printf("\n-- C：收缩后复用 + phase5 收口一致性 --\n");
+    phase5_commit(fs, inum, root_blk);   /* 提交点：把收缩后的空根叶收口进 inode */
+    CHECK(inode_data_root(fs, inum) == root_blk, "C phase5 收口：inode.data_root == 收缩后空根叶");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(0, 8, 500)) == RC_OK, "收缩后 map [0,8)p500");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(8, 4, 508)) == RC_OK, "map [8,12)p508 → 左并");
     audit_t c1;
-    audit_run(fs, inum, "C", &c1);
+    audit_run(fs, root_blk, inum, "C", &c1);
     CHECK(c1.records == 1, "C records=1（合并 [0,12)p500）got %lu", c1.records);
+    phase5_commit(fs, inum, root_blk);
+    CHECK(inode_data_root(fs, inum) == root_blk, "C 二次收口后 inode.data_root == live 根");
+    /* 收尾清空，留干净盘给 D 组统计（可选） */
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 12, 500)) == RC_OK, "C 清空 [0,12)p500");
+    audit_run(fs, root_blk, inum, "C 清空后", nullptr);
+    phase5_commit(fs, inum, root_blk);
 
     /* ═══════════════════════════════════════════════════════════════
      * D 组：十万级极端增删（单文件压力，打穿内部层）
@@ -702,15 +767,17 @@ int main(int argc, char **argv) {
     uint64_t sinum = 0;
     rc = fs.root_dir_lookup("stress.bin", &sinum);
     CHECK(rc == RC_OK && sinum != 0, "lookup stress.bin → inum=%lu", sinum);
-    CHECK(file_to_extent_mode(fs, sinum) != PTR_INVALID, "stress.bin 跃迁建树根");
+    uint64_t sroot = file_to_extent_mode(fs, sinum);
+    CHECK(sroot != PTR_INVALID, "stress.bin 跃迁建树根");
+    const uint64_t SROOT0 = sroot;   /* phase5 初提交根（满树后将被多次根裂甩旧） */
 
     std::mt19937 rng(42);   /* 固定种子：确定性可复现 */
 
     auto stress_map = [&](uint64_t fb) -> result_code_t {
-        return fs.extent_map_range(sinum, mk_ext(fb, 1, 0x200000 + fb));
+        return fs.extent_map_range(sroot, sinum, mk_ext(fb, 1, 0x200000 + fb));
     };
     auto stress_unmap = [&](uint64_t fb) -> result_code_t {
-        return fs.extent_unmap_range(sinum, mk_ext(fb, 1, 0x200000 + fb));
+        return fs.extent_unmap_range(sroot, sinum, mk_ext(fb, 1, 0x200000 + fb));
     };
 
     /* 阶段 1：随机序插 A 空间 12 万条 */
@@ -732,11 +799,14 @@ int main(int argc, char **argv) {
         CHECK(ok, "阶段1：随机序插入 %lu 条完成 (%ld ms)", STRESS_NA, ms);
     }
     audit_t d1;
-    audit_run(fs, sinum, "D 满树", &d1);
+    audit_run(fs, sroot, sinum, "D 满树", &d1);
     CHECK(d1.records == STRESS_NA, "D 满树 records=%lu got %lu", STRESS_NA, d1.records);
     CHECK(d1.inner >= 2 && d1.leaves > 338,
           "D 满树已打穿内部层：inner=%lu leaves=%lu（期望 inner≥2 且叶>338）",
           d1.inner, d1.leaves);
+    CHECK(inode_data_root(fs, sinum) == SROOT0,
+          "detach：D 满树多次根裂，inode.data_root 仍为初提交值（stale 即正确）");
+    phase5_commit(fs, sinum, sroot);   /* 打穿后收口一次（后续不再写） */
 
     /* 阶段 3：随机序删 A 空间 6 万条（剩 6 万） */
     {
@@ -757,7 +827,7 @@ int main(int argc, char **argv) {
         CHECK(ok, "阶段3：随机序删除 %lu 条完成 (%ld ms)", STRESS_NA / 2, ms);
     }
     audit_t d2;
-    audit_run(fs, sinum, "D 半树", &d2);
+    audit_run(fs, sroot, sinum, "D 半树", &d2);
     CHECK(d2.records == STRESS_NA / 2, "D 半树 records=%lu got %lu", STRESS_NA / 2, d2.records);
 
     /* 阶段 5：随机序插 B 空间 6 万条（穿插进既有树） */
@@ -779,7 +849,7 @@ int main(int argc, char **argv) {
         CHECK(ok, "阶段5：随机序插入 %lu 条（B 空间）完成 (%ld ms)", STRESS_NB, ms);
     }
     audit_t d3;
-    audit_run(fs, sinum, "D 回满", &d3);
+    audit_run(fs, sroot, sinum, "D 回满", &d3);
     CHECK(d3.records == STRESS_NA, "D 回满 records=%lu got %lu", STRESS_NA, d3.records);
 
     /* 阶段 7：随机序全删（A 剩 6 万在树 + B 6 万） */
@@ -807,9 +877,11 @@ int main(int argc, char **argv) {
               not_found, STRESS_NA / 2, ms);
     }
     audit_t d4;
-    audit_run(fs, sinum, "D 终态", &d4);
+    audit_run(fs, sroot, sinum, "D 终态", &d4);
     CHECK(d4.records == 0 && d4.leaves == 1 && d4.nodes == 1,
           "D 终态：空根叶 records=%lu leaves=%lu", d4.records, d4.leaves);
+    phase5_commit(fs, sinum, sroot);   /* 终态收口：空根叶入 inode */
+    CHECK(inode_data_root(fs, sinum) == sroot, "D 终态收口后 inode.data_root == live 空根叶");
     }   /* 非 par 模式：A/B/C/D 串行语义组 */
 
     printf("\n%d passed, %d failed\n", g_pass.load(), g_fail.load());
