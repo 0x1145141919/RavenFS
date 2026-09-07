@@ -8,6 +8,12 @@
  *      是 detach 的预期行为），随后用 phase5_commit() 一次回写模拟提交点收口；
  *   3. 全树审计（audit_run）从 live root_blk 出发，锚校验仍验证 owner 穿透。
  *
+ * 2026-09-07 世界观同步（融合演进史见 Docs/pwrite_pipeline.md §1/§2）：map 只左融合——
+ * 同叶 GLB 紧贴 && phys 连续 → 扩长不插记录。本文件 A/C 组构造含大量
+ * "紧贴 + phys 连续"序列，断言从"纯插不并（7bde35c）"迁到"左并"：
+ * [0,4)p100 + [4,6)p104 → [0,6)p100 单条（原 2 条）；填洞同理。
+ * 右并/跨界仍不做（残留合法，激进重建兑底）。
+ *
  * 按 Sparrow 2026-09-03 建议的测试路线：
  *   1. root_dir_insert_dentry 建真 REG 文件（正门拿 inode，不伪造槽）
  *   2. 测试内做 inline→extent 跃迁（alloc 树根 2 块 + 根叶 meta +
@@ -621,24 +627,24 @@ int main(int argc, char **argv) {
     CHECK(root_blk != PTR_INVALID, "inline→extent 跃迁建树根 blk=%lu", root_blk);
     const uint64_t ROOT0 = root_blk;   /* 初始根叶（detach：此后 live 根只在 root_blk 里） */
 
-    /* ── 2. A 组：基础语义（map 降级 2026-09-06：纯插不融合） ── */
-    printf("\n-- A：基础 map/unmap 语义（纯插不融合，单叶根树） --\n");
+    /* ── 2. A 组：基础语义（2026-09-07 定案：map 只左融合） ── */
+    printf("\n-- A：基础 map/unmap 语义（左融合，单叶根树） --\n");
     audit_run(fs, root_blk, inum, "empty", nullptr);
 
     CHECK(fs.extent_map_range(root_blk, inum, mk_ext(0, 4, 100)) == RC_OK, "map [0,4)p100");
     audit_run(fs, root_blk, inum, "A1", nullptr);
 
-    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(4, 2, 104)) == RC_OK, "map [4,6)p104（紧贴不并）");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(4, 2, 104)) == RC_OK, "map [4,6)p104（紧贴+连续 → 左并）");
     CHECK(fs.extent_map_range(root_blk, inum, mk_ext(10, 3, 200)) == RC_OK, "map [10,13)p200（留洞 [6,10)）");
     audit_t a2;
     audit_run(fs, root_blk, inum, "A2", &a2);
-    CHECK(a2.records == 3, "A2 records=3（纯插：紧贴/phys 连续也不并，融合归 merge_range）got %lu", a2.records);
+    CHECK(a2.records == 2, "A2 records=2（左并：GLB [0,4) 吸 [4,6) → [0,6)；洞另一侧独立）got %lu", a2.records);
 
-    /* 填洞纯插（原"双并桥接自动合并"语义已剥离 → 现在只是又一条独立记录） */
-    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(6, 4, 106)) == RC_OK, "map [6,10)p106（填洞，不并）");
+    /* 填洞：与 GLB [0,6) 紧贴+连续 → 左并扩为 [0,10)（原"双并桥接"右并侧剥离） */
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(6, 4, 106)) == RC_OK, "map [6,10)p106（填洞，左并 GLB）");
     audit_t a3;
     audit_run(fs, root_blk, inum, "A3", &a3);
-    CHECK(a3.records == 4, "A3 records=4（[0,4)[4,6)[6,10)[10,13) 四条紧贴分离）got %lu", a3.records);
+    CHECK(a3.records == 2, "A3 records=2（[0,10)p100 + [10,13)p200，phys 断点分条）got %lu", a3.records);
 
     /* 重叠防御（双向：起点覆盖 + 插入段覆盖右邻起点） */
     CHECK(fs.extent_map_range(root_blk, inum, mk_ext(1, 1, 0)) == RC_ERR_OVERLAP, "overlap [1,2) 内嵌 → OVERLAP");
@@ -649,13 +655,13 @@ int main(int argc, char **argv) {
     CHECK(fs.extent_map_range(root_blk, inum, mk_ext(9, 2, 7)) == RC_ERR_OVERLAP, "overlap [9,11) 同 → OVERLAP");
     audit_t a4;
     audit_run(fs, root_blk, inum, "A4(overlap 后无副作用)", &a4);
-    CHECK(a4.records == 4 && a4.bad == 0, "overlap 失败零副作用 records=4");
+    CHECK(a4.records == 2 && a4.bad == 0, "overlap 失败零副作用 records=2");
 
     /* unmap：三字段全等校验 */
     CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(10, 3, 200)) == RC_OK, "unmap 精确 [10,13)p200");
     audit_t a5;
     audit_run(fs, root_blk, inum, "A5", &a5);
-    CHECK(a5.records == 3, "A5 records=3 got %lu", a5.records);
+    CHECK(a5.records == 1, "A5 records=1 got %lu", a5.records);
 
     CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 10, 999)) == RC_ERR_STATE, "unmap phys 失配 → STATE");
     CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 9, 100)) == RC_ERR_STATE,  "unmap length 失配 → STATE");
@@ -663,11 +669,9 @@ int main(int argc, char **argv) {
     CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(20, 1, 50)) == RC_ERR_NOT_FOUND, "unmap 空洞 → NOT_FOUND");
     audit_run(fs, root_blk, inum, "A6(失配后无副作用)", nullptr);
 
-    /* 紧贴分离记录的独立可撤销性（降级核心收益：不融合 → 每条记录三字段全等
-     * 可被精确 unmap——pwrite 回滚不再需要区间撤销/裁切 hack） */
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 4, 100)) == RC_OK, "unmap 紧贴记录 [0,4)p100 → 独立可撤");
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(4, 2, 104)) == RC_OK, "unmap [4,6)p104 → 独立可撤");
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(6, 4, 106)) == RC_OK, "unmap [6,10)p106 → 独立可撤");
+    /* 记录的独立可撤销性（定案收益：左并后记录 = 最大 phys run，unmap 三字段
+     * 全等仍可精确撤——pwrite 回滚不需要区间撤销/裁切 hack） */
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 10, 100)) == RC_OK, "unmap 左并整条 [0,10)p100 → 独立可撤");
     audit_t a7;
     audit_run(fs, root_blk, inum, "A7", &a7);
     CHECK(a7.records == 0 && a7.leaves == 1, "A7 空根叶 records=0 got %lu", a7.records);
@@ -724,15 +728,14 @@ int main(int argc, char **argv) {
     phase5_commit(fs, inum, root_blk);   /* 提交点：把收缩后的空根叶收口进 inode */
     CHECK(inode_data_root(fs, inum) == root_blk, "C phase5 收口：inode.data_root == 收缩后空根叶");
     CHECK(fs.extent_map_range(root_blk, inum, mk_ext(0, 8, 500)) == RC_OK, "收缩后 map [0,8)p500");
-    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(8, 4, 508)) == RC_OK, "map [8,12)p508（紧贴不并）");
+    CHECK(fs.extent_map_range(root_blk, inum, mk_ext(8, 4, 508)) == RC_OK, "map [8,12)p508（紧贴+连续 → 左并）");
     audit_t c1;
     audit_run(fs, root_blk, inum, "C", &c1);
-    CHECK(c1.records == 2, "C records=2（纯插：紧贴 [0,8)+[8,12) 分离）got %lu", c1.records);
+    CHECK(c1.records == 1, "C records=1（左并：[0,8)+[8,12) → [0,12)p500）got %lu", c1.records);
     phase5_commit(fs, inum, root_blk);
     CHECK(inode_data_root(fs, inum) == root_blk, "C 二次收口后 inode.data_root == live 根");
-    /* 收尾清空（两条紧贴记录各自精确 unmap），留干净盘给 D 组统计（可选） */
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 8, 500)) == RC_OK, "C 清空 [0,8)p500");
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(8, 4, 508)) == RC_OK, "C 清空 [8,12)p508");
+    /* 收尾清空（整条精确 unmap），留干净盘给 D 组统计（可选） */
+    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 12, 500)) == RC_OK, "C 清空 [0,12)p500");
     audit_run(fs, root_blk, inum, "C 清空后", nullptr);
     phase5_commit(fs, inum, root_blk);
 

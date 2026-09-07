@@ -146,7 +146,7 @@ int main(int argc, char **argv) {
                             "297B/512B档", "552B上限/512B档", "41B前缀变体x", "41B前缀变体y" };
     bool p1_ok = true;
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        result_code_t r = fs.root_dir_insert_dentry(names[i]);
+        result_code_t r = fs.root_dir_insert_dentry(names[i], INODE_TYPE_REGULAR);
         if (r != RC_OK) { p1_ok = false; printf("  [FAIL] insert(%s) → %s\n", tags[i], rc_name(r)); g_fail++; continue; }
         uint64_t inum = 0;
         result_code_t lr = fs.root_dir_lookup(names[i], &inum);
@@ -160,9 +160,9 @@ int main(int argc, char **argv) {
     /* ══ Phase 2：完整名字比较（尾部读堆） ══ */
     printf("\n--- Phase 2: 长名完整比较 ---\n");
     {
-        result_code_t r = fs.root_dir_insert_dentry(n41);
+        result_code_t r = fs.root_dir_insert_dentry(n41, INODE_TYPE_REGULAR);
         CHECK(r == RC_ERR_EXIST, "重复插 41B → %s（expect RC_ERR_EXIST，尾部比较命中）", rc_name(r));
-        result_code_t r2 = fs.root_dir_insert_dentry(n552);
+        result_code_t r2 = fs.root_dir_insert_dentry(n552, INODE_TYPE_REGULAR);
         CHECK(r2 == RC_ERR_EXIST, "重复插 552B → %s（expect RC_ERR_EXIST）", rc_name(r2));
         /* 前缀相同尾部不同：n41x/n41y 都已插入且各自可查（上阶段已验证） */
         uint64_t inum = 0;
@@ -215,7 +215,7 @@ int main(int argc, char **argv) {
     /* ══ Phase 4：rm 长名 → 释放 → 位图回落 ══ */
     printf("\n--- Phase 4: 长名删除与堆释放 ---\n");
     {
-        result_code_t r = fs.root_dir_rm_dentry(n41);
+        result_code_t r = fs.root_dir_rm_dentry(n41, false);
         CHECK(r == RC_OK, "rm(41B) → %s", rc_name(r));
         uint64_t inum = 0;
         result_code_t lr = fs.root_dir_lookup(n41, &inum);
@@ -225,13 +225,13 @@ int main(int argc, char **argv) {
         CHECK(bits == exp_8B - 1, "8B_8k 位图置位 %llu == 期望 %llu（释放后回落）",
               (unsigned long long)bits, (unsigned long long)(exp_8B - 1));
         /* 再删一条（n41x） */
-        result_code_t r2 = fs.root_dir_rm_dentry(n41x);
+        result_code_t r2 = fs.root_dir_rm_dentry(n41x, false);
         CHECK(r2 == RC_OK, "rm(41B 变体 x) → %s", rc_name(r2));
         uint64_t bits2 = count_bits(fs, dino.heaps_8B_8k.bitmap_base_block_ptr);
         CHECK(bits2 == exp_8B - 2, "8B_8k 位图置位 %llu == 期望 %llu",
               (unsigned long long)bits2, (unsigned long long)(exp_8B - 2));
         /* 删 512B 档一条 */
-        result_code_t r3 = fs.root_dir_rm_dentry(n552);
+        result_code_t r3 = fs.root_dir_rm_dentry(n552, false);
         CHECK(r3 == RC_OK, "rm(552B) → %s", rc_name(r3));
         uint64_t bits3 = count_bits(fs, dino.heaps_512B_8k.bitmap_base_block_ptr);
         CHECK(bits3 == exp_512B - 1, "512B_8k 位图置位 %llu == 期望 %llu",
@@ -245,8 +245,8 @@ int main(int argc, char **argv) {
     {
         uint64_t inum2 = 0;
         /* 清空 64B 档两条 → 64B_8k 变全空；8B 档还剩 n80/n41y（6 单元） */
-        CHECK(fs.root_dir_rm_dentry(n81) == RC_OK, "rm(81B) 清空 64B 档");
-        CHECK(fs.root_dir_rm_dentry(n104) == RC_OK, "rm(104B) 清空 64B 档");
+        CHECK(fs.root_dir_rm_dentry(n81, false) == RC_OK, "rm(81B) 清空 64B 档");
+        CHECK(fs.root_dir_rm_dentry(n104, false) == RC_OK, "rm(104B) 清空 64B 档");
 
         raven_dir_Inode_t dino = read_dir_inode(fs);
         const uint64_t b64_bmp  = dino.heaps_64B_8k.bitmap_base_block_ptr;
@@ -265,7 +265,7 @@ int main(int argc, char **argv) {
               "64B_8k 位图/数据块已归还（全局 bitmap 空闲）");
         /* 归还的块可被再分配：插 41B 名字应激活新 64B 堆？——不，41B 走 8B 档；
          * 插 81B 应重新激活 64B_8k（且分配到的基址可能复用归还块） */
-        CHECK(fs.root_dir_insert_dentry(n81) == RC_OK, "重新插 81B → 64B_8k 重新激活");
+        CHECK(fs.root_dir_insert_dentry(n81, INODE_TYPE_REGULAR) == RC_OK, "重新插 81B → 64B_8k 重新激活");
         raven_dir_Inode_t dino3 = read_dir_inode(fs);
         CHECK(dino3.heaps_64B_8k.bitmap_base_block_ptr != NAME_HEAP_INACTIVE,
               "64B_8k 已重新激活（懒激活复用）");

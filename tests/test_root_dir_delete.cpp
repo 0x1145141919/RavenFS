@@ -303,7 +303,7 @@ int main(int argc, char **argv) {
 
     /* 1a. 空目录上删：RC_ERR_NOT_FOUND */
     {
-        result_code_t r = fs.root_dir_rm_dentry("ghost");
+        result_code_t r = fs.root_dir_rm_dentry("ghost", false);
         printf("  [%s] rm(\"ghost\") 空目录 → %s（expect RC_ERR_NOT_FOUND）\n",
                r == RC_ERR_NOT_FOUND ? "PASS" : "FAIL", rc_name(r));
         r == RC_ERR_NOT_FOUND ? g_pass++ : g_fail++;
@@ -311,10 +311,10 @@ int main(int argc, char **argv) {
 
     /* 1b. 先插一条再删的常规路径 */
     {
-        result_code_t ri = fs.root_dir_insert_dentry("alpha");
+        result_code_t ri = fs.root_dir_insert_dentry("alpha", INODE_TYPE_REGULAR);
         CHECK(ri == RC_OK, "insert(\"alpha\") → %s", rc_name(ri));
         if (ri == RC_OK) inserted++;
-        result_code_t r = fs.root_dir_rm_dentry("alpha");
+        result_code_t r = fs.root_dir_rm_dentry("alpha", false);
         bool ok = (r == RC_OK);
         printf("  [%s] rm(\"alpha\") → %s（expect RC_OK）\n", ok ? "PASS" : "FAIL", rc_name(r));
         ok ? g_pass++ : g_fail++;
@@ -325,7 +325,7 @@ int main(int argc, char **argv) {
                lr == RC_ERR_NOT_FOUND ? "PASS" : "FAIL", rc_name(lr));
         lr == RC_ERR_NOT_FOUND ? g_pass++ : g_fail++;
         /* 再删一次：已消失 → NOT_FOUND */
-        result_code_t r2 = fs.root_dir_rm_dentry("alpha");
+        result_code_t r2 = fs.root_dir_rm_dentry("alpha", false);
         printf("  [%s] rm(\"alpha\") 二次 → %s（expect RC_ERR_NOT_FOUND）\n",
                r2 == RC_ERR_NOT_FOUND ? "PASS" : "FAIL", rc_name(r2));
         r2 == RC_ERR_NOT_FOUND ? g_pass++ : g_fail++;
@@ -335,15 +335,15 @@ int main(int argc, char **argv) {
     {
         char long553[554];
         memset(long553, 'v', 553); long553[553] = 0;
-        result_code_t r = fs.root_dir_rm_dentry(long553);
+        result_code_t r = fs.root_dir_rm_dentry(long553, false);
         printf("  [%s] rm(553B) → %s（expect RC_ERR_NAME_LEN）\n",
                r == RC_ERR_NAME_LEN ? "PASS" : "FAIL", rc_name(r));
         r == RC_ERR_NAME_LEN ? g_pass++ : g_fail++;
-        result_code_t r2 = fs.root_dir_rm_dentry(long40);   /* 合法但不存在 → NOT_FOUND */
+        result_code_t r2 = fs.root_dir_rm_dentry(long40, false);   /* 合法但不存在 → NOT_FOUND */
         printf("  [%s] rm(40B) → %s（expect RC_ERR_NOT_FOUND，合法长度不存在）\n",
                r2 == RC_ERR_NOT_FOUND ? "PASS" : "FAIL", rc_name(r2));
         r2 == RC_ERR_NOT_FOUND ? g_pass++ : g_fail++;
-        result_code_t r3 = fs.root_dir_rm_dentry(long41);
+        result_code_t r3 = fs.root_dir_rm_dentry(long41, false);
         printf("  [%s] rm(41B) → %s（expect RC_ERR_NOT_FOUND）\n",
                r3 == RC_ERR_NOT_FOUND ? "PASS" : "FAIL", rc_name(r3));
         r3 == RC_ERR_NOT_FOUND ? g_pass++ : g_fail++;
@@ -351,10 +351,10 @@ int main(int argc, char **argv) {
 
     /* 1d. 39B 上限名：插→删→再删 */
     {
-        result_code_t ri = fs.root_dir_insert_dentry(long39);
+        result_code_t ri = fs.root_dir_insert_dentry(long39, INODE_TYPE_REGULAR);
         CHECK(ri == RC_OK, "insert(39B) → %s", rc_name(ri));
         if (ri == RC_OK) inserted++;
-        result_code_t r = fs.root_dir_rm_dentry(long39);
+        result_code_t r = fs.root_dir_rm_dentry(long39, false);
         bool ok = (r == RC_OK);
         printf("  [%s] rm(39B) → %s（expect RC_OK）\n", ok ? "PASS" : "FAIL", rc_name(r));
         ok ? g_pass++ : g_fail++;
@@ -363,7 +363,7 @@ int main(int argc, char **argv) {
 
     /* 1e. 空名：不插则 NOT_FOUND（与 insert 测试对称，insert 空名合法） */
     {
-        result_code_t r = fs.root_dir_rm_dentry("");
+        result_code_t r = fs.root_dir_rm_dentry("", false);
         printf("  [%s] rm(\"\") 未插空名 → %s（expect RC_ERR_NOT_FOUND）\n",
                r == RC_ERR_NOT_FOUND ? "PASS" : "FAIL", rc_name(r));
         r == RC_ERR_NOT_FOUND ? g_pass++ : g_fail++;
@@ -379,7 +379,7 @@ int main(int argc, char **argv) {
     int progress = batch_n >= 1000 ? batch_n / 8 : 1;
     for (int i = 0; i < batch_n; i++) {
         snprintf(nb, sizeof(nb), "f%05d", i);
-        result_code_t r = fs.root_dir_insert_dentry(nb);
+        result_code_t r = fs.root_dir_insert_dentry(nb, INODE_TYPE_REGULAR);
         if (r != RC_OK) { batch_ok = false; printf("  insert f%05d 失败: %s\n", i, rc_name(r)); break; }
         inserted++;
         if (progress >= 1 && (i + 1) % progress == 0)
@@ -408,7 +408,7 @@ int main(int argc, char **argv) {
     int del_done = 0;
     for (int i = 0; i < fwd_target; i++) {
         snprintf(nb, sizeof(nb), "f%05d", i);
-        result_code_t r = fs.root_dir_rm_dentry(nb);
+        result_code_t r = fs.root_dir_rm_dentry(nb, false);
         if (r != RC_OK) { del_ok = false; printf("  rm f%05d 失败: %s\n", i, rc_name(r)); break; }
         inserted--;
         del_done++;
@@ -439,7 +439,7 @@ int main(int argc, char **argv) {
     int rev_done = 0;
     for (int i = batch_n - 1; i >= del_done; i--) {
         snprintf(nb, sizeof(nb), "f%05d", i);
-        result_code_t r = fs.root_dir_rm_dentry(nb);
+        result_code_t r = fs.root_dir_rm_dentry(nb, false);
         if (r != RC_OK) { rev_ok = false; printf("  rm f%05d 失败: %s\n", i, rc_name(r)); break; }
         inserted--;
         rev_done++;
@@ -457,7 +457,7 @@ int main(int argc, char **argv) {
 
     /* 2c. 删空后再删 → NOT_FOUND */
     {
-        result_code_t r = fs.root_dir_rm_dentry("f00000");
+        result_code_t r = fs.root_dir_rm_dentry("f00000", false);
         printf("  [%s] rm(\"f00000\") 删空后 → %s（expect RC_ERR_NOT_FOUND）\n",
                r == RC_ERR_NOT_FOUND ? "PASS" : "FAIL", rc_name(r));
         r == RC_ERR_NOT_FOUND ? g_pass++ : g_fail++;

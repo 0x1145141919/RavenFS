@@ -90,6 +90,10 @@ extent_unmap_range = 独立撤销原语：三字段全等侦查式精确删除�
 - 降级 commit：`7bde35c`（map 纯净原语化 + 测试回归 75 绿 + hpp 声明调整）
 - merge_range 独立实现/测试：另行立项（设计见 `extent_merge_range.md`，F/M 双算子
   不动点，机械全部现成：balance_from / node_balance / root_shrink / 分裂级联）
+  → **2026-09-07 追记：未落地即退役**——09-06 定案（决策文档 `decision_fullmerge_20260906.md`
+  已完成使命扬）改走"map 只左融合 + 激进重建 extent_rebuild_tree"，两过程稿一并扬；
+  演进总纲见 `pwrite_pipeline.md` §1/§6。本落账条目保留原文以存照（勿再启 merge_range）。
 - F 组测试文件（`tests/test_extent_fusion.cpp`，本次事故的探测器）转型为 merge_range
   测试基座：铺可并树已简化为直接 map 紧贴连续记录
+  → **2026-09-07 追记：实际转型为左融合 + 激进重建基座**（F/L/R/D 四组，99 断言全绿）
 - 关联纪律：`DISCIPLINE.md`（项目级）、工作区 `MEMORY.md` 教训条目

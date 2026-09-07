@@ -19,4 +19,5 @@ add_library(ravenfs_juvenile STATIC
     name_heap.cpp
     inode_cache.cpp
     mdata_piece_cache.cpp
+    direct_file_ops.cpp
 )

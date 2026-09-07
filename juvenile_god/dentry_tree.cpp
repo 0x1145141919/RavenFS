@@ -386,8 +386,10 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
  * 下游资产维护（2026-09-01 下沉，宗旨：删条目即维护下游）：
  *   - dir 型目标：树删**前**校验空（NOT_EMPTY 零副作用），删后全量回收
  *     （名字堆 → 树根 2 块 → inode 槽）；
- *   - REG/SOFT_SYM 目标：link_count--，归零触发全量空间回收
- *     （暂 RC_ERR_NOT_SUPPORTED 哨兵，inode 暂挂孤儿，fsck 可回收）；
+ *   - REG/SOFT_SYM 目标：link_count--，归零 → regular_file_reclaim 全量
+ *     回收（2026-09-07 补票：inline/direct/extent 全形态释放数据 + inode 槽，
+ *     零泄露；destroy_data=true 时数据块 free 前清零）。回收失败 →
+ *     RC_ERR_NOT_SUPPORTED 哨兵（树删已生效，inode 暂挂孤儿，fsck 可回收）；
  *   - 悬空条目（inum = PTR_INVALID / 位图未亮）：只删树条目，跳过资产维护。
  *
  * result_flags：
@@ -397,7 +399,8 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
 result_code_t RavenFS_juvenile::dentry_leaf_entry_delete(
     uint64_t leaf_blk_base_idx,
     uint16_t idx,
-    uint64_t &result_flags)
+    uint64_t &result_flags,
+    bool destroy_data)
 {
     result_flags = 0;
 
@@ -467,6 +470,7 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_delete(
 
     /* ── 树删后：下游 inode 资产维护（DELETE_FULL）──
      * 树删已落盘：此处失败仅上报错误，孤儿/计数偏差由 fsck 修正。 */
+    bool need_reclaim = false;   /* REG/SOFT_SYM 归零：延后到 tgt_sess 析构后执行 */
     if (has_inode) {
         InodeSession tgt_sess(inode_cache_mgr, inum);
         if (!tgt_sess) return RC_ERR_IO;
@@ -484,13 +488,18 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_delete(
             lc--;
             tgt_sess.inode->link_count = lc;
             tgt_sess.dirty();
-            if (lc == 0) {
-                /* 全量空间回收（extent 树 / 直指区间 / 内联 + inode 槽）暂未实现：
-                 * 哨兵拒绝 —— inode 暂挂孤儿（位图亮 + link_count=0），
-                 * 不静默泄漏、不悬挂；fsck 可识别回收。 */
-                return RC_ERR_NOT_SUPPORTED;
-            }
+            if (lc == 0) need_reclaim = true;
         }
+    }
+
+    /* ── 归零全量回收（2026-09-07 补票，tgt_sess 析构后执行避免同 inode 双会话）──
+     * regular_file_reclaim 按形态释放数据（extent 叶链遍历 + 自底向上释节点 /
+     * direct 区间 / inline 内联）+ inode 槽，零泄露。失败 → 哨兵：树删 +
+     * link_count=0 已落盘，inode 孤儿暂挂（位图亮），不静默泄漏、不悬挂，
+     * fsck 可识别回收。 */
+    if (need_reclaim) {
+        if (regular_file_reclaim(inum, destroy_data) != RC_OK)
+            return RC_ERR_NOT_SUPPORTED;
     }
     return RC_OK;
 }

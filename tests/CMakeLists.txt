@@ -26,6 +26,14 @@ add_executable(ravenfs_juv_extent_ops
 )
 target_link_libraries(ravenfs_juv_extent_ops PRIVATE ravenfs_juvenile Threads::Threads)
 
+# v1.1 map 自动融合路线专项测试（F 组：简单融合矩阵 → 12 万 BOSS → 并行；
+# 含区间取样工具 range_sample 与跨界左并盲区探测）
+add_executable(ravenfs_juv_extent_fusion
+    test_extent_fusion.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_extent_fusion PRIVATE ravenfs_juvenile Threads::Threads)
+
 # v1.1 幼年期上帝类：root_dir_rm_dentry 接口专项测试
 add_executable(ravenfs_juv_delete
     test_root_dir_delete.cpp

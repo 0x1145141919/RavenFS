@@ -298,7 +298,7 @@ int main(int argc, char **argv) {
         { ctrl,          RC_OK,            "控制字符 0x01-0x03" },
     };
     for (const auto &c : cases) {
-        result_code_t r = fs.root_dir_insert_dentry(c.name);
+        result_code_t r = fs.root_dir_insert_dentry(c.name, INODE_TYPE_REGULAR);
         bool ok = (r == c.expect);
         if (ok) inserted += (c.expect == RC_OK);
         printf("  [%s] insert(\"%s\") → %-16s expect %-16s  %s\n",
@@ -308,7 +308,7 @@ int main(int argc, char **argv) {
 
     /* 空名再插一次：hash 相同，应判 EXIST（同时暴露 memcpy 越界读行为） */
     {
-        result_code_t r = fs.root_dir_insert_dentry("");
+        result_code_t r = fs.root_dir_insert_dentry("", INODE_TYPE_REGULAR);
         bool ok = (r == RC_ERR_EXIST);
         printf("  [%s] insert(\"\") 再次 → %s（expect RC_ERR_EXIST；空名条目已存在）\n",
                ok ? "PASS" : "FAIL", rc_name(r));
@@ -319,7 +319,7 @@ int main(int argc, char **argv) {
 
     /* 长名重复插入：hash 相同 → 叶子内完整名字比较（dentry_name_cmp 读堆尾部）→ EXIST */
     {
-        result_code_t r = fs.root_dir_insert_dentry(long41);
+        result_code_t r = fs.root_dir_insert_dentry(long41, INODE_TYPE_REGULAR);
         bool ok = (r == RC_ERR_EXIST);
         printf("  [%s] insert(41B) 再次 → %s（expect RC_ERR_EXIST，尾部比较命中）\n",
                ok ? "PASS" : "FAIL", rc_name(r));
@@ -335,7 +335,7 @@ int main(int argc, char **argv) {
     int progress = insert_n >= 1000 ? insert_n / 8 : 1;
     for (int i = 0; i < insert_n; i++) {
         snprintf(nb, sizeof(nb), "f%05d", i);
-        result_code_t r = fs.root_dir_insert_dentry(nb);
+        result_code_t r = fs.root_dir_insert_dentry(nb, INODE_TYPE_REGULAR);
         if (r != RC_OK) { batch_ok = false; fail_at = i; fail_rc = r; break; }
         inserted++;   /* 每成功一个立即计数，失败时树内条目数仍准确 */
         if (progress >= 1 && (i + 1) % progress == 0)
@@ -367,7 +367,7 @@ int main(int argc, char **argv) {
         int len = 41 + (i * 7) % 512;   /* 41,48,...,552 循环 */
         for (int j = 0; j < len; j++) lname[j] = seed_chars[(i + j * 3) % 62];
         lname[len] = 0;
-        result_code_t r = fs.root_dir_insert_dentry(lname);
+        result_code_t r = fs.root_dir_insert_dentry(lname, INODE_TYPE_REGULAR);
         if (r != RC_OK) { long_ok = false; long_fail_at = i; long_fail_rc = r; break; }
         inserted++;
         /* 抽查：插入后立即 lookup（完整名字比较读堆） */

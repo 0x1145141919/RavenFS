@@ -198,7 +198,7 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
  * RC_ERR_NOT_SUPPORTED = 归零全量空间回收未实现哨兵：树删 + link_count--
  * 已生效，inode 暂挂孤儿（位图亮 + 计数 0，fsck 可回收）；流程照常走完。
  * ═══════════════════════════════════════════════════════════════════ */
-result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *name)
+result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *name, bool destroy_data)
 {
     if (!name_len_limiter(name))
         return RC_ERR_NAME_LEN;
@@ -242,7 +242,7 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
     const uint64_t e_remain   = leaf->entries[idx].full_char_remain_ptr;
 
     uint64_t flags = 0;
-    rc = dentry_leaf_entry_delete(leaf_blk, idx, flags);
+    rc = dentry_leaf_entry_delete(leaf_blk, idx, flags, destroy_data);
     /* RC_ERR_NOT_SUPPORTED = 归零全量回收未实现哨兵：树删 + link_count-- 已生效，
      * inode 暂挂孤儿。继续完成删除流程（平衡 + owner 计数维护），最后上报。 */
     const bool orphan_pending = (rc == RC_ERR_NOT_SUPPORTED);
@@ -425,9 +425,9 @@ result_code_t RavenFS_juvenile::root_dir_insert_dentry(const char *name, uint8_t
 {
     return dir_insert_dentry(sb.root_inode, name, inode_type);
 }
-result_code_t RavenFS_juvenile::root_dir_rm_dentry(const char *name)
+result_code_t RavenFS_juvenile::root_dir_rm_dentry(const char *name, bool destroy_data)
 {
-    return dir_rm_dentry(sb.root_inode, name);
+    return dir_rm_dentry(sb.root_inode, name, destroy_data);
 }
 result_code_t RavenFS_juvenile::root_dir_lookup(const char *name, uint64_t *out_inum)
 {

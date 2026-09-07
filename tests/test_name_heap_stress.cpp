@@ -163,7 +163,7 @@ int main(int argc, char **argv) {
         for (uint64_t i = 0; i < count; i++) {
             gen_name(nm, GROUPS[g], i);
             result_code_t r = MIX ? fs.root_dir_insert_dentry(nm, mix_type(g, i))
-                                  : fs.root_dir_insert_dentry(nm);
+                                  : fs.root_dir_insert_dentry(nm, INODE_TYPE_REGULAR);
             if (r != RC_OK) { fail_at = i; fail_rc = r; break; }
             total_inserted++;
             if (prog >= 1 && (i + 1) % prog == 0)
@@ -230,7 +230,7 @@ int main(int argc, char **argv) {
     {
         /* 512B 档满后加塞 → 该目录长名空间耗尽 */
         gen_name(nm, GROUPS[4], GROUPS[4].full_count);
-        result_code_t r = fs.root_dir_insert_dentry(nm);
+        result_code_t r = fs.root_dir_insert_dentry(nm, INODE_TYPE_REGULAR);
         CHECK(r == RC_ERR_NO_BLOCK, "512B 档满后加塞 → %s（expect RC_ERR_NO_BLOCK）", rc_name(r));
         uint64_t inum = 0;
         result_code_t lr = fs.root_dir_lookup(nm, &inum);
@@ -239,7 +239,7 @@ int main(int argc, char **argv) {
     if (FULL) {
         /* 8B 档 3 堆全满后加塞 → 8B 档耗尽 */
         gen_name(nm, GROUPS[0], GROUPS[0].full_count);
-        result_code_t r = fs.root_dir_insert_dentry(nm);
+        result_code_t r = fs.root_dir_insert_dentry(nm, INODE_TYPE_REGULAR);
         CHECK(r == RC_ERR_NO_BLOCK, "8B 档 3 堆满后加塞 → %s（expect RC_ERR_NO_BLOCK）", rc_name(r));
     }
 
@@ -286,7 +286,7 @@ int main(int argc, char **argv) {
         for (uint64_t k = 0; k < count; k++) {
             const uint64_t i = count - 1 - k;   /* 逆序 */
             gen_name(nm, GROUPS[g], i);
-            result_code_t r = fs.root_dir_rm_dentry(nm);
+            result_code_t r = fs.root_dir_rm_dentry(nm, false);
             if (r != RC_OK) { p4_ok = false; fail_at = i; fail_rc = r; break; }
             deleted++;
             if (prog >= 1 && (k + 1) % prog == 0)
@@ -338,9 +338,9 @@ int main(int argc, char **argv) {
             CHECK(fs2.root_dir_lookup(nm, &inum) == RC_ERR_NOT_FOUND, "重挂载后仍为空");
             /* 删光后可写：重新插长名 → 堆重新激活 */
             gen_name(nm, GROUPS[1], 9999);
-            CHECK(fs2.root_dir_insert_dentry(nm) == RC_OK, "重插长名（堆重新激活）→ RC_OK");
+            CHECK(fs2.root_dir_insert_dentry(nm, INODE_TYPE_REGULAR) == RC_OK, "重插长名（堆重新激活）→ RC_OK");
             CHECK(fs2.root_dir_lookup(nm, &inum) == RC_OK, "重插后可查");
-            CHECK(fs2.root_dir_rm_dentry(nm) == RC_OK, "重插后删除 → RC_OK");
+            CHECK(fs2.root_dir_rm_dentry(nm, false) == RC_OK, "重插后删除 → RC_OK");
         }
     }
     ::close(mnt.dev.fd);

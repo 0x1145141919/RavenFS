@@ -117,11 +117,17 @@ public:
     result_code_t root_dir_direct_file_punch_hole(const char *name,uint64_t offset,uint64_t len);
     result_code_t root_dir_direct_file_trunacate(const char *name,uint64_t len_new);
     result_code_t root_dir_direct_file_pread(const char *name,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
-    /* 物理删除：dentry 树移除（memmove + 刷父 hash_max）→ inode_free。
+    /* 物理删除：dentry 树移除（memmove + 刷父 hash_max）→ 目标 inode 全量回收。
+     * destroy_data = 销毁模式：数据块 free 前清零（防恢复）；false = 仅释放（块标
+     * free，数据残留盘上，同 TRIM 语义）。
      * dir 型目标：删除前置校验目录必须全空（树根叶子 entry_count==0），
-     * 非空 → RC_ERR_NOT_EMPTY；空目录连带回收名字堆 + 释放树根 2 块。
-     * 未找到 → RC_ERR_NOT_FOUND。 */
-    result_code_t root_dir_rm_dentry(const char *name);
+     * 非空 → RC_ERR_NOT_EMPTY；空目录连带回收名字堆 + 释放树根 2 块；
+     * destroy_data 对 dir 型无额外效果（名字堆块不清零，KISS）。
+     * REG/SOFT_SYM 目标：link_count--，归零 → regular_file_reclaim（按形态
+     * inline/direct/extent 释放数据 + inode 槽；extent 型叶链遍历释放数据块 +
+     * 自底向上释放树节点，零泄露）。回收失败 → RC_ERR_NOT_SUPPORTED 哨兵
+     * （树删已生效，inode 孤儿暂挂，fsck 可回收）。未找到 → RC_ERR_NOT_FOUND。 */
+    result_code_t root_dir_rm_dentry(const char *name,bool destroy_data);
 
     /* 查找：命中 → RC_OK 且 *out_inum 输出；未命中 → RC_ERR_NOT_FOUND。 */
     result_code_t root_dir_lookup(const char *name, uint64_t *out_inum);
@@ -150,12 +156,20 @@ private:
      * 目标目录 inode_idx 的 data_root 恒有效（v1.1 §10 不变量 11），
      * 遇 PTR_INVALID = 严重内部磁盘契约违反 → RC_ERR_STATE。 */
     result_code_t dir_insert_dentry(uint64_t inode_idx,const char *name,uint8_t inode_type);
-    result_code_t dir_rm_dentry(uint64_t inode_idx,const char *name);
+    result_code_t dir_rm_dentry(uint64_t inode_idx,const char *name,bool destroy_data);
     result_code_t dir_readdir_interval(uint64_t inode_idx,uint64_t base,uint64_t entry_count,dentry_out*buf);
     result_code_t direct_file_pwrite(uint64_t inode_idx,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
     result_code_t direct_file_punch_hole(uint64_t inode_idx,uint64_t offset,uint64_t len);
     result_code_t direct_file_trunacate(uint64_t inode_idx,uint64_t len_new);//增大忽略，缩小内部编译为punch_hole的尾巴打洞条件
     result_code_t direct_file_pread(uint64_t inode_idx,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
+    /* 归零回收（link_count==0 时的 REG/SOFT_SYM 全量空间回收，2026-09-07 补票）：
+     * 按 ftype 分流 —— inline：inode 内联数据随槽释放（destroy 时先清零数据域）；
+     * direct：data_root 直指区间 [data_root, ceil(size/4K)) 释放（destroy 先清零）；
+     * extent：最左叶下钻 → 叶链遍历逐记录释放数据块（destroy 先清零）→ 叶块整体
+     * 释放 → 自底向上逐层释放内节点 → 根 → inode_free。零泄露。
+     * 失败：已释放部分不回滚（位图幂等），返回错误码；调用方（dentry 删除路径）
+     * 按孤儿挂账处理（树删已生效）。destroy 清零分段批量写，成本高（销毁语义）。 */
+    result_code_t regular_file_reclaim(uint64_t inode_idx,bool destroy_data);
     result_code_t dir_name_heap_release(uint64_t inode_idx);//作为dir关闭时调用，遍历十个堆，全空则释放
     result_code_t dir_lookup(uint64_t inode_idx,const char *name, uint64_t *out_inum);
     int64_t dir_readdir(uint64_t inode_idx,dentry_out **out_buf);
@@ -194,14 +208,19 @@ private:
      * root_blk in/out —— 入 = 当前树根，出 = 操作后根（根裂建新根 / 根收缩更迭经引用带出）；
      * owner_inode_idx 降级为纯审计锚（根 meta parent_ptr.ptr = "."，只写不读），
      * 不触发任何 inode I/O —— inode.data_root 回写权收归调用方提交点（direct_file
-     * 五步管线 phase5）。顶层 inode 态校验（type/direct_bit/data_root 有效性）删除：
+     * 四步管线 phase4）。顶层 inode 态校验（type/direct_bit/data_root 有效性）删除：
      * 调用方负责传入合法文件树根（本原语仅保 RC_ERR_OVERLAP/NOT_FOUND 等树内语义）。 */
-    result_code_t extent_map_range(uint64_t &root_blk, uint64_t owner_inode_idx, const extent_t &ext); //内部有任何区间有交集会报错
-    result_code_t extent_discard_range(uint64_t &root_blk, uint64_t owner_inode_idx, uint64_t logical_base_blk,uint64_t len);
+    result_code_t extent_map_range(uint64_t &root_blk, uint64_t owner_inode_idx, const extent_t &ext); //内部有任何区间有交集会报错；同叶 GLB 紧贴+phys 连续时左融合（扩长不插记录）
     result_code_t extent_unmap_range(uint64_t &root_blk, uint64_t owner_inode_idx, const extent_t &ext);//外部有侦查，这里是精确匹配删除extent_t叶子节点的记录
 
-    result_code_t extent_merge_range(uint64_t &root_blk, uint64_t owner_inode_idx, uint64_t logical_block_interval_base,uint64_t blk_len);//查看区间B+树的[logical_block_interval_base,logical_block_interval_base+blk_len)的对应逻辑且物理连续的extent在这个接口里面原子性融合
-    //很明显此接口不关心是否外部位图上是否实际占用只是记录耦合
+    /* 激进重建原语（2026-09-07 落地；融合策略演进史见 Docs/pwrite_pipeline.md §1/§2）
+     * 整树范围：叶链收集全部记录 → 可并对全并 → 均分重打包（每节点 168..337）→
+     * 自下而上构建新树 → free 旧树 → root_blk 换新根。
+     * 失败原子性：新树全部节点建成前旧树只读；任何分配失败 = free 新节点、旧树无损。
+     * 低配于 entry[0] 跨界残留 / 随机写中间插入残留 / 历史遗留的兜底面。
+     * 已退役：extent_merge_range（区间 F/M 融合）与 extent_discard_range（lesson 已否的
+     * 补偿原语）设计作废，签名一并移除。 */
+    result_code_t extent_rebuild_tree(uint64_t &root_blk, uint64_t owner_inode_idx);
     /* ── 位图核心 ── */
     bool bitmaps_load();     /* mount 时：直写=全量 pread 入内存；mmap 后端=窗口切片（不预取）。
                                 * 两模式共用自描述校验(§6.6)；原始内存喂给 bitmap_slices_mgr_t 装配 */
@@ -462,7 +481,7 @@ private:
      * DELETE_TREE_ONLY = fsck 清理悬挂条目：inode 可能无效，只删树条目（预留，暂未使用） */
     enum delete_policy_t : uint8_t { DELETE_FULL = 0, DELETE_TREE_ONLY = 1 };
     result_code_t dentry_leaf_entry_insert(uint64_t leaf_blk_base_idx,name_cmlpx_t* name,uint16_t idx,uint64_t&result_flags,uint8_t inode_type,uint64_t owner_dir_inode);//下沉版（2026-09-01）：分配+初始化目标 inode（DIR 急建树根/REG/SOFT_SYM 内联）+ 长名外置分配 + 树插 + owner 目录 size++/link_count=size+2；失败 guard 全回滚。result_flags: bit0=需分裂, bit1=父层max需刷新
-    result_code_t dentry_leaf_entry_delete(uint64_t leaf_blk_base_idx,uint16_t idx,uint64_t&result_flags);//删条目+维护下游资产（DELETE_FULL 语义）：dir 型目标先校验空（NOT_EMPTY 零副作用）再删，删后全量回收（名字堆/树根 2 块/inode 槽）；REG/SOFT_SYM 目标 link_count--，归零触发全量空间回收（暂 RC_ERR_NOT_SUPPORTED 哨兵，inode 暂挂孤儿）。成功时result_flags有效，bits[0]=欠载需合并，bits[1]=父层对应entry的max需刷新
+    result_code_t dentry_leaf_entry_delete(uint64_t leaf_blk_base_idx,uint16_t idx,uint64_t&result_flags,bool destroy_data);//删条目+维护下游资产（DELETE_FULL 语义）：dir 型目标先校验空（NOT_EMPTY 零副作用）再删，删后全量回收（名字堆/树根 2 块/inode 槽；destroy_data 对 dir 无额外效果）；REG/SOFT_SYM 目标 link_count--，归零 → regular_file_reclaim(inum, destroy_data)（inline/direct/extent 全形态释放 + inode 槽，2026-09-07 补票）。回收失败 → RC_ERR_NOT_SUPPORTED 哨兵（树删已生效，inode 孤儿暂挂，fsck 可回收）。成功时result_flags有效，bits[0]=欠载需合并，bits[1]=父层对应entry的max需刷新
     split_result_t dentry_leaf_split(uint64_t victim_node_blkbase);//会内部进行叶子链表的维护，不会进行父节点的修改
     split_result_t dentry_inner_split(uint64_t victim_node_blkbase);//不会进行父节点的修改
     result_code_t dentry_spilt_parent_apply(uint64_t parent_node_blkbase,uint16_t victim_in_node_id,split_result_t result,bool&is_parent_spilt_acquire);
@@ -492,15 +511,18 @@ private:
      * total ≤ 337 ／分裂左 168 右 count−168。split_result_t 复用，其
      * low_node_maxhash 字段在 extent 侧承载“左半最大开边界 key”。
      * ══════════════════════════════════════════════════════════ */
-    split_result_t extent_leaf_split(uint64_t victim_blk);   /* 叶裂：链表维护，不动父 */
-    split_result_t extent_inner_split(uint64_t victim_blk);  /* 内裂：右半孩子 reparent 新块 */
+    /* 分裂三件套（2026-09-07 预算化）：节点块号由调用方预分配传入（prealloc_blk）——
+     * map_range 按树高预算整条分裂链节点（depth+1），分裂函数自身不再 alloc →
+     * 无 ENOSPC 失败面；剩余预算由调用方收尾归还（map 原子性闭环）。 */
+    split_result_t extent_leaf_split(uint64_t victim_blk, uint64_t prealloc_blk);   /* 叶裂：链表维护，不动父 */
+    split_result_t extent_inner_split(uint64_t victim_blk, uint64_t prealloc_blk);  /* 内裂：右半孩子 reparent 新块 */
     result_code_t extent_spilt_parent_apply(uint64_t parent_blk, uint16_t victim_idx,
                                             split_result_t r, bool &parent_spilt);
     /* 根更迭沿引用链穿透（detach，2026-09-06）：三者收 root_blk& in/out；
      * owner_inode_idx 仅写根 meta "." 审计锚，零 inode I/O。 */
     result_code_t extent_new_root_inner(uint64_t low_blk, uint64_t low_key,
                                         uint64_t high_blk, uint64_t owner_inode_idx,
-                                        uint64_t &root_blk);
+                                        uint64_t &root_blk, uint64_t prealloc_blk);
     result_code_t extent_node_balance(uint64_t parent_blk, uint16_t idx, bool &need_balance);
     result_code_t extent_root_shrink(uint64_t &root_blk, uint64_t owner_inode_idx);
     result_code_t extent_balance_from(uint64_t child_blk, uint64_t owner_inode_idx,

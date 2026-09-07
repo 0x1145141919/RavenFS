@@ -1,6 +1,8 @@
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"   /* mdata_piece_session：8K 元数据节点会话（头里仅前置声明） */
 #include <cstring>
+#include <vector>
+#include <algorithm>
 
 /* ═══════════════════════════════════════════════════════════════════
  * extent_tree.cpp — RavenFS v1.1 extent B+tree 轮子区
@@ -521,11 +523,14 @@ result_code_t RavenFS_juvenile::extent_refresh_key_chain(uint64_t blk)
 /* ═══════════════════════════════════════════════════════════════════
  * extent_leaf_split — 叶分裂（337 阶：左 168 右 count−168）
  * 不修改父层；low_node_maxhash 承载左半最大开边界 key。
+ * 2026-09-07：prealloc_blk = 调用方预算池提供的节点块号（map_range 按树高预分配），
+ * 本函数不再 alloc → 无 ENOSPC 失败面（IO/STATE 校验保留）。
  * 链表维护（同 dentry_leaf_split）：
  *   victim(左) → new(右) → old_next；old_next.prev = new（若存在）；
  *   根叶分裂后 victim 转链表成员：无前驱 → ptrs[1]=INVALID。
  * ═══════════════════════════════════════════════════════════════════ */
-RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_leaf_split(uint64_t victim_blk)
+RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_leaf_split(uint64_t victim_blk,
+                                                                     uint64_t prealloc_blk)
 {
     split_result_t res;
     res.rc = RC_OK;
@@ -544,8 +549,7 @@ RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_leaf_split(uint64_t vi
     uint16_t count = (uint16_t)victim->meta.parent_ptr.entry_count;
     if (count <= 337) { res.rc = RC_ERR_STATE; return res; }   /* 只有超满才裂 */
 
-    uint64_t new_blk = block_alloc_hard(2, 1);
-    if (new_blk == PTR_INVALID) { res.rc = RC_ERR_NO_BLOCK; return res; }
+    const uint64_t new_blk = prealloc_blk;   /* 预算块：调用方保证已分配 */
 
     /* ⚠ 旧后继在改写 victim.ptrs[2] 之前取；位域读出为 52 位形态 */
     const bool victim_is_root = victim->meta.parent_ptr.is_root_node;
@@ -591,8 +595,10 @@ RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_leaf_split(uint64_t vi
 /* ═══════════════════════════════════════════════════════════════════
  * extent_inner_split — 内部节点分裂（337 阶：左 168 右 count−168）
  * 内部节点无兄弟链表；右半孩子全部 reparent 到新块（否则上溯走错父）。
+ * 2026-09-07：prealloc_blk = 预算池节点块号，本函数不再 alloc（无 ENOSPC 面）。
  * ═══════════════════════════════════════════════════════════════════ */
-RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_inner_split(uint64_t victim_blk)
+RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_inner_split(uint64_t victim_blk,
+                                                                      uint64_t prealloc_blk)
 {
     split_result_t res;
     res.rc = RC_OK;
@@ -611,8 +617,7 @@ RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_inner_split(uint64_t v
     uint16_t count = (uint16_t)victim->meta.parent_ptr.entry_count;
     if (count <= 337) { res.rc = RC_ERR_STATE; return res; }
 
-    uint64_t new_blk = block_alloc_hard(2, 1);
-    if (new_blk == PTR_INVALID) { res.rc = RC_ERR_NO_BLOCK; return res; }
+    const uint64_t new_blk = prealloc_blk;   /* 预算块：调用方保证已分配 */
 
     mdata_piece_session new_sess(mdata_piece_mgr, new_blk);
     if (new_sess.index_error()) { res.rc = RC_ERR_STATE; return res; }
@@ -705,10 +710,10 @@ result_code_t RavenFS_juvenile::extent_spilt_parent_apply(
 result_code_t RavenFS_juvenile::extent_new_root_inner(uint64_t low_blk, uint64_t low_key,
                                                       uint64_t high_blk,
                                                       uint64_t owner_inode_idx,
-                                                      uint64_t &root_blk)
+                                                      uint64_t &root_blk,
+                                                      uint64_t prealloc_blk)
 {
-    uint64_t new_root_blk = block_alloc_hard(2, 1);
-    if (new_root_blk == PTR_INVALID) return RC_ERR_NO_BLOCK;
+    const uint64_t new_root_blk = prealloc_blk;   /* 预算块：调用方保证已分配 */
 
     mdata_piece_session root_sess(mdata_piece_mgr, new_root_blk);
     if (root_sess.index_error()) return RC_ERR_STATE;
@@ -1107,24 +1112,33 @@ result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * extent_map_range — 声明式映射原语（插侧 · 降级版：只插入，不融合）
+ * extent_map_range — 声明式映射原语（插侧 · 2026-09-06 定案：有界左融合）
  *
- * 2026-09-06 降级决策（F 组融合测试实证 map 内建融合不完备——跨界左并
- * 缺失、融合致欠载叶不回收，见 tests/test_extent_fusion.cpp F1d/F2）：
- *   融合义务从 map 剥离 → 归显式收敛原语 extent_merge_range（单独实现/测试）。
- *   map 语义收缩为：插入 ext 记录 + 重叠防御 + 超满分裂。树内可并残留由
- *   调用方显式 merge 收敛（pwrite 五步管线 phase3 的职责）。
+ * 演进史：
+ *   - 2026-09-03 内建自动融合（左并/右并/跨界）→ F 组测试实证不完备
+ *     （f1d 跨界左并盲区 / F2 融合致欠载叶不回收）→ 7bde35c 降级为纯插；
+ *   - 2026-09-06 定案（演进史见 Docs/pwrite_pipeline.md §1/§2）：map 只左融合（同叶
+ *     GLB 单对）+ 全量融合归激进重建（extent_rebuild_tree）。
+ *
+ * 左融合语义（有界单对，不承诺完备）：
+ *   插入前查 GLB —— 逻辑紧贴（GLB.end == ext.fblkbase）&& phys 连续
+ *   （GLB.phys_end == ext.block_base.ptr）→ 不插新记录，GLB.length += 段长。
+ *   count 不变、无腾槽 → 无超满分裂可能 → 零新增失败路径；不删记录 →
+ *   无欠载制造路径（与旧融合死因无交集）。顺序写（occupy 尾巴延展）下
+ *   记录数 ≈ phys run 数，不随写次数涨。
+ *   刻意不做：entry[0]（GLB=NONE）跨界左并——跨叶要动前叶 count/max +
+ *   父 hint 刷新链，不值；f1d 形态残留显式接受，交激进重建兑底。
  *
  * 语义：声明 [ext.fblkbase, ext.fblkbase+ext.length) 由 ext.block_base 起
  * length 个连续 FS_block 背书（纯记录层，不碰数据侧位图）。重叠防御双向：
  *   - 落点 GLB 覆盖 ext.fblkbase（起点落入既有区间）→ RC_ERR_OVERLAP；
- *   - 插入段覆盖右邻起点（ext.end > 右邻.fblkbase）→ RC_ERR_OVERLAP。
- * 紧贴合法（半开区间无交集），但**不自动融合**——相邻可并记录保持分离，
- * canonical 收敛（可并即并）是 extent_merge_range 的职责。
+ *   - 区间终点盖右邻起点（ext.end > 右邻.fblkbase）→ RC_ERR_OVERLAP
+ *     （左并/纯插共用：扩长后终点同样不得盖右邻）。
+ * 紧贴合法（半开区间无交集）；紧贴+连续走左融合，其余残留合法。
  *
- * 内部：纯插（GLB 后 memmove 腾槽）→ count+1 → 超满（>337）分裂级联
- * （叶裂 → 父 apply → 内裂递归 → 根裂建新根）→ 父 key 上溯刷新。
- * 无融合 → 无"融合致邻叶欠载"路径 → 无 other_underflow 平衡段。
+ * 内部：左融合命中 = 零结构变化（仅 GLB 为叶末项时叶 max 变 → 上刷父链，
+ * 复用 insert 尾插的 extent_refresh_key_chain）；否则纯插（GLB 后 memmove
+ * 腾槽）→ count+1 → 超满（>337）分裂级联 → 父 key 上溯刷新。
  *
  * 外显契约（detach，2026-09-06）：root_blk in/out（根裂建新根经引用带出）；
  * owner_inode_idx 纯审计锚（根 meta "."）；不碰 inode。调用方保证 root_blk
@@ -1146,6 +1160,10 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
     bool need_split = false;
     bool did_split = false;
     uint64_t split_high_leaf = 0;
+    bool left_merged = false;       /* 左融合命中（同叶 GLB 扩长，count 不变） */
+    bool left_key_changed = false;  /* 左融合对象为叶末项 → 叶 max 变 → 需刷父链 */
+    std::vector<uint64_t> reserve_pool;   /* 分裂预算池（2026-09-07 map 原子性） */
+    size_t pool_used = 0;
 
     {
         mdata_piece_session sess(mdata_piece_mgr, leaf_blk);
@@ -1158,95 +1176,147 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
 
         if (hit) return RC_ERR_OVERLAP;   /* 起点被 GLB 覆盖（区间重叠） */
 
-        /* ── 纯插（不融合）：GLB 后腾槽插入 ── */
+        /* 右邻防御（左并/纯插共用：无论扩长还是新插，终点都不得盖右邻起点） */
         const uint16_t pos = (glb == EXTENT_LEAF_GLB_NONE) ? 0 : (uint16_t)(glb + 1);
         if (pos < count) {
-            /* 防御：插入段不得覆盖右邻起点（半开合法 = ext.end <= 右邻.fblkbase） */
             const extent_t r = leaf->extents[pos];
             if (ext.fblkbase + ext.length > r.fblkbase)
                 return RC_ERR_OVERLAP;
         }
-        if (pos < count) {
-            memmove(&leaf->extents[pos + 1], &leaf->extents[pos],
-                    (size_t)(count - pos) * sizeof(extent_t));
-        }
-        leaf->extents[pos] = ext;
-        count++;
-        leaf->meta.parent_ptr.entry_count = count;
 
-        need_split = count > 337;
-        sess.dirty();
-    }   /* 叶会话析构写回；分裂前必须关（同块双会话不互见修改） */
-
-    /* ── 分裂级联（叶裂 → 父 apply → 内裂递归 → 根裂建新根） ── */
-    if (need_split) {
-        split_result_t sr = extent_leaf_split(leaf_blk);
-        if (sr.rc != RC_OK) return sr.rc;
-        did_split = true;
-        split_high_leaf = sr.high_node_blkidx;
-        if (trace.depth == 1) {
-            rc = extent_new_root_inner(sr.low_node_blkidx, sr.low_node_maxhash,
-                                       sr.high_node_blkidx, owner_inode_idx, root_blk);
-            if (rc) return rc;
-        } else {
-            uint64_t parent_blk = trace.blocks[trace.depth - 2];
-            uint16_t child_idx = trace.child_idx[trace.depth - 2];
-            bool parent_spilt = false;
-            rc = extent_spilt_parent_apply(parent_blk, child_idx, sr, parent_spilt);
-            if (rc) return rc;
-            uint64_t cur_parent = parent_blk;
-            int guard = 0;
-            while (parent_spilt) {
-                if (++guard > 64) return RC_ERR_STATE;
-                mdata_piece_session ps(mdata_piece_mgr, cur_parent);
-                if (ps.index_error()) return RC_ERR_STATE;
-                if (!ps) return RC_ERR_IO;
-                Bptree_extent_inner_node_t *pn = (Bptree_extent_inner_node_t *)ps.data;
-                if (!is_extent_node(&pn->meta) || !pn->meta.parent_ptr.is_inner_node)
-                    return RC_ERR_STATE;
-                const bool parent_is_root = pn->meta.parent_ptr.is_root_node;
-                const uint64_t grand_blk = pn->meta.parent_ptr.ptr;
-                split_result_t isr = extent_inner_split(cur_parent);
-                if (isr.rc != RC_OK) return isr.rc;
-                if (parent_is_root) {
-                    rc = extent_new_root_inner(isr.low_node_blkidx, isr.low_node_maxhash,
-                                               isr.high_node_blkidx, owner_inode_idx,
-                                               root_blk);
-                    if (rc) return rc;
-                    break;
-                }
-                if (grand_blk == PTR_INVALID_52) return RC_ERR_STATE;
-                mdata_piece_session gs(mdata_piece_mgr, grand_blk);
-                if (gs.index_error()) return RC_ERR_STATE;
-                if (!gs) return RC_ERR_IO;
-                Bptree_extent_inner_node_t *grand = (Bptree_extent_inner_node_t *)gs.data;
-                if (!is_extent_node(&grand->meta) || !grand->meta.parent_ptr.is_inner_node)
-                    return RC_ERR_STATE;
-                const uint16_t gcnt = (uint16_t)grand->meta.parent_ptr.entry_count;
-                uint16_t grand_idx = 0;
-                bool found = false;
-                for (; grand_idx < gcnt; grand_idx++) {
-                    if (grand->extents[grand_idx].sub_node_ptr.ptr == cur_parent) {
-                        found = true; break;
-                    }
-                }
-                if (!found) return RC_ERR_STATE;
-                rc = extent_spilt_parent_apply(grand_blk, grand_idx, isr, parent_spilt);
-                if (rc) return rc;
-                cur_parent = grand_blk;
+        /* ── 左融合（2026-09-06 定案）：GLB 紧贴 && phys 连续 → 扩长不插记录。
+         * 有界单对：不承诺完备、不删记录（无欠载路径）；GLB=NONE（entry[0]
+         * 落点）刻意跳过跨界左并（跨叶成本不值，残留交激进重建兑底）。 ── */
+        if (glb != EXTENT_LEAF_GLB_NONE) {
+            const extent_t &g = leaf->extents[glb];
+            if (g.fblkbase + g.length == ext.fblkbase &&
+                g.block_base.ptr + g.length == ext.block_base.ptr) {
+                leaf->extents[glb].length += ext.length;  /* 零结构变化：count/槽位不动 */
+                left_key_changed = (glb == count - 1);    /* 叶末项 → 子树 max 变 */
+                left_merged = true;
+                sess.dirty();
             }
         }
+
+        if (!left_merged) {
+            /* ── 分裂预算（2026-09-07 map 原子性）：满叶（337）纯插必裂 → 按树高预分配
+             * 整条分裂链节点：depth+1 = 叶裂 1 + 每内层至多 1 + 根裂建新根 1。
+             * alloc 在树改动（memmove）之前 → 失败 = free 已分配 + 返回，树零改动、
+             * 真原子失败（级联中途 ENOSPC 留孤儿的 C 决策缺口对 map 关闭）。
+             * 不满叶插入零预算；左并分支零预算。 ── */
+            if (count == 337) {
+                reserve_pool.reserve((size_t)trace.depth + 1);
+                for (int i = 0; i <= trace.depth; i++) {
+                    const uint64_t b = block_alloc_hard(2, 1);
+                    if (b == PTR_INVALID) {
+                        for (uint64_t x : reserve_pool) block_free(x, 2);
+                        return RC_ERR_NO_BLOCK;   /* 未 dirty：会话析构不写回，树零改动 */
+                    }
+                    reserve_pool.push_back(b);
+                }
+            }
+            /* ── 纯插（不融合）：GLB 后腾槽插入 ── */
+            if (pos < count) {
+                memmove(&leaf->extents[pos + 1], &leaf->extents[pos],
+                        (size_t)(count - pos) * sizeof(extent_t));
+            }
+            leaf->extents[pos] = ext;
+            count++;
+            leaf->meta.parent_ptr.entry_count = count;
+
+            need_split = count > 337;
+            sess.dirty();
+        }
+    }   /* 叶会话析构写回；分裂/刷链前必须关（同块双会话不互见修改） */
+
+    if (left_merged) {
+        /* 零结构变化收尾：count 未增 → 无分裂路径；GLB 非叶末 → 叶 max 未变，
+         * 父链零刷新。仅 GLB 为叶末项时叶 max 变 → 复用 insert 尾插刷链路径。 */
+        if (left_key_changed) {
+            rc = extent_refresh_key_chain(leaf_blk);
+            if (rc) return rc;
+        }
+        return RC_OK;
     }
 
-    /* ── 父 key 刷新：从本叶上溯；分裂后两半叶都刷。
-     * 降级版无 balance 路径（融合剥离），顺序纪律保留（防未来加回）。 ── */
-    rc = extent_refresh_key_chain(leaf_blk);
-    if (rc) return rc;
-    if (did_split) {
-        rc = extent_refresh_key_chain(split_high_leaf);
+    /* ── 分裂级联 + 父 key 刷新（lambda：错误经 return 统一走预算归还收尾） ── */
+    auto split_and_refresh = [&]() -> result_code_t {
+        if (need_split) {
+            split_result_t sr = extent_leaf_split(leaf_blk, reserve_pool[pool_used++]);
+            if (sr.rc != RC_OK) return sr.rc;
+            did_split = true;
+            split_high_leaf = sr.high_node_blkidx;
+            if (trace.depth == 1) {
+                rc = extent_new_root_inner(sr.low_node_blkidx, sr.low_node_maxhash,
+                                           sr.high_node_blkidx, owner_inode_idx, root_blk,
+                                           reserve_pool[pool_used++]);
+                if (rc) return rc;
+            } else {
+                uint64_t parent_blk = trace.blocks[trace.depth - 2];
+                uint16_t child_idx = trace.child_idx[trace.depth - 2];
+                bool parent_spilt = false;
+                rc = extent_spilt_parent_apply(parent_blk, child_idx, sr, parent_spilt);
+                if (rc) return rc;
+                uint64_t cur_parent = parent_blk;
+                int guard = 0;
+                while (parent_spilt) {
+                    if (++guard > 64) return RC_ERR_STATE;
+                    mdata_piece_session ps(mdata_piece_mgr, cur_parent);
+                    if (ps.index_error()) return RC_ERR_STATE;
+                    if (!ps) return RC_ERR_IO;
+                    Bptree_extent_inner_node_t *pn = (Bptree_extent_inner_node_t *)ps.data;
+                    if (!is_extent_node(&pn->meta) || !pn->meta.parent_ptr.is_inner_node)
+                        return RC_ERR_STATE;
+                    const bool parent_is_root = pn->meta.parent_ptr.is_root_node;
+                    const uint64_t grand_blk = pn->meta.parent_ptr.ptr;
+                    split_result_t isr = extent_inner_split(cur_parent, reserve_pool[pool_used++]);
+                    if (isr.rc != RC_OK) return isr.rc;
+                    if (parent_is_root) {
+                        rc = extent_new_root_inner(isr.low_node_blkidx, isr.low_node_maxhash,
+                                                   isr.high_node_blkidx, owner_inode_idx,
+                                                   root_blk, reserve_pool[pool_used++]);
+                        if (rc) return rc;
+                        break;
+                    }
+                    if (grand_blk == PTR_INVALID_52) return RC_ERR_STATE;
+                    mdata_piece_session gs(mdata_piece_mgr, grand_blk);
+                    if (gs.index_error()) return RC_ERR_STATE;
+                    if (!gs) return RC_ERR_IO;
+                    Bptree_extent_inner_node_t *grand = (Bptree_extent_inner_node_t *)gs.data;
+                    if (!is_extent_node(&grand->meta) || !grand->meta.parent_ptr.is_inner_node)
+                        return RC_ERR_STATE;
+                    const uint16_t gcnt = (uint16_t)grand->meta.parent_ptr.entry_count;
+                    uint16_t grand_idx = 0;
+                    bool found = false;
+                    for (; grand_idx < gcnt; grand_idx++) {
+                        if (grand->extents[grand_idx].sub_node_ptr.ptr == cur_parent) {
+                            found = true; break;
+                        }
+                    }
+                    if (!found) return RC_ERR_STATE;
+                    rc = extent_spilt_parent_apply(grand_blk, grand_idx, isr, parent_spilt);
+                    if (rc) return rc;
+                    cur_parent = grand_blk;
+                }
+            }
+        }
+
+        /* 父 key 刷新：从本叶上溯；分裂后两半叶都刷。 */
+        rc = extent_refresh_key_chain(leaf_blk);
         if (rc) return rc;
-    }
-    return RC_OK;
+        if (did_split) {
+            rc = extent_refresh_key_chain(split_high_leaf);
+            if (rc) return rc;
+        }
+        return RC_OK;
+    };
+    rc = split_and_refresh();
+
+    /* 预算归还（统一收尾）：级联实际消耗 pool_used 个（多数情况只裂一层 → 大部
+     * 分预算归还；最坏全链分裂 depth+1 个全部消耗）。错误路径同样在此归还。 */
+    for (; pool_used < reserve_pool.size(); pool_used++)
+        block_free(reserve_pool[pool_used], 2);
+    return rc;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1308,4 +1378,189 @@ result_code_t RavenFS_juvenile::extent_unmap_range(uint64_t &root_blk, uint64_t 
     if (is_root) return RC_OK;   /* 根叶欠载/空均合法，且无父 key */
     if (underflow) return extent_balance_from(leaf_blk, owner_inode_idx, root_blk);
     return extent_refresh_key_chain(leaf_blk);   /* 仅叶 max 变时上溯（删末项/删空） */
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 激进重建打包助手（extent_rebuild_tree 专用，2026-09-06 定案）
+ *
+ * 均分打包：items 个元素分到 groups 组（前 rem 组多 1 个）。
+ * 容量论证：groups = ceil(items/337) 时每组 ∈ [168, 337]（items ≥ 338 且
+ * groups ≥ 2；items ≤ 337 时单组根节点任意 count）——非根节点欠载免疫，
+ * 审计的 168 下限自动满足。337 阶容量：ceil ≤ 337 由 groups 定义保证。
+ * ═══════════════════════════════════════════════════════════════════ */
+static uint64_t rb_group_size(uint64_t items, uint64_t groups, uint64_t idx) {
+    return items / groups + (idx < items % groups ? 1 : 0);
+}
+/* 子→父反函数：child_idx 在父层 groups 个节点中的归属（O(1)，均分反解） */
+static uint64_t rb_parent_of(uint64_t child_items, uint64_t parent_groups, uint64_t child_idx) {
+    const uint64_t base = child_items / parent_groups;   /* ≥1：groups ≤ items */
+    const uint64_t rem = child_items % parent_groups;
+    if (rem == 0) return child_idx / base;
+    const uint64_t big_end = rem * (base + 1);           /* 前 rem 组是大组（base+1） */
+    return (child_idx < big_end) ? child_idx / (base + 1)
+                                 : rem + (child_idx - big_end) / base;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * extent_rebuild_tree — 激进重建原语（全量融合，2026-09-06 定案）
+ *
+ * 定位：全量融合 = 激进重建（低频兜底面：entry[0] 跨界残留 / 随机写中间
+ * 插入残留 / 历史遗留）。完整算法链：
+ *   叶链遍历收集全部记录（叶序 = 逻辑序）→ 可并对全并（紧贴 && phys 连续）
+ *   → 均分重打包（每节点 168..337）→ 自下而上构建内部节点 → swap 新根
+ *   → free 旧树。顺带兑现：整树节点收集释放轮子（待办 #3）。
+ *
+ * 失败原子性：新树全部节点**先分配先写盘**（旧树全程只读）——任何一步
+ * 失败 = 仅 free 已分配的新节点、旧树无损（调用方可重试或 fsck）。
+ * 旧树 free 与 root_blk 更替在成功路径末尾：崩溃窗口（free 后 inode 未
+ * 回写）与 unmap 后数据块 free 同模型，归 fsck 范畴（C 决策）。
+ *
+ * 打包规则：每层节点数 = ceil(本层元素 / 337)，均分填充（非根节点
+ * 恒 ∈ [168,337]）；根单节点（叶或内）允许任意 count ∈ [1,337]。
+ * 叶链表重建：ptrs[1]=前驱 / ptrs[2]=后继（首尾 PTR_INVALID），
+ * 兄弟链序 == 层内块序（DFS 序一致，audit_chain 可验）。
+ *
+ * 外显契约（detach 同 map/unmap）：root_blk in/out（换新根经引用带出）；
+ * owner_inode_idx 纯审计锚（根 meta "."）；不碰 inode；调用方负责把新
+ * root_blk 回写 inode.data_root（文件层提交点）。
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::extent_rebuild_tree(uint64_t &root_blk, uint64_t owner_inode_idx)
+{
+    const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+    std::vector<uint64_t> old_blocks;   /* 旧树全部节点块号（整体释放） */
+    std::vector<extent_t> recs;         /* 全部记录（叶序 = 逻辑序） */
+
+    /* ── 1. 旧树遍历：单趟栈式 DFS，节点块收集 + 叶记录收集 ──
+     * 子节点倒序入栈 → 出栈序 = 左→右 = 逻辑序（树不变量：子树区间有序）。 */
+    {
+        std::vector<uint64_t> stack;
+        stack.push_back(root_blk);
+        uint64_t guard = 0;                       /* 防环/天文节点数防御 */
+        while (!stack.empty()) {
+            if (++guard > (1ull << 26)) return RC_ERR_STATE;
+            const uint64_t blk = stack.back();
+            stack.pop_back();
+            if (blk == PTR_INVALID_52) return RC_ERR_STATE;
+            mdata_piece_session sess(mdata_piece_mgr, blk);
+            if (sess.index_error()) return RC_ERR_STATE;
+            if (!sess) return RC_ERR_IO;
+            Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
+            if (!is_extent_node(meta)) return RC_ERR_STATE;
+            old_blocks.push_back(blk);
+            if (meta->parent_ptr.is_inner_node) {
+                Bptree_extent_inner_node_t *inner = (Bptree_extent_inner_node_t *)sess.data;
+                const uint16_t cnt = (uint16_t)inner->meta.parent_ptr.entry_count;
+                if (cnt == 0) return RC_ERR_STATE;
+                for (uint16_t i = cnt; i-- > 0;)   /* 倒序：先入栈最右 → 最左先出 */
+                    stack.push_back(inner->extents[i].sub_node_ptr.ptr);
+            } else {
+                Bptree_extent_leaf_node_t *leaf = (Bptree_extent_leaf_node_t *)sess.data;
+                const uint16_t cnt = (uint16_t)leaf->meta.parent_ptr.entry_count;
+                const size_t old = recs.size();
+                recs.resize(old + cnt);
+                memcpy(&recs[old], leaf->extents, (size_t)cnt * sizeof(extent_t));
+            }
+        }
+    }
+
+    /* ── 2. 可并对全并（就地压缩）：紧贴 && phys 连续 → 吸收右邻 ── */
+    size_t w = 0;
+    for (size_t i = 0; i < recs.size(); i++) {
+        if (w > 0) {
+            extent_t &p = recs[w - 1];
+            const extent_t &c = recs[i];
+            if (p.fblkbase + p.length == c.fblkbase &&
+                p.block_base.ptr + p.length == c.block_base.ptr) {
+                p.length += c.length;
+                continue;
+            }
+        }
+        recs[w++] = recs[i];
+    }
+    recs.resize(w);
+
+    const uint64_t M = recs.size();
+    if (M == 0) return RC_OK;   /* 空树无融合需求（结构畸形由 audit 另查） */
+
+    /* ── 3. 层规划 + 全量预分配（失败 = free 新节点，旧树无损） ── */
+    std::vector<uint64_t> m;                          /* m[k] = k 层节点数 */
+    m.push_back((M + 336) / 337);
+    while (m.back() > 1) m.push_back((m.back() + 336) / 337);
+    const size_t top = m.size() - 1;
+
+    std::vector<std::vector<uint64_t>> blks(m.size());
+    std::vector<uint64_t> all_new;                    /* 回滚清单 */
+    for (size_t k = 0; k < m.size(); k++) {
+        blks[k].resize(m[k]);
+        for (uint64_t i = 0; i < m[k]; i++) {
+            const uint64_t b = block_alloc_hard(2, 1);
+            if (b == PTR_INVALID) {
+                for (uint64_t x : all_new) block_free(x, 2);
+                return RC_ERR_NO_BLOCK;               /* 原子失败：旧树未动 */
+            }
+            blks[k][i] = b;
+            all_new.push_back(b);
+        }
+    }
+
+    /* ── 4. 填叶层（level 0）：均分打包 + 叶链表 + 逐叶 max ── */
+    std::vector<uint64_t> lmax(m[0]);                 /* 层 max key 数组 */
+    {
+        uint64_t off = 0;
+        for (uint64_t g = 0; g < m[0]; g++) {
+            const uint64_t cnt_g = rb_group_size(M, m[0], g);
+            const bool leaf_is_root = (m.size() == 1);
+            const uint64_t parent = leaf_is_root
+                ? owner_inode_idx
+                : blks[1][rb_parent_of(m[0], m[1], g)];
+            mdata_piece_session sess(mdata_piece_mgr, blks[0][g]);
+            if (sess.index_error()) { for (uint64_t x : all_new) block_free(x, 2); return RC_ERR_STATE; }
+            if (!sess) { for (uint64_t x : all_new) block_free(x, 2); return RC_ERR_IO; }
+            Bptree_extent_leaf_node_t *leaf = (Bptree_extent_leaf_node_t *)sess.data;
+            extent_node_meta_init(sess.data, (uint16_t)cnt_g, false, leaf_is_root, parent);
+            leaf->meta.ptrs[0].ptr = PTR_INVALID;
+            leaf->meta.ptrs[1].ptr = (g == 0) ? PTR_INVALID : blks[0][g - 1];
+            leaf->meta.ptrs[2].ptr = (g == m[0] - 1) ? PTR_INVALID : blks[0][g + 1];
+            memcpy(leaf->extents, &recs[off], (size_t)cnt_g * sizeof(extent_t));
+            lmax[g] = recs[off + cnt_g - 1].fblkbase + recs[off + cnt_g - 1].length;
+            off += cnt_g;
+            sess.dirty();
+        }
+    }
+
+    /* ── 5. 填内层（自底向上）：hint = 子层 max + 子块号；写子即定父（预分配） ── */
+    for (size_t k = 1; k <= top; k++) {
+        std::vector<uint64_t> kmax(m[k]);
+        uint64_t coff = 0;
+        for (uint64_t p = 0; p < m[k]; p++) {
+            const uint64_t cnt_p = rb_group_size(m[k - 1], m[k], p);
+            const bool is_root_p = (k == top);
+            const uint64_t parent = is_root_p
+                ? owner_inode_idx
+                : blks[k + 1][rb_parent_of(m[k], m[k + 1], p)];
+            mdata_piece_session sess(mdata_piece_mgr, blks[k][p]);
+            if (sess.index_error()) { for (uint64_t x : all_new) block_free(x, 2); return RC_ERR_STATE; }
+            if (!sess) { for (uint64_t x : all_new) block_free(x, 2); return RC_ERR_IO; }
+            Bptree_extent_inner_node_t *inner = (Bptree_extent_inner_node_t *)sess.data;
+            extent_node_meta_init(sess.data, (uint16_t)cnt_p, true, is_root_p, parent);
+            inner->meta.ptrs[0].ptr = PTR_INVALID;
+            inner->meta.ptrs[1].ptr = PTR_INVALID;
+            inner->meta.ptrs[2].ptr = PTR_INVALID;
+            for (uint64_t t = 0; t < cnt_p; t++) {
+                inner->extents[t].key = lmax[coff + t];
+                inner->extents[t].sub_node_ptr.ptr = blks[k - 1][coff + t];
+            }
+            kmax[p] = inner->extents[cnt_p - 1].key;
+            coff += cnt_p;
+            sess.dirty();
+        }
+        lmax.swap(kmax);
+    }
+
+    /* ── 6. 收尾：free 旧树（去重防环）→ root_blk 换新根 ── */
+    std::sort(old_blocks.begin(), old_blocks.end());
+    old_blocks.erase(std::unique(old_blocks.begin(), old_blocks.end()), old_blocks.end());
+    for (uint64_t b : old_blocks) block_free(b, 2);
+    root_blk = blks[top][0];
+    return RC_OK;
 }
