@@ -2,7 +2,7 @@
 
 > 本文只承载**当前设计**，历史过程稿/决策演进已扬（git 历史可追溯）。
 > 代码主体未落地：`direct_file_ops.cpp` 仅 ftype + `regular_file_reclaim` + 骨架注释；
-> 底层 extent 原语已落地（§8）。本文是 `direct_file_pwrite` / `direct_file_punch_hole` /
+> 底层 extent 原语已落地（§9）。本文是 `direct_file_pwrite` / `direct_file_punch_hole` /
 > `direct_file_trunacate` 的实现总纲，供续写，不依赖会话记忆。
 >
 > 配套判据（不重复）：`disk_layout_v1.1.md` §3.2（三态解码判据：size 优先，
@@ -79,8 +79,8 @@ result_code_t dfprealloc_and_plan(uint64_t inode_idx, uint64_t offset, uint64_t 
 - **affect_extents = 纯新段**：只为写域中空洞/增长部分分配物理块；旧 extent 覆盖部分
   不出现（保留，phase3 直接写旧物理块）。pwrite **不需要 unmap 任何旧 extent**
   （覆盖写不搬数据）；unmap 是 punch_hole/truncate 的主场。
-- 列表即回滚账本：phase1 失败整体 free；phase2 中途失败 → 已 map 逆序 unmap+free、
-  未 map 直接 free。
+- 列表即回滚账本：phase1 失败整体 free；phase2 中途失败 → 已 map 逆序
+  `unmap_range_loose` + free、未 map 直接 free（§6）。
 - **规划域**（字节 → 逻辑块域）：非 inline 初始态 = `[off>>12, (off+len+4095)>>12)`
   半开；**inline 迁出**（newsize>160）域扩为 `[0, ceil(newsize/4096))`——头部旧内容
   （inline_data）的物化分配是 phase1 职责，[0,160) 字节拷贝归 phase3。
@@ -102,10 +102,16 @@ result_code_t dfprealloc_and_plan(uint64_t inode_idx, uint64_t offset, uint64_t 
 - **map 原子性（预算池，2026-09-07）**：满叶（337）纯插必裂 → map 按树高预分配
   `depth+1` 个节点（叶裂 + 每内层 + 根裂建新根），分裂函数自身零 alloc → 级联无
   ENOSPC 面；预算 alloc 在树改动前 → 失败 = 树零改动真原子；用不完收尾归还。
-  不满叶插入零预算。→ phase2 逆序回滚只需处理"map 成功后 unmap 账本"，无孤儿面。
-- 失败回滚（账本 = phase1 列表）：未 map 段直接 free；已 map 逆序 unmap+free；
-  左并已并入旧记录的紧贴段 → 裁切回滚（unmap 并入后整条 + map 回旧部 + free 新物理
-  块）；建空树无存活映射 → free 树根。inode 未动。
+  不满叶插入零预算。→ phase2 逆序回滚只需处理"map 成功后 loose 账本"，无孤儿面。
+- 失败回滚（2026-09-07 定案：账本驱动 + loose 一统，账本 = phase1 列表）：
+  对每个已 map 段 X **逆序调 `unmap_range_loose(X)`**——独立记录 → full 分支整删；
+  左并已并入旧记录的紧贴段 → tail 分支裁尾（count 不变、零分配、零欠载 → 回滚路径
+  **无 ENOSPC 失败面**，恒成功）。**逆序贴尾不变量**：逆序时后并入的先裁，每步裁切
+  恒贴当前记录尾，永不落中间（无拆两端）。未 map 段起点在空洞 → loose 返回
+  NOT_FOUND → 仅 free 物理块（无需另记已 map/未 map 进度）。X 的 phys 由账本自算
+  free，裁掉段的 phys = 线性映射偏移段。建空树无存活映射 → free 树根。inode 未动。
+  （旧方案"unmap 并入后整条 + map 回旧部"已废弃：map 回旧部是新插入，满叶需预算
+  → 回滚路径自身带 ENOSPC 失败面，回滚失败 = 树丢旧记录。）
 
 ## 7. phase3 — 数据写入
 
@@ -121,9 +127,23 @@ result_code_t dfprealloc_and_plan(uint64_t inode_idx, uint64_t offset, uint64_t 
 
 ## 9. 底层现状（已落地）
 
-- **extent 原语 detach**：`extent_map_range / extent_unmap_range / extent_rebuild_tree`
+- **extent 原语 detach**：`extent_map_range / extent_unmap_range_loose / extent_rebuild_tree`
   收 `root_blk&` in/out，owner 纯审计锚（根 meta "."），零 inode I/O；根更迭引用带出。
-- **map 左并 + 分裂预算池**（2026-09-07）：见 §2/§6。测试：fusion F/L/E 组。
+  unmap 家族唯一接口 = loose（2026-09-07 extent_unmap_range 退役并入其 full 分支：
+  三字段全等整删语义不变，多出 head/tail/mid 子集删除；回滚/punch/truncate 共用）。
+- **实现布局（2026-09-07 拆域）**：extent 树代码分置 `extent_walk_lookup.cpp`（导航）/ 
+  `extent_iterator.cpp` / `extent_split.cpp`（分裂 + 节点基建）/ `extent_balance.cpp` /
+  `extent_map_unmap.cpp`（map + loose + 分裂级联内核）/ `extent_rebuild.cpp`；
+  dentry 树同批拆 4 域。
+- **map 左并 + 分裂预算池**（2026-09-07）：见 §2/§6。级联机械抽为 `extent_split_cascade`
+  （map 纯插与 loose 拆两端共用内核）。测试：fusion F/L/E 组。
+- **`unmap_range_loose` 三分支**（2026-09-07 落地）：full 整删（前 unmap_range 机械，
+  单 walk）/ head+tail 缩水（零分配零欠载，phase2 左并回滚 = tail）/ mid 拆两端
+  （满叶预算前移，同 map 原子性）。契约：逻辑域身份 + phys 偏移自洽防错删。
+  测试：发烟 `ravenfs_juv_extent_unmap_loose` 62 断言（A~E 组：契约防御/三分支形态/
+  左并回滚模拟/满叶分裂）；压测 `ravenfs_juv_extent_loose_stress` 47 断言
+  （12 万宽 4 打底：A 规整组预期形态 + B 混沌 4×25904 乱序 + C 全删收敛空根叶 +
+  S4 NO_BLOCK 注入失败零改动；验证支柱 = 账本模型差分）。
 - **激进重建 `extent_rebuild_tree`**：见 §2。测试：fusion R 组（ENOSPC 旧树无损）。
 - **归零回收 `regular_file_reclaim(inum, destroy_data)`**：REG/SOFT_SYM link_count 归零
   时全形态回收（inline 清数据域 / direct 直指区间 / extent 叶链遍历 + 自底向上释节点
@@ -133,8 +153,9 @@ result_code_t dfprealloc_and_plan(uint64_t inode_idx, uint64_t offset, uint64_t 
 
 ## 10. punch_hole / truncate 复用
 
-同一四步管线：phase1 域 = 打洞区间；phase2 落地序列**含 unmap**（打洞/截断是 unmap
-主场：整块释放、残块清零保留）；无融合必要（洞两侧物理不连续，天然不可并）。
+同一四步管线：phase1 域 = 打洞区间；phase2 落地序列**含 loose**（打洞/截断是 unmap
+主场：命中每条 extent 切段调 `unmap_range_loose`——整块释放走 full、残块清零保留走
+head/tail/mid，段化后每段必落单条记录内）；无融合必要（洞两侧物理不连续，天然不可并）。
 truncate 缩小编译为"尾巴打洞 + size 收口"，但 **size ≤ 160 强制回迁 inline**（判据
 必然推论）：读回 inline_data + 释放全部数据块与树节点（机械同 reclaim）+
 data_root = PTR_INVALID——禁止只打尾洞不搬回（会造成 size ≤ 160 却外置映射的不一致态）。
@@ -143,7 +164,9 @@ data_root = PTR_INVALID——禁止只打尾洞不搬回（会造成 size ≤ 16
 
 1. 建空根叶原语（§9）
 2. `dfprealloc_and_plan` 实现（§5 规格）
-3. phase2 ENOSPC 逆序回滚路径验证（含左并裁切回滚：unmap 整条 + map 回旧部）
+3. phase2 ENOSPC 逆序回滚集成验证（树侧机械已就绪：loose tail 裁切零分配恒成功，
+   发烟 D 组 + stress 已覆盖 loose 全分支；待办 = dfprealloc_and_plan → map → 失败
+   注入 → 逆序 loose 的管线级联测）
 4. 并发前提：同 inode 写互斥由调用方保证（phase1 读态 ~ phase4 写之间无锁原子性）
 5. 融合接线：close 插桩 + `merge_extents(fd,start,len)` 三端透传 + 碎片度阈值判定（§2）
 6. 分配侧刷回批量连续分配（碎片预防第一性；occupy 尾延展已在 phase1 策略内）
@@ -156,5 +179,5 @@ data_root = PTR_INVALID——禁止只打尾洞不搬回（会造成 size ≤ 16
 > 直写 = 四步管线一条路：phase1 预分配纯新段（尾延展优先）→ phase2 形态判定 + 逐段
 > map（**左并**让尾延展段扩长并入旧记录；**预算池**让分裂原子）→ phase3 写数据 →
 > phase4 inode 一次写 = 提交点。融合不进独立 phase：map 左并随插入生效，激进重建
-> close 级兜底。回滚：phase1 失败整体 free，phase2 失败逆序 unmap 账本——map 自身
-> 已无孤儿面。
+> close 级兜底。回滚：phase1 失败整体 free，phase2 失败逆序 `loose` 账本（full 整删
+> + tail 贴尾裁切，零分配恒成功）——map 自身已无孤儿面。

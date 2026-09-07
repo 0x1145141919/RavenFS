@@ -290,7 +290,7 @@ static void run_f1(RavenFS_juvenile &fs, uint64_t inum, uint64_t &root) {
         std::vector<extent_t> v;
         if (!range_sample(fs, root, 0, 1ull << 40, v)) return false;
         for (auto it = v.rbegin(); it != v.rend(); ++it) {
-            if (fs.extent_unmap_range(root, inum, *it) != RC_OK) return false;
+            if (fs.extent_unmap_range_loose(root, inum, *it) != RC_OK) return false;
         }
         return true;
     };
@@ -410,7 +410,7 @@ static void run_l(RavenFS_juvenile &fs, uint64_t inum, uint64_t &root) {
         std::vector<extent_t> v;
         if (!range_sample(fs, root, 0, 1ull << 40, v)) return false;
         for (auto it = v.rbegin(); it != v.rend(); ++it)
-            if (fs.extent_unmap_range(root, inum, *it) != RC_OK) return false;
+            if (fs.extent_unmap_range_loose(root, inum, *it) != RC_OK) return false;
         return true;
     };
 
@@ -688,7 +688,7 @@ static void run_e(RavenFS_juvenile &fs, uint64_t inum, uint64_t &root) {
         std::vector<extent_t> v;
         if (!range_sample(fs, root, 0, 1ull << 40, v)) return false;
         for (auto it = v.rbegin(); it != v.rend(); ++it)
-            if (fs.extent_unmap_range(root, inum, *it) != RC_OK) return false;
+            if (fs.extent_unmap_range_loose(root, inum, *it) != RC_OK) return false;
         return true;
     };
     CHECK(wipe(), "E 清场");

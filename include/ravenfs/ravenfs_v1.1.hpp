@@ -211,7 +211,12 @@ private:
      * 四步管线 phase4）。顶层 inode 态校验（type/direct_bit/data_root 有效性）删除：
      * 调用方负责传入合法文件树根（本原语仅保 RC_ERR_OVERLAP/NOT_FOUND 等树内语义）。 */
     result_code_t extent_map_range(uint64_t &root_blk, uint64_t owner_inode_idx, const extent_t &ext); //内部有任何区间有交集会报错；同叶 GLB 紧贴+phys 连续时左融合（扩长不插记录）
-    result_code_t extent_unmap_range(uint64_t &root_blk, uint64_t owner_inode_idx, const extent_t &ext);//外部有侦查，这里是精确匹配删除extent_t叶子节点的记录
+    /* 子集删除原语（2026-09-07；unmap 家族唯一接口，extent_unmap_range 退役并入其
+     * full 分支）：ext 必须被树内单条记录完全覆盖（逻辑域身份 + phys 偏移自洽
+     * 校验防错删）；整条删（full，三字段全等）/ 贴头贴尾缩水（零分配零
+     * 欠载）/ 中间拆两端（左段留槽缩尾 + 右段新插，满叶预算前移同 map 原子性）
+     * 三分支。phase2 回滚（逆序账本 = 整删 + 贴尾裁）与 punch_hole 段化删除共用。 */
+    result_code_t extent_unmap_range_loose(uint64_t &root_blk, uint64_t owner_inode_idx, const extent_t &ext);
 
     /* 激进重建原语（2026-09-07 落地；融合策略演进史见 Docs/pwrite_pipeline.md §1/§2）
      * 整树范围：叶链收集全部记录 → 可并对全并 → 均分重打包（每节点 168..337）→
@@ -528,6 +533,18 @@ private:
     result_code_t extent_balance_from(uint64_t child_blk, uint64_t owner_inode_idx,
                                       uint64_t &root_blk); /* 欠载链修复（自下而上，含收尾根收缩） */
     result_code_t extent_refresh_key_chain(uint64_t blk);    /* 节点 max key 变更后沿父链上溯刷新 */
+    /* 分裂级联 + 父 key 刷新（2026-09-07 从 map_range 闭包抽取：map 纯插 / unmap_loose
+     * 拆两端共用，单一事实源）：叶已超满（count>337，已 dirty）→ 用预算池打完整条分裂
+     * 链（叶裂 → 内层逐级 → 根裂建新根）→ 两半叶父链刷新。预算池由调用方预分配
+     * （depth+1 个），pool_used 出参记消耗，剩余归还归调用方统一收尾。 */
+    result_code_t extent_split_cascade(uint64_t leaf_blk, const bptree_path_t &trace,
+                                       std::vector<uint64_t> &reserve_pool, size_t &pool_used,
+                                       uint64_t owner_inode_idx, uint64_t &root_blk);
+    /* 节点基建（2026-09-07 拆文件升格：原 extent_tree.cpp 文件级 static，跨
+     * split/rebuild 两域使用故入类；定义随主要消费者在 extent_split.cpp） */
+    static void extent_node_meta_init(void *node_buf, uint16_t entry_count,
+                                      bool is_inner, bool is_root, uint64_t parent_ptr);
+    static uint64_t extent_node_max_key(const void *node_buf);
 };
 bool is_dentry_node(Bptree_meta_t*meta);
 bool is_extent_node(Bptree_meta_t*meta);

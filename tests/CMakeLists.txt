@@ -84,3 +84,17 @@ add_executable(ravenfs_bench_session
     ${CPU_ID_STUB}
 )
 target_link_libraries(ravenfs_bench_session PRIVATE ravenfs_juvenile)
+
+# v1.1 extent_unmap_range_loose 子集删除原语专项（发烟：三分支 + 契约 + 满叶分裂）
+add_executable(ravenfs_juv_extent_unmap_loose
+    test_extent_unmap_loose.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_extent_unmap_loose PRIVATE ravenfs_juvenile)
+
+# v1.1 extent_unmap_range_loose 大型压测（12 万打底：A 规整 + B 混沌 + 乱序全删 + NO_BLOCK 注入）
+add_executable(ravenfs_juv_extent_loose_stress
+    test_extent_loose_stress.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_extent_loose_stress PRIVATE ravenfs_juvenile)

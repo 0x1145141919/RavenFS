@@ -391,7 +391,7 @@ static void par_worker_run(par_worker_t *W) {
         uint64_t ta = ms_el();
         for (uint64_t k = 0; k < NA / 2; k++) {
             uint64_t fb = ord[k] * 2;
-            r = fs.extent_unmap_range(root_blk, inum, mk_ext(fb, 1, PHY_BASE + fb));
+            r = fs.extent_unmap_range_loose(root_blk, inum, mk_ext(fb, 1, PHY_BASE + fb));
             W->ops.fetch_add(1, std::memory_order_relaxed);
             if (r != RC_OK) PAR_FAIL("delHalf", k, r);
         }
@@ -445,7 +445,7 @@ static void par_worker_run(par_worker_t *W) {
         std::shuffle(ord.begin(), ord.end(), rng);
         uint64_t ta = ms_el();
         for (uint64_t k = 0; k < ord.size(); k++) {
-            r = fs.extent_unmap_range(root_blk, inum, mk_ext(ord[k], 1, PHY_BASE + ord[k]));
+            r = fs.extent_unmap_range_loose(root_blk, inum, mk_ext(ord[k], 1, PHY_BASE + ord[k]));
             if (r == RC_ERR_NOT_FOUND) { W->not_found++; continue; }
             W->ops.fetch_add(1, std::memory_order_relaxed);
             if (r != RC_OK) PAR_FAIL("delAll", k, r);
@@ -657,25 +657,28 @@ int main(int argc, char **argv) {
     audit_run(fs, root_blk, inum, "A4(overlap 后无副作用)", &a4);
     CHECK(a4.records == 2 && a4.bad == 0, "overlap 失败零副作用 records=2");
 
-    /* unmap：三字段全等校验 */
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(10, 3, 200)) == RC_OK, "unmap 精确 [10,13)p200");
+    /* loose full：三字段全等精确整删 */
+    CHECK(fs.extent_unmap_range_loose(root_blk, inum, mk_ext(10, 3, 200)) == RC_OK, "loose full 精确删 [10,13)p200");
     audit_t a5;
     audit_run(fs, root_blk, inum, "A5", &a5);
     CHECK(a5.records == 1, "A5 records=1 got %lu", a5.records);
 
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 10, 999)) == RC_ERR_STATE, "unmap phys 失配 → STATE");
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 9, 100)) == RC_ERR_STATE,  "unmap length 失配 → STATE");
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(1, 9, 100)) == RC_ERR_STATE,  "unmap fblkbase 失配 → STATE");
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(20, 1, 50)) == RC_ERR_NOT_FOUND, "unmap 空洞 → NOT_FOUND");
-    audit_run(fs, root_blk, inum, "A6(失配后无副作用)", nullptr);
+    /* loose 防御组：phys 偏移自洽 / 终点越出 / 起点空洞（语义换代 2026-09-07：
+     * 三字段全等侦查式删除退役，full 分支继承防错删；length 小于记录长不再是
+     * 失配而是合法子集操作） */
+    CHECK(fs.extent_unmap_range_loose(root_blk, inum, mk_ext(0, 10, 999)) == RC_ERR_STATE, "loose phys 偏移失配（off=0 期望 p100）→ STATE");
+    CHECK(fs.extent_unmap_range_loose(root_blk, inum, mk_ext(0, 11, 100)) == RC_ERR_STATE, "loose 终点越出记录（[0,11) 超 [0,10)）→ STATE");
+    CHECK(fs.extent_unmap_range_loose(root_blk, inum, mk_ext(1, 9, 100)) == RC_ERR_STATE,  "loose fblkbase 失配 phys 不自洽（off=1 期望 p101）→ STATE");
+    CHECK(fs.extent_unmap_range_loose(root_blk, inum, mk_ext(20, 1, 50)) == RC_ERR_NOT_FOUND, "loose 空洞 → NOT_FOUND");
+    audit_run(fs, root_blk, inum, "A6(防御失败后无副作用)", nullptr);
 
-    /* 记录的独立可撤销性（定案收益：左并后记录 = 最大 phys run，unmap 三字段
-     * 全等仍可精确撤——pwrite 回滚不需要区间撤销/裁切 hack） */
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 10, 100)) == RC_OK, "unmap 左并整条 [0,10)p100 → 独立可撤");
+    /* 记录的独立可撤销性（full 分支 = 前 unmap_range 语义：三字段全等整删——
+     * pwrite 回滚的纯插段撤销路径） */
+    CHECK(fs.extent_unmap_range_loose(root_blk, inum, mk_ext(0, 10, 100)) == RC_OK, "loose full 整条 [0,10)p100 → 独立可撤");
     audit_t a7;
     audit_run(fs, root_blk, inum, "A7", &a7);
     CHECK(a7.records == 0 && a7.leaves == 1, "A7 空根叶 records=0 got %lu", a7.records);
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 10, 100)) == RC_ERR_NOT_FOUND, "空树再 unmap → NOT_FOUND");
+    CHECK(fs.extent_unmap_range_loose(root_blk, inum, mk_ext(0, 10, 100)) == RC_ERR_NOT_FOUND, "空树再 loose → NOT_FOUND");
 
     /* detach 断言：A 组全程单叶（≤4 记录）→ 根未更迭，live 根 == 初值；
      * inode.data_root 自 phase5 初提交后从未被原语改写。 */
@@ -709,7 +712,7 @@ int main(int argc, char **argv) {
      * （根收缩更迭同样经 root_blk& 自动带出，中途审计用 live 根） */
     bool all_ok = true;
     for (uint64_t i = 0; i < N; i++) {
-        result_code_t r = fs.extent_unmap_range(root_blk, inum, mk_ext(i * 2, 1, 1000 + i));
+        result_code_t r = fs.extent_unmap_range_loose(root_blk, inum, mk_ext(i * 2, 1, 1000 + i));
         if (r != RC_OK) { CHECK(false, "unmap #%lu → %s", i, rc_name(r)); all_ok = false; break; }
         if ((i + 1) % 100 == 0) audit_run(fs, root_blk, inum, "B 删除中", nullptr);
     }
@@ -735,7 +738,7 @@ int main(int argc, char **argv) {
     phase5_commit(fs, inum, root_blk);
     CHECK(inode_data_root(fs, inum) == root_blk, "C 二次收口后 inode.data_root == live 根");
     /* 收尾清空（整条精确 unmap），留干净盘给 D 组统计（可选） */
-    CHECK(fs.extent_unmap_range(root_blk, inum, mk_ext(0, 12, 500)) == RC_OK, "C 清空 [0,12)p500");
+    CHECK(fs.extent_unmap_range_loose(root_blk, inum, mk_ext(0, 12, 500)) == RC_OK, "C 清空 [0,12)p500");
     audit_run(fs, root_blk, inum, "C 清空后", nullptr);
     phase5_commit(fs, inum, root_blk);
 
@@ -780,7 +783,7 @@ int main(int argc, char **argv) {
         return fs.extent_map_range(sroot, sinum, mk_ext(fb, 1, 0x200000 + fb));
     };
     auto stress_unmap = [&](uint64_t fb) -> result_code_t {
-        return fs.extent_unmap_range(sroot, sinum, mk_ext(fb, 1, 0x200000 + fb));
+        return fs.extent_unmap_range_loose(sroot, sinum, mk_ext(fb, 1, 0x200000 + fb));
     };
 
     /* 阶段 1：随机序插 A 空间 12 万条 */
