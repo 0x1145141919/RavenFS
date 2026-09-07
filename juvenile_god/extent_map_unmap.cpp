@@ -8,15 +8,17 @@
  * extent_map_unmap.cpp — 区段树 map/unmap 轮子（原 extent_tree.cpp 拆出）
  *
  * 本文件是写路径（direct_file_* 四步管线 phase2）与打洞/截断的树操作
- * 落点：extent_map_range 逐段声明式映射（左并 + 预算池原子分裂），
+ * 落点：extent_map_range 逐段声明式映射（叶内融合 + 预算池原子分裂 + 欠载平衡链），
  * extent_unmap_range_loose 子集删除（unmap 家族唯一接口，2026-09-07
  * extent_unmap_range 退役并入其 full 分支）。
  * ═══════════════════════════════════════════════════════════════════ */
 
 
 /* ═══════════════════════════════════════════════════════════════════
- * extent 原语对实现（2026-09-03 定稿；2026-09-07 unmap 侧换代）——
- *   extent_map_range   ：声明式映射（插入 + 邻接合并 + 溢出分裂级联）
+ * extent 原语对实现（2026-09-03 定稿；2026-09-07 换代：unmap 家族收敛 loose /
+ * map 侧叶内融合四形态）——
+ *   extent_map_range   ：声明式映射（叶内融合四形态：纯插 / 左并 / 右并 /
+ *     双并三合一 + 预算池原子分裂 + 欠载平衡链）
  *   extent_unmap_range_loose：子集删除（full/head/tail/mid 三分支，
  *     前 extent_unmap_range 的整条删除语义 = 其 full 分支）
  *
@@ -41,42 +43,55 @@
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* ═══════════════════════════════════════════════════════════════════
- * extent_map_range — 声明式映射原语（插侧 · 2026-09-06 定案：有界左融合）
+ * extent_map_range — 声明式映射原语（插侧 · 2026-09-07 叶内融合四形态完备）
  *
  * 演进史：
  *   - 2026-09-03 内建自动融合（左并/右并/跨界）→ F 组测试实证不完备
  *     （f1d 跨界左并盲区 / F2 融合致欠载叶不回收）→ 7bde35c 降级为纯插；
  *   - 2026-09-06 定案（演进史见 Docs/pwrite_pipeline.md §1/§2）：map 只左融合（同叶
- *     GLB 单对）+ 全量融合归激进重建（extent_rebuild_tree）。
+ *     GLB 单对）+ 全量融合归激进重建（extent_rebuild_tree）；
+ *   - 2026-09-07（晚）叶内四形态完备换代：左融合推广为同叶 L/R 双判定（纯插 /
+ *     左融合 / 右融合 / 双融合三合一），叶内 canonical 合并义务全覆盖；跨界
+ *     （entry[0] 前跨前叶 / 叶末越叶）仍显式放弃，f1d 残留待遇不变（交激进
+ *     重建兑底）。四形态侦查在树改动前一次完成。
  *
- * 左融合语义（有界单对，不承诺完备）：
- *   插入前查 GLB —— 逻辑紧贴（GLB.end == ext.fblkbase）&& phys 连续
- *   （GLB.phys_end == ext.block_base.ptr）→ 不插新记录，GLB.length += 段长。
- *   count 不变、无腾槽 → 无超满分裂可能 → 零新增失败路径；不删记录 →
- *   无欠载制造路径（与旧融合死因无交集）。顺序写（occupy 尾巴延展）下
- *   记录数 ≈ phys run 数，不随写次数涨。
- *   刻意不做：entry[0]（GLB=NONE）跨界左并——跨叶要动前叶 count/max +
- *   父 hint 刷新链，不值；f1d 形态残留显式接受，交激进重建兑底。
+ * 形态语义（同叶内；紧贴 = 半开区间端相接，融合 = 紧贴 && phys 连续）：
+ *   L = GLB 紧贴 && GLB.phys_end == ext.block_base.ptr；
+ *   R = ext.end == 右邻.fblkbase && ext.phys_end == 右邻.block_base.ptr；
+ *   - 纯插（!L && !R）：GLB 后腾槽插入 → count+1。唯一可能超满的形态：满叶
+ *     （337）需预算 depth+1 先分配（失败 = free + 返回，树零改动真原子，同
+ *     unmap mid）。收尾 refresh 链（叶末插入 → 叶 max 变 → 上溯，内部短路）。
+ *   - 左融合（L && !R）：GLB.length += 段长，count 不变零腾槽 → 无超满无欠载
+ *     零分配。GLB 为叶末项 → 叶 max 变 → 收尾刷父链；否则零刷新。
+ *   - 右融合（!L && R）：段并入右邻头（fblkbase/block_base 同步左移 cut，phys
+ *     随逻辑线性平移，连续映射保持）。终点不变 → 叶 max 恒不变 → 父链零刷新。
+ *     count 不变 → 无超满无欠载零分配。修旧"前插纯插致与右邻紧贴连续两条并
+ *     存"的叶内残留（canonical 义务叶内完备化）。
+ *   - 双融合（L && R）：三合一 —— GLB 扩长覆盖 [GLB.base, 右邻.end) + memmove
+ *     删右邻 → count−1。唯一删记录的形态 → 非根 168→167 欠载 → 收尾走
+ *     extent_balance_from（同 unmap full；detach：根收缩经 root_blk 带出）。
+ *     叶 max 恒不变（右邻若为末项，新末项 = 扩长 GLB，终点 = 原末项终点）→
+ *     无刷新义务。count−1 永不超满 → 零分配。
  *
  * 语义：声明 [ext.fblkbase, ext.fblkbase+ext.length) 由 ext.block_base 起
  * length 个连续 FS_block 背书（纯记录层，不碰数据侧位图）。重叠防御双向：
  *   - 落点 GLB 覆盖 ext.fblkbase（起点落入既有区间）→ RC_ERR_OVERLAP；
  *   - 区间终点盖右邻起点（ext.end > 右邻.fblkbase）→ RC_ERR_OVERLAP
- *     （左并/纯插共用：扩长后终点同样不得盖右邻）。
- * 紧贴合法（半开区间无交集）；紧贴+连续走左融合，其余残留合法。
+ *     （四形态共用：防御先于融合判定，真重叠与融合判定（==）互斥）。
+ * 紧贴合法（半开区间无交集）；紧贴+连续 = 融合义务，其余残留合法。
  *
- * 内部：左融合命中 = 零结构变化（仅 GLB 为叶末项时叶 max 变 → 上刷父链，
- * 复用 insert 尾插的 extent_refresh_key_chain）；否则纯插（GLB 后 memmove
- * 腾槽）→ count+1 → 超满（>337）分裂级联 → 父 key 上溯刷新。
+ * 失败面汇总（对比 09-06 版新增两条结构路径）：纯插满叶分裂级联（预算池，
+ * 无 ENOSPC）；双融合欠载平衡链（无分配无 ENOSPC，仅 IO/STATE）。左/右融合
+ * 零失败面。所有树改动在单叶会话内一次 dirty；分裂/平衡/刷链前必须已关
+ * 会话（同块双会话不互见修改）。
  *
- * 外显契约（detach，2026-09-06）：root_blk in/out（根裂建新根经引用带出）；
- * owner_inode_idx 纯审计锚（根 meta "."）；不碰 inode。调用方保证 root_blk
- * 指向合法 extent 树根（inline→extent 跃迁归 direct_file_* 层）。
- * ═══════════════════════════════════════════════════════════════════ */
+ * 外显契约（detach，2026-09-06）：root_blk in/out（根裂建新根 / 根收缩经引用
+ * 带出）；owner_inode_idx 纯审计锚（根 meta "."）；不碰 inode。调用方保证
+ * root_blk 指向合法 extent 树根（inline→extent 跃迁归 direct_file_* 层）。
+ */
 result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t owner_inode_idx,
                                                  const extent_t &ext)
 {
-    const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
     if (ext.length == 0) return RC_OK;   /* 空映射：无操作 */
 
     bptree_path_t trace;
@@ -86,10 +101,14 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
     const uint16_t glb = trace.child_idx[trace.depth - 1];
     const bool hit = trace.is_leaf_hit;
 
-    bool need_split = false;
-    bool left_merged = false;       /* 左融合命中（同叶 GLB 扩长，count 不变） */
-    bool left_key_changed = false;  /* 左融合对象为叶末项 → 叶 max 变 → 需刷父链 */
-    std::vector<uint64_t> reserve_pool;   /* 分裂预算池（2026-09-07 map 原子性） */
+    /* 四形态（2026-09-07）：none=纯插 / left=扩 GLB 尾 / right=并入右邻头 /
+     * both=GLB 扩长吞右邻（count−1）。跨界一律不做（L/R 均为叶内判定）。 */
+    enum class merge_t { none, left, right, both } merge;
+    bool underflow = false;         /* both：删右邻后非根欠载（count<168） */
+    bool is_root_leaf = false;      /* both：根叶无欠载概念且无父 key */
+    bool left_key_changed = false;  /* left：GLB 为叶末项 → 叶 max 变 */
+    bool need_split = false;        /* none：纯插后超满（count>337） */
+    std::vector<uint64_t> reserve_pool;   /* 分裂预算池（仅 none + 满叶需要） */
     size_t pool_used = 0;
 
     {
@@ -103,7 +122,7 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
 
         if (hit) return RC_ERR_OVERLAP;   /* 起点被 GLB 覆盖（区间重叠） */
 
-        /* 右邻防御（左并/纯插共用：无论扩长还是新插，终点都不得盖右邻起点） */
+        /* 右邻重叠防御（四形态共用：扩长/并入/新插后终点都不得盖右邻起点） */
         const uint16_t pos = (glb == EXTENT_LEAF_GLB_NONE) ? 0 : (uint16_t)(glb + 1);
         if (pos < count) {
             const extent_t r = leaf->extents[pos];
@@ -111,27 +130,65 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
                 return RC_ERR_OVERLAP;
         }
 
-        /* ── 左融合（2026-09-06 定案）：GLB 紧贴 && phys 连续 → 扩长不插记录。
-         * 有界单对：不承诺完备、不删记录（无欠载路径）；GLB=NONE（entry[0]
-         * 落点）刻意跳过跨界左并（跨叶成本不值，残留交激进重建兑底）。 ── */
+        /* ── 形态判定（树改动前一次完成；packed 成员禁引用 → 局部拷贝）── */
+        bool L = false, R = false;
         if (glb != EXTENT_LEAF_GLB_NONE) {
-            const extent_t &g = leaf->extents[glb];
-            if (g.fblkbase + g.length == ext.fblkbase &&
-                g.block_base.ptr + g.length == ext.block_base.ptr) {
-                leaf->extents[glb].length += ext.length;  /* 零结构变化：count/槽位不动 */
-                left_key_changed = (glb == count - 1);    /* 叶末项 → 子树 max 变 */
-                left_merged = true;
-                sess.dirty();
-            }
+            const extent_t g = leaf->extents[glb];
+            L = (g.fblkbase + g.length == ext.fblkbase &&
+                 g.block_base.ptr + g.length == ext.block_base.ptr);
         }
+        if (pos < count) {
+            const extent_t r = leaf->extents[pos];
+            R = (ext.fblkbase + ext.length == r.fblkbase &&
+                 ext.block_base.ptr + ext.length == r.block_base.ptr);
+        }
+        merge = L ? (R ? merge_t::both : merge_t::left)
+                  : (R ? merge_t::right : merge_t::none);
 
-        if (!left_merged) {
-            /* ── 分裂预算（2026-09-07 map 原子性）：满叶（337）纯插必裂 → 按树高预分配
-             * 整条分裂链节点：depth+1 = 叶裂 1 + 每内层至多 1 + 根裂建新根 1。
-             * alloc 在树改动（memmove）之前 → 失败 = free 已分配 + 返回，树零改动、
-             * 真原子失败（级联中途 ENOSPC 留孤儿的 C 决策缺口对 map 关闭）。
-             * 不满叶插入零预算；左并分支零预算。 ── */
+        if (merge == merge_t::left) {
+            /* 左融合（2026-09-06 语义保留）：GLB 扩尾，count/槽位不动 */
+            leaf->extents[glb].length += ext.length;
+            left_key_changed = (glb == count - 1);    /* 叶末项 → 叶 max 变 */
+            sess.dirty();
+        } else if (merge == merge_t::right) {
+            /* 右融合：段并入右邻头 —— 起点/phys 同步左移 cut（R 条件保证
+             * r.fblkbase == ext.fblkbase + cut → 无下溢）。终点不动 → 叶 max
+             * 不变 → 收尾零刷新。count 不变 → 零分配零失败面。 */
+            const uint64_t cut = ext.length;
+            extent_t nr = leaf->extents[pos];
+            nr.fblkbase -= cut;
+            nr.block_base.ptr -= cut;
+            nr.length += cut;
+            leaf->extents[pos] = nr;
+            sess.dirty();
+        } else if (merge == merge_t::both) {
+            /* 双融合（三合一）：GLB 扩长覆盖到右邻终点（长度用 右邻.end − GLB
+             * 起点 的防溢出写法）+ memmove 删右邻 → count−1。L&&R 已证 phys
+             * 三连连续 → 合并单条连续映射合法。删记录 → 非根 168→167 欠载
+             * → 收尾走平衡链；叶 max 恒不变（论证见注释）→ 零刷新。 */
+            const extent_t g = leaf->extents[glb];
+            const extent_t r = leaf->extents[pos];
+            extent_t ng = g;
+            ng.length = (r.fblkbase + r.length) - g.fblkbase;
+            leaf->extents[glb] = ng;
+            if (pos < count - 1) {
+                memmove(&leaf->extents[pos], &leaf->extents[pos + 1],
+                        (size_t)(count - pos - 1) * sizeof(extent_t));
+            }
+            memset(&leaf->extents[count - 1], 0, sizeof(extent_t));
+            count--;
+            leaf->meta.parent_ptr.entry_count = count;
+            is_root_leaf = leaf->meta.parent_ptr.is_root_node;
+            underflow = (!is_root_leaf && count < 168);
+            sess.dirty();
+        } else {
+            /* ── 纯插（无融合命中）：GLB 后腾槽插入 ── */
             if (count == 337) {
+                /* 分裂预算（2026-09-07 map 原子性）：满叶纯插必裂 → 按树高预分配
+                 * 整条分裂链节点（depth+1 = 叶裂 1 + 每内层至多 1 + 根裂建新根 1）。
+                 * alloc 在 memmove 之前 → 失败 = free 已分配 + 返回，树零改动、
+                 * 真原子失败。不满叶插入零预算；融合分支恒零预算（count 不增 /
+                 * 反减 → 永不超满，无 ENOSPC 面）。 ── */
                 reserve_pool.reserve((size_t)trace.depth + 1);
                 for (int i = 0; i <= trace.depth; i++) {
                     const uint64_t b = block_alloc_hard(2, 1);
@@ -142,7 +199,6 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
                     reserve_pool.push_back(b);
                 }
             }
-            /* ── 纯插（不融合）：GLB 后腾槽插入 ── */
             if (pos < count) {
                 memmove(&leaf->extents[pos + 1], &leaf->extents[pos],
                         (size_t)(count - pos) * sizeof(extent_t));
@@ -150,29 +206,38 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
             leaf->extents[pos] = ext;
             count++;
             leaf->meta.parent_ptr.entry_count = count;
-
             need_split = count > 337;
             sess.dirty();
         }
-    }   /* 叶会话析构写回；分裂/刷链前必须关（同块双会话不互见修改） */
+    }   /* 叶会话析构写回；分裂/平衡/刷链前必须关（同块双会话不互见修改） */
 
-    if (left_merged) {
-        /* 零结构变化收尾：count 未增 → 无分裂路径；GLB 非叶末 → 叶 max 未变，
-         * 父链零刷新。仅 GLB 为叶末项时叶 max 变 → 复用 insert 尾插刷链路径。 */
+    if (merge == merge_t::left) {
+        /* 左融合收尾：GLB 非叶末 → 叶 max 未变 → 父链零刷新；仅叶末项上溯。 */
         if (left_key_changed) {
             rc = extent_refresh_key_chain(leaf_blk);
             if (rc) return rc;
         }
         return RC_OK;
     }
+    if (merge == merge_t::right)
+        return RC_OK;   /* 终点不变 → 叶 max 不变 → 父链零刷新 */
 
-    /* ── 分裂级联 + 父 key 刷新（2026-09-07 抽取为 extent_split_cascade 共用：
-     * map 纯插与 unmap_loose 拆两端同一套机械，单一事实源） ── */
+    if (merge == merge_t::both) {
+        /* 双融合收尾：仅"删记录致欠载"一条结构路径 → 平衡链（detach：根收缩
+         * 经 root_blk 带出，inode.data_root 提交归调用方）；无欠载 → 零收尾
+         * （叶 max 不变论证）。根叶恒合法（count≥1）。 */
+        if (is_root_leaf) return RC_OK;
+        if (underflow)
+            return extent_balance_from(leaf_blk, owner_inode_idx, root_blk);
+        return RC_OK;
+    }
+
+    /* ── none（纯插）收尾：分裂级联 + 父 key 刷新 ── */
     if (need_split)
         rc = extent_split_cascade(leaf_blk, trace, reserve_pool, pool_used,
                                   owner_inode_idx, root_blk);
     else
-        rc = extent_refresh_key_chain(leaf_blk);   /* 纯插不裂：仅叶 max 变时上溯（内部短路） */
+        rc = extent_refresh_key_chain(leaf_blk);   /* 纯插不裂：叶末插入 max 变时上溯（内部短路） */
 
     /* 预算归还（统一收尾）：级联实际消耗 pool_used 个（多数情况只裂一层 → 大部
      * 分预算归还；最坏全链分裂 depth+1 个全部消耗）。错误路径同样在此归还。 */

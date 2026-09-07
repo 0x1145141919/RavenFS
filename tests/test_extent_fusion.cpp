@@ -6,9 +6,10 @@
  * 促成 7bde35c 降级 + 09-06 融合定案（决策过程稿已完成使命扬）。本文件随定案转型：
  *
  * 新世界观（演进史见 Docs/pwrite_pipeline.md §1/§2）：
- *   1. map 只左融合 —— 同叶 GLB 紧贴 && phys 连续 → 扩长不插记录
- *      （count 不变、零结构变化、无新失败路径）；GLB=NONE（entry[0] 落点）
- *      跨界左并刻意跳过；右并不做。可并残留 = 合法形态。
+ *   1. map 叶内融合四形态完备（2026-09-07 换代，原只左融合推广）—— 同叶
+ *      L/R 双判定：纯插 / 左融合（扩 GLB 尾）/ 右融合（并入右邻头）/ 双融合
+ *      （L&&R 三合一，count−1 → 非根欠载走 extent_balance_from）。跨界
+ *      （entry[0] 前跨前叶 / 叶末越叶）仍刻意跳过 → 可并残留仅存跨叶边界。
  *   2. 全量融合 = 激进重建（extent_rebuild_tree）：收集 → 全并 → 均分打包
  *      → 自下而上建树 → free 旧树 → swap 新根。失败原子性：新树建成前
  *      旧树只读，ENOSPC = 丢新节点旧树无损。
@@ -19,11 +20,12 @@
  *   - audit（结构义务）：只查重叠/超满/欠载/父链 key/兄弟链序。可并残留
  *     不再 bad（canonical 承诺废除）；结构层从"查融合"退为"查不变量"。
  *   - 行为断言（融合语义）用 range_sample / window_is_single 记录粒度验证：
- *     F1a 左并扩长 → 单条；F1b/c 右并不做 → 残留两条合法；F1d 跨界跳过 →
- *     残留三条合法；F2 乱序 12 万 → 结构绿 + 确有融合 + rebuild 收敛单条；
- *     L1 顺序写 N 次记录恒 1（左并核心承诺）；L2 phys 断点分条正确；
- *     L3 GLB=叶末左并 → 父链 key 刷新正确；R1 rebuild 碎片树 → 单条；
- *     R2 rebuild 中途 ENOSPC → 旧树无损。
+ *     F1a 左并扩长 → 单条；F1b 右并（前插右邻融合）→ 单条；F1c 双并桥接
+ *     （L&&R 三合一）→ 单条；F1d 跨叶边界缺口 → 残留两条合法；F1e 双并致
+ *     欠载（非根 168 叶边界）→ 平衡链 + 根收缩收敛单叶根；F2 乱序 12 万 →
+ *     结构绿 + 确有融合 + rebuild 收敛单条；L1 顺序写 N 次记录恒 1（左并
+ *     核心承诺）；L2 phys 断点分条正确；L3 GLB=叶末左并 → 父链 key 刷新
+ *     正确；R1 rebuild 碎片树 → 单条；R2 rebuild 中途 ENOSPC → 旧树无损。
  *
  * 附带工具（用户调试用）：range_sample() —— 基于 extent_iterator 的区间
  * 取样：构造 extent_iterator(&fs, leaf_blk, glb)（walk 落点起游走），列出
@@ -284,7 +286,7 @@ static void fusion_base_340(RavenFS_juvenile &fs, uint64_t &root, uint64_t inum)
 }
 
 static void run_f1(RavenFS_juvenile &fs, uint64_t inum, uint64_t &root) {
-    printf("\n-- F1：左融合矩阵（新世界观） --\n");
+    printf("\n-- F1：叶内融合矩阵（四形态） --\n");
     /* 清场：unmap 当前全部记录（三字段全等）→ 空树 */
     auto wipe = [&]() -> bool {
         std::vector<extent_t> v;
@@ -305,41 +307,38 @@ static void run_f1(RavenFS_juvenile &fs, uint64_t inum, uint64_t &root) {
         CHECK(a.records == 1 && a.nodes == 1, "f1a records=1 nodes=1 got %lu/%lu", a.records, a.nodes);
     }
 
-    /* f1b 右并场景（前插）：GLB=NONE 无左并对象 → 右并不做 → 残留两条合法 */
+    /* f1b 右并场景（前插）：GLB=NONE 无左并对象，但右邻紧贴 + phys 连续 → 右融合：
+     * 段并入右邻头（fblkbase/block_base 同步左移）→ 单条；count 不变 → 无欠载
+     * 无分裂零分配；右邻终点未动 → 叶 max 不变 → 父链零刷新。 */
     CHECK(wipe(), "f1b 清场");
     CHECK(fs.extent_map_range(root, inum, mk_ext(10, 3, 200)) == RC_OK, "f1b map [10,13)p200");
     CHECK(fs.extent_map_range(root, inum, mk_ext(6, 4, 196)) == RC_OK, "f1b map [6,10)p196");
+    CHECK(window_is_single(fs, root, 6, 13, 196, nullptr), "f1b 右融合 → [6,13)p196 单条");
     {
-        std::vector<extent_t> v;
-        CHECK(range_sample(fs, root, 6, 7, v) && v.size() == 2,
-              "f1b 右并不做 → 窗口 [6,13) 残留 2 条（got %zu）", v.size());
-        bool shape = v.size() == 2 && v[0].fblkbase == 6 && v[0].length == 4 &&
-                     v[1].fblkbase == 10 && v[1].length == 3;
-        CHECK(shape, "f1b 残留形态 = [6,10)p196 + [10,13)p200");
         audit_t a; audit_run(fs, root, inum, "f1b", &a);
-        CHECK(a.records == 2, "f1b records=2 got %lu", a.records);
+        CHECK(a.records == 1 && a.nodes == 1, "f1b records=1 nodes=1 got %lu/%lu", a.records, a.nodes);
     }
 
-    /* f1c 双并桥接场景：B 填洞左并 A 扩长 → 与 C 新产生可并残留（不承诺完备） */
+    /* f1c 双并桥接（L&&R 三合一）：B 填洞紧贴 A 尾 && phys 连续，且 B 尾紧贴 C 头
+     * && phys 连续 → 双融合：A 扩长吞 B 与 C、memmove 删 C → 单条 [0,13)p100，
+     * count−1。根叶无欠载 → 零收尾（叶 max 不变：删末项后新末项终点 = 原末项
+     * 终点 → 父链零刷新）。 */
     CHECK(wipe(), "f1c 清场");
     CHECK(fs.extent_map_range(root, inum, mk_ext(0, 4, 100)) == RC_OK, "f1c map A=[0,4)p100");
     CHECK(fs.extent_map_range(root, inum, mk_ext(10, 3, 110)) == RC_OK, "f1c map C=[10,13)p110");
     CHECK(fs.extent_map_range(root, inum, mk_ext(4, 6, 104)) == RC_OK, "f1c map B=[4,10)p104（洞）");
+    CHECK(window_is_single(fs, root, 0, 13, 100, nullptr), "f1c 双融合 → [0,13)p100 单条");
     {
-        std::vector<extent_t> v;
-        CHECK(range_sample(fs, root, 0, 13, v) && v.size() == 2,
-              "f1c 左并一次 → 残留 2 条（got %zu）", v.size());
-        bool shape = v.size() == 2 && v[0].fblkbase == 0 && v[0].length == 10 &&
-                     v[0].block_base.ptr == 100 && v[1].fblkbase == 10 && v[1].length == 3;
-        CHECK(shape, "f1c 形态 = A 左并 B → [0,10)p100 + C[10,13)p110（右并缺口残留）");
         audit_t a; audit_run(fs, root, inum, "f1c", &a);
-        CHECK(a.records == 2 && a.bad == 0, "f1c records=2 got %lu", a.records);
+        CHECK(a.records == 1 && a.nodes == 1 && a.bad == 0,
+              "f1c records=1 nodes=1 got %lu/%lu", a.records, a.nodes);
     }
 
-    /* f1d 跨界左并盲区（刻意跳过）：340 打底双保险分离 → L1=168 条 / L2=172 条。
-     * X=[335,336)p1335 路由落 L2 头（GLB=NONE）→ 跨界左并不做 → 纯插 →
-     * L1 末 [334,335)p1334 与 X、X 与 L2 原首 [336,337)p1336 同叶紧贴连续
-     * 残留三条 → audit 绿（残留合法）+ 窗口三记录。 */
+    /* f1d 跨叶边界缺口（叶内完备后唯一残留缝）：340 打底双保险分离 →
+     * L1=168 条 / L2=172 条。X=[335,336)p1335 路由落 L2 头（GLB=NONE）→ 无左
+     * 并对象但右邻紧贴 + 连续 → 右融合进 L2 首 → [335,337)p1335；与 L1 末
+     * [334,335)p1334 跨叶紧贴连续 → 跨界不并 → 窗口 [334,337) 残留 2 条合法。
+     * audit 绿 = 右融合改叶首起点不动叶 max → 父 hint 无需刷新。 */
     {
         CHECK(wipe(), "f1d 清场");
         fusion_base_340(fs, root, inum);
@@ -348,17 +347,57 @@ static void run_f1(RavenFS_juvenile &fs, uint64_t inum, uint64_t &root) {
         CHECK(ad0.records == 340 && ad0.bad == 0, "f1d 打底 records=340 got %lu", ad0.records);
         CHECK(fs.extent_map_range(root, inum, mk_ext(335, 1, 1335)) == RC_OK, "f1d map X=[335,336)p1335");
         audit_t ad;
-        audit_run(fs, root, inum, "f1d 跨界跳过", &ad);
+        audit_run(fs, root, inum, "f1d 跨叶缺口", &ad);
+        CHECK(ad.records == 340 && ad.bad == 0, "f1d records=340（右并不增条）got %lu", ad.records);
         std::vector<extent_t> v;
         range_sample(fs, root, 334, 3, v);
-        CHECK(v.size() == 3, "f1d 跨叶残留 3 条合法（got %zu）：[334,335)+X+[336,337)", v.size());
+        CHECK(v.size() == 2, "f1d 跨叶残留 2 条合法（got %zu）：[334,335)+[335,337)", v.size());
+        bool shape = v.size() == 2 && v[0].fblkbase == 334 && v[0].length == 1 &&
+                     v[0].block_base.ptr == 1334 && v[1].fblkbase == 335 &&
+                     v[1].length == 2 && v[1].block_base.ptr == 1335;
+        CHECK(shape, "f1d 形态 = [334,335)p1334 + [335,337)p1335（X 已右并入 L2 首）");
+    }
+
+    /* f1e 双并致欠载 → 平衡链 + 根收缩（map 欠载路径直接验证，2026-09-07）：
+     * 打底 A[0,4)p100 + C[10,13)p110 + 双保险分离填充至 338 条 → 第 338 条纯插
+     * 触发分裂（左叶 168 = A+C+166 填充 [0,346)，右叶 170，根内 2 孩）→ 左叶
+     * 非根 count==168 恰在欠载线上。map B=[4,10)p104（洞）命中 L&&R → 双融合
+     * 删 C → 左叶 167 欠载 → extent_balance_from：167+170=337 ≤337 → 合并单叶
+     * → 父(根)2→1 → root_shrink → 337 条单叶根（root_blk 引用带出）。audit
+     * 绿 + nodes=1 即整链走通（根内 1 孩残留会被 audit 抓 bad）。 */
+    {
+        CHECK(wipe(), "f1e 清场");
+        CHECK(fs.extent_map_range(root, inum, mk_ext(0, 4, 100)) == RC_OK, "f1e map A=[0,4)p100");
+        CHECK(fs.extent_map_range(root, inum, mk_ext(10, 3, 110)) == RC_OK, "f1e map C=[10,13)p110");
+        bool ok = true;
+        for (uint64_t fb = 14; fb < 346 && ok; fb += 2) {      /* 166 条左叶填充 */
+            result_code_t r = fs.extent_map_range(root, inum, mk_ext(fb, 1, 10000 + fb));
+            if (r != RC_OK) { CHECK(false, "f1e 左叶填充 fb=%lu → %s", fb, rc_name(r)); ok = false; }
+        }
+        for (uint64_t fb = 346; fb < 686 && ok; fb += 2) {     /* 170 条 → 第 338 条触发分裂 */
+            result_code_t r = fs.extent_map_range(root, inum, mk_ext(fb, 1, 10000 + fb));
+            if (r != RC_OK) { CHECK(false, "f1e 右叶填充 fb=%lu → %s", fb, rc_name(r)); ok = false; }
+        }
+        if (ok) {
+            audit_t a0; audit_run(fs, root, inum, "f1e 打底338", &a0);
+            CHECK(a0.records == 338 && a0.bad == 0 && a0.inner == 1 && a0.leaves == 2,
+                  "f1e 打底 records=338 inner=1 leaves=2 got %lu/%lu/%lu",
+                  a0.records, a0.inner, a0.leaves);
+            CHECK(fs.extent_map_range(root, inum, mk_ext(4, 6, 104)) == RC_OK, "f1e map B=[4,10)p104（桥接）");
+            audit_t a; audit_run(fs, root, inum, "f1e 欠载平衡后", &a);
+            CHECK(a.bad == 0, "f1e 平衡链后结构绿");
+            CHECK(a.records == 337 && a.nodes == 1 && a.leaves == 1,
+                  "f1e 双并−1+合并+根收缩 → records=337 nodes=1 got %lu/%lu", a.records, a.nodes);
+            CHECK(window_is_single(fs, root, 0, 13, 100, nullptr), "f1e A 扩长吞 C → [0,13)p100 单条");
+        }
     }
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * F2：BOSS —— 12 万条紧贴 + phys 连续乱序插（新世界观）
- * 左并渐进收敛 + 分裂/刷新机械在乱序下的稳定性靶：每窗审计结构绿；
- * 终态审计绿 + 记录数 < 总数（确有融合；乱序右并缺口残留合法）；
+ * F2：BOSS —— 12 万条紧贴 + phys 连续乱序插（叶内四形态世界观）
+ * 左并/右并渐进收敛 + 双并桥接 + 分裂/刷新机械在乱序下的稳定性靶：
+ * 每窗审计结构绿；终态审计绿 + 记录数 < 总数（确有融合；残留 = 跨叶
+ * 边界缺口 + 渐进左并后新产生的叶内紧贴连续对，显式接受）；
  * 终态交 R1 激进重建 → 单条 [0,N)（端到端）。
  * ═══════════════════════════════════════════════════════════════════ */
 static void run_f2(RavenFS_juvenile &fs, uint64_t inum, uint64_t &root) {
@@ -385,7 +424,7 @@ static void run_f2(RavenFS_juvenile &fs, uint64_t inum, uint64_t &root) {
         audit_t af;
         audit_run(fs, root, inum, "F2 终态", &af);
         CHECK(af.bad == 0, "F2 终态结构绿");
-        printf("  [F2] 终态 records=%lu（12 万条全覆盖 phys 连续，残留 = 乱序右并缺口）\n", af.records);
+        printf("  [F2] 终态 records=%lu（12 万条全覆盖 phys 连续，残留 = 跨叶缺口 + 叶内紧贴连续对）\n", af.records);
         CHECK(af.records < TOTAL, "F2 确有融合发生：records=%lu < %lu", af.records, TOTAL);
         std::vector<extent_t> v;
         range_sample(fs, root, 0, TOTAL, v);
