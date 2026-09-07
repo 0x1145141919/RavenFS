@@ -28,3 +28,6 @@ core.*
 
 # 工作日志（Raven 侧维护，不随仓库走）
 ravenfs_log.txt
+
+# kernel 测试素材（SparrowOS 侧资源，勿入 ravenfs 仓库）
+imgs/
