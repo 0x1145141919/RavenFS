@@ -105,3 +105,18 @@ add_executable(ravenfs_juv_pwrite_phase1
     ${CPU_ID_STUB}
 )
 target_link_libraries(ravenfs_juv_pwrite_phase1 PRIVATE ravenfs_juvenile)
+
+# v1.1 direct_file_pwrite 五段管线发烟 step1：inline 升格 direct/extent 双路径
+# （audit = 测试侧 hack helper：ftype/InodeSession/walk+iterator/read_block/位图账本）
+add_executable(ravenfs_juv_pwrite_smoke
+    test_pwrite_smoke.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_pwrite_smoke PRIVATE ravenfs_juvenile)
+
+# v1.1 pwrite 真盘规模阶梯：超大 direct（GB 级）+ 超多 extent（洞写 10^5+ 记录）
+add_executable(ravenfs_juv_pwrite_big
+    test_pwrite_big.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_pwrite_big PRIVATE ravenfs_juvenile)
