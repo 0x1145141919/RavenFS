@@ -189,6 +189,12 @@ private:
      * 裂段（每轮 ≥1 块，有界）；唯一失败面 = 某轮一块都榨不出 → 整体回滚。 */
     result_code_t dfprealloc_and_plan(raven_Inode_t *inode, uint64_t offset, uint64_t len,
                                       std::list<extent_t> &affect_extents);
+    /* 建空根叶（2026-09-09，pwrite_pipeline.md §9 缺口原语补票）：phase2 物化
+     * 第一步（inline/direct → extent 跃迁开树）。alloc 2 块（8K 节点，align 2^1）
+     * + meta 初始化（根叶，entry_count=0，parent_ptr.ptr=owner_inode_idx 审计锚，
+     * ptrs[0..2]=PTR_INVALID —— 文件树根无链表无 ".."）。root_blk 出参。
+     * 失败（无块）→ RC_ERR_NO_BLOCK，root_blk 不变。 */
+    result_code_t extent_new_root_leaf(uint64_t owner_inode_idx, uint64_t &root_blk);
     result_code_t df_extentify(uint64_t inode_idx);//把REGULAR/INODE型的
     /* ══════════════════════════════════════════════════════════
      * 位图接口组 A/B：薄转发 → bitmap_slices_mgr_t（独立模块）

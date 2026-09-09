@@ -227,7 +227,9 @@ phase4（phase3 不碰树）。
   时全形态回收（inline 清数据域 / direct 直指区间 / extent 叶链遍历 + 自底向上释节点
   + inode 槽，零泄露）；destroy_data=true 数据块 free 前清零。已接 dentry 删除链。
 - 缺口原语：**建空根叶**（phase2 物化的第一步，路径 3/5）——rebuild 内建树覆盖批量
-  场景，但单棵空根叶原语未独立（测试现手搓）。
+  场景，但单棵空根叶原语未独立（测试现手搓）。**2026-09-09 已补票**：
+  `extent_new_root_leaf(owner_inode_idx, root_blk&)` 落地（alloc 2 块 align 2^1 +
+  meta 初始化 + ptrs 置 INVALID），pwrite 总装物化路径在用。
 
 ## 10. punch_hole / truncate 复用
 
@@ -243,18 +245,23 @@ data_root = PTR_INVALID——禁止只打尾洞不搬回（会造成 size ≤ 16
 
 ## 11. 待办（当前未完成）
 
-1. 建空根叶原语（§9）
-2. `dfprealloc_and_plan` 实现（§5 规格 + direct 候选/降级裁剪 + §5.1 部分满足裂段语义 + 水位线待办）
-3. phase1.5 形态判别实现（§4 判据：纯决策零副作用）
-4. phase2 ENOSPC 逆序回滚集成验证（树侧机械已就绪：loose tail 裁切零分配恒成功，
-   发烟 D 组 + stress 已覆盖 loose 全分支；待办 = dfprealloc_and_plan → 判别 → map →
-   失败注入 → 逆序 loose 的管线级联测）
+> 2026-09-09 更新：phase1（#2）、phase1.5 判别（#3，改内嵌）、建空根叶（#1）、
+> pwrite 总装（direct_file_pwrite 五段合体）已落地。总装把 phase1.5 判别内嵌在
+> pwrite 内（09-09 拍板：不独立成函数）；phase2/3/4 同理以段落 + 局部 lambda
+> 实现在 direct_file_ops.cpp（无独立 phase 签名，避免为内部结构加公共面）。
+
+1. ~~建空根叶原语~~ → 已落地 `extent_new_root_leaf`（§9 补票）
+2. ~~`dfprealloc_and_plan` 实现~~ → 已落地（§5 规格 + direct 候选/降级裁剪 + §5.1 部分满足裂段语义；专项测试 90 断言）
+3. ~~phase1.5 形态判别实现~~ → 已内嵌于 direct_file_pwrite（§4 判据：非树态看 affect 形状，保 direct 跳 phase2；extent 免判别）
+4. ~~direct_file_pwrite 总装~~ → 已落地（五段管线 + phase2 失败逆序 loose/弃孤儿树 + phase4 出口坍缩 + 提交前统一清理；待集成测试）
 5. 并发前提：同 inode 写互斥由调用方保证（phase1 读态 ~ phase4 写之间无锁原子性）
 6. 融合接线（低频兑底）：close 插桩 + `merge_extents(fd,start,len)` 三端透传 +
    碎片度阈值判定（§2）
 7. 分配侧刷回批量连续分配（碎片预防第一性；occupy 尾延展已在 phase1 策略内）
-8. phase4 出口坍缩接线（§8：判定 + 先 inode 后 free 根的顺序纪律——原 §4.7 待办
-   的载体；truncate ≤160 回 inline 是 §10 既有回迁，机械就绪）
+8. ~~phase4 出口坍缩接线~~ → 已随总装落地（判定 + 先 inode 后 free 根顺序纪律）
+
+待补：pwrite 管线级联集成测试（phase1 → 判别 → map → phase3 → phase4，含三态
+迁移矩阵 + 坍缩触发 + NO_BLOCK 注入），以及 punch_hole/truncate 复用接线。
 
 ---
 

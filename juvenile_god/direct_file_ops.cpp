@@ -287,34 +287,373 @@ result_code_t RavenFS_juvenile::dfprealloc_and_plan(raven_Inode_t *inode, uint64
     return RC_OK;
 }
 
-result_code_t RavenFS_juvenile::direct_file_pwrite
-    (uint64_t inode_idx, 
-    uint64_t offset, 
-    uint64_t len, 
-    void *buf)
+/* ═══════════════════════════════════════════════════════════════════
+ * extent_new_root_leaf — 建空根叶（phase2 物化第一步，pwrite_pipeline.md §9 补票）
+ *
+ * alloc 2 块（8K 节点，align 2^1）→ extent_node_meta_init（根叶 count=0，
+ * 审计锚 owner_inode_idx）→ ptrs[0..2] = PTR_INVALID（文件树根无链表无 ".."）。
+ * root_blk 出参；失败（无块）→ RC_ERR_NO_BLOCK，root_blk 不变。
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::extent_new_root_leaf(uint64_t owner_inode_idx, uint64_t &root_blk)
 {
-    //采取元数据规划
-    regular_file_type_t pre_file_state;
-    uint64_t data_root;
+    const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+    const uint64_t blk = block_alloc_hard(2, 1);
+    if (blk == PTR_INVALID) return RC_ERR_NO_BLOCK;
     {
-        InodeSession f(this->inode_cache_mgr,inode_idx);
-        //边界条件错误处理
-        pre_file_state=ftype(f.inode);
-        data_root=f.inode->data_root;
+        mdata_piece_session s(mdata_piece_mgr, blk);
+        if (s.index_error() || !s) {
+            block_free(blk, 2);
+            return RC_ERR_STATE;
+        }
+        extent_node_meta_init(s.data, 0, false, true, owner_inode_idx);
+        Bptree_meta_t *meta = (Bptree_meta_t *)s.data;
+        meta->ptrs[0].ptr = PTR_INVALID_52;
+        meta->ptrs[1].ptr = PTR_INVALID_52;
+        meta->ptrs[2].ptr = PTR_INVALID_52;
+        s.dirty();
     }
-    //接下来就是复杂的从pre_file_state状态转变了，虽然是状态转变但是是有副作用的状态转变，并且要考虑中间产生了位图资源用尽的回退这种边界条件，以及普通回滚
-    //很明显初始条件是inline/direct/extent三种，我的推演发现在这个接口里面要考虑以下几个状态转变可能，但是很明显需要中间边分配边记录，最后成定论是什么状态
-    //1.inline->inline态，最简单
-    //2.inline->direct,扩容的时候优先尝试这个路径，hard_alloc
-    //3.inline->extent,当inline->direct的升格超过2个FS_Block的时候才允许降级到这个，使用soft_alloc(笑死，一个块的时候没法撕成两个FS_block,若是一个块都没法hard_alloc出来只能说明满了)
-    //4.direct->direct,不触发分配最好，触发了分配尽可能尝试调用block_occupy_soft尾部占领，尾部占领成功自然是皆大欢喜
-    //5.direct->extent, 4的软占领有剩余降级这个路径
-    //6.extent->extent, 待写区间落到extents上，若有空洞，尽可能从左侧区间尾巴上向右soft_occupy,能合并就合并
-    //7.extent->direct,虽然极为罕见但是也有可能6的合并全文件合并到一个extent了，按照尽可能direct的宗旨就要坍缩到direct
-    //不妨根据最复杂的extent初始条件的工作流程来写这个函数的五步骤：资源预分配并区间合并->根据老的extents编译一个原语操作序列->执行操作序列(map/unmap)->文件数据写入->元数据回写
-    //很明显有些相对简单的边界条件可以适当简化省略对应的phase
-    return result_code_t();
+    root_blk = blk;
+    return RC_OK;
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * direct_file_pwrite — pwrite 五段管线总装（pwrite_pipeline.md 全文）
+ *
+ * 形态决策内嵌（phase1.5 不独立成函数，09-09 拍板）：保 direct ⇔ 非树态
+ * 且 affect 形状满足（inline 迁出 = 1 段 0 起始；direct = 空 或 1 段尾贴）；
+ * extent 旧态免判别直出 map-only。
+ *
+ * 管线（含各 phase 失败回滚，inode 写 = 唯一提交点）：
+ *   phase1  dfprealloc_and_plan（含 inline→inline 豁免前置判断）
+ *   phase1.5 判别（本函数内嵌）
+ *   phase2  [仅树路径] 物化建树（direct 旧区 map 一条零搬移）→ 逐段 map；
+ *           失败：已 map 逆序 unmap_range_loose + 全段 free phys + 新建树
+ *           无存活映射则 free 树根（extent 旧态树原样，零清理）
+ *   phase3  数据写入（新段 zero+overlay / 旧块 read-modify-write / 整块直写）；
+ *           inline 迁出 [0,pre_size) 物化拷贝 + 直接占位块批量清零
+ *   phase4  一次 InodeSession 写 = 提交点；树路径提交前 O(1) 坍缩判定
+ *           （根叶 && count==1 && 单条覆盖 [0,newceil)）→ 先 inode 后 free 旧根
+ *
+ * 写前必读：同 inode 写互斥由调用方保证（§11.5）；本函数不开锁。
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::direct_file_pwrite(uint64_t inode_idx, uint64_t offset, uint64_t len, void *buf)
+{
+    const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+    constexpr uint64_t FS_BLOCK = 4096;
+    constexpr uint64_t INLINE_MAX = 160;
+
+    if (len == 0) return RC_OK;                          /* POSIX：零长写无操作 */
+    if (offset > ~0ULL - len) return RC_ERR_STATE;       /* offset+len 溢出 */
+    const uint64_t end_byte = offset + len;
+
+    /* ── 入口读态：一次 InodeSession（phase1 复用同映像指针；关后只用拷贝）── */
+    uint64_t pre_size = 0, pre_data_root = 0;
+    regular_file_type_t pre_shape = inline_file;
+    uint8_t old_inline[INLINE_MAX] = {0};
+    uint64_t old_inline_len = 0;
+    uint64_t newsize = 0;
+    std::list<extent_t> affect;
+    {
+        InodeSession s(inode_cache_mgr, inode_idx);
+        if (!s.inode) return RC_ERR_IO;
+        raven_Inode_t *ino = s.inode;
+        if (ino->type != INODE_TYPE_REGULAR && ino->type != INODE_TYPE_SOFT_SYM)
+            return RC_ERR_STATE;
+        pre_size = ino->size;
+        pre_data_root = ino->data_root;
+        pre_shape = ftype(ino);
+        newsize = end_byte > pre_size ? end_byte : pre_size;
+
+        /* ── inline→inline 豁免：不走管线，纯 inode 内写（零分配零树）── */
+        if (pre_shape == inline_file && newsize <= INLINE_MAX) {
+            if (offset > pre_size)   /* 中间未写洞清零（原内容可能越 size 有残留） */
+                memset(ino->inline_data + pre_size, 0, offset - pre_size);
+            memcpy(ino->inline_data + offset, buf, len);
+            ino->size = newsize;
+            s.dirty();
+            return RC_OK;
+        }
+        if (pre_shape == inline_file) {
+            old_inline_len = pre_size;
+            memcpy(old_inline, ino->inline_data, sizeof(old_inline));   /* 物化拷贝源 */
+        }
+
+        /* ── phase1：资源预分配 + 区间规划 ── */
+        result_code_t rc = dfprealloc_and_plan(ino, offset, len, affect);
+        if (rc) return rc;
+        if (pre_shape == inline_file && affect.empty())
+            return RC_ERR_STATE;    /* 迁出必吐新段（防御：规划/豁免分派矛盾） */
+    }
+
+    const uint64_t oldceil = (pre_size + FS_BLOCK - 1) / FS_BLOCK;
+    const uint64_t size_ceil = (newsize + FS_BLOCK - 1) / FS_BLOCK;   /* 提交后 size 块数（坍缩判定上界） */
+    std::vector<extent_t> segs(affect.begin(), affect.end());   /* 升序账本（回滚/查找用） */
+
+    /* ── phase1.5 形态判别（内嵌）：keep_direct 或上树 ── */
+    bool keep_direct = false;
+    if (pre_shape == extent) {
+        keep_direct = false;                       /* 树已在 → map-only（判别只发生在非树态） */
+    } else if (pre_shape == direct) {
+        if (segs.empty()) {
+            keep_direct = true;                    /* 覆盖写 / 增长未跨块界：base 不动 */
+        } else if (segs.size() == 1) {
+            const extent_t &e = segs[0];
+            keep_direct = (e.fblkbase == oldceil &&
+                           e.block_base.ptr == pre_data_root + oldceil);   /* 1 段尾贴 */
+        }
+    } else {   /* inline 迁出 */
+        keep_direct = (segs.size() == 1 && segs[0].fblkbase == 0);
+    }
+
+    /* phase2 已开始后的统一失败清理。inode 恒未动（提交点是 phase4）；
+     * mapped = 已成功 map 的段数。
+     *   extent 旧态：树是原树 → 已 map 段逆序 loose 归位（零清理残留）；
+     *   物化新建树：整体弃（节点块遍历释放；数据块 phys 零碰——seg 归账本、
+     *     direct 旧区仍归 inode）——树可能已分裂多节点，只 free 根会泄漏。 */
+    auto free_orphan_extent_tree = [&](uint64_t tree_root) {
+        /* 叶链遍历登记 + 父集去重自底向上（同 regular_file_reclaim extent 分支，
+         * 零数据释放；结构异常即弃疗 = 孤儿留盘 fsck 收）。 */
+        std::vector<uint64_t> leaves, parents;
+        uint64_t cur = tree_root;
+        for (int d = 0; d < 64 && cur != PTR_INVALID_52; d++) {
+            mdata_piece_session sess(mdata_piece_mgr, cur);
+            if (sess.index_error() || !sess) return;
+            Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
+            if (!is_extent_node(meta)) return;
+            if (!meta->parent_ptr.is_inner_node) {
+                if (!meta->parent_ptr.is_root_node) parents.push_back(meta->parent_ptr.ptr);
+                leaves.push_back(cur);
+                cur = meta->ptrs[2].ptr;
+                continue;
+            }
+            auto *inner = (Bptree_extent_inner_node_t *)sess.data;
+            if (inner->meta.parent_ptr.entry_count == 0) return;
+            cur = inner->extents[0].sub_node_ptr.ptr;
+        }
+        for (uint64_t b : leaves) block_free(b, 2);
+        std::sort(parents.begin(), parents.end());
+        parents.erase(std::unique(parents.begin(), parents.end()), parents.end());
+        std::vector<uint64_t> layer = parents;
+        while (!layer.empty()) {
+            std::vector<uint64_t> next;
+            bool saw_root = false;
+            for (uint64_t b : layer) {
+                mdata_piece_session sess(mdata_piece_mgr, b);
+                if (sess.index_error() || !sess) return;
+                Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
+                if (!is_extent_node(meta) || !meta->parent_ptr.is_inner_node) return;
+                if (meta->parent_ptr.is_root_node) saw_root = true;
+                else next.push_back(meta->parent_ptr.ptr);
+            }
+            for (uint64_t b : layer) block_free(b, 2);
+            if (saw_root) break;
+            std::sort(next.begin(), next.end());
+            next.erase(std::unique(next.begin(), next.end()), next.end());
+            layer = next;
+        }
+    };
+    uint64_t root_blk = pre_data_root;             /* extent 旧态：现树根（后续经引用更迭） */
+    const bool tree_path = !keep_direct;
+    auto cleanup_after_phase2 = [&](size_t mapped) {
+        if (tree_path) {
+            if (pre_shape == extent) {
+                for (size_t i = mapped; i-- > 0;)
+                    extent_unmap_range_loose(root_blk, inode_idx, segs[i]);   /* 逆序归位 */
+            } else {
+                free_orphan_extent_tree(root_blk);
+            }
+        }
+        for (const extent_t &e : segs) block_free(e.block_base.ptr, e.length);
+    };
+
+    /* ── phase2：逐段 map（仅树路径；保 direct 全程无树）── */
+    if (tree_path && pre_shape != extent) {
+        /* 物化：非树态跃迁 → 建空根叶（direct 旧区随后 map 一条，零搬移） */
+        result_code_t rc = extent_new_root_leaf(inode_idx, root_blk);
+        if (rc) {
+            for (const extent_t &e : segs) block_free(e.block_base.ptr, e.length);
+            return rc;   /* 树未建成：仅 phase1 账本 */
+        }
+        if (pre_shape == direct) {
+            extent_t oldrec;
+            oldrec.fblkbase = 0;
+            oldrec.length = oldceil;
+            oldrec.block_base.ptr = pre_data_root;
+            oldrec.block_base.free_to_use = 0;
+            rc = extent_map_range(root_blk, inode_idx, oldrec);   /* 空根叶纯插，无失败面 */
+            if (rc) {
+                block_free(root_blk, 2);
+                for (const extent_t &e : segs) block_free(e.block_base.ptr, e.length);
+                return rc;
+            }
+        }
+    }
+    if (tree_path) {
+        size_t mapped = 0;
+        result_code_t rc = RC_OK;
+        for (size_t i = 0; i < segs.size(); i++) {
+            rc = extent_map_range(root_blk, inode_idx, segs[i]);
+            if (rc) break;
+            mapped++;
+        }
+        if (rc) {
+            cleanup_after_phase2(mapped);
+            return rc;
+        }
+    }
+
+    /* ── phase4 前置：坍缩判定（树路径提交前 O(1) 读根；phase3 不碰树）──
+     * 根叶 && count==1 && 单条覆盖 [0, newceil) → 可坍缩 direct。 */
+    bool collapse = false;
+    uint64_t collapse_base = 0;
+    if (tree_path) {
+        mdata_piece_session s(mdata_piece_mgr, root_blk);
+        if (s.index_error() || !s || !is_extent_node((Bptree_meta_t *)s.data)) {
+            /* 树结构异常：inode 未动，树 + 账本统一回滚（extent 旧态树归原位） */
+            cleanup_after_phase2(segs.size());
+            return RC_ERR_STATE;
+        }
+        Bptree_meta_t *meta = (Bptree_meta_t *)s.data;
+        if (!meta->parent_ptr.is_inner_node &&
+            (uint16_t)meta->parent_ptr.entry_count == 1) {
+            const extent_t e0 = ((Bptree_extent_leaf_node_t *)s.data)->extents[0];
+            if (e0.fblkbase == 0 && e0.fblkbase + e0.length == size_ceil) {
+                collapse = true;
+                collapse_base = e0.block_base.ptr;
+            }
+        }
+    }
+
+    /* ── phase3：文件数据写入 ──
+     * 新段块（affect 命中）：零垫底 + overlay 用户数据（新块未写区清零契约）；
+     * 旧块：整块覆盖直写（免读），否则 read-modify-write 保周围内容。
+     * inline 迁出：新块 0 额外叠加 [0, pre_size) 物化拷贝（在零垫底之上）。 */
+    {
+        uint8_t *user = (uint8_t *)buf;
+        std::vector<uint8_t> tmp(FS_BLOCK);
+        const bool mig = (pre_shape == inline_file);   /* inline 迁出（block 0 恒为新段） */
+        const uint64_t d_start = offset >> 12;
+        const uint64_t d_end = (end_byte + FS_BLOCK - 1) / FS_BLOCK;  /* 写域上界（≠newceil：end_byte<size 时勿碰旧块） */
+
+        /* 段查找游标：segs 升序互不重叠；b 升序推进时同步前进。命中 = 新段 phys。 */
+        size_t seg_i = 0;
+        auto seg_phys_of = [&](uint64_t b) -> uint64_t {
+            while (seg_i < segs.size() && b >= segs[seg_i].fblkbase + segs[seg_i].length)
+                seg_i++;
+            if (seg_i < segs.size() && b >= segs[seg_i].fblkbase)
+                return segs[seg_i].block_base.ptr + (b - segs[seg_i].fblkbase);
+            return PTR_INVALID_52;   /* 未命中 = 旧块 */
+        };
+        /* 旧块物理：树路径 → 树 walk；保 direct → 直指公式（仅 direct 旧态存在旧块） */
+        auto old_phys_of = [&](uint64_t b, uint64_t &out) -> result_code_t {
+            if (tree_path) {
+                bptree_path_t tr;
+                result_code_t rc = extent_Bptree_walk(root_blk, &tr, b);
+                if (rc) return rc;
+                if (!tr.is_leaf_hit) return RC_ERR_STATE;   /* phase1/2 覆盖不变量破坏：防御 */
+                mdata_piece_session s(mdata_piece_mgr, tr.blocks[tr.depth - 1]);
+                if (s.index_error() || !s) return RC_ERR_IO;
+                auto *leaf = (Bptree_extent_leaf_node_t *)s.data;
+                const uint16_t glb = tr.child_idx[tr.depth - 1];
+                if (glb >= (uint16_t)leaf->meta.parent_ptr.entry_count) return RC_ERR_STATE;
+                const extent_t &e = leaf->extents[glb];
+                out = e.block_base.ptr + (b - e.fblkbase);
+                return RC_OK;
+            }
+            if (b >= oldceil) return RC_ERR_STATE;   /* 保 direct：新块必在 seg 内（防御） */
+            out = pre_data_root + b;
+            return RC_OK;
+        };
+        /* 单块写入：ws/we = 本块内用户字节区间（半开，可为空）。新段块零垫底+
+         * overlay（含 inline 物化拷贝）；旧块整块直写或 read-modify-write。 */
+        auto write_blk = [&](uint64_t b, uint64_t ws, uint64_t we) -> result_code_t {
+            const uint64_t phys = seg_phys_of(b);
+            const uint64_t blk_off = b * FS_BLOCK;
+            const size_t n = we > ws ? (size_t)(we - ws) : 0;
+            if (phys != PTR_INVALID_52) {
+                /* 新段块 */
+                memset(tmp.data(), 0, FS_BLOCK);
+                if (mig && b == 0 && old_inline_len > 0)
+                    memcpy(tmp.data(), old_inline, old_inline_len);   /* inline 内容迁出 */
+                if (n) memcpy(tmp.data() + (ws - blk_off), user + (ws - offset), n);
+                write_block(phys, tmp.data());
+                return RC_OK;
+            }
+            /* 旧块 */
+            uint64_t ophys = 0;
+            result_code_t rc = old_phys_of(b, ophys);
+            if (rc) return rc;
+            if (ws == blk_off && we == blk_off + FS_BLOCK) {
+                write_block(ophys, user + (ws - offset));   /* 整块覆盖直写，免读 */
+                return RC_OK;
+            }
+            read_block(ophys, tmp.data());
+            if (n) memcpy(tmp.data() + (ws - blk_off), user + (ws - offset), n);
+            write_block(ophys, tmp.data());
+            return RC_OK;
+        };
+
+        /* ① 保 direct 且 inline 迁出：占位块（[1,d_start) 与 [d_end, seg 尾)）清零 ——
+         * direct 语义全覆盖，未写区必须读 0（§7；extent 路径洞无 phys 天然读 0）。 */
+        if (keep_direct && mig) {
+            std::vector<uint8_t> zeros(FS_BLOCK, 0);
+            const uint64_t seg_base = segs[0].block_base.ptr;
+            const uint64_t seg_len = segs[0].length;
+            for (uint64_t b = 1; b < d_start && b < seg_len; b++)
+                write_block(seg_base + b, zeros.data());
+            for (uint64_t b = d_end; b < seg_len; b++)
+                write_block(seg_base + b, zeros.data());
+        }
+
+        /* ② 物化块 block 0（inline 迁出且 0 ∉ D：d_start>0，内容拷入 + 清零） */
+        if (mig && d_start > 0) {
+            result_code_t rc = write_blk(0, 0, 0);
+            if (rc) {
+                cleanup_after_phase2(tree_path ? segs.size() : 0);
+                return rc;
+            }
+        }
+
+        /* ③ D 逐块写（升序；seg 游标随 b 推进） */
+        for (uint64_t b = d_start; b < d_end; b++) {
+            const uint64_t ws = offset > b * FS_BLOCK ? offset : b * FS_BLOCK;
+            const uint64_t we = end_byte < (b + 1) * FS_BLOCK ? end_byte : (b + 1) * FS_BLOCK;
+            result_code_t rc = write_blk(b, ws, we);
+            if (rc) {
+                /* phase3 失败：已写数据不回滚（崩溃模型：③ 前 = 孤儿资源，fsck 收）；
+                 * inode 未动 = 文件仍指旧态 → 树（若已建）+ 账本统一回滚。 */
+                cleanup_after_phase2(tree_path ? segs.size() : 0);
+                return rc;
+            }
+        }
+    }
+
+
+    /* ── phase4：inode 一次写 = 提交点（坍缩：先提交 direct 态再 free 旧根）── */
+    {
+        const uint64_t direct_base = keep_direct
+            ? (pre_shape == inline_file ? segs[0].block_base.ptr : pre_data_root)
+            : (collapse ? collapse_base : 0);
+        InodeSession s(inode_cache_mgr, inode_idx);
+        if (!s.inode) {
+            /* 提交前会话失败：inode 未动，树 + 账本统一回滚后报错 */
+            cleanup_after_phase2(tree_path ? segs.size() : 0);
+            return RC_ERR_IO;
+        }
+        s.inode->size = newsize;
+        if (keep_direct || collapse) {
+            s.inode->is_data_root_direct_bit = 1;
+            s.inode->data_root = direct_base;
+        } else {
+            s.inode->is_data_root_direct_bit = 0;
+            s.inode->data_root = root_blk;
+        }
+        s.dirty();
+    }
+    if (collapse) block_free(root_blk, 2);   /* ③ 后清扫：崩溃窗口 = 孤儿 2 块，无悬垂 */
+    return RC_OK;
+}
+
 
 /* ═══════════════════════════════════════════════════════════════════
  * regular_file_reclaim — 归零回收（REG/SOFT_SYM link_count==0 全量空间回收）
