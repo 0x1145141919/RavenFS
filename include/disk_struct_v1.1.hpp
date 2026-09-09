@@ -58,6 +58,7 @@ enum : result_code_t {
     RC_ERR_NOT_EMPTY,       /* 目录非空：dir 型目标删除前置校验失败（rmdir 语义） */
     RC_ERR_NOT_SUPPORTED,   /* 功能暂不支持：REG/SOFT_SYM 归零全量空间回收未实现哨兵（inode 暂挂孤儿，fsck 可回收） */
     RC_ERR_OVERLAP,         /* extent 区间与既有映射重叠（extent_map_range 防御；正常流程 = 外部侦查错误/契约违反） */
+    RC_ERR_IS_DIR,          /* dir 型目标：文件数据操作接口不受理（pread/punch_hole/truncate 对 dir；Linux EISDIR 对齐，2026-09-09 新增） */
 
     RC_NEED_SPLIT = 0x1000, /* 内部使用：本层分裂，需父层处理 */
 };

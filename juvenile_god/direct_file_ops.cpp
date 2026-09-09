@@ -813,3 +813,170 @@ result_code_t RavenFS_juvenile::regular_file_reclaim(uint64_t inode_idx, bool de
     inode_free(inode_idx);   /* 数据资产清完后槽回收（最后一步，幂等位图操作） */
     return RC_OK;
 }
+/* ═══════════════════════════════════════════════════════════════════
+ * direct_file_pread — 文件数据读（纯读零副作用，规格 punch_truncate_pread_spec.md §4）
+ *
+ * 契约（Linux filemap_read 对齐，R2/R3/R4/R6）：
+ *   - len==0 → RC_OK，*out_bytes=0（不发 IO）
+ *   - offset ≥ size → RC_OK，*out_bytes=0（越界读是正常结果）
+ *   - offset+len 溢出 → RC_ERR_STATE
+ *   - 成功：*out_bytes = min(len, size-offset)（EOF 短读）；只读 [0,size)，
+ *     盘上 [size, 块上界) 残留永不拷出
+ *   - 洞读 0；不分配、不 dirty、不扩文件、不维护 atime（v1.1 全系不维护时间戳）
+ *   - 受理 = REGULAR only：DIR → RC_ERR_IS_DIR；SOFT_SYM/其它 → RC_ERR_STATE
+ *
+ * 形态分流（判据 ftype()，size 优先）：
+ *   inline ：源 = inode.inline_data[offset..]（会话内 memcpy，零 IO）
+ *   direct ：base+逻辑块号 直指公式，全覆盖无洞；逐块 read_block → 裁字节区间
+ *   extent ：walk 定位 + iterator 游走；记录段拷 phys、洞段填 0（不读盘）
+ *     树尾洞 / 记录间隙洞 = memset 0（与"从未写"不可区分，P9 语义）
+ *
+ * 性能注：extent 逐块 IO（每块 1 次 4K read + 节点读摊销）；连续记录段可
+ * 后续换 read_buff 批量（正确性优先，先逐块）。
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::direct_file_pread(uint64_t inode_idx, uint64_t offset,
+                                                  uint64_t len, void *buf,
+                                                  uint64_t *out_bytes)
+{
+    constexpr uint64_t FS_BLOCK = 4096;
+    constexpr uint64_t INLINE_MAX = 160;
+    if (!out_bytes) return RC_ERR_STATE;
+    *out_bytes = 0;
+    if (len == 0) return RC_OK;                          /* R1：零长读无操作 */
+    if (offset > ~0ULL - len) return RC_ERR_STATE;       /* offset+len 溢出 */
+    if (!buf) return RC_ERR_STATE;
+
+    uint8_t *dst = (uint8_t *)buf;
+
+    /* ── 会话内：受理校验 + inline 直拷 + 非 inline 字段快照 ── */
+    uint64_t fsize = 0, base = 0, root = 0;
+    bool is_direct = false;
+    {
+        InodeSession s(inode_cache_mgr, inode_idx);
+        if (!s.inode) return RC_ERR_IO;
+        raven_Inode_t *ino = s.inode;
+        if (ino->type == INODE_TYPE_DIR) return RC_ERR_IS_DIR;
+        if (ino->type != INODE_TYPE_REGULAR) return RC_ERR_STATE;  /* SOFT_SYM 拒 */
+        fsize = ino->size;
+        if (offset >= fsize) return RC_OK;               /* R2：越界读 = 0 字节 */
+        if (fsize <= INLINE_MAX) {                       /* inline：会话内直拷 */
+            const uint64_t n = len < fsize - offset ? len : fsize - offset;
+            memcpy(dst, ino->inline_data + offset, n);
+            *out_bytes = n;
+            return RC_OK;
+        }
+        base = ino->data_root;
+        is_direct = ino->is_data_root_direct_bit;
+        root = ino->data_root;
+    }   /* 会话析构（非 inline 走 IO 段），字段已快照 */
+
+    const uint64_t clamp_end = offset + len < fsize ? offset + len : fsize; /* EOF clamp */
+    const uint64_t n = clamp_end - offset;
+    if (n == 0) { *out_bytes = 0; return RC_OK; }
+
+    /* ── direct：base + 逻辑块号，全覆盖无洞 ── */
+    if (is_direct) {
+        if (base == PTR_INVALID) return RC_ERR_STATE;
+        const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+        if (base == PTR_INVALID_52) return RC_ERR_STATE;
+        std::vector<uint8_t> tmp(FS_BLOCK);
+        const uint64_t first = offset >> 12;
+        const uint64_t last = (clamp_end + FS_BLOCK - 1) >> 12;
+        for (uint64_t b = first; b < last; b++) {
+            const uint64_t blk_off = b * FS_BLOCK;
+            const uint64_t lo = offset > blk_off ? offset - blk_off : 0;
+            const uint64_t hi = clamp_end - blk_off < FS_BLOCK ? clamp_end - blk_off : FS_BLOCK;
+            if (lo >= hi) continue;
+            read_block(base + b, tmp.data());
+            memcpy(dst + (blk_off + lo - offset), tmp.data() + lo, hi - lo);
+        }
+        *out_bytes = n;
+        return RC_OK;
+    }
+
+    /* ── extent：walk + iterator；记录段拷 phys、洞段填 0 ── */
+    if (root == PTR_INVALID) return RC_ERR_STATE;
+    const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+    if (root == PTR_INVALID_52) return RC_ERR_STATE;
+    const uint64_t d_start = offset >> 12;
+    const uint64_t d_end = (clamp_end + FS_BLOCK - 1) >> 12;
+
+    bptree_path_t trace;
+    result_code_t rc = extent_Bptree_walk(root, &trace, d_start);
+    if (rc) return rc;
+    const uint64_t leaf_blk = trace.blocks[trace.depth - 1];
+    const uint16_t glb = trace.child_idx[trace.depth - 1];
+    const bool hit = trace.is_leaf_hit;
+
+    extent_iterator it(this, leaf_blk, glb);
+    /* 定位：hit → it 已在覆盖记录；!hit 且 glb 有效 → ++ 到首个可能覆盖记录 /
+     * 首个 fblkbase > d_start 的记录；glb 虚拟前位 → ++ 进入首记录（头洞自理）。
+     * 与 range_sample(测试) 同款定位，保证洞/记录边界语义一致。 */
+    if (glb == EXTENT_LEAF_GLB_NONE) {
+        if (it.iterator_erro_flag) return RC_ERR_STATE;
+        ++it;
+    } else if (!hit) {
+        if (it.iterator_erro_flag) return RC_ERR_STATE;
+        ++it;
+    }
+
+    std::vector<uint8_t> tmp(FS_BLOCK);
+    uint64_t cur_b = d_start;
+    extent_t R;
+
+    /* 树尾核验：确认 iterator 耗尽是真树尾（读 it.leaf_blk 的 meta ptrs[2]），
+     * 非 IO/结构错误（dfprealloc 同款模式）。 */
+    auto at_tree_end = [&]() -> bool {
+        mdata_piece_session s(mdata_piece_mgr, it.leaf_blk());
+        if (s.index_error() || !s) return false;
+        auto *lf = (Bptree_extent_leaf_node_t *)s.data;
+        if (!is_extent_node(&lf->meta) || lf->meta.parent_ptr.is_inner_node) return false;
+        if (lf->meta.parent_ptr.is_root_node) return true;   /* 单叶树 */
+        return lf->meta.ptrs[2].ptr == PTR_INVALID_52;
+    };
+
+    for (;;) {
+        if (cur_b >= d_end) break;
+        if (!it.iterator_erro_flag && it.current_extent(R)) {
+            if (R.fblkbase + R.length <= cur_b) {
+                /* GLB 已越过 cur_b（理论不达：GLB=最后 fblkbase≤target，覆盖则 hit）。
+                 * 防御：本记录不覆盖 cur_b，视作洞间隙，推进 it 本记录后重判。 */
+                ++it;
+                continue;
+            }
+            if (R.fblkbase > cur_b) {
+                /* 洞 [cur_b, R.fblkbase) 填 0（记录间隙洞 / 头洞） */
+                const uint64_t s_lo = cur_b * FS_BLOCK;
+                const uint64_t s_hi = R.fblkbase * FS_BLOCK;
+                const uint64_t zlo = s_lo > offset ? s_lo : offset;
+                const uint64_t zhi = s_hi < clamp_end ? s_hi : clamp_end;
+                if (zhi > zlo) memset(dst + (zlo - offset), 0, zhi - zlo);
+                cur_b = R.fblkbase;
+                continue;   /* 下轮进入记录段 */
+            }
+            /* 记录段 [cur_b, min(R.end, d_end))：逐块拷 phys */
+            const uint64_t last_b = R.fblkbase + R.length < d_end ? R.fblkbase + R.length : d_end;
+            for (uint64_t b = cur_b; b < last_b; b++) {
+                const uint64_t blk_off = b * FS_BLOCK;
+                const uint64_t lo = offset > blk_off ? offset - blk_off : 0;
+                const uint64_t hi = clamp_end - blk_off < FS_BLOCK ? clamp_end - blk_off : FS_BLOCK;
+                if (lo >= hi) continue;
+                read_block(R.block_base.ptr + (b - R.fblkbase), tmp.data());
+                memcpy(dst + (blk_off + lo - offset), tmp.data() + lo, hi - lo);
+            }
+            cur_b = last_b;
+            ++it;
+        } else {
+            /* iterator 耗尽（++ 越树尾）或 IO/结构错误：核验真树尾后收尾洞段 */
+            if (it.iterator_erro_flag && at_tree_end()) {
+                const uint64_t zlo = cur_b * FS_BLOCK > offset ? cur_b * FS_BLOCK : offset;
+                const uint64_t zhi = clamp_end;
+                if (zhi > zlo) memset(dst + (zlo - offset), 0, zhi - zlo);
+                break;
+            }
+            return RC_ERR_STATE;   /* 树遍历异常（读路径无分配，零副作用） */
+        }
+    }
+    *out_bytes = n;
+    return RC_OK;
+}

@@ -114,9 +114,13 @@ public:
     result_code_t root_dir_insert_dentry(const char *name,uint8_t inode_type);
 
     result_code_t root_dir_direct_file_pwrite(const char *name,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
+    /* root_dir 文件数据接口（punch_hole/truncate/pread）：受理 = REGULAR only
+     * （dir→RC_ERR_IS_DIR；SOFT_SYM→RC_ERR_STATE）；字节粒度（非 O_DIRECT）；
+     * 规格：Docs/punch_truncate_pread_spec.md */
     result_code_t root_dir_direct_file_punch_hole(const char *name,uint64_t offset,uint64_t len);
     result_code_t root_dir_direct_file_trunacate(const char *name,uint64_t len_new);
-    result_code_t root_dir_direct_file_pread(const char *name,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
+    /* 左闭右开区间；*out_bytes = 实际读字节数（EOF 短读/越界读=0，Linux 短读语义） */
+    result_code_t root_dir_direct_file_pread(const char *name,uint64_t offset,uint64_t len,void*buf,uint64_t*out_bytes);//左闭右开区间
     /* 物理删除：dentry 树移除（memmove + 刷父 hash_max）→ 目标 inode 全量回收。
      * destroy_data = 销毁模式：数据块 free 前清零（防恢复）；false = 仅释放（块标
      * free，数据残留盘上，同 TRIM 语义）。
@@ -160,8 +164,14 @@ private:
     result_code_t dir_readdir_interval(uint64_t inode_idx,uint64_t base,uint64_t entry_count,dentry_out*buf);
     result_code_t direct_file_pwrite(uint64_t inode_idx,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
     result_code_t direct_file_punch_hole(uint64_t inode_idx,uint64_t offset,uint64_t len);
-    result_code_t direct_file_trunacate(uint64_t inode_idx,uint64_t len_new);//增大忽略，缩小内部编译为punch_hole的尾巴打洞条件
-    result_code_t direct_file_pread(uint64_t inode_idx,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
+    /* 增大 = 上调 size（pwrite 空写骨架：phase1/1.5 分配判别 + 物化 + 零垫底 +
+     * phase4；extent 态纯 size 推进零分配），缩小内部编译为 punch_hole 的尾巴
+     * 打洞条件 + 形态出口（坍缩 direct / ≤160 强制回迁 inline）——
+     * 规格 Docs/punch_truncate_pread_spec.md §6 */
+    result_code_t direct_file_trunacate(uint64_t inode_idx,uint64_t len_new);
+    /* 左闭右开区间；*out_bytes = 实际读字节数（EOF 短读/越界读=0，Linux 短读语义）
+     * 规格 Docs/punch_truncate_pread_spec.md §4 */
+    result_code_t direct_file_pread(uint64_t inode_idx,uint64_t offset,uint64_t len,void*buf,uint64_t*out_bytes);//左闭右开区间
     /* 归零回收（link_count==0 时的 REG/SOFT_SYM 全量空间回收，2026-09-07 补票）：
      * 按 ftype 分流 —— inline：inode 内联数据随槽释放（destroy 时先清零数据域）；
      * direct：data_root 直指区间 [data_root, ceil(size/4K)) 释放（destroy 先清零）；

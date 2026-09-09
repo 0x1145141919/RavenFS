@@ -1,6 +1,6 @@
 # RavenFS — 磁盘布局 v1.1
 
-> 2026-08-19 对齐定稿；2026-08-29 修订（dir inode 直指 dentry 树 + 固定 10 堆描述符，据 `disk_struct_v1.1.hpp` 反向维护）；2026-09-01 修订（区段树区间语义半开化 + link_count 契约补全）；2026-09-04 修订（REG/SYM 数据区解码判据伪代码化、弃哨兵主判；文件数据区状态机契约落 v1 §4.1，v1.1 收编 §10 不变量 22~25）。
+> 2026-08-19 对齐定稿；2026-08-29 修订（dir inode 直指 dentry 树 + 固定 10 堆描述符，据 `disk_struct_v1.1.hpp` 反向维护）；2026-09-01 修订（区段树区间语义半开化 + link_count 契约补全）；2026-09-04 修订（REG/SYM 数据区解码判据伪代码化、弃哨兵主判；文件数据区状态机契约落 v1 §4.1，v1.1 收编 §10 不变量 22~25）；2026-09-09 修订（不变量 24：extent→direct 出口缩水通道 + truncate 增大语义，据 `punch_truncate_pread_spec.md` 拍板）。
 > v1（`disk_layout_v1.md` + `block_model.md`）的继承与修正。
 > 结构定义见 `include/disk_struct_v1.1.hpp`，本文是它的设计意图与不变量契约。
 
@@ -448,7 +448,7 @@ bitmap 亮灯；数据面容量 = 2^total_bits_count_log2 × 粒度，见下表�
 
 22. 解码判据只依 `size` 与 `is_data_root_direct_bit`（size 优先；`data_root` 取值不参与判定）：size ≤ 160 → 内联（内容 inline_data[0..size-1]，规范 data_root = PTR_INVALID）；size > 160 ∧ direct_bit = 1 → 直指（data_root = 连续区首块，物理占块 = ceil(size/4096)，逻辑字节 o → data_root + o/4096 块内 o%4096，无块级空洞）；size > 160 ∧ direct_bit = 0 → 区段树（data_root = 根块号，空洞读 0）
 23. 三态互斥由 size 保证：外置两态只在 size > 160 出现；size ≤ 160 而 data_root ≠ PTR_INVALID = 不一致（fsck 以 size 为准清理残留并告警）
-24. 迁移：inline → direct/extent（写跨 160，内容拷入首块）；direct 增长需相邻块可续，不可得 → 整文件迁 extent（数据零搬移，旧连续区 = 单条 extent）；写洞 / 打洞（size 不变，整块释放、残块清零）产生块级洞 → extent；truncate 缩至 >160 态不变（direct 释放尾块 / extent 删尾部 extent）；truncate 缩至 ≤160 → 强制回迁内联（读回 inline_data + 释放数据块与树 + 复位 data_root）；extent → direct 不做
+24. 迁移：inline → direct/extent（写跨 160，内容拷入首块）；direct 增长需相邻块可续，不可得 → 整文件迁 extent（数据零搬移，旧连续区 = 单条 extent）；写洞 / 打洞（size 不变，整块释放、残块清零）产生块级洞 → extent；truncate 缩至 >160 态不变（direct 释放尾块 / extent 删尾部 extent）；truncate 增大 = 上调 size（inline ≤160 补零推进；inline 跨 160 迁出 / direct 跨块增长与 pwrite 同机械——占位分配是 direct 全覆盖表示的物理义务；extent 纯 size 推进零分配，真稀疏）；truncate 缩至 ≤160 → 强制回迁内联（读回 inline_data + 释放数据块与树 + 复位 data_root）；extent → direct **不做主动/重建式迁移**（不追严格融合），但**尾部元数据写回提交期允许出口缩水**：根叶 && 严格单条 && 覆盖 [0, ceil(size))（fblkbase==0 且 end==ceil(size/4096)）→ 缩 direct（先 inode 后 free 旧根，孤儿语义）——pwrite 增长 / truncate 缩小后收敛单条时触发，判定见 `pwrite_pipeline.md` §8 与 `punch_truncate_pread_spec.md` §6.3
 25. 翻转写序（外置分配 / 迁移 / 回迁统一）：位图亮灯 → 数据块 / 树节点落盘 → inode 字段翻转（data_root / direct_bit / size 同一次写 = 提交点）；崩溃窗口 = 孤儿块，fsck 回收；禁止先翻 inode（会造出悬挂映射）
 
 ---
