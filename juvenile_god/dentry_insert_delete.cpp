@@ -153,7 +153,14 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
     entry->hash = name->hash;
     entry->inode_ptr.free_to_use = name->name_len;
     entry->inode_ptr.ptr = name->inum;
-    memcpy(entry->name, name->name, DENTRY_INLINE_NAME_MAX);   /* 前 40B（长名尾部在堆） */
+    /* 前 40B（长名尾部在堆）。按 name_len 拷（≤40），剩余 [name_len,40) 清零——
+     * 防源端越界读（name 字面量/短名 buffer 可能不足 40）；比较逻辑按
+     * dentry_name_cmp 的 e_inline=min(len,40) 用，但清零保确定性。 */
+    const uint16_t ncopy = name->name_len < DENTRY_INLINE_NAME_MAX
+                               ? name->name_len : DENTRY_INLINE_NAME_MAX;
+    memcpy(entry->name, name->name, ncopy);
+    if (ncopy < DENTRY_INLINE_NAME_MAX)
+        memset(entry->name + ncopy, 0, DENTRY_INLINE_NAME_MAX - ncopy);
     entry->full_char_remain_ptr = name->full_char_remain_ptr;
 
     count++;
