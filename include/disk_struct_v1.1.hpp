@@ -281,7 +281,8 @@ template <class T> static inline T &ravenfs_fs_ref(T *t) { return *t; }
  *
  * Backup Superblock（备胎）：
  *   位置：随机散落在 FS_block 世界内，bitmap 标记 allocated
- *   内容：与 Primary 全同（magic ~ crc32 所有字段一致）
+ *   内容：与 Primary 全同（magic ~ crc32 所有字段一致；卷生命周期时间戳除外——
+ *   Backup 保留 mkfs 时刻，不随挂载/卸载更新，救急副本语义可接受）
  *   backup_prev = 前驱 Backup 的 FS_block 号（PTR_INVALID=链头）
  *   backup_next = 后继 Backup 的 FS_block 号（PTR_INVALID=链尾）
  *   backup_count = 备份总数（与 Primary 交叉校验）
@@ -305,7 +306,19 @@ struct RavenSuperblock {
     uint64_t  backup_next;          // Primary: 链头 | Backup: 后继 FS_block 号
     uint32_t  backup_count;         // 两者均存，交叉校验
 
-    uint8_t   pad[3960];
+    /* ── 卷生命周期时间戳（2026-09-09；epoch 秒；运行时维护，0=从未） ──
+     * born_time    卷建立时间（mkfs 写入，之后恒不变）
+     * mount_time   最近一次挂载时间（挂载路径写；readonly 审计挂载不写）
+     * umount_time  最近一次干净卸载时间（卸载路径写；崩溃/掉电则停留在上次
+     *               干净卸载 → 与 mount_time 对照可检出非正常关机）
+     * modify_time  最近一次卷几何变更时间（扩容/缩容；当前无在线路径，
+     *               mkfs 时 == born_time，未来 resize 工具维护） */
+    uint64_t  born_time;
+    uint64_t  mount_time;
+    uint64_t  umount_time;
+    uint64_t  modify_time;
+
+    uint8_t   pad[3928];
 }__attribute__((packed));
 static_assert(sizeof(RavenSuperblock)==4096,"RavenSuperblock size must be 4096B");
 constexpr uint16_t RAVENFS_MAX_NAME_LEN=DENTRY_INLINE_NAME_MAX+512;

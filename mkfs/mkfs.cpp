@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cassert>
 #include <cerrno>
+#include <ctime>
 
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -286,6 +287,16 @@ static void build_superblock(RavenSuperblock *sb, const MkfsParams &p,
     sb->backup_prev  = PTR_INVALID;
     sb->backup_next  = p.backups > 0 ? backup_blocks[0] : PTR_INVALID;
     sb->backup_count = p.backups;
+
+    /* 卷生命周期时间戳（2026-09-09）：born = 建立时刻；mount/umount = 0（从未，
+     * 由挂载/卸载路径运行时维护）；modify = 几何变更时间，mkfs 即创建 → == born。
+     * 注意：本函数同时服务 Primary 与 Backup（后者拷贝后仅改 prev/next），
+     * Backup 时间戳天然停留在此 mkfs 时刻，不随动——见结构体头注释。 */
+    const uint64_t now = (uint64_t)time(nullptr);
+    sb->born_time   = now;
+    sb->mount_time  = 0;
+    sb->umount_time = 0;
+    sb->modify_time = now;
 }
 
 /* 52 位指针空间无效哨兵（PTR_INVALID 的 52 位截断形态；ptrs[i].ptr 为位域） */

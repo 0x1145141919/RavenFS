@@ -24,6 +24,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <new>
 extern "C" uint32_t get_processor_id();
 
@@ -238,6 +239,21 @@ RavenFS_juvenile::RavenFS_juvenile(const linux_userspace_mount_t &mnt, uint64_t 
         }
     }
 
+    /* ── 挂载时间戳（运维信息，2026-09-09）：非 readonly 挂载在 SB 校验通过后
+     * 立即落盘（此时尚未建 mmap 窗口，纯 pwrite 最干净）。umount_time 不在此
+     * 动——干净卸载由 dtor 写；崩溃/掉电则留在上次干净卸载值 → 下次挂载可见
+     * umount 陈旧 = 非正常关机证据。readonly 审计挂载（rfs-audit）不写。
+     * 失败静默：时间戳写失败不阻断挂载（读校验已通过，盘面可用）。 */
+    if (!param.is_readonly) {
+        sb.mount_time = (uint64_t)time(nullptr);
+        RavenSuperblock tmp = sb;
+        tmp.crc32 = 0;
+        tmp.crc32 = crc32_compute(&tmp, sizeof(tmp));
+        alignas(4096) uint8_t sb_out[4096];
+        memcpy(sb_out, &tmp, sizeof(tmp));
+        (void)pwrite(fd, sb_out, 4096, 0);
+    }
+
     /* ── 几何推导（block_model §3.2，与 mkfs calc_geometry 同源）── */
     total_blocks = sb.total_blocks;
     inode_count  = sb.inode_array_count;
@@ -338,6 +354,18 @@ RavenFS_juvenile::~RavenFS_juvenile() {
     caches_teardown();
     if (!param.is_readonly && fd >= 0 && block_bits && inode_bits)
         bitmaps_flush();
+    /* ── 卸载时间戳（2026-09-09）：干净卸载标记，bitmaps_flush 之后写。
+     * 崩溃/掉电则无此写 → 下次挂载可见 umount 停留在上次干净卸载值。
+     * 失败静默：析构路径不因时间戳失败抛错/报错。 */
+    if (!param.is_readonly && fd >= 0) {
+        sb.umount_time = (uint64_t)time(nullptr);
+        RavenSuperblock tmp = sb;
+        tmp.crc32 = 0;
+        tmp.crc32 = crc32_compute(&tmp, sizeof(tmp));
+        alignas(4096) uint8_t sb_out[4096];
+        memcpy(sb_out, &tmp, sizeof(tmp));
+        (void)pwrite(fd, sb_out, 4096, 0);
+    }
     delete bitmap_mgr; bitmap_mgr = nullptr;
     if (mmap_base_) {
         munmap(mmap_base_, mmap_size_);   /* mmap 后端：位图/缓存全在窗口内，一次释放 */
