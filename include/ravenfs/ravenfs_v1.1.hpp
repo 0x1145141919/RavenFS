@@ -199,6 +199,22 @@ private:
      * 裂段（每轮 ≥1 块，有界）；唯一失败面 = 某轮一块都榨不出 → 整体回滚。 */
     result_code_t dfprealloc_and_plan(raven_Inode_t *inode, uint64_t offset, uint64_t len,
                                       std::list<extent_t> &affect_extents);
+    /* pwrite 五段管线通用体（2026-09-09 从 direct_file_pwrite 抽出）：pwrite 与
+     * truncate 增大（P4 空写骨架）共用。data_is_zero=true 时 phase3 不 overlay 用户
+     * 数据——新块零垫底 + 可选 inline 迁出拷贝 + 旧块只清零写域（保周边）；false =
+     * 原 pwrite 语义（overlay buf）。buf 在 data_is_zero=true 时可为 nullptr。 */
+    result_code_t df_pipeline(uint64_t inode_idx, uint64_t offset, uint64_t len,
+                              const void *buf, bool data_is_zero);
+    /* 孤儿树节点释放（新建树折弃，punch 物化回滚 / truncate 回滚共用）：只释放节点
+     * 2 块（最左叶下钻 → 叶链 → 父集去重自底向上），数据块 phys 零碰（归调用方账本）。
+     * 结构异常即弃疗（孤儿留盘 fsck 收）。 */
+    void extent_orphan_release(uint64_t tree_root);
+    /* 数据资产释放（**不 free inode 槽**）：truncate 缩至 ≤160 强制回迁 inline 前，
+     * 释放旧 direct run / extent 树+数据块（机械同 regular_file_reclaim 中枢，仅省
+     * inode_free 一步）。shape/data_root/fsize 由调用方快照传入（提交前旧态）。成功 =
+     * 资产清空（inode 槽仍在，供回迁写）；失败返回错误码（IO/STATE）。 */
+    result_code_t file_data_release(regular_file_type_t shape, uint64_t data_root,
+                                    uint64_t fsize, bool destroy_data);
     /* 建空根叶（2026-09-09，pwrite_pipeline.md §9 缺口原语补票）：phase2 物化
      * 第一步（inline/direct → extent 跃迁开树）。alloc 2 块（8K 节点，align 2^1）
      * + meta 初始化（根叶，entry_count=0，parent_ptr.ptr=owner_inode_idx 审计锚，

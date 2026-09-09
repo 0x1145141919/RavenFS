@@ -121,6 +121,14 @@ add_executable(ravenfs_juv_pread_smoke
 )
 target_link_libraries(ravenfs_juv_pread_smoke PRIVATE ravenfs_juvenile)
 
+# v1.1 direct_file_punch_hole / direct_file_trunacate 发烟：三形态段化 + KEEP_SIZE +
+# 缩小三出口 + 增大 P4（规格 punch_truncate_pread_spec.md §5/§6）
+add_executable(ravenfs_juv_punch_truncate_smoke
+    test_punch_truncate_smoke.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_punch_truncate_smoke PRIVATE ravenfs_juvenile)
+
 # v1.1 pwrite 真盘规模阶梯：超大 direct（GB 级）+ 超多 extent（洞写 10^5+ 记录）
 add_executable(ravenfs_juv_pwrite_big
     test_pwrite_big.cpp

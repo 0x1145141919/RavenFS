@@ -336,7 +336,8 @@ result_code_t RavenFS_juvenile::extent_new_root_leaf(uint64_t owner_inode_idx, u
  *
  * 写前必读：同 inode 写互斥由调用方保证（§11.5）；本函数不开锁。
  * ═══════════════════════════════════════════════════════════════════ */
-result_code_t RavenFS_juvenile::direct_file_pwrite(uint64_t inode_idx, uint64_t offset, uint64_t len, void *buf)
+result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset, uint64_t len,
+                                            const void *buf, bool data_is_zero)
 {
     const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
     constexpr uint64_t FS_BLOCK = 4096;
@@ -529,7 +530,7 @@ result_code_t RavenFS_juvenile::direct_file_pwrite(uint64_t inode_idx, uint64_t 
      * 旧块：整块覆盖直写（免读），否则 read-modify-write 保周围内容。
      * inline 迁出：新块 0 额外叠加 [0, pre_size) 物化拷贝（在零垫底之上）。 */
     {
-        uint8_t *user = (uint8_t *)buf;
+        const uint8_t *user = (const uint8_t *)buf;
         std::vector<uint8_t> tmp(FS_BLOCK);
         const bool mig = (pre_shape == inline_file);   /* inline 迁出（block 0 恒为新段） */
         const uint64_t d_start = offset >> 12;
@@ -575,7 +576,7 @@ result_code_t RavenFS_juvenile::direct_file_pwrite(uint64_t inode_idx, uint64_t 
                 memset(tmp.data(), 0, FS_BLOCK);
                 if (mig && b == 0 && old_inline_len > 0)
                     memcpy(tmp.data(), old_inline, old_inline_len);   /* inline 内容迁出 */
-                if (n) memcpy(tmp.data() + (ws - blk_off), user + (ws - offset), n);
+                if (n && !data_is_zero) memcpy(tmp.data() + (ws - blk_off), user + (ws - offset), n);
                 write_block(phys, tmp.data());
                 return RC_OK;
             }
@@ -583,6 +584,13 @@ result_code_t RavenFS_juvenile::direct_file_pwrite(uint64_t inode_idx, uint64_t 
             uint64_t ophys = 0;
             result_code_t rc = old_phys_of(b, ophys);
             if (rc) return rc;
+            if (data_is_zero) {
+                /* 增大空写：读-改-写，只清零写域字节（保块内周边） */
+                read_block(ophys, tmp.data());
+                if (n) memset(tmp.data() + (ws - blk_off), 0, n);
+                write_block(ophys, tmp.data());
+                return RC_OK;
+            }
             if (ws == blk_off && we == blk_off + FS_BLOCK) {
                 write_block(ophys, user + (ws - offset));   /* 整块覆盖直写，免读 */
                 return RC_OK;
@@ -652,6 +660,12 @@ result_code_t RavenFS_juvenile::direct_file_pwrite(uint64_t inode_idx, uint64_t 
     }
     if (collapse) block_free(root_blk, 2);   /* ③ 后清扫：崩溃窗口 = 孤儿 2 块，无悬垂 */
     return RC_OK;
+}
+
+/* 薄封装：pwrite = df_pipeline(buf, data_is_zero=false)（覆盖写语义） */
+result_code_t RavenFS_juvenile::direct_file_pwrite(uint64_t inode_idx, uint64_t offset, uint64_t len, void *buf)
+{
+    return df_pipeline(inode_idx, offset, len, buf, false);
 }
 
 
@@ -979,4 +993,602 @@ result_code_t RavenFS_juvenile::direct_file_pread(uint64_t inode_idx, uint64_t o
     }
     *out_bytes = n;
     return RC_OK;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * extent_orphan_release — 孤儿树释放（新建树折弃，punch/truncate 物化回滚共用）
+ *
+ * 只释放节点 2 块（最左叶下钻 → 叶链 → 父集去重自底向上），数据块 phys 零碰
+ * （归调用方账本 / 折弃时数据块归旧态仍在）。结构异常即弃疗（孤儿留盘 fsck 收）。
+ * 与 direct_file_pwrite 内 free_orphan_extent_tree lambda 同机械。
+ * ═══════════════════════════════════════════════════════════════════ */
+void RavenFS_juvenile::extent_orphan_release(uint64_t tree_root)
+{
+    const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+    if (tree_root == PTR_INVALID_52) return;
+    std::vector<uint64_t> leaves, parents;
+    uint64_t cur = tree_root;
+    for (int d = 0; d < 64 && cur != PTR_INVALID_52; d++) {
+        mdata_piece_session sess(mdata_piece_mgr, cur);
+        if (sess.index_error() || !sess) return;
+        Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
+        if (!is_extent_node(meta)) return;
+        if (!meta->parent_ptr.is_inner_node) {
+            if (!meta->parent_ptr.is_root_node) parents.push_back(meta->parent_ptr.ptr);
+            leaves.push_back(cur);
+            cur = meta->ptrs[2].ptr;
+            continue;
+        }
+        auto *inner = (Bptree_extent_inner_node_t *)sess.data;
+        if (inner->meta.parent_ptr.entry_count == 0) return;
+        cur = inner->extents[0].sub_node_ptr.ptr;
+    }
+    for (uint64_t b : leaves) block_free(b, 2);
+    std::sort(parents.begin(), parents.end());
+    parents.erase(std::unique(parents.begin(), parents.end()), parents.end());
+    std::vector<uint64_t> layer = parents;
+    while (!layer.empty()) {
+        std::vector<uint64_t> next;
+        bool saw_root = false;
+        for (uint64_t b : layer) {
+            mdata_piece_session sess(mdata_piece_mgr, b);
+            if (sess.index_error() || !sess) return;
+            Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
+            if (!is_extent_node(meta) || !meta->parent_ptr.is_inner_node) return;
+            if (meta->parent_ptr.is_root_node) saw_root = true;
+            else next.push_back(meta->parent_ptr.ptr);
+        }
+        for (uint64_t b : layer) block_free(b, 2);
+        if (saw_root) break;
+        std::sort(next.begin(), next.end());
+        next.erase(std::unique(next.begin(), next.end()), next.end());
+        layer = next;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * file_data_release — 数据资产释放（不 free inode 槽）
+ *
+ * truncate 缩至 ≤160 强制回迁 inline 前，释放旧 direct run / extent 树+数据块。
+ * 机械同 regular_file_reclaim 中枢（直接按 shape/data_root/fsize 快照释放），仅省
+ * inode_free 一步（inode 槽留待回迁写）。inline 形 = no-op。destroy_data=true 时
+ * 数据块 free 前清零（防恢复，成本高）。
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::file_data_release(regular_file_type_t shape, uint64_t droot,
+                                                  uint64_t fsize, bool destroy_data)
+{
+    const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+    constexpr uint64_t FS_BLOCK = 4096;
+    if (shape == inline_file) return RC_OK;
+
+    auto zero_range = [&](uint64_t blk, uint64_t count) -> result_code_t {
+        constexpr uint64_t SEG = 256;
+        std::vector<uint8_t> zeros((size_t)SEG * FS_BLOCK, 0);
+        while (count > 0) {
+            uint64_t n = count < SEG ? count : SEG;
+            result_code_t r = write_buff(blk, n, zeros.data());
+            if (r != RC_OK) return r;
+            blk += n;
+            count -= n;
+        }
+        return RC_OK;
+    };
+
+    if (shape == direct) {
+        if (droot == PTR_INVALID_52) return RC_ERR_STATE;
+        const uint64_t blocks = (fsize + FS_BLOCK - 1) / FS_BLOCK;
+        if (destroy_data) {
+            result_code_t r = zero_range(droot, blocks);
+            if (r != RC_OK) return r;
+        }
+        block_free(droot, blocks);
+        return RC_OK;
+    }
+
+    /* extent */
+    if (droot == PTR_INVALID_52) return RC_ERR_STATE;
+    std::vector<uint64_t> leaves, parents;
+    uint64_t cur = droot;
+    bool found_leaf = false;
+    for (int d = 0; d < 64; d++) {
+        mdata_piece_session sess(mdata_piece_mgr, cur);
+        if (sess.index_error()) return RC_ERR_STATE;
+        if (!sess) return RC_ERR_IO;
+        Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
+        if (!is_extent_node(meta)) return RC_ERR_STATE;
+        if (!meta->parent_ptr.is_inner_node) { found_leaf = true; break; }
+        Bptree_extent_inner_node_t *inner = (Bptree_extent_inner_node_t *)sess.data;
+        const uint16_t cnt = (uint16_t)inner->meta.parent_ptr.entry_count;
+        if (cnt == 0) return RC_ERR_STATE;
+        cur = inner->extents[0].sub_node_ptr.ptr;
+    }
+    if (!found_leaf) return RC_ERR_STATE;
+    uint64_t iter = cur;
+    while (iter != PTR_INVALID_52) {
+        mdata_piece_session sess(mdata_piece_mgr, iter);
+        if (sess.index_error()) return RC_ERR_STATE;
+        if (!sess) return RC_ERR_IO;
+        Bptree_extent_leaf_node_t *leaf = (Bptree_extent_leaf_node_t *)sess.data;
+        if (!is_extent_node(&leaf->meta) || leaf->meta.parent_ptr.is_inner_node)
+            return RC_ERR_STATE;
+        const uint16_t cnt = (uint16_t)leaf->meta.parent_ptr.entry_count;
+        for (uint16_t i = 0; i < cnt; i++) {
+            const extent_t e = leaf->extents[i];
+            if (e.block_base.ptr == PTR_INVALID_52 || e.length == 0) return RC_ERR_STATE;
+            if (destroy_data) {
+                result_code_t r = zero_range(e.block_base.ptr, e.length);
+                if (r != RC_OK) return r;
+            }
+            block_free(e.block_base.ptr, e.length);
+        }
+        if (!leaf->meta.parent_ptr.is_root_node)
+            parents.push_back(leaf->meta.parent_ptr.ptr);
+        leaves.push_back(iter);
+        iter = leaf->meta.ptrs[2].ptr;
+    }
+    for (uint64_t b : leaves) block_free(b, 2);
+    std::sort(parents.begin(), parents.end());
+    parents.erase(std::unique(parents.begin(), parents.end()), parents.end());
+    std::vector<uint64_t> layer = parents;
+    while (!layer.empty()) {
+        std::vector<uint64_t> next;
+        bool saw_root = false;
+        for (uint64_t b : layer) {
+            mdata_piece_session sess(mdata_piece_mgr, b);
+            if (sess.index_error()) return RC_ERR_STATE;
+            if (!sess) return RC_ERR_IO;
+            Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
+            if (!is_extent_node(meta) || !meta->parent_ptr.is_inner_node) return RC_ERR_STATE;
+            if (meta->parent_ptr.is_root_node) saw_root = true;
+            else next.push_back(meta->parent_ptr.ptr);
+        }
+        for (uint64_t b : layer) block_free(b, 2);
+        if (saw_root) break;
+        std::sort(next.begin(), next.end());
+        next.erase(std::unique(next.begin(), next.end()), next.end());
+        layer = next;
+    }
+    return RC_OK;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * direct_file_punch_hole — 打洞（KEEP_SIZE，恒不写 size；规格 punch_truncate_pread_spec.md §5）
+ *
+ * 契约（Linux ext4 punch_hole 对齐，P3/P4/P5/P6/P7）：
+ *   - REG only：DIR → RC_ERR_IS_DIR；SOFT_SYM → RC_ERR_STATE
+ *   - offset≥size → RC_OK（no-op，P3）；len==0 → RC_OK；溢出 → RC_ERR_STATE
+ *   - clamp_end = min(off+len, round_up(size,4096))（P4）
+ *   - 段化（P5/P6）：头/尾残块就地清零（保留）；整块域 [db_start,db_end) 释放
+ *   - 形态分流（§5.2）：
+ *       inline  ：就地 memset inline_data（无块可释，P7）
+ *       direct  ：整块域空 → 纯字节清零保 direct；整块域非空 → 物化上树（§5.3）
+ *       extent  ：残块清零；整块域非空 → 逐记录 loose（§5.4，部分生效可接受）
+ *   - 无 phase4 坍缩出口（KEEP_SIZE；洞不可恢复 → 出口恒 extent 或空树/直保 direct）
+ *
+ * 残块清零采用"字节域零化"统一机械：整块域空 → zero [off,clamp_end)；非空 →
+ * zero [off, db_start*4096)（头残块）+ [db_end*4096, clamp_end)（尾残块），中间
+ * 整块域跳过（释放/已洞）。
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::direct_file_punch_hole(uint64_t inode_idx, uint64_t offset, uint64_t len)
+{
+    const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+    constexpr uint64_t FS_BLOCK = 4096;
+    constexpr uint64_t INLINE_MAX = 160;
+
+    uint64_t size = 0, droot = 0;
+    bool is_direct = false;
+    regular_file_type_t shape = inline_file;
+    {
+        InodeSession s(inode_cache_mgr, inode_idx);
+        if (!s.inode) return RC_ERR_IO;
+        raven_Inode_t *ino = s.inode;
+        if (ino->type == INODE_TYPE_DIR) return RC_ERR_IS_DIR;
+        if (ino->type != INODE_TYPE_REGULAR) return RC_ERR_STATE;
+        size = ino->size;
+        if (len == 0) return RC_OK;                  /* P2：零长 → no-op */
+        if (offset > ~0ULL - len) return RC_ERR_STATE;  /* 溢出防御在前（§4 同款 pread） */
+        if (offset >= size) return RC_OK;            /* P3：洞越 EOF → no-op */
+        shape = ftype(ino);
+        droot = ino->data_root;
+        is_direct = ino->is_data_root_direct_bit;
+
+        if (shape == inline_file) {
+            /* inline：洞域 ⊆ [0,size)，就地清零（无块级概念） */
+            const uint64_t he = (offset + len < size) ? (offset + len) : size;
+            if (he > offset) memset(ino->inline_data + offset, 0, he - offset);
+            s.dirty();
+            return RC_OK;
+        }
+    }
+
+    const uint64_t roundup_size = ((size + FS_BLOCK - 1) / FS_BLOCK) * FS_BLOCK;
+    const uint64_t clamp_end = (offset + len < roundup_size) ? (offset + len) : roundup_size;
+    if (offset >= clamp_end) return RC_OK;   /* 防御 */
+    const uint64_t db_start = (offset + FS_BLOCK - 1) >> 12;   /* ceil(off/4096) */
+    const uint64_t db_end = clamp_end >> 12;
+    const uint64_t oldceil = (size + FS_BLOCK - 1) >> 12;
+
+    /* ── phys 解析 + 字节零化 ── */
+    auto extent_phys_of = [&](uint64_t root_blk, uint64_t b, uint64_t &phys) -> bool {
+        if (root_blk == PTR_INVALID_52) return false;
+        bptree_path_t tr;
+        if (extent_Bptree_walk(root_blk, &tr, b) != RC_OK) return false;
+        if (!tr.is_leaf_hit) return false;
+        mdata_piece_session s(mdata_piece_mgr, tr.blocks[tr.depth - 1]);
+        if (s.index_error() || !s) return false;
+        auto *leaf = (Bptree_extent_leaf_node_t *)s.data;
+        const uint16_t glb = tr.child_idx[tr.depth - 1];
+        if (glb >= (uint16_t)leaf->meta.parent_ptr.entry_count) return false;
+        const extent_t &e = leaf->extents[glb];
+        phys = e.block_base.ptr + (b - e.fblkbase);
+        return true;
+    };
+    auto block_phys_of = [&](uint64_t b, uint64_t &phys) -> bool {
+        if (is_direct) {
+            if (droot == PTR_INVALID_52) return false;
+            phys = droot + b;
+            return true;
+        }
+        return extent_phys_of(droot, b, phys);
+    };
+    auto zero_block_range = [&](uint64_t b, uint64_t lo, uint64_t hi) {
+        if (lo >= hi) return;
+        uint64_t phys = 0;
+        if (!block_phys_of(b, phys)) return;   /* 洞：已读 0，跳过 */
+        std::vector<uint8_t> tmp(FS_BLOCK);
+        read_block(phys, tmp.data());
+        memset(tmp.data() + lo, 0, hi - lo);
+        write_block(phys, tmp.data());
+    };
+    auto zero_byte_range = [&](uint64_t lo, uint64_t hi) {
+        if (lo >= hi) return;
+        const uint64_t b_first = lo >> 12, b_last = (hi - 1) >> 12;
+        for (uint64_t b = b_first; b <= b_last; b++) {
+            const uint64_t blk_off = b * FS_BLOCK;
+            const uint64_t lo_in = (lo > blk_off) ? (lo - blk_off) : 0;
+            const uint64_t hi_in = (hi < blk_off + FS_BLOCK) ? (hi - blk_off) : FS_BLOCK;
+            zero_block_range(b, lo_in, hi_in);
+        }
+    };
+    auto commit_root = [&](uint64_t new_root) {
+        InodeSession s(inode_cache_mgr, inode_idx);
+        if (!s.inode) return;
+        s.inode->data_root = new_root;
+        s.dirty();
+    };
+
+    /* ── direct → extent 物化（整块域非空，§5.3）── */
+    if (is_direct && db_start < db_end) {
+        uint64_t new_root = 0;
+        result_code_t rc = extent_new_root_leaf(inode_idx, new_root);
+        if (rc) return rc;                       /* 建树前：零改动 */
+        if (db_start > 0) {
+            extent_t seg;
+            seg.fblkbase = 0; seg.length = db_start;
+            seg.block_base.ptr = droot; seg.block_base.free_to_use = 0;
+            rc = extent_map_range(new_root, inode_idx, seg);
+            if (rc) { extent_orphan_release(new_root); return rc; }
+        }
+        if (db_end < oldceil) {
+            extent_t seg;
+            seg.fblkbase = db_end; seg.length = oldceil - db_end;
+            seg.block_base.ptr = droot + db_end; seg.block_base.free_to_use = 0;
+            rc = extent_map_range(new_root, inode_idx, seg);
+            if (rc) { extent_orphan_release(new_root); return rc; }
+        }
+        /* 残块字节清零（inode 未提交，现仍 direct → droot+块号） */
+        zero_byte_range(offset, db_start * FS_BLOCK);
+        zero_byte_range(db_end * FS_BLOCK, clamp_end);
+        /* 提交：direct_bit=0、data_root=new_root、size 不变 */
+        {
+            InodeSession s(inode_cache_mgr, inode_idx);
+            if (!s.inode) { extent_orphan_release(new_root); return RC_ERR_IO; }
+            s.inode->is_data_root_direct_bit = 0;
+            s.inode->data_root = new_root;
+            s.dirty();
+        }
+        /* 洞整块域 phys 释放（先 inode 后 free：孤儿窗口无悬垂） */
+        block_free(droot + db_start, db_end - db_start);
+        return RC_OK;
+    }
+
+    /* ── 残块字节清零（direct 保/ extent）── */
+    if (db_start >= db_end) {
+        zero_byte_range(offset, clamp_end);              /* 无整块域：纯字节零化 */
+    } else {
+        zero_byte_range(offset, db_start * FS_BLOCK);
+        zero_byte_range(db_end * FS_BLOCK, clamp_end);
+    }
+
+    /* ── extent 逐记录 loose（整块域非空，§5.4）── */
+    if (!is_direct && db_start < db_end) {
+        uint64_t root_blk = droot;
+        std::vector<std::pair<uint64_t, uint64_t>> freed;   /* phys,len 洞整块域释放（提交后 free） */
+        for (int guard = 0; guard < 100000; guard++) {
+            bptree_path_t trace;
+            result_code_t rc = extent_Bptree_walk(root_blk, &trace, db_start);
+            if (rc) { if (root_blk != droot) commit_root(root_blk); return rc; }
+            const uint64_t leaf = trace.blocks[trace.depth - 1];
+            const uint16_t glb = trace.child_idx[trace.depth - 1];
+            const bool hit = trace.is_leaf_hit;
+            extent_iterator it(this, leaf, glb);
+            if (it.iterator_erro_flag) break;
+            if (glb == EXTENT_LEAF_GLB_NONE) { ++it; if (it.iterator_erro_flag) break; }
+            else if (!hit) { ++it; if (it.iterator_erro_flag) break; }
+            extent_t e;
+            bool found = false;
+            uint64_t lo_ext = 0, len_ext = 0, phys_ext = 0;
+            while (!it.iterator_erro_flag && it.current_extent(e)) {
+                if (e.fblkbase >= db_end) break;             /* 已越洞域 */
+                if (e.fblkbase + e.length > db_start) {
+                    const uint64_t s = (e.fblkbase > db_start) ? e.fblkbase : db_start;
+                    const uint64_t t = (e.fblkbase + e.length < db_end) ? (e.fblkbase + e.length) : db_end;
+                    if (s < t) {
+                        lo_ext = s; len_ext = t - s;
+                        phys_ext = e.block_base.ptr + (s - e.fblkbase);
+                        found = true; break;
+                    }
+                }
+                ++it;
+            }
+            if (!found) break;
+            extent_t lext;
+            lext.fblkbase = lo_ext; lext.length = len_ext;
+            lext.block_base.ptr = phys_ext; lext.block_base.free_to_use = 0;
+            rc = extent_unmap_range_loose(root_blk, inode_idx, lext);
+            if (rc) {
+                /* 部分 punch：已生效不回滚（§5.4）——root 若变先提交，报错 */
+                if (root_blk != droot) commit_root(root_blk);
+                return rc;
+            }
+            const uint64_t fptr = lext.block_base.ptr;
+            freed.push_back({fptr, lext.length});
+        }
+        if (root_blk != droot) commit_root(root_blk);
+        for (auto &f : freed) block_free(f.first, f.second);   /* 洞整块域释放（loose 后无引用，无悬垂） */
+    }
+    return RC_OK;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * direct_file_trunacate — 截断（命名 typo 保持现名，P8；规格 punch_truncate_pread_spec.md §6）
+ *
+ * 语义分流（§6.1）：== size → RC_OK no-op；> size → 增大（§6.5）；< size → 缩小（§6.2/6.3/6.4）。
+ *
+ * 缩小（tail-punch 编译）：
+ *   - 域 = [len_new, size)；释放整块域 [newceil, oldceil)；EOF 残块（len_new 非对齐）
+ *     保留 + [len_new, 4096*newceil) 清零到块上界（T3 stale 防护）
+ *   - 出口（§6.3）：len_new≤160 → 强制回迁 inline（读回 + 释放外置资产 + 复位）；
+ *     160<len_new 且 direct → 直接缩 run（释放尾块，保 direct）；
+ *     160<len_new 且 extent → 尾 loose + 出口坍缩判定（根叶单条覆盖 [0,newceil) → direct）
+ *
+ * 增大（§6.5 P4）：
+ *   - inline ≤160：补零推进（memset + size）
+ *   - inline >160 / direct：df_pipeline 空写骨架（零垫底 + 无 overlay）
+ *   - extent：纯 size 推进零分配（真稀疏）
+ *
+ * 统一纪律（§6.4）：inode 一次写（size+形态+data_root）= 唯一提交点，先于一切 free
+ * （坍缩旧根 free、direct 尾块 free、回迁全资产 free 全部后置 → 孤儿窗口，无悬垂）。
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64_t len_new)
+{
+    const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+    constexpr uint64_t FS_BLOCK = 4096;
+    constexpr uint64_t INLINE_MAX = 160;
+
+    uint64_t size = 0, droot = 0;
+    bool is_direct = false;
+    regular_file_type_t shape = inline_file;
+    bool pipeline_grow = false;
+    {
+        InodeSession s(inode_cache_mgr, inode_idx);
+        if (!s.inode) return RC_ERR_IO;
+        raven_Inode_t *ino = s.inode;
+        if (ino->type == INODE_TYPE_DIR) return RC_ERR_IS_DIR;
+        if (ino->type != INODE_TYPE_REGULAR) return RC_ERR_STATE;
+        size = ino->size;
+        shape = ftype(ino);
+        droot = ino->data_root;
+        is_direct = ino->is_data_root_direct_bit;
+
+        if (len_new == size) return RC_OK;              /* T7 no-op */
+
+        if (len_new > size) {
+            /* ── 增大（§6.5）── */
+            if (shape == inline_file && len_new <= INLINE_MAX) {
+                memset(ino->inline_data + size, 0, len_new - size);   /* 补零推进 */
+                ino->size = len_new;
+                s.dirty();
+                return RC_OK;
+            }
+            if (shape == extent) {
+                ino->size = len_new;   /* 纯 size 推进零分配（真稀疏） */
+                s.dirty();
+                return RC_OK;
+            }
+            pipeline_grow = true;   /* inline>160 / direct → df_pipeline 空写 */
+            /* 注：inline>160 与 direct 的增长段在 df_pipeline 内分配/零垫底 */
+        } else {
+            /* len_new < size → 缩小 */
+            if (shape == inline_file) {
+                /* size≤160 的 inline 截断：纯收 size */
+                ino->size = len_new;
+                s.dirty();
+                return RC_OK;
+            }
+            /* size>160：缩小落到 scope 外处理（需多会话：pread 读回 / 释放 / 提交） */
+        }
+    }
+
+    if (pipeline_grow)
+        return df_pipeline(inode_idx, size, len_new - size, nullptr, true);
+
+    /* ── 缩小（size>160，shape = direct / extent）── */
+    const uint64_t oldceil = (size + FS_BLOCK - 1) >> 12;
+    const uint64_t newceil = (len_new + FS_BLOCK - 1) >> 12;
+
+    /* §6.3.1：len_new ≤ 160 → 强制回迁 inline（读回 + 释放外置资产 + 复位） */
+    if (len_new <= INLINE_MAX) {
+        uint8_t buf[INLINE_MAX];
+        uint64_t got = 0;
+        result_code_t rc = direct_file_pread(inode_idx, 0, len_new, buf, &got);
+        if (rc) return rc;
+        if (got != len_new) return RC_ERR_STATE;   /* 防御：读不足 */
+        /* 提交点：inode 一次写（size + 形态 + data_root 同写）——先于一切 free */
+        {
+            InodeSession s(inode_cache_mgr, inode_idx);
+            if (!s.inode) return RC_ERR_IO;
+            s.inode->size = len_new;
+            s.inode->is_data_root_direct_bit = 0;
+            s.inode->data_root = PTR_INVALID;
+            memcpy(s.inode->inline_data, buf, len_new);
+            s.dirty();
+        }
+        /* 后置：释放旧外置资产（direct run / extent 树+数据块；孤儿窗口 fsck 收） */
+        rc = file_data_release(shape, droot, size, false);
+        if (rc) return rc;
+        return RC_OK;
+    }
+
+    /* §6.3.2：160 < len_new 且 direct → 直接缩 run（保 direct；零树操作） */
+    if (is_direct) {
+        /* EOF 残块清零到块上界（len_new 非对齐时） */
+        if (len_new % FS_BLOCK != 0) {
+            const uint64_t eof_blk = len_new >> 12;
+            if (eof_blk < oldceil) {
+                const uint64_t phys = droot + eof_blk;
+                std::vector<uint8_t> tmp(FS_BLOCK);
+                read_block(phys, tmp.data());
+                memset(tmp.data() + (len_new - eof_blk * FS_BLOCK), 0, newceil * FS_BLOCK - len_new);
+                write_block(phys, tmp.data());
+            }
+        }
+        {
+            InodeSession s(inode_cache_mgr, inode_idx);
+            if (!s.inode) return RC_ERR_IO;
+            s.inode->size = len_new;   /* base/direct_bit 不动 */
+            s.dirty();
+        }
+        /* 后置：释放尾块 [newceil, oldceil) */
+        block_free(droot + newceil, oldceil - newceil);
+        return RC_OK;
+    }
+
+    /* §6.3.3：160 < len_new 且 extent → 尾洞 loose + 出口坍缩判定 */
+    {
+        uint64_t root_blk = droot;
+        std::vector<std::pair<uint64_t, uint64_t>> freed;
+        auto extent_phys_of = [&](uint64_t rblk, uint64_t b, uint64_t &phys) -> bool {
+            if (rblk == PTR_INVALID_52) return false;
+            bptree_path_t tr;
+            if (extent_Bptree_walk(rblk, &tr, b) != RC_OK) return false;
+            if (!tr.is_leaf_hit) return false;
+            mdata_piece_session s(mdata_piece_mgr, tr.blocks[tr.depth - 1]);
+            if (s.index_error() || !s) return false;
+            auto *leaf = (Bptree_extent_leaf_node_t *)s.data;
+            const uint16_t glb = tr.child_idx[tr.depth - 1];
+            if (glb >= (uint16_t)leaf->meta.parent_ptr.entry_count) return false;
+            const extent_t &e = leaf->extents[glb];
+            phys = e.block_base.ptr + (b - e.fblkbase);
+            return true;
+        };
+        for (int guard = 0; guard < 100000; guard++) {
+            bptree_path_t trace;
+            result_code_t rc = extent_Bptree_walk(root_blk, &trace, newceil);
+            if (rc) {
+                /* 部分 shrink：root 若变先提交，防悬挂 */
+                if (root_blk != droot) {
+                    InodeSession s(inode_cache_mgr, inode_idx);
+                    if (s.inode) { s.inode->data_root = root_blk; s.dirty(); }
+                }
+                return rc;
+            }
+            const uint64_t leaf = trace.blocks[trace.depth - 1];
+            const uint16_t glb = trace.child_idx[trace.depth - 1];
+            const bool hit = trace.is_leaf_hit;
+            extent_iterator it(this, leaf, glb);
+            if (it.iterator_erro_flag) break;
+            if (glb == EXTENT_LEAF_GLB_NONE) { ++it; if (it.iterator_erro_flag) break; }
+            else if (!hit) { ++it; if (it.iterator_erro_flag) break; }
+            extent_t e;
+            bool found = false;
+            uint64_t lo_ext = 0, len_ext = 0, phys_ext = 0;
+            while (!it.iterator_erro_flag && it.current_extent(e)) {
+                if (e.fblkbase >= oldceil) break;
+                if (e.fblkbase + e.length > newceil) {
+                    const uint64_t s = (e.fblkbase > newceil) ? e.fblkbase : newceil;
+                    const uint64_t t = (e.fblkbase + e.length < oldceil) ? (e.fblkbase + e.length) : oldceil;
+                    if (s < t) {
+                        lo_ext = s; len_ext = t - s;
+                        phys_ext = e.block_base.ptr + (s - e.fblkbase);
+                        found = true; break;
+                    }
+                }
+                ++it;
+            }
+            if (!found) break;
+            extent_t lext;
+            lext.fblkbase = lo_ext; lext.length = len_ext;
+            lext.block_base.ptr = phys_ext; lext.block_base.free_to_use = 0;
+            rc = extent_unmap_range_loose(root_blk, inode_idx, lext);
+            if (rc) {
+                /* 部分 shrink：已 loose 生效不回滚（合法形态）——root 若变先提交，防悬挂 */
+                if (root_blk != droot) {
+                    InodeSession s(inode_cache_mgr, inode_idx);
+                    if (s.inode) { s.inode->data_root = root_blk; s.dirty(); }
+                }
+                return rc;
+            }
+            const uint64_t fptr = lext.block_base.ptr;
+            freed.push_back({fptr, lext.length});
+        }
+
+        /* EOF 残块清零到块上界（len_new 非对齐；block newceil-1 保留，经树解析 phys） */
+        if (len_new % FS_BLOCK != 0) {
+            const uint64_t eof_blk = len_new >> 12;
+            uint64_t phys = 0;
+            if (extent_phys_of(root_blk, eof_blk, phys)) {
+                std::vector<uint8_t> tmp(FS_BLOCK);
+                read_block(phys, tmp.data());
+                memset(tmp.data() + (len_new - eof_blk * FS_BLOCK), 0, newceil * FS_BLOCK - len_new);
+                write_block(phys, tmp.data());
+            }
+        }
+
+        /* 出口坍缩判定：根叶 && count==1 && 单条覆盖 [0,newceil) → direct */
+        bool collapse = false;
+        uint64_t collapse_base = 0;
+        {
+            mdata_piece_session s(mdata_piece_mgr, root_blk);
+            if (s.index_error() || !s) return RC_ERR_STATE;
+            Bptree_meta_t *meta = (Bptree_meta_t *)s.data;
+            if (!is_extent_node(meta)) return RC_ERR_STATE;
+            if (!meta->parent_ptr.is_inner_node &&
+                (uint16_t)meta->parent_ptr.entry_count == 1) {
+                const extent_t e0 = ((Bptree_extent_leaf_node_t *)s.data)->extents[0];
+                if (e0.fblkbase == 0 && e0.fblkbase + e0.length == newceil) {
+                    collapse = true;
+                    collapse_base = e0.block_base.ptr;
+                }
+            }
+        }
+
+        /* 提交点（inode 一次写）——先于一切 free */
+        {
+            InodeSession s(inode_cache_mgr, inode_idx);
+            if (!s.inode) return RC_ERR_IO;
+            s.inode->size = len_new;
+            if (collapse) {
+                s.inode->is_data_root_direct_bit = 1;
+                s.inode->data_root = collapse_base;
+            } else {
+                s.inode->is_data_root_direct_bit = 0;
+                s.inode->data_root = root_blk;
+            }
+            s.dirty();
+        }
+        if (collapse) block_free(root_blk, 2);   /* 坍缩旧根：孤儿 2 块，无悬垂 */
+        for (auto &f : freed) block_free(f.first, f.second);   /* 释放尾块数据 */
+        return RC_OK;
+    }
 }
