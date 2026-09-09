@@ -98,3 +98,10 @@ add_executable(ravenfs_juv_extent_loose_stress
     ${CPU_ID_STUB}
 )
 target_link_libraries(ravenfs_juv_extent_loose_stress PRIVATE ravenfs_juvenile)
+
+# v1.1 dfprealloc_and_plan（pwrite phase1）专项：三初始态 × 覆盖/增长/洞写 × 锚定成败/用尽回滚
+add_executable(ravenfs_juv_pwrite_phase1
+    test_pwrite_phase1.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_pwrite_phase1 PRIVATE ravenfs_juvenile)

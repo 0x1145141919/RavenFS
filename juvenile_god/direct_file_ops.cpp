@@ -4,6 +4,7 @@
 #include "../include/ravenfs/bitmap_slices.hpp"  /* bitmap_slices_cfg_t / bitmap_slices_mgr_t：位图模块（2026-09-03 顶出） */
 #include <vector>
 #include <algorithm>
+#include <iterator>
 #include <cstring>
 RavenFS_juvenile::regular_file_type_t RavenFS_juvenile::ftype(raven_Inode_t *inode)
 {
@@ -17,6 +18,275 @@ RavenFS_juvenile::regular_file_type_t RavenFS_juvenile::ftype(raven_Inode_t *ino
         }
     }
 }
+/* ═══════════════════════════════════════════════════════════════════
+ * dfprealloc_and_plan — pwrite 五段管线 phase1：资源预分配 + 区间规划
+ *
+ * 设计总纲见 Docs/pwrite_pipeline.md §5/§5.1（2026-09-08 定案 + 09-09 拍板）。
+ * 一句话：为写域中「纯新段」（空洞/增长/物化块）预分配物理块，吐出升序
+ * affect_extents 账本；inode 恒未动，失败逆序 free 整账本。
+ *
+ * 入参 inode = 调用方 InodeSession 作用域内的磁盘 inode 内存映像（纯读，
+ * 不 dirty）。本函数自身不再开 inode 会话（09-09 拍板：避免 phase 间重复读）。
+ *
+ * 形态分支（判据 disk_layout §3.2，size 优先）：
+ *   inline（size≤160，迁出 off+len>160）：
+ *     direct 候选 = alloc_hard 整域 [0, ceil(newsize/4K)) 一次（单片连续原子）；
+ *     失败降级 = 物化块 [0,1) ∪ 写域 [off>>12, newceil)，洞留空，soft 逐段。
+ *   direct：
+ *     覆盖写 / 增长未跨块界（newceil==oldceil）→ 零新段空返；
+ *     增长段 [oldceil, newceil) = alloc_piece 锚定旧 run 物理尾
+ *     （data_root+oldceil）→ 贴尾成功保 direct，部分/失败前缀保留 + soft 裂段。
+ *   extent：
+ *     D=[off>>12, ceil((off+len)/4K)) 与树记录求差 → 逐洞段；段起点 == 左邻
+ *     记录终点 → 锚 = 左邻 phys 尾（phase2 map 左并前置），否则无锚 soft。
+ *
+ * 部分满足（§5.1 拍板）：锚定撞占用只认前缀 / soft 只给部分 → 缺口继续榨
+ * soft 裂段（每轮 ≥1 块，有界）；唯一失败面 = 某轮一块都榨不出
+ * （PTR_INVALID）→ RC_ERR_NO_BLOCK + 整体回滚。收尾合并相邻「逻辑紧贴 + phys
+ * 连续」条目（等价 phase2 必发生的左并，纯减少记录数 + 让 phase1.5 判 direct
+ * 不失真）。
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::dfprealloc_and_plan(raven_Inode_t *inode, uint64_t offset, uint64_t len,
+                                                    std::list<extent_t> &affect_extents)
+{
+    const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+    constexpr uint64_t FS_BLOCK = 4096;
+    constexpr uint64_t INLINE_MAX = 160;
+
+    affect_extents.clear();
+    if (!inode) return RC_ERR_STATE;
+    if (inode->type != INODE_TYPE_REGULAR && inode->type != INODE_TYPE_SOFT_SYM)
+        return RC_ERR_STATE;                       /* 非 REG/SOFT_SYM：不在受理范围 */
+    if (len == 0) return RC_OK;                    /* 零长写无操作（POSIX：不扩文件） */
+    if (offset > ~0ULL - len) return RC_ERR_STATE; /* offset+len 溢出：调用方参数错误 */
+
+    const uint64_t fsize = inode->size;
+    const uint64_t end_byte = offset + len;
+    const uint64_t newsize = end_byte > fsize ? end_byte : fsize;
+
+    /* 回滚账本：逆序 free（唯一失败出口前调用；位图 free 幂等） */
+    auto rollback = [&]() {
+        for (auto it = affect_extents.rbegin(); it != affect_extents.rend(); ++it)
+            block_free(it->block_base.ptr, it->length);
+        affect_extents.clear();
+    };
+
+    /* 落实一段逻辑域 [a, a+need)：anchor 有效（= 左邻记录 phys 尾）时先锚定
+     * occupy（物理紧贴 → phase2 左并）；撞占用只认前缀；缺口 + 无锚段走 soft
+     * 榨取裂段。任何 alloc 完全失败（PTR_INVALID，一块都榨不出）→ false。
+     * 成功段 append affect_extents（调用序保证 fblkbase 升序）。 */
+    auto alloc_piece = [&](uint64_t a, uint64_t need, uint64_t anchor) -> bool {
+        uint64_t cur = a;
+        uint64_t rest = need;
+        if (anchor != PTR_INVALID_52) {
+            uint64_t r = rest;
+            const uint64_t got = block_occupy_soft(anchor, rest, &r);
+            if (got != PTR_INVALID) {              /* 锚定前缀 ≥1 块（occupy 契约） */
+                const uint64_t claimed = rest - r;
+                extent_t e;
+                e.fblkbase = cur;
+                e.length = claimed;
+                e.block_base.ptr = got;
+                e.block_base.free_to_use = 0;
+                affect_extents.push_back(e);
+                cur += claimed;
+                rest = r;
+            }
+        }
+        while (rest > 0) {
+            uint64_t r = rest;
+            const uint64_t got = block_alloc_soft(rest, &r);
+            if (got == PTR_INVALID) return false;  /* 唯一失败面：一块都榨不出 */
+            const uint64_t claimed = rest - r;     /* ≥1（soft 契约：有返回必 ≥1） */
+            extent_t e;
+            e.fblkbase = cur;
+            e.length = claimed;
+            e.block_base.ptr = got;
+            e.block_base.free_to_use = 0;
+            affect_extents.push_back(e);
+            cur += claimed;
+            rest = r;
+        }
+        return true;
+    };
+
+    const regular_file_type_t shape = ftype(inode);
+
+    /* ── inline 迁出（size≤160 且 newsize>160）── */
+    if (shape == inline_file) {
+        if (newsize <= INLINE_MAX) return RC_OK;   /* inline→inline 豁免（防御：调用方本不进来） */
+        const uint64_t newceil = (newsize + FS_BLOCK - 1) / FS_BLOCK;
+
+        /* direct 候选：整域 [0, newceil) 一次 hard（单片连续 + 原子，无部分分配） */
+        const uint64_t blk = block_alloc_hard(newceil, 0);
+        if (blk != PTR_INVALID) {
+            extent_t e;
+            e.fblkbase = 0;
+            e.length = newceil;
+            e.block_base.ptr = blk;
+            e.block_base.free_to_use = 0;
+            affect_extents.push_back(e);
+            return RC_OK;
+        }
+
+        /* 降级：物化块 [0,1)（inline 内容迁出必须）∪ 写域 [off>>12, newceil)；
+         * 中间洞留空不分配（extent 表示下读 0）。两段均无锚（逻辑不相邻，
+         * phys 连续无收益）。off < 4096 时写域起点 == 0 → 单段整域 [0, newceil)
+         * （物化块被写域吸收，勿漏写域主体！）；否则 [0,1) + [d_start, newceil)。 */
+        const uint64_t d_start = offset >> 12;
+        if (d_start == 0) {
+            if (!alloc_piece(0, newceil, PTR_INVALID_52)) {
+                rollback();
+                return RC_ERR_NO_BLOCK;
+            }
+        } else {
+            if (!alloc_piece(0, 1, PTR_INVALID_52)) {
+                rollback();
+                return RC_ERR_NO_BLOCK;
+            }
+            if (d_start < newceil) {
+                if (!alloc_piece(d_start, newceil - d_start, PTR_INVALID_52)) {
+                    rollback();
+                    return RC_ERR_NO_BLOCK;
+                }
+            }
+        }
+        return RC_OK;
+    }
+
+    /* ── direct（size>160，直指连续区间 [data_root, +oldceil)）── */
+    if (shape == direct) {
+        const uint64_t oldceil = (fsize + FS_BLOCK - 1) / FS_BLOCK; /* 现有物理覆盖块数 */
+        const uint64_t newceil = (newsize + FS_BLOCK - 1) / FS_BLOCK;
+        if (newceil <= oldceil) return RC_OK;      /* 覆盖写 / 增长未跨块界：零新段 */
+        if (inode->data_root == PTR_INVALID_52) return RC_ERR_STATE; /* direct 态必须有 base */
+        /* 增长段 [oldceil, newceil)：锚 = 旧 run 物理尾 data_root+oldceil。
+         * 贴尾成功 → 单段 → phase1.5 保 direct；部分/失败 → 前缀保留 +
+         * soft 裂段（多段/非尾贴 → phase1.5 物化上树，物理事实不可 direct）。 */
+        if (!alloc_piece(oldceil, newceil - oldceil, inode->data_root + oldceil)) {
+            rollback();
+            return RC_ERR_NO_BLOCK;
+        }
+        return RC_OK;
+    }
+
+    /* ── extent：树内逐洞规划（map-only 路径；无 direct 候选，判别留给 phase1.5）── */
+    const uint64_t root = inode->data_root;
+    if (root == PTR_INVALID_52) return RC_ERR_STATE;
+    const uint64_t d_start = offset >> 12;
+    const uint64_t d_end = (end_byte + FS_BLOCK - 1) >> 12;
+    if (d_start >= d_end) return RC_OK;            /* 域空（len>0 时恒有 d_end>d_start，防御） */
+
+    /* walk 定位 d_start：落点叶子 + GLB + 覆盖标志（零分配，失败零副作用） */
+    bptree_path_t trace;
+    result_code_t rc = extent_Bptree_walk(root, &trace, d_start);
+    if (rc) return rc;
+    const uint64_t leaf_blk = trace.blocks[trace.depth - 1];
+    const uint16_t glb = trace.child_idx[trace.depth - 1];
+    const bool hit = trace.is_leaf_hit;
+
+    extent_iterator it(this, leaf_blk, glb);
+    uint64_t cur = d_start;              /* 扫描游标（逻辑块，升序推进） */
+    bool have_prev = false;              /* 已消费左邻记录（锚候选） */
+    uint64_t prev_end = 0;               /* 左邻记录逻辑终点 */
+    uint64_t prev_pend = 0;              /* 左邻记录物理终点（block_base+length） */
+    extent_t R;                          /* 当前扫描到的记录副本 */
+
+    /* 起点预定位：把游标推进到「首个 ≥cur 的记录之前」，并备好左上下文 */
+    if (hit) {
+        /* GLB 覆盖 d_start：[d_start, R.end) 跳过；R 成为左上下文 */
+        if (!it.current_extent(R)) return RC_ERR_STATE;   /* hit 必可读，防御 */
+        prev_end = R.fblkbase + R.length;
+        prev_pend = R.block_base.ptr + R.length;
+        have_prev = true;
+        cur = prev_end;
+        if (cur >= d_end) return RC_OK;  /* 写域全被覆盖：零新段 */
+        ++it;                            /* 前进到下一记录；树尾则 erro（循环内消化） */
+    } else if (glb != EXTENT_LEAF_GLB_NONE) {
+        /* 未命中但有 GLB（其终点 ≤ d_start）：作为左上下文；
+         * 锚只在中段起点恰 == GLB 终点（d_start==prev_end）时成立，循环统一判定 */
+        if (!it.current_extent(R)) return RC_ERR_STATE;
+        prev_end = R.fblkbase + R.length;
+        prev_pend = R.block_base.ptr + R.length;
+        have_prev = true;
+        ++it;
+    } else {
+        /* 虚拟前位（GLB==NONE）：文件头洞 / 空树，无左上下文 */
+        ++it;                            /* → 首记录；空树则 erro → 循环消化为全洞段 */
+    }
+
+    /* 段发射：洞段 [a,b)（a<b，b≤d_end）；锚 ⇔ 左邻记录终点恰 == 段起点 */
+    auto emit_piece = [&](uint64_t a, uint64_t b) -> bool {
+        if (a >= b) return true;
+        const uint64_t anchor = (have_prev && prev_end == a) ? prev_pend : PTR_INVALID_52;
+        return alloc_piece(a, b - a, anchor);
+    };
+
+    /* erro 消化辅助：确认迭代器耗尽 = 真树尾（右兄弟链尽），非 IO/结构错误 */
+    auto at_tree_end = [&]() -> bool {
+        mdata_piece_session s(mdata_piece_mgr, it.leaf_blk());
+        if (s.index_error() || !s) return false;
+        auto *lf = (Bptree_extent_leaf_node_t *)s.data;
+        if (!is_extent_node(&lf->meta) || lf->meta.parent_ptr.is_inner_node) return false;
+        if (lf->meta.parent_ptr.is_root_node) return true;   /* 单叶树 */
+        return lf->meta.ptrs[2].ptr == PTR_INVALID_52;
+    };
+
+    for (;;) {
+        if (cur >= d_end) break;
+        if (!it.iterator_erro_flag && it.current_extent(R)) {
+            /* it 指向下一记录 R（不变量：R.fblkbase ≥ cur） */
+            if (R.fblkbase >= d_end) {
+                /* 记录起点已越域：剩余 [cur, d_end) 为尾洞段，收尾 */
+                if (!emit_piece(cur, d_end)) {
+                    rollback();
+                    return RC_ERR_NO_BLOCK;
+                }
+                break;
+            }
+            /* 洞段 [cur, R.fblkbase)（若紧邻记录则空段跳过） */
+            if (!emit_piece(cur, R.fblkbase)) {
+                rollback();
+                return RC_ERR_NO_BLOCK;
+            }
+            /* 覆盖区 [R.fblkbase, R.end)：跳过，R 升级为左上下文 */
+            cur = R.fblkbase + R.length;
+            if (cur >= d_end) break;
+            prev_end = cur;
+            prev_pend = R.block_base.ptr + R.length;
+            have_prev = true;
+            ++it;
+        } else {
+            /* 迭代器耗尽（++ 越树尾）或 IO/结构错误：核验真树尾后收尾洞段 */
+            if (it.iterator_erro_flag && at_tree_end()) {
+                if (!emit_piece(cur, d_end)) {
+                    rollback();
+                    return RC_ERR_NO_BLOCK;
+                }
+                break;
+            }
+            return RC_ERR_STATE;         /* 树遍历异常：本路径尚无分配，零副作用 */
+        }
+    }
+
+    /* 收尾：合并相邻「逻辑紧贴 + phys 连续」条目 —— 等价 phase2 map 必发生的
+     * 左并（纯减少记录数；让 phase1.5 的 direct 判据（段数==1 等）不失真）。 */
+    if (affect_extents.size() > 1) {
+        auto prev = affect_extents.begin();
+        for (auto it = std::next(prev); it != affect_extents.end();) {
+            if (prev->fblkbase + prev->length == it->fblkbase &&
+                prev->block_base.ptr + prev->length == it->block_base.ptr) {
+                prev->length += it->length;
+                it = affect_extents.erase(it);
+            } else {
+                prev = it;
+                ++it;
+            }
+        }
+    }
+    return RC_OK;
+}
+
 result_code_t RavenFS_juvenile::direct_file_pwrite
     (uint64_t inode_idx, 
     uint64_t offset, 

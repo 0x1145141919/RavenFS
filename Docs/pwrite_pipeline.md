@@ -109,10 +109,12 @@ phase2 只见"已判定形态的执行"，不重复决策。
 
 ## 5. phase1 `dfprealloc_and_plan` 规格
 
-声明（hpp 已加）：
+声明（hpp 已加；2026-09-09 改签：入参 = 磁盘 inode 内存映像指针而非 inode_idx——
+避免 phase1/1.5/2 重复开 InodeSession；调用方在 phase1 前开一个会话作用域取得
+映像，本函数纯读不 dirty，phase4 提交时另开 session 写回）：
 
 ```cpp
-result_code_t dfprealloc_and_plan(uint64_t inode_idx, uint64_t offset, uint64_t len,
+result_code_t dfprealloc_and_plan(raven_Inode_t *inode, uint64_t offset, uint64_t len,
                                   std::list<extent_t> &affect_extents);
 ```
 
@@ -136,9 +138,24 @@ result_code_t dfprealloc_and_plan(uint64_t inode_idx, uint64_t offset, uint64_t 
 2. **失败降级 → extent 候选**：**裁剪为必需段再 soft 分配**——物化块（inline 块 0）
    ∪ 写域；size 内未写空洞**留空不分配**（extent 表示下洞无 phys，读 0）→ 天然多段
    → phase1.5 判物化。禁止把整域硬分 soft（会让 extent 态洞白占 phys = 浪费 + 账本脏）。
+   注意降级输出也可能恰为 1 段 0 起始（inline 且 off<4096 时 soft 一次拿满）——形态
+   判定以形状为准不认路径，照样保 direct，不浪费。
 3. **extent 态**：空洞写/extent 尾增长按既有 occupy 策略（尾延展优先，
    `block_occupy_soft` 物理紧贴 → phase2 map 左并）。数据块 align_log2=0
    （8K 对齐只约束树节点）。
+
+### 5.1 部分满足与失败面（2026-09-09 拍板）
+
+- **碎片裂段**：一段逻辑域锚定 occupy 撞占用只认前缀、或 soft 只给部分 → 缺口
+  **继续榨 soft_alloc 裂段**（一段逻辑域可拆成多条 phys 记录；extent 表示合法，
+  phase2 逐段 map，若相邻段 phys 碰巧连续由 map 左并自动收敛）。每轮至少认领
+  1 块 → 循环有界。direct 增长锚定部分成功时前缀**保留**（旧 run 变长，物化时
+  map 旧区一条更长；记录数与整体软分相同、run 严格更长，不劣）。
+- **唯一失败面**：某轮 alloc 一块都榨不出（PTR_INVALID）→ 全面失败 = 已分配段
+  逆序 block_free 整账本 + 清空 affect_extents + 返回 RC_ERR_NO_BLOCK；树 walk
+  IO/STATE 异常同样先回滚账本再原样上抛。半满足**不是**失败面。
+- **待办（未来）**：phase1 内引入分配器**水位线机制**作为单次写分配量上限
+  （碎片严重时限制裂段总量），当前版本不做。
 
 ## 6. phase2 — 逐段 map（仅上树路径）
 
@@ -227,7 +244,7 @@ data_root = PTR_INVALID——禁止只打尾洞不搬回（会造成 size ≤ 16
 ## 11. 待办（当前未完成）
 
 1. 建空根叶原语（§9）
-2. `dfprealloc_and_plan` 实现（§5 规格 + direct 候选/降级裁剪）
+2. `dfprealloc_and_plan` 实现（§5 规格 + direct 候选/降级裁剪 + §5.1 部分满足裂段语义 + 水位线待办）
 3. phase1.5 形态判别实现（§4 判据：纯决策零副作用）
 4. phase2 ENOSPC 逆序回滚集成验证（树侧机械已就绪：loose tail 裁切零分配恒成功，
    发烟 D 组 + stress 已覆盖 loose 全分支；待办 = dfprealloc_and_plan → 判别 → map →

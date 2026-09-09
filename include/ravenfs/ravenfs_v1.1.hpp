@@ -173,10 +173,22 @@ private:
     result_code_t dir_name_heap_release(uint64_t inode_idx);//作为dir关闭时调用，遍历十个堆，全空则释放
     result_code_t dir_lookup(uint64_t inode_idx,const char *name, uint64_t *out_inum);
     int64_t dir_readdir(uint64_t inode_idx,dentry_out **out_buf);
-    result_code_t dfprealloc_and_plan(uint64_t inode_idx,uint64_t offset,uint64_t len,std::list<extent_t>&affect_extents);//pwrite的phase1的预分配以及区间规划阶段
-    //这个接口是pwrite的第一步的根据预先写入进行规划的接口，根据写入需求去吐出相应的给写入需求规划的extents里面，放在affect_extents里面之中，很明显是afftect_extents里面是有序单调递增链表
-    //很明显，inline->inline不在这个函数的受理范围之内
-    //外部根据原来的B+树判断是改了，增加了还是什么，下游再根据affect_extents实际对照编译出map/unmap序列
+    /* pwrite 五段管线 phase1：资源预分配 + 区间规划（pwrite_pipeline.md §5）。
+     * 入参 inode = 磁盘 inode 内存映像指针（调用方 InodeSession 作用域内、会话存活期
+     * 有效；self_reliat 后端 get 占坑 accessor 防淘汰，见 inode_cache_radix.hpp）。
+     * 本函数纯读映像（不 dirty）；phase4 提交由调用方另开 session 调整字段写回。
+     * 输出 affect_extents = 纯新段（fblkbase 升序、互不重叠、与现映射零相交、
+     * length=块数、block_base 恒有效）；列表即回滚账本 —— 本函数失败 = 逆序
+     * block_free 整账本后清空返回错误码，inode 恒未动。
+     * inline→inline（off+len ≤ 160）不在受理范围：防御性空返 RC_OK。
+     * 分配策略（2026-09-08 定案 + 09-09 拍板）：非树态先 direct 候选
+     * （inline 迁出 = hard 整域 [0,ceil(newsize/4K))；direct 增长 = occupy_soft
+     * 锚定旧 run 物理尾），失败降级裁剪必需段（inline：物化块∪写域，洞留空；
+     * direct：增长段）soft 分配；extent 态逐洞规划，段起点紧贴旧记录终点时
+     * 锚定左邻 phys 尾（phase2 map 左并前置）。碎片部分满足 = 继续榨 soft_alloc
+     * 裂段（每轮 ≥1 块，有界）；唯一失败面 = 某轮一块都榨不出 → 整体回滚。 */
+    result_code_t dfprealloc_and_plan(raven_Inode_t *inode, uint64_t offset, uint64_t len,
+                                      std::list<extent_t> &affect_extents);
     result_code_t df_extentify(uint64_t inode_idx);//把REGULAR/INODE型的
     /* ══════════════════════════════════════════════════════════
      * 位图接口组 A/B：薄转发 → bitmap_slices_mgr_t（独立模块）
