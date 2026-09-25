@@ -30,6 +30,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "audit_check.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"
 
 #include <cstdio>
@@ -469,6 +470,7 @@ int main(int argc, char **argv) {
     CHECK(tree_count(fs, root_b, inum_b, "S4 重试后") == 338, "S4 重试后 records=338（1 拆 2）");
 
     printf("\n════════════════════════════════════════════════════\n");
+    (void)audit_clean(fs, "extent-loose-stress-final");
     printf(" SUMMARY: %d passed, %d failed\n", g_pass, g_fail);
     printf("════════════════════════════════════════════════════\n");
     return g_fail ? 1 : 0;

@@ -21,6 +21,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "audit_check.hpp"
 #include "../include/ravenfs/inode_cache_radix.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"
 #include "../include/ravenfs/bitmap_slices.hpp"
@@ -376,6 +377,7 @@ int main(int argc, char **argv) {
     group_I(fs);
 
     uint64_t C0 = PTR_INVALID, total = 0;
+    (void)audit_clean(fs, "pread-before-exhaust");
     claim_all(fs, &C0, &total);
     CHECK(free_blocks(fs) == 0, "claim: 榨干 free==0");
     CHECK(C0 != PTR_INVALID && total >= 1500, "claim: 自由区充足 total=%llu",

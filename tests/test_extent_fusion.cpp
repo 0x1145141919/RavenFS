@@ -37,6 +37,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "audit_check.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"
 
 #include <cstdio>
@@ -903,6 +904,7 @@ int main(int argc, char **argv) {
         if (!new_file("e.bin", &i5, &r5)) return 1;
         run_e(fs, i5, r5);   /* E：map 分裂预算原子性 */
     }
+    (void)audit_clean(fs, "extent-fusion-final");
     printf("\n%d passed, %d failed\n", g_pass.load(), g_fail.load());
     return g_fail.load() ? 1 : 0;
 }

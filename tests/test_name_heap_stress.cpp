@@ -27,6 +27,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "audit_check.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"   /* mdata_piece_session：与名字堆同视角读位图 */
 #include "../include/ravenfs/inode_cache_radix.hpp"   /* mix 模式类型抽查：InodeSession 走缓存读 */
 
@@ -324,6 +325,7 @@ int main(int argc, char **argv) {
         CHECK(all_inactive, "10 个堆全部重置未激活（空间全归还）");
         fs.dump_info();
     }
+    CHECK(audit_clean(fs, "name-heap-stress-final") == 0, "audit_inode 全净 (name_heap_stress)");
     }   /* fs 析构：位图全量写回 */
 
     /* ══ Phase 6：持久化 + 可写验证 ══ */

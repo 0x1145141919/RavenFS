@@ -25,6 +25,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "audit_check.hpp"
 #include "../include/ravenfs/inode_cache_radix.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"
 #include "../include/ravenfs/bitmap_slices.hpp"
@@ -492,6 +493,7 @@ int main(int argc, char **argv) {
     group_P(fs);
     group_T(fs);
 
+    CHECK(audit_clean(fs, "punch-truncate-final") == 0, "audit_inode 全净 (punch/truncate)");
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

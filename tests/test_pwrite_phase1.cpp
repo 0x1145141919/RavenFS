@@ -36,6 +36,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "audit_check.hpp"
 #include "../include/ravenfs/inode_cache_radix.hpp"   /* InodeSession 完整类型 */
 #include "../include/ravenfs/mdata_piece_caches.hpp"  /* mdata_piece_session 完整类型 */
 #include "../include/ravenfs/bitmap_slices.hpp"       /* bitmap_slices_mgr_t（free 审计） */
@@ -544,6 +545,7 @@ int main(int argc, char **argv) {
             CHECK(plan.front().block_base.ptr == P + 2, "D6: 锚定 P+2");
     }
 
+    (void)audit_clean(fs, "pwrite-phase1-final");
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

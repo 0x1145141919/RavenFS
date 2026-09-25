@@ -34,6 +34,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "audit_check.hpp"
 #include "../include/ravenfs/inode_cache_radix.hpp"   /* InodeSession 完整类型 */
 #include "../include/ravenfs/mdata_piece_caches.hpp"  /* mdata_piece_session（树审计） */
 #include "../include/ravenfs/bitmap_slices.hpp"       /* bitmap_mgr free 审计 */
@@ -606,6 +607,7 @@ int main(int argc, char **argv) {
     }
 
     group_A(fs);
+    (void)audit_clean(fs, "pwrite-before-exhaust");
 
     /* 全局舞台：A 组用低址连续自由跑 direct 后，claim-all 榨干全域；
      * B/C 组各自从 C0 起开窗（相对断言，互不依赖盘面历史）。 */

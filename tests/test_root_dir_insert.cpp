@@ -19,6 +19,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "audit_check.hpp"
 
 #include <cstdio>
 #include <cstdarg>
@@ -385,6 +386,7 @@ int main(int argc, char **argv) {
     CHECK(long_ok, "长名批量 %d 全成功且可查", long_n);
 
     verify_tree(fs, inserted, "Phase 2b 后");
+    CHECK(audit_clean(fs, "insert-final") == 0, "audit_inode 全净 (insert)");
     }   /* ← fs 析构：位图全量写回 */
 
     /* 复播二分模式：到这里就够，直接汇总（不动 Phase 3） */

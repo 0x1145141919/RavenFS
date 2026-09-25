@@ -16,6 +16,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "audit_check.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"   /* verify 同步点：flush_all 需完整类型 */
 
 #include <cstdio>
@@ -271,6 +272,7 @@ int main(int argc, char **argv) {
               "64B_8k 已重新激活（懒激活复用）");
         CHECK(fs.root_dir_lookup(n81, &inum2) == RC_OK, "重插 81B 可查");
     }
+    CHECK(audit_clean(fs, "name-heap-final") == 0, "audit_inode 全净 (name_heap)");
     }   /* fs 析构：位图全量写回 */
 
     /* ══ Phase 5：持久化（重挂载） ══ */

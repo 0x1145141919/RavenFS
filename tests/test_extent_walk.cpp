@@ -21,6 +21,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "audit_check.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"   /* mdata_piece_session 完整类型 */
 
 #include <cstdio>
@@ -337,6 +338,7 @@ int main(int argc, char **argv) {
         CHECK(old.index() == 1 && it.index() == 0, "后缀 -- 返回旧位置 (1→0)");
     }
 
+    (void)audit_clean(fs, "extent-walk-final");
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

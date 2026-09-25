@@ -12,8 +12,9 @@
  *       断言：audit 结构不变量 + records==N + 账本 == N + 节点×2（零泄漏）
  *       + 全量写块读回。
  *
- * 验证策略：同 smoke（测试侧 hack helper，不信任接口互验）。树审计
- * audit_run 抄 test_extent_fusion（DFS 结构不变量 + 兄弟链序）。
+ * 验证策略：树审计用 audit_inode 模块（ravenfs_audit.hpp）——单 inode 只
+ * DFS 其 extent 树（audit_begin + audit_inode），不信任被审接口互验；
+ * 终态再用 audit_filesystem 全盘收口（含对账）。
  *
  * 环境纪律：<device> 外部先 mkfs（跑法同 smoke）。B1 先占低址连续区，
  * B2 骨架锚 B1 尾（hint 低址序确定性，D4 实证同款）。
@@ -24,6 +25,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "audit_check.hpp"
 #include "../include/ravenfs/inode_cache_radix.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"
 #include "../include/ravenfs/bitmap_slices.hpp"
@@ -187,58 +189,8 @@ static uint64_t verify_blocks(RavenFS_juvenile &fs, uint64_t inum,
     return bad;
 }
 
-/* ═══════════ 树完整性审计（DFS，抄 test_extent_fusion） ═══════════ */
-struct audit_t {
-    uint64_t nodes = 0, inner = 0, leaves = 0, records = 0, bad = 0;
-};
-static uint64_t audit_node(RavenFS_juvenile &fs, audit_t &a, uint64_t blk,
-                           uint64_t expect_parent, bool expect_root,
-                           uint64_t inum, uint64_t depth) {
-    if (depth > 64) { a.bad++; return 0; }
-    mdata_piece_session s(fs.mdata_piece_mgr, blk);
-    if (s.index_error() || !s) { a.bad++; return 0; }
-    Bptree_meta_t *meta = (Bptree_meta_t *)s.data;
-    if (!is_extent_node(meta)) { a.bad++; return 0; }
-    if (meta->parent_ptr.is_root_node != expect_root) { a.bad++; return 0; }
-    if (expect_root) { if (meta->parent_ptr.ptr != inum) a.bad++; }
-    else { if (meta->parent_ptr.ptr != expect_parent) a.bad++; }
-    a.nodes++;
-    const uint16_t cnt = (uint16_t)meta->parent_ptr.entry_count;
-    if (!meta->parent_ptr.is_inner_node) {
-        a.leaves++;
-        auto *leaf = (Bptree_extent_leaf_node_t *)s.data;
-        a.records += cnt;
-        if (cnt > 337) a.bad++;
-        if (!expect_root && (cnt < 168 || cnt == 0)) a.bad++;
-        for (uint16_t i = 0; i < cnt; i++) {
-            const extent_t e = leaf->extents[i];
-            if (i > 0) {
-                const extent_t p = leaf->extents[i - 1];
-                if (p.fblkbase + p.length > e.fblkbase) a.bad++;
-            }
-        }
-        return cnt > 0 ? leaf->extents[cnt - 1].fblkbase +
-                             leaf->extents[cnt - 1].length
-                       : 0;
-    }
-    a.inner++;
-    auto *inner = (Bptree_extent_inner_node_t *)s.data;
-    if (cnt == 0) a.bad++;
-    if (cnt > 337) a.bad++;
-    if (expect_root && cnt == 1) a.bad++;
-    if (!expect_root && cnt < 168) a.bad++;
-    uint64_t prev_key = 0;
-    for (uint16_t i = 0; i < cnt; i++) {
-        const extent_hint_t h = inner->extents[i];
-        if (h.sub_node_ptr.ptr == 0 || h.sub_node_ptr.ptr == PTR_INVALID) a.bad++;
-        if (i > 0 && h.key <= prev_key) a.bad++;
-        prev_key = h.key;
-        uint64_t child_max = audit_node(fs, a, h.sub_node_ptr.ptr, blk, false,
-                                        inum, depth + 1);
-        if (h.key != child_max) a.bad++;
-    }
-    return prev_key;
-}
+/* 树完整性审计由 audit_inode 模块承担（ravenfs_audit.hpp）：
+ * 原来自抄的 audit_t / audit_node（DFS 结构不变量）已退役。 */
 
 /* ═══════════════════════════════════════════════════════════════
  * B1：超大 direct 文件（顺序 chunk 写，尾贴保 direct）
@@ -329,23 +281,25 @@ static void run_B2(RavenFS_juvenile &fs, uint64_t n) {
     CHECK(writes_ok == n - 2, "B2: 洞写全部 RC_OK（%llu 次）",
           (unsigned long long)(n - 2));
 
-    /* 树结构审计 + 记录数精确 */
-    audit_t aud;
-    audit_node(fs, aud, s2.data_root, 0, true, b, 0);
-    CHECK(aud.bad == 0, "B2: 树结构不变量绿（nodes=%llu inner=%llu leaves=%llu）",
-          (unsigned long long)aud.nodes, (unsigned long long)aud.inner,
-          (unsigned long long)aud.leaves);
-    CHECK(aud.records == n, "B2: 树记录精确 == %llu（got %llu）",
-          (unsigned long long)n, (unsigned long long)aud.records);
-    /* 账本：数据 n 块 + 树节点 aud.nodes × 2 块/节点（骨架后起算） */
-    const uint64_t expect_used = (n - 2) + (aud.nodes - 1) * 2;
+    /* 树结构审计（audit_inode 模块：只审该 inode 的 extent 树）+ 记录数精确 */
+    audit_opts_t aopt;
+    audit_ctx_t actx;
+    fs.audit_begin(actx, aopt);
+    fs.audit_inode(b, actx);
+    CHECK(actx.btree_bad == 0, "B2: 树结构不变量绿（audit_inode nodes=%llu inner=%llu leaves=%llu）",
+          (unsigned long long)actx.nodes, (unsigned long long)actx.inner,
+          (unsigned long long)actx.leaves);
+    CHECK(actx.records == n, "B2: 树记录精确 == %llu（got %llu）",
+          (unsigned long long)n, (unsigned long long)actx.records);
+    /* 账本：数据 n 块 + 树节点 actx.nodes × 2 块/节点（骨架后起算） */
+    const uint64_t expect_used = (n - 2) + (actx.nodes - 1) * 2;
     const uint64_t used = fb - free_blocks(fs);
     CHECK(used == expect_used, "B2: 账本零泄漏（used=%llu 期望=%llu 树节点=%llu）",
           (unsigned long long)used, (unsigned long long)expect_used,
-          (unsigned long long)aud.nodes);
+          (unsigned long long)actx.nodes);
     printf("  洞写耗时 %.1fs（%.0f 次/s）；树 %llu 节点 %llu 叶；记录 %llu\n",
-           ws, (n - 2) / ws, (unsigned long long)aud.nodes,
-           (unsigned long long)aud.leaves, (unsigned long long)aud.records);
+           ws, (n - 2) / ws, (unsigned long long)actx.nodes,
+           (unsigned long long)actx.leaves, (unsigned long long)actx.records);
 
     /* 全量写块读回（偶数逻辑块，逐块 resolve） */
     auto t2 = std::chrono::steady_clock::now();
@@ -364,6 +318,9 @@ static void run_B2(RavenFS_juvenile &fs, uint64_t n) {
     double rs = std::chrono::duration<double>(t3 - t2).count();
     CHECK(bad == 0, "B2: %llu 个写块全量读回 == 模式", (unsigned long long)n);
     printf("  读回耗时 %.1fs（%llu 块 resolve）\n", rs, (unsigned long long)n);
+
+    /* 归还拦路虎块（B2 收尾）→ 终态全盘审计可全净 */
+    fs.block_free(blocker, 1);
 }
 
 int main(int argc, char **argv) {
@@ -388,6 +345,8 @@ int main(int argc, char **argv) {
     if (b1_gb > 0) run_B1(fs, b1_gb);
     if (b2_n > 1) run_B2(fs, b2_n);
 
+    CHECK(audit_clean(fs, "pwrite-big-final") == 0,
+          "pwrite_big 终态 audit_filesystem 全净");
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

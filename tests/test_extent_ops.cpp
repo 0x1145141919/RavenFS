@@ -38,6 +38,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "audit_check.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"   /* mdata_piece_session 完整类型 */
 
 #include <cstdio>
@@ -890,6 +891,7 @@ int main(int argc, char **argv) {
     CHECK(inode_data_root(fs, sinum) == sroot, "D 终态收口后 inode.data_root == live 空根叶");
     }   /* 非 par 模式：A/B/C/D 串行语义组 */
 
+    (void)audit_clean(fs, "extent-ops-final");
     printf("\n%d passed, %d failed\n", g_pass.load(), g_fail.load());
     return g_fail.load() ? 1 : 0;
 }

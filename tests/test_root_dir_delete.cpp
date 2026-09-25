@@ -22,6 +22,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "audit_check.hpp"
 #include "../include/ravenfs/inode_cache_radix.hpp"   /* verify 同步点：flush_all 需完整类型 */
 #include "../include/ravenfs/mdata_piece_caches.hpp"
 
@@ -454,6 +455,7 @@ int main(int argc, char **argv) {
     printf("  删空后剩余条目: %llu\n", (unsigned long long)inserted);
     CHECK(inserted == 0, "全部删空（剩余 0）");
     fs.dump_info();
+    CHECK(audit_clean(fs, "delete-empty") == 0, "audit_inode 全净 (delete 删空)");
 
     /* 2c. 删空后再删 → NOT_FOUND */
     {
