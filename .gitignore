@@ -31,3 +31,6 @@ ravenfs_log.txt
 
 # kernel 测试素材（SparrowOS 侧资源，勿入 ravenfs 仓库）
 imgs/
+
+# 独立虚拟机环境（脚本 + 磁盘镜像，不随仓库走）
+linux/vm/
