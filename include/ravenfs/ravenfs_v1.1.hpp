@@ -3,6 +3,13 @@
 #include "cache_mgr_mode.hpp"
 #include "../magics.h"
 #include <list>
+/* audit 类型（完整定义在 ravenfs_audit.hpp；此处仅前置声明，
+ * 避免把 <unordered_set> 等拉进 `#define private public` 的测试 TU） */
+struct audit_ctx_t;
+struct audit_opts_t;
+struct audit_report_t;
+struct audit_tree_ctx_t;
+struct audit_heap_region_t;
 /* 缓存子模块前置声明（仅成员指针用，不拉完整头）：
  * 完整类型由使用方 cpp 各自 include inode_cache_radix.hpp /
  * mdata_piece_caches.hpp —— 这两个头会拉 util/tsc.h → <chrono>，
@@ -150,6 +157,21 @@ public:
     uint64_t get_ctrl_word(){
         return God_CTRL_WORD;
     }
+
+    /* ══════════════════════════════════════════════════════════
+     * 静态合法性审计（audit_inode 模块；设计基线 Docs/audit_inode_design.md）
+     * 内部测试/调试手段：只读、不修复；重点 B+树数据结构一致性。
+     * 复用本类位图（block_test/inode_test）+ 缓存（mdata_piece_session），
+     * 但 DFS/路由独立推导（不借 dentry/extent_Bptree_walk）。
+     * ══════════════════════════════════════════════════════════ */
+    /* seed ctx：几何 + 位图/标志位尺寸 + 结构块白名单（含 backup SB 块）。
+     * 供 audit_filesystem 内部与单独调用 audit_inode 前使用。 */
+    result_code_t audit_begin(audit_ctx_t &ctx, const audit_opts_t &opts);
+    /* 单 inode 审计（粒度 = 一个 inode；dir 只 DFS 自己的 dentry 树，不下钻子目录）。
+     * 返回 RC_OK = 遍历完成（不代表无异常）；异常在 ctx 计数 + 标志位 + 日志。 */
+    result_code_t audit_inode(uint64_t inum, audit_ctx_t &ctx);
+    /* 全盘审计驱动：枚举全部已分配 inode → audit_inode → 收口对账 → 汇总日志。 */
+    result_code_t audit_filesystem(const audit_opts_t &opts, audit_report_t &rep);
 private:
     uint64_t God_CTRL_WORD;
     enum regular_file_type_t{
@@ -589,6 +611,21 @@ private:
     static void extent_node_meta_init(void *node_buf, uint16_t entry_count,
                                       bool is_inner, bool is_root, uint64_t parent_ptr);
     static uint64_t extent_node_max_key(const void *node_buf);
+
+    /* ── audit 内部机械（juvenile_god/audit.cpp）── */
+    /* B+树 DFS 递归核：返回子树 max key（dentry=hash / extent=开边界）；
+     * sub_ok = 该节点成功读取并通过身份校验（父层据此决定是否做 key==max 比对）。 */
+    uint64_t audit_btree_node(audit_ctx_t &ctx, audit_tree_ctx_t &t, uint64_t blk,
+                              uint64_t owner_inum, uint64_t expect_parent, bool expect_root,
+                              bool is_dentry, uint64_t size_bound, int depth, bool &sub_ok);
+    /* 叶链一致性：兄弟链双向自洽 + 链序 == DFS 叶序。 */
+    void audit_leaf_chain(audit_ctx_t &ctx, audit_tree_ctx_t &t, uint64_t root_blk,
+                          bool is_dentry, uint64_t owner_inum);
+    void audit_dir_inode(audit_ctx_t &ctx, uint64_t inum, const raven_dir_Inode_t *dino);
+    void audit_file_inode(audit_ctx_t &ctx, uint64_t inum, const raven_Inode_t *ino);
+    void audit_name_heaps(audit_ctx_t &ctx, uint64_t inum, const raven_dir_Inode_t *dino);
+    /* 读堆位图某一 bit：-1 = 读失败，否则 0/1。 */
+    int  audit_heap_bit(const audit_heap_region_t &r, uint64_t bit);
 };
 bool is_dentry_node(Bptree_meta_t*meta);
 bool is_extent_node(Bptree_meta_t*meta);

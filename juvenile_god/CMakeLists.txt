@@ -19,6 +19,7 @@
 # name_heap.cpp        — 名字堆：长名外置分配/释放/读写（Raven 实现）
 # inode_cache.cpp      — inode 缓存三模式（FULL_RAM / CTRL_ARRAY 已实现，RADIX 草稿）
 # mdata_piece_cache.cpp — 8K 元数据负载片缓存 self_reliat 双档（CTRL_ARRAY ≤13 / RADIX >13）
+# audit.cpp         — 静态合法性审计（audit_inode 模块；复用位图+缓存；Docs/audit_inode_design.md）
 
 add_library(ravenfs_juvenile STATIC
     ravenfs_juvenile.cpp
@@ -38,4 +39,5 @@ add_library(ravenfs_juvenile STATIC
     inode_cache.cpp
     mdata_piece_cache.cpp
     direct_file_ops.cpp
+    audit.cpp
 )
