@@ -131,7 +131,10 @@ struct dentry *ravenfs_lookup(struct inode *dir, struct dentry *dentry,
 int ravenfs_iterate(struct file *file, struct dir_context *ctx);
 int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry,
 		   umode_t mode, bool excl);
+struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry,
+			     umode_t mode);
 int ravenfs_unlink(struct inode *dir, struct dentry *dentry);
+int ravenfs_rmdir(struct inode *dir, struct dentry *dentry);
 
 /* 名字物化（≤40 内联 / >40 读名字堆尾段）—— 供 dentry_write.c 复合序比较用 */
 int ravenfs_ddentry_name(struct super_block *sb, const struct ddentry_t *e,
@@ -235,6 +238,8 @@ int ravenfs_name_heap_write(struct super_block *sb, u32 name_len, u64 remain_ptr
 			    const char *tail);
 int ravenfs_name_heap_free(struct super_block *sb, u64 dir_ino, u32 name_len,
 			   u64 remain_ptr);
+/* 释放目录的全部【已空】名字堆并重置描述符（rmdir / 目录析构） */
+int ravenfs_dir_name_heap_release(struct super_block *sb, u64 dir_ino);
 
 struct ravenfs_session *ravenfs_session_get(struct super_block *sb, u64 inum);
 void ravenfs_session_put(struct ravenfs_session *s);

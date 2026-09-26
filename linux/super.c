@@ -457,7 +457,9 @@ static const struct super_operations ravenfs_sops = {
 static const struct inode_operations ravenfs_dir_inode_operations = {
 	.lookup		= ravenfs_lookup,
 	.create		= ravenfs_create,
+	.mkdir		= ravenfs_mkdir,
 	.unlink		= ravenfs_unlink,
+	.rmdir		= ravenfs_rmdir,
 	.getattr	= ravenfs_getattr,
 };
 

@@ -356,3 +356,63 @@ int ravenfs_name_heap_free(struct super_block *sb, u64 dir_ino, u32 name_len,
 	}
 	return -EINVAL;					/* 块号不落任何堆数据区（调用方 bug） */
 }
+
+/*
+ * 释放目录的全部【已空】名字堆（堆回收，god `dir_name_heap_release` 移植）。
+ * 遍历 10 个控制器：已激活且位图面无任何置位（全空）→ 位图面 + 数据面归还位图 →
+ * 描述符重置未激活哨兵；非空堆跳过（数据面不收缩）。有释放 → session dirty。
+ * ⚠ 重置用 `RFS_NHC_SET`（gran/bits=0、bitmap/data=MASK52）；memset 0 是雷（0 是合法块号）。
+ */
+int ravenfs_dir_name_heap_release(struct super_block *sb, u64 dir_ino)
+{
+	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, dir_ino);
+	struct raven_Inode_t *r;
+	u32 s;
+	bool changed = false;
+
+	if (IS_ERR(ds))
+		return PTR_ERR(ds);
+	r = ravenfs_session_inode(ds);
+	if (RFS_INO1_GET_TYPE(r->word1) != INODE_TYPE_DIR)
+		return -EINVAL;
+
+	for (s = 0; s < 10; s++) {
+		struct name_heap_controller_t *ctrl =
+			rfs_dir_heap((struct raven_dir_Inode_t *)r, s);
+		u64 bmp_blks, data_blks, p;
+		bool empty = true;
+
+		if (!ctrl || RFS_NHC_BITMAP(*ctrl) == (u64)NAME_HEAP_INACTIVE)
+			continue; /* 未激活 */
+		bmp_blks = rfs_heap_bmp_blocks((u8)RFS_NHC_BITS(*ctrl));
+		data_blks = rfs_heap_data_blocks((u8)RFS_NHC_BITS(*ctrl),
+						 (u8)RFS_NHC_GRAN(*ctrl));
+
+		/* 全空判定：位图面全部字节 == 0 */
+		for (p = 0; p < bmp_blks / 2 && empty; p++) {
+			struct ravenfs_msession *ms __free(ravenfs_msession) =
+				ravenfs_mdata_get(sb, RFS_NHC_BITMAP(*ctrl) + p * 2);
+			const u8 *b;
+			u32 i;
+
+			if (IS_ERR(ms))
+				return PTR_ERR(ms);
+			b = ravenfs_msession_node(ms);
+			for (i = 0; i < RAVENFS_MDATA_NODE_BYTES && empty; i++)
+				if (b[i])
+					empty = false;
+		}
+		if (!empty)
+			continue;
+
+		ravenfs_block_free(sb, RFS_NHC_BITMAP(*ctrl), bmp_blks);
+		ravenfs_block_free(sb, RFS_NHC_DATA(*ctrl), data_blks);
+		RFS_NHC_SET(*ctrl, 0, 0, (u64)NAME_HEAP_INACTIVE, 0, (u64)NAME_HEAP_INACTIVE);
+		changed = true;
+	}
+	if (changed) {
+		ds->row->dirty = true;
+		ds->row->stamp = ktime_get_ns();
+	}
+	return 0;
+}

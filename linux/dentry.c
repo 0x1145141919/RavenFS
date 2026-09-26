@@ -396,6 +396,249 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 		if (inode->i_nlink)
 			inode_dec_link_count(inode);
 	}
+
+	/* 目录已变空 → 归还其已空名字堆（ko 版 dir_name_heap_release；大魔王 Phase5 堆回收） */
+	if (dr->size == 0)
+		ravenfs_dir_name_heap_release(sb, dir->i_ino);
+	return 0;
+}
+
+/*
+ * mkdir：在 dir 下建子目录。子目录**急建空根叶**（v1.1 §10 不变量 11：DIR 的
+ * data_root 恒有效），dir inode 的 10 个名字堆描述符显式置未激活哨兵（memset 0 是雷）。
+ * 复用与 create 同一条多级 ddentry 树插入路径。
+ */
+struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+			     struct dentry *dentry, umode_t mode)
+{
+	struct super_block *sb = dir->i_sb;
+	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
+	struct ravenfs_session *ts __free(ravenfs_session) = NULL;
+	struct ravenfs_msession *ms __free(ravenfs_msession) = NULL;
+	struct raven_Inode_t *dr, *tr;
+	struct Bptree_ddentry_leaf_node_t *lf;
+	struct rfs_dpath path;
+	struct timespec64 now;
+	struct inode *inode;
+	u64 inum, root_blk, new_root, hash;
+	u64 remain_ptr = (u64)PTR_INVALID;
+	u32 nlen = dentry->d_name.len, s;
+	int err;
+
+	if (nlen == 0 || nlen > RAVENFS_MAX_NAME_LEN)
+		return ERR_PTR(-ENAMETOOLONG);
+	if (!S_ISDIR(dir->i_mode))
+		return ERR_PTR(-ENOTDIR);
+
+	ds = ravenfs_session_get(sb, dir->i_ino);
+	if (IS_ERR(ds))
+		return ERR_CAST(ds);
+	dr = ravenfs_session_inode(ds);
+	if (RFS_INO1_GET_TYPE(dr->word1) != INODE_TYPE_DIR)
+		return ERR_PTR(-ENOTDIR);
+	root_blk = dr->data_root;
+	if (root_blk == (u64)PTR_INVALID)
+		return ERR_PTR(-EIO);
+
+	err = ravenfs_ddentry_walk(sb, dir->i_ino, dentry->d_name.name, nlen, &path);
+	if (err)
+		return ERR_PTR(err);
+	if (path.hit)
+		return ERR_PTR(-EEXIST);
+	hash = xxh64(dentry->d_name.name, nlen, 0);
+
+	inum = ravenfs_inode_alloc(sb);
+	if (inum == (u64)PTR_INVALID)
+		return ERR_PTR(-ENOSPC);
+	new_root = ravenfs_block_alloc(sb, 2, 1);
+	if (new_root == (u64)PTR_INVALID) {
+		ravenfs_inode_free(sb, inum);
+		return ERR_PTR(-ENOSPC);
+	}
+
+	/* 子目录空根叶：count=0, root=1, ptr=自身 inum(".")，ptrs[1]=".."=父目录 */
+	ms = ravenfs_mdata_get(sb, new_root);
+	if (IS_ERR(ms)) {
+		ravenfs_block_free(sb, new_root, 2);
+		ravenfs_inode_free(sb, inum);
+		return ERR_CAST(ms);
+	}
+	lf = ravenfs_msession_node(ms);
+	memset(lf, 0, RAVENFS_NODE_BYTES);
+	lf->meta.magics[0] = DENTRY_MAGIC1;
+	lf->meta.magics[1] = DENTRY_MAGIC2;
+	lf->meta.magics[2] = DENTRY_MAGIC3;
+	lf->meta.magics[3] = DENTRY_MAGIC4;
+	lf->meta.parent_ptr.v = RFS_PP_PACK(0, 0, 1, inum);
+	lf->meta.ptrs[0].v = RFS_PTR_PACK(0, RFS_MASK52);
+	lf->meta.ptrs[1].v = RFS_PTR_PACK(0, dir->i_ino);	/* ".." */
+	lf->meta.ptrs[2].v = RFS_PTR_PACK(0, RFS_MASK52);
+	ms->row->dirty = true;
+	ms->row->stamp = ktime_get_ns();
+	ravenfs_mdata_put(ms);
+	ms = NULL;
+
+	ts = ravenfs_session_get(sb, inum);
+	if (IS_ERR(ts)) {
+		ravenfs_block_free(sb, new_root, 2);
+		ravenfs_inode_free(sb, inum);
+		return ERR_CAST(ts);
+	}
+	tr = ravenfs_session_inode(ts);
+	now = current_time(dir);
+	memset(tr, 0, RAVENFS_INODE_SIZE);
+	tr->word1 = RFS_INO1_PACK(INODE_TYPE_DIR, 0, 0);
+	tr->uid = i_uid_read(dir);
+	tr->gid = i_gid_read(dir);
+	tr->mode_xattr = RFS_MODE_XATTR_PACK(mode & 0o7777, RFS_XATTR_NONE);
+	tr->link_count = 2;		/* size(0) + 2 */
+	tr->size = 0;
+	tr->data_root = new_root;
+	tr->mtime = now.tv_sec;
+	tr->m_ns_stamp = (u32)now.tv_nsec;
+	tr->ctime = now.tv_sec;
+	tr->c_ns_stamp = (u32)now.tv_nsec;
+	tr->atime = now.tv_sec;
+	tr->a_ns_stamp = (u32)now.tv_nsec;
+	for (s = 0; s < 10; s++)
+		RFS_NHC_SET(*rfs_dir_heap((struct raven_dir_Inode_t *)tr, s), 0, 0,
+			    (u64)NAME_HEAP_INACTIVE, 0, (u64)NAME_HEAP_INACTIVE);
+	ts->row->dirty = true;
+	ts->row->stamp = ktime_get_ns();
+
+	if (nlen > DENTRY_INLINE_NAME_MAX) {
+		err = ravenfs_name_heap_alloc(sb, dir->i_ino, nlen, &remain_ptr);
+		if (err)
+			goto fail_root;
+		err = ravenfs_name_heap_write(sb, nlen, remain_ptr,
+					      (const char *)dentry->d_name.name + DENTRY_INLINE_NAME_MAX);
+		if (err) {
+			ravenfs_name_heap_free(sb, dir->i_ino, nlen, remain_ptr);
+			goto fail_root;
+		}
+	}
+
+	err = ravenfs_ddentry_insert(sb, dir->i_ino, &path, dentry->d_name.name, nlen,
+				     hash, inum, remain_ptr);
+	if (err) {
+		if (nlen > DENTRY_INLINE_NAME_MAX)
+			ravenfs_name_heap_free(sb, dir->i_ino, nlen, remain_ptr);
+		goto fail_root;
+	}
+
+	dr->size += 1;
+	dr->link_count = (u32)dr->size + 2;
+	dr->mtime = now.tv_sec;
+	dr->m_ns_stamp = (u32)now.tv_nsec;
+	dr->ctime = now.tv_sec;
+	dr->c_ns_stamp = (u32)now.tv_nsec;
+	ds->row->dirty = true;
+	ds->row->stamp = ktime_get_ns();
+	dir->i_size = dr->size;
+	set_nlink(dir, dr->link_count);
+	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
+	inode_set_ctime(dir, now.tv_sec, now.tv_nsec);
+	mark_inode_dirty(dir);
+
+	inode = ravenfs_iget(sb, inum);
+	if (IS_ERR(inode))
+		return ERR_CAST(inode);
+	d_instantiate(dentry, inode);
+	return NULL;		/* 用原 dentry（VFS 约定：非 NULL 才替换） */
+
+fail_root:
+	if (nlen > DENTRY_INLINE_NAME_MAX)
+		ravenfs_name_heap_free(sb, dir->i_ino, nlen, remain_ptr);
+	ravenfs_mdata_drop(sb, new_root);
+	ravenfs_block_free(sb, new_root, 2);
+	ravenfs_inode_reclaim(sb, inum);
+	return ERR_PTR(err);
+}
+
+/*
+ * rmdir：删空目录。判空用**盘上 size==0**（不用 dcache 的 simple_empty —— 见 spec §4.11.3）。
+ * 空校验在树删**之前**（失败零副作用）。删后回收目标目录资源：名字堆全归还 →
+ * 树根 2 块 →（目标 inode 槽由 clear_nlink 后的 evict → ravenfs_inode_reclaim 回收）。
+ */
+int ravenfs_rmdir(struct inode *dir, struct dentry *dentry)
+{
+	struct super_block *sb = dir->i_sb;
+	struct inode *target = d_inode(dentry);
+	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
+	struct ravenfs_session *ts __free(ravenfs_session) = NULL;
+	struct raven_Inode_t *dr, *tr;
+	struct rfs_dpath path;
+	struct rfs_delinfo di;
+	struct timespec64 now;
+	u64 root_blk, t_root;
+	u32 nlen = dentry->d_name.len;
+	int err;
+
+	if (nlen == 0 || nlen > RAVENFS_MAX_NAME_LEN)
+		return -ENAMETOOLONG;
+	if (!target || !S_ISDIR(target->i_mode))
+		return -ENOTDIR;
+
+	ds = ravenfs_session_get(sb, dir->i_ino);
+	if (IS_ERR(ds))
+		return PTR_ERR(ds);
+	dr = ravenfs_session_inode(ds);
+	root_blk = dr->data_root;
+	if (root_blk == (u64)PTR_INVALID)
+		return -EIO;
+
+	/* 盘上判空（零副作用：失败前不碰树） */
+	ts = ravenfs_session_get(sb, target->i_ino);
+	if (IS_ERR(ts))
+		return PTR_ERR(ts);
+	tr = ravenfs_session_inode(ts);
+	if (RFS_INO1_GET_TYPE(tr->word1) != INODE_TYPE_DIR)
+		return -EINVAL;
+	if (tr->size != 0)
+		return -ENOTEMPTY;
+	t_root = tr->data_root;
+	if (t_root == (u64)PTR_INVALID)
+		return -EIO;
+
+	err = ravenfs_ddentry_walk(sb, dir->i_ino, dentry->d_name.name, nlen, &path);
+	if (err)
+		return err;
+	if (!path.hit)
+		return -ENOENT;
+
+	memset(&di, 0, sizeof(di));
+	di.remain = (u64)PTR_INVALID;
+	err = ravenfs_ddentry_delete(sb, dir->i_ino, &path, &di);
+	if (err)
+		return err;
+
+	/* 目标目录资源回收：名字堆（全归还）→ 树根 2 块 */
+	ravenfs_dir_name_heap_release(sb, target->i_ino);
+	ravenfs_mdata_drop(sb, t_root);
+	ravenfs_block_free(sb, t_root, 2);
+
+	now = current_time(dir);
+	dr->size -= 1;
+	dr->link_count = (u32)dr->size + 2;
+	dr->mtime = now.tv_sec;
+	dr->m_ns_stamp = (u32)now.tv_nsec;
+	dr->ctime = now.tv_sec;
+	dr->c_ns_stamp = (u32)now.tv_nsec;
+	ds->row->dirty = true;
+	ds->row->stamp = ktime_get_ns();
+	dir->i_size = dr->size;
+	set_nlink(dir, dr->link_count);
+	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
+	inode_set_ctime(dir, now.tv_sec, now.tv_nsec);
+	mark_inode_dirty(dir);
+
+	/* 目标 dir inode：nlink→0 → VFS evict → ravenfs_inode_reclaim 回收槽位+清零记录 */
+	clear_nlink(target);
+	inode_set_ctime(target, now.tv_sec, now.tv_nsec);
+
+	/* 父目录已变空 → 归还其已空名字堆 */
+	if (dr->size == 0)
+		ravenfs_dir_name_heap_release(sb, dir->i_ino);
 	return 0;
 }
 

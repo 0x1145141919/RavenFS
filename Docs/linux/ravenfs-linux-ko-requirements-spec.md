@@ -165,17 +165,17 @@
 
 | ID | 需求 | 依据 | 优先 | 框架优先落点 | 现状 |
 |---|---|---|---|---|---|
-| R-NS-01 | `lookup`：名字→inode；命中 `d_splice_alias`，miss 返 NULL；真错误才 `ERR_PTR` | A: `vfs.rst`；ext2 | **M** | `dir_lookup` + `iget_locked` | ❌（god 有 lookup） |
-| R-NS-02 | `create`（普通文件）：`d_instantiate_new` | A: ext2 | **M** | `dir_insert_dentry(...,REGULAR)` | ❌ |
-| R-NS-03 | `mkdir`/`rmdir`：rmdir 先判空 → `-ENOTEMPTY` | A: ext2 | **M** | `dir_insert_dentry(...,DIR)` / `dir_rm_dentry` | ❌ |
-| R-NS-04 | `unlink`：删名字 → `link_count--`；先删 dentry 落盘后计数 | A: 不变量 20 | **M** | `dir_rm_dentry` | ❌ |
+| R-NS-01 | `lookup`：名字→inode；命中 `d_splice_alias`，miss 返 NULL；真错误才 `ERR_PTR` | A: `vfs.rst`；ext2 | **M** | `dir_lookup` + `iget_locked` | ✅ ko（M2） |
+| R-NS-02 | `create`（普通文件）：`d_instantiate_new` | A: ext2 | **M** | `dir_insert_dentry(...,REGULAR)` | ✅ ko（M3.4a） |
+| R-NS-03 | `mkdir`/`rmdir`：rmdir 先判空 → `-ENOTEMPTY` | A: ext2 | **M** | `dir_insert_dentry(...,DIR)` / `dir_rm_dentry` | ✅ ko（M5；判空用盘上 `size==0`，非 dcache） |
+| R-NS-04 | `unlink`：删名字 → `link_count--`；先删 dentry 落盘后计数 | A: 不变量 20 | **M** | `dir_rm_dentry` | ✅ ko（M3.4a） |
 | R-NS-05 | `link`（硬链接）：目录禁链 `-EPERM`；已存在 `-EEXIST` | A: 盘面 §3.3；I1 | **M** | `dir_link` | ❌ |
 | R-NS-06 | `symlink` + `get_link`：fast（≤160 内联 → `simple_get_link`）/ slow（`page_get_link`）双态 | A: ext2 `symlink.c:24/31`；I5 | **M** | len 自然分派 | ❌ |
 | R-NS-07 | `mknod`：建 FIFO/socket/device 节点；**VFS 四型都走此回调**（socket `bind` 亦经 `vfs_mknod`） | A: `net/unix/af_unix.c:1384`；E2 | **L** | `init_special_inode` + v1.2 `type:6`（chr/blk `rdev` 落 `inline_data[0:4]` **小端 u32**） | ❌（v1.2 起支持） |
 | R-NS-08 | `rename`：`RENAME_NOREPLACE`+`RENAME_EXCHANGE`；未知 flag → `-EINVAL`；目录改名 `..`+两父 nlink | A: `uapi/linux/fs.h`；I2 | **M** | `dir_rename` | ❌ |
 | R-NS-09 | `tmpfile`（`O_TMPFILE`，glibc `tmpfile()`） | A: ext2 `ext2_tmpfile` | **M** | `.tmpfile` | ❌ |
 | R-NS-10 | `atomic_open`：可选优化；缺省退化为 lookup→create | A: `vfs.rst` | C | 不做 | ❌ |
-| R-NS-11 | `iterate_shared`（readdir）：cookie 续读、`.`/`..` **合成**；**单次 syscall 内原子/稳定**（VFS `i_rwsem` 读锁）；**跨调用不保证原子/一致性**（锁按 syscall 持有→释放，不阻止并发修改）；cookie 失效 → 容错重扫（**不得崩/不得死循环**；允许重/跳） | A: `fs/readdir.c:103`；E4/I4 | **M** | `dir_context.pos` + `dir_emit`；cookie = 叶块号+槽号（**可校验可重定位**） | ❌ |
+| R-NS-11 | `iterate_shared`（readdir）：cookie 续读、`.`/`..` **合成**；**单次 syscall 内原子/稳定**（VFS `i_rwsem` 读锁）；**跨调用不保证原子/一致性**（锁按 syscall 持有→释放，不阻止并发修改）；cookie 失效 → 容错重扫（**不得崩/不得死循环**；允许重/跳） | A: `fs/readdir.c:103`；E4/I4 | **M** | `dir_context.pos` + `dir_emit`；cookie = 叶块号+槽号（**可校验可重定位**） | ✅ ko（M2.1） |
 | R-NS-12 | `permission`：缺省走 `generic_permission`（`fs/namei.c:521`），**不实现** | A: `vfs.rst` | C | 用缺省 | ✅ |
 | R-NS-13 | `d_revalidate`：本地磁盘 FS 不需要（**一致性纪律见 §4.11.3**） | A: 惯例 | C | 不做 | ✅ |
 
