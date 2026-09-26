@@ -415,6 +415,10 @@ static void ravenfs_put_super(struct super_block *sb)
 	ravenfs_ttl_stop(sb);		/* 先停 TTL 淘汰器（避免与折构竞争） */
 	ravenfs_mdata_cache_destroy(sb);	/* 折构：主动全量刷回/释放（§4.11.1 ②） */
 	ravenfs_cache_destroy(sb);
+	/* 位图全量刷回（M3 持久化）；ro 挂载不写 */
+	if (!(sb->s_flags & SB_RDONLY))
+		ravenfs_bitmap_flush(sb);
+	ravenfs_bitmap_destroy(sb);
 	kfree(sb->s_fs_info);
 	sb->s_fs_info = NULL;
 }
@@ -534,6 +538,14 @@ static int ravenfs_parse_superblock(struct super_block *sb, const void *buf,
 		sb->s_fs_info = NULL;
 		kfree(sbi);
 		return -ENOMEM;
+	}
+	if (ravenfs_bitmap_create(sb)) {	/* 双位图内存分片分配器（bitmap.c） */
+		ravenfs_ttl_stop(sb);
+		ravenfs_mdata_cache_destroy(sb);
+		ravenfs_cache_destroy(sb);
+		sb->s_fs_info = NULL;
+		kfree(sbi);
+		return -EIO;
 	}
 	return 0;
 bad:

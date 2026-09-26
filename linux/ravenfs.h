@@ -74,6 +74,7 @@ struct ravenfs_sb_info {
 	struct ravenfs_cache *icache;	/* disk_inode_cache_mgr（§4.11.1） */
 	struct ravenfs_mdata_cache *mcache;	/* mdata_piece_cache_mgr（8K 节点） */
 	struct ravenfs_ttl *ttl;	/* 自写 TTL 淘汰器（cache_ttl.c） */
+	struct ravenfs_bitmap_mgr *bitmap;	/* 双位图分片分配器（bitmap.c，全量内存） */
 };
 
 struct ravenfs_inode_info {
@@ -269,5 +270,19 @@ static inline void *ravenfs_msession_node(struct ravenfs_msession *s)
 struct ravenfs_ttl;
 int  ravenfs_ttl_start(struct super_block *sb);
 void ravenfs_ttl_stop(struct super_block *sb);
+
+/* ── 双位图分片分配器（bitmap.c）── */
+struct ravenfs_bitmap_mgr;
+int  ravenfs_bitmap_create(struct super_block *sb);
+void ravenfs_bitmap_destroy(struct super_block *sb);
+void ravenfs_bitmap_flush(struct super_block *sb);
+u64  ravenfs_block_alloc(struct super_block *sb, u64 count, u32 align_log2);
+void ravenfs_block_free(struct super_block *sb, u64 blk, u64 count);
+bool ravenfs_block_test(struct super_block *sb, u64 blk);
+u64  ravenfs_inode_alloc(struct super_block *sb);
+void ravenfs_inode_free(struct super_block *sb, u64 inum);
+bool ravenfs_inode_test(struct super_block *sb, u64 inum);
+u64  ravenfs_block_free_total(struct super_block *sb);
+u64  ravenfs_inode_free_total(struct super_block *sb);
 
 #endif /* _RAVENFS_H */
