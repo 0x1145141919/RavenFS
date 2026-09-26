@@ -277,7 +277,7 @@ static void build_superblock(RavenSuperblock *sb, const MkfsParams &p,
                               const uint64_t *backup_blocks) {
     memset(sb, 0, sizeof(*sb));
     sb->magic          = SUPERBLOCK_MAGIC;
-    sb->version        = RAVENFS_VERSION;   /* v1.1 = 2 */
+    sb->version        = RAVENFS_VERSION;   /* v1.2 = 3 */
     sb->world_base_lba = p.world_base_lba;
     sb->total_blocks   = geo.total_blocks;
     sb->inode_array_count = p.inode_count;
@@ -299,8 +299,8 @@ static void build_superblock(RavenSuperblock *sb, const MkfsParams &p,
     sb->modify_time = now;
 }
 
-/* 52 位指针空间无效哨兵（PTR_INVALID 的 52 位截断形态；ptrs[i].ptr 为位域） */
-static constexpr uint64_t PTR52_INVALID = 0xFFFFFFFFFFFFFULL;
+/* 52 位指针空间无效哨兵（PTR_INVALID 的 52 位截断形态；v1.2 用掩码+宏访问 ptr） */
+static constexpr uint64_t PTR52_INVALID = RFS_MASK52;
 
 static void build_root_dentry_node(Bptree_dentry_leaf_node_t *node)
 {
@@ -314,32 +314,28 @@ static void build_root_dentry_node(Bptree_dentry_leaf_node_t *node)
     node->meta.magics[1] = DENTRY_MAGIC2;
     node->meta.magics[2] = DENTRY_MAGIC3;
     node->meta.magics[3] = DENTRY_MAGIC4;
-    node->meta.parent_ptr.entry_count   = 0;
-    node->meta.parent_ptr.is_inner_node = 0;
-    node->meta.parent_ptr.is_root_node  = 1;
-    node->meta.parent_ptr.ptr           = 0;   /* . = 根 inode 自身 */
-    node->meta.ptrs[0].ptr = PTR52_INVALID;   /* 预留 */
-    node->meta.ptrs[1].ptr = 0;               /* .. = 根 inode（根的父亲是自己） */
-    node->meta.ptrs[2].ptr = PTR52_INVALID;   /* 预留 */
+    node->meta.parent_ptr.v = RFS_PP_PACK(0, 0, 1, 0);          /* . = 根 inode 自身 */
+    node->meta.ptrs[0].v = RFS_PTR_PACK(0, PTR52_INVALID);      /* 预留 */
+    node->meta.ptrs[1].v = RFS_PTR_PACK(0, 0);                  /* .. = 根 inode（根的父亲是自己） */
+    node->meta.ptrs[2].v = RFS_PTR_PACK(0, PTR52_INVALID);      /* 预留 */
     /* entries[127] 全零（memset） */
 }
 
 static void build_root_inode(raven_Inode_t *inode, uint64_t root_dentry_block) {
     memset(inode, 0, sizeof(*inode));
-    inode->type                    = INODE_TYPE_DIR;
+    /* v1.2 第一字：type:6 | direct:1 | i_flags:57（DIR 的 direct 位恒 0） */
+    inode->word1                   = RFS_INO1_PACK(INODE_TYPE_DIR, 0, 0);
     inode->uid                     = 0;
     inode->gid                     = 0;
-    inode->permission_bits         = 0755;
+    /* v1.2 mode_xattr：mode:12 | xattr_ptr:52（无 xattr = 52 位全 1 哨兵） */
+    inode->mode_xattr              = RFS_MODE_XATTR_PACK(0755, RFS_XATTR_NONE);
     inode->size                    = 0;
     inode->data_root               = root_dentry_block;
     inode->link_count              = 2;
     /* 名字堆 10 描述符：未激活哨兵（bitmap/data_base 双指针 52 位全 1） */
-    constexpr uint64_t NAME_HEAP_INACTIVE = (1ULL << 52) - 1;
     raven_dir_Inode_t *dino = (raven_dir_Inode_t *)inode;
-    for (int i = 0; i < 10; i++) {
-        ((name_heap_controller_t *)&dino->heaps_8B_8k)[i].bitmap_base_block_ptr = NAME_HEAP_INACTIVE;
-        ((name_heap_controller_t *)&dino->heaps_8B_8k)[i].data_base_block_ptr   = NAME_HEAP_INACTIVE;
-    }
+    for (int i = 0; i < 10; i++)
+        RFS_NHC_SET(dino->heaps[i], 0, 0, NAME_HEAP_INACTIVE, 0, NAME_HEAP_INACTIVE);
 }
 
 /* ═══════════════════════════════════════════════════════════════

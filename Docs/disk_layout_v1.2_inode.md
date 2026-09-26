@@ -104,7 +104,7 @@
 **盘上表示（"只有名字，没有身体"）**：
 
 - `size = 0`、`data_root = PTR_INVALID`（落 **inline 态**）、**无 extent 树、无名字堆**；
-- CHR/BLK：`rdev` 存 `inline_data[0:4]`（小端），编码 = `new_encode_dev()`（`include/linux/kdev_t.h:39`：12 位 major + 20 位 minor 打包成 u32）；
+- **CHR/BLK**：`rdev` 存 `inline_data[0:4]`（**小端 u32**），编码 = `new_encode_dev()`（`include/linux/kdev_t.h:39`：12 位 major + 20 位 minor 恰打包进 32 位）。**2026-09-26 定：统一小端 u32；上限若需更大 → 升 `inline_data[0:8]` 小端 u64**（同起点）。
 - FIFO/SOCK：`inline_data` 无内容（建议置 0）；**不需要 `rdev`**；
 - 非设备文件 `rdev` **无定义**（建议置 0），防止 `getattr` 里 `stat->rdev = i_rdev` 带出垃圾。
 
@@ -119,12 +119,12 @@
 ### 5.1 指针与上限
 - inode 侧只有 **一个 52 位块指针**（`permission_bits.xattr_ptr`）；**块自描述** → inode 无需 xattr 的 size/root/direct 字段。
 - **单块**（ext2/4 的 `h_blocks` 是死字段：`fs/ext4/xattr.c:201` 硬断言 `!= 1` 即报错，`:2025` 写入恒 1）→ 上限 = 一块；放不下 → `-E2BIG`。
-- 块尺寸：**1 个 FS_block（4096B）**——不受 8K 节点对齐约束（8K 是 B+tree 节点形状，xattr 是独立结构；且 R-IO-01b 已弃 8K piece 缓存，b1 buffer_head 天然 4K）。
+- 块尺寸：**1 个 FS_block（4096B）**——**2026-09-26 定：统一 4K，非 8K piece**。不受 8K 节点对齐约束（8K 是 B+tree 节点形状，xattr 是独立结构；且 R-IO-01b 已弃 8K piece 缓存，b1 buffer_head 天然 4K）。
 
 ### 5.2 块头（建议 32B，对齐 ext 形状）
 ```c
 struct rfs_xattr_block_hdr {   // 32B
-    uint32_t h_magic;          // 识别（待定；ext2 取 0xEA020000）
+    uint32_t h_magic;          // 识别魔数 = 0x52465358（"RFSX"）
     uint32_t h_refcount;       // v1.2 恒 1（共享留将来）
     uint32_t h_blocks;         // 恒 1（沿用 ext 死字段约定，防未来）
     uint32_t h_hash;           // 全集 hash（v1.2 可置 0；共享用）
@@ -132,13 +132,15 @@ struct rfs_xattr_block_hdr {   // 32B
 };
 ```
 
+> **为何 xattr magic 只给 u32（2026-09-26 定）**：B+tree 节点用 256-bit 强魔数，是为**容灾重建**——全盘扫描时低误报识别节点类型。而**灾难场景关心的是文件组织 + 目录树**，没人会去重建 xattr → xattr 块**无扫描级强度需求**，一个 u32 token（`"RFSX"`）意思意思即可；且 xattr 只经 inode 指针可达，指针跟随后的轻识别足够。
+
 ### 5.3 条目（紧凑变长，4B 对齐）
 ```c
-struct rfs_xattr_entry {           // 8B 头 + 变长
+struct rfs_xattr_entry {           // 8B 定长头 + 变长数据
     uint8_t  e_name_len;           // 名字后缀长（不含命名空间前缀）
     uint8_t  e_name_index;         // 命名空间索引（见下，抄 ext4）
     uint16_t e_value_len;
-    uint16_t e_reserved;
+    uint32_t e_reserved;           // 保留（置 0）——凑齐 8B 自然对齐
     char     e_name[e_name_len];   // 名字后缀
     uint8_t  e_value[e_value_len]; // 值（紧随 name，按 4B 对齐）
 };                                 // 扫描终止：剩余 < 8B 或全 0 区
@@ -158,13 +160,13 @@ struct rfs_xattr_entry {           // 8B 头 + 变长
 
 - 位表见 `include/linux/fs.h:2098`（`S_SYNC/S_NOATIME/S_APPEND/S_IMMUTABLE/S_DIRSYNC/…/S_ANON_INODE`，当前最高 bit 19）。
 - 字段给 57 位，**存值不移位**，余位预留。
-- **v1.2 不实现任何 flag**（`chattr/lsattr` 现为可降级项 R-DG-03）；写 0 即可。字段存在的意义 = **将来支持 `chattr` 不再动盘面**。
+- **v1.2 不实现任何 flag**（`chattr/lsattr` 现为可降级项 R-DG-03；**2026-09-26 定：当前版本不做**）；写 0 即可。字段存在的意义 = **将来支持 `chattr` 不再动盘面**。
 
 ---
 
 ## 7. 不变量增补（对 v1.1 §10 的追加/修订）
 
-- **26（新）· 无数据类型**：`type ∈ {1,2,6,12}` ⇒ `size==0` ∧ `data_root==PTR_INVALID` ∧ 无树；`rdev` 仅 `type ∈ {2,6}` 有效。
+- **26（新）· 无数据类型**：`type ∈ {1,2,6,12}` ⇒ `size==0` ∧ `data_root==PTR_INVALID` ∧ 无树；`rdev` 仅 `type ∈ {2,6}` 有效（**存 `inline_data[0:4]` 小端 u32**，见 §9-5）。
 - **27（新）· 类型值域**：`type` 必须 ∈ `{1,2,4,6,8,10,12}`；其余（含 0）= 硬错。
 - **28（新）· 权限/指针**：`permission_bits` 低 12 位 = 权限；高 52 位 = 块号或全 1 哨兵（**不得 0**）。
 - **29（新）· xattr 块**：见 §5.5。
@@ -183,6 +185,8 @@ struct rfs_xattr_entry {           // 8B 头 + 变长
 | `audit` | §7 之不变量 26–30；xattr 块认领/校验；无类型 inode 的 `inline_data` 第 3 释义；`rdev` 校验 |
 | `ravenfs.ko` | `getattr/setattr/mknod` + xattr 四回调；`i_mode/i_rdev/i_flags` 由新字段还原 |
 | **兼容性** | **v1.1 盘不兼容**（位域语义变）→ 直接 reformat，不提供迁移工具 |
+
+> **落地顺序（2026-09-26 定）**：**用户态上帝类（`juvenile_god`）刻意暂不迁移 v1.2**（仍用 `disk_struct_v1.1.hpp`）；**`mkfs` 先行适配 v1.2**（✅ 已改：`include/disk_struct_v1.2.h` + root inode v1.2 写法 + `version=3`）。god / audit / tests 的 v1.2 迁移待后续批次（§8.1 的 12 个语义点）。
 
 ### 8.1 `type` 常量普查（2026-09-26 实测）
 
@@ -219,12 +223,12 @@ struct rfs_xattr_entry {           // 8B 头 + 变长
 ## 9. 未决 / 待裁
 
 1. ~~**`type` 常量普查**：god 里 `type` 分派点的完整清单（改动前必须先盘）。~~ → ✅ **已完成（2026-09-26）**，见 §8.1。
-2. **xattr 块尺寸**：4K（本文推荐，bh 天然粒度）vs 8K piece。
-3. **`h_magic` 取值**（建议与 B+tree 节点 magic 同一套"扫描识别"命名）。
-4. **字段改名**：`permission_bits → mode_xattr` 是否采纳。
-5. **`rdev` 存法**：`inline_data[0:4]` 小端（本文推荐）—— 是否确认；`inline_data[4:160]` 是否强制置 0。
-6. **`i_flags` 是否现在实现 `chattr`**（本文默认不实现，仅留字段）。
-7. **`RAVENFS_VERSION` 新值**（建议 3）。
+2. ~~**xattr 块尺寸**：4K（本文推荐，bh 天然粒度）vs 8K piece。~~ → ✅ **已定（2026-09-26）：统一 1 个 FS_block = 4K**。
+3. ~~**`h_magic` 取值**（建议与 B+tree 节点 magic 同一套"扫描识别"命名）。~~ → ✅ **已定（2026-09-26）：`0x52465358`（"RFSX"）u32 token**（xattr 无扫描/重建需求，见 §5.2 注）。
+4. ~~**字段改名**：`permission_bits → mode_xattr` 是否采纳。~~ → ✅ **已定（2026-09-26）：采纳 `mode_xattr`**（`disk_struct_v1.2.h` 已用此名）。
+5. ~~**`rdev` 存法**：`inline_data[0:4]` 小端 —— 是否确认；`inline_data[4:160]` 是否强制置 0。~~ → ✅ **已定（2026-09-26）**：rdev **统一存 `inline_data` 起始 4B = 小端 u32**（`new_encode_dev` 打包）；上限若需更大 → 升 `inline_data[0:8]` 小端 u64（同起点）。**非设备文件 / FIFO / SOCK 置 0**（u32 方案下 `inline_data[4:160]` 置 0）。
+6. ~~**`i_flags` 是否现在实现 `chattr`**（本文默认不实现，仅留字段）。~~ → ✅ **已定（2026-09-26）：当前版本不实现 → `-EOPNOTSUPP` 降级**（字段保留，将来实现不动盘面）。
+7. ~~**`RAVENFS_VERSION` 新值**（建议 3）。~~ → ✅ **已定（2026-09-26）：3**（`disk_struct_v1.2.h` 已落）。
 
 ---
 

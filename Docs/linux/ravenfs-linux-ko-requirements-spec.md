@@ -1,7 +1,7 @@
 # RavenFS → Linux KO：第一约束需求规格书（Arch 根文件系统）
 
 > 2026-09-26 · Raven · **v1.0（决议收敛版）**
-> **定位**：把验收纲领（`ravenfs-linux-ko-acceptance-plan.md`）**第一约束**「满足 Arch Linux 用户态程序的规格需求」实体化为可签发、可验收、可追溯的正式规格书。**本文件接管纲领 §1**（其清单改为引用本文）。
+> **定位**：把验收纲领（`ravenfs-linux-ko-acceptance-plan.md`）**第一约束**「满足 Arch Linux 用户态程序的规格需求」实体化为可签发、可验收、可追溯的正式规格书。**本文件接管纲领 §1**（2026-09-26 已执行：纲领清单改为指向本文的指针；**冲突一律以本文为准**）。
 > **本文性质**：**已按 E1–E8 全部决策重推**——不是"列需求 + 待裁"，而是**净需求面**：从三份参考实现（ext2/ext4/btrfs）出发，**减去内核代劳**、加上 **Arch 硬增量**与 **v1.2 盘面增量**。
 > **地面真值**：本机内核源码 `/home/PS/PS_git/custom-kernel/linux-vfio/src/linux-7.2.3/`（所有签名/字段/常量逐字摘自该树）。
 > **关联**：`disk_layout_v1.2_inode.md`（v1.2 inode 盘面，权威详版）、`concept_iface_design.md`（平台无关接口 I1–I8）、`disk_layout_v1.1.md`（v1.1 盘面不变量）、`audit_inode_design.md`（验收预言机）、`linux_vfs_iface_spec.md`（回调逐字规格）。
@@ -28,7 +28,7 @@
 | **架构·锁** | **模型 (A)** | B+tree 节点逻辑原子性靠自建 **node latch**（按块号索引的 latch 表）；页锁**逐页、绝不嵌套两页** |
 | **E2** | **v1.2 inode 盘面** | 第一字 `type:6｜direct:1｜i_flags:57`；`permission_bits → mode:12｜xattr_ptr:52`；rdev→`inline_data`；xattr=**单块自描述**。**字节布局不变**，但旧盘不兼容 → reformat + `RAVENFS_VERSION 2→3` |
 | **E3** | 目录 `nlink` | `i_nlink` **直接报 `size+2`**（`size`=条目数 ⇒ 恒过报；find 只失去优化、不漏） |
-| **E4** | readdir cookie | **单次 syscall 原子**（VFS `i_rwsem` 读锁）；**跨调用不阻止并发修改**；cookie = 可校验+可重定位，失效→容错重扫 |
+| **E4** | readdir cookie | **原子性只到单次 syscall**（VFS `i_rwsem` 读锁，本次调用内目录稳定）；**跨调用不保证原子/一致性**（锁已释放，不阻止并发修改）；并发下只承诺**不崩/不死循环**（允许重/跳）；cookie = 可校验+可重定位 |
 | **E5** | 时间戳 | **不自建触发表**（内核已定）→ mtime/ctime 由 `generic_file_write_iter` + **`filemap_page_mkwrite`（mmap）** 免费推；**FS 义务仅 3 处** |
 | **E6** | `s_maxbytes` | **`1<<52`（4 PiB，字节）**；≤ `MAX_LFS_FILESIZE` |
 | **E7** | xattr | **真需求**；**单块上限**（`h_blocks` 死字段恒 1） |
@@ -167,16 +167,16 @@
 | R-NS-04 | `unlink`：删名字 → `link_count--`；先删 dentry 落盘后计数 | A: 不变量 20 | **M** | `dir_rm_dentry` | ❌ |
 | R-NS-05 | `link`（硬链接）：目录禁链 `-EPERM`；已存在 `-EEXIST` | A: 盘面 §3.3；I1 | **M** | `dir_link` | ❌ |
 | R-NS-06 | `symlink` + `get_link`：fast（≤160 内联 → `simple_get_link`）/ slow（`page_get_link`）双态 | A: ext2 `symlink.c:24/31`；I5 | **M** | len 自然分派 | ❌ |
-| R-NS-07 | `mknod`：建 FIFO/socket/device 节点；**VFS 四型都走此回调**（socket `bind` 亦经 `vfs_mknod`） | A: `net/unix/af_unix.c:1384`；E2 | **L** | `init_special_inode` + v1.2 `type:6`（chr/blk `rdev` 落 `inline_data`） | ❌（v1.2 起支持） |
+| R-NS-07 | `mknod`：建 FIFO/socket/device 节点；**VFS 四型都走此回调**（socket `bind` 亦经 `vfs_mknod`） | A: `net/unix/af_unix.c:1384`；E2 | **L** | `init_special_inode` + v1.2 `type:6`（chr/blk `rdev` 落 `inline_data[0:4]` **小端 u32**） | ❌（v1.2 起支持） |
 | R-NS-08 | `rename`：`RENAME_NOREPLACE`+`RENAME_EXCHANGE`；未知 flag → `-EINVAL`；目录改名 `..`+两父 nlink | A: `uapi/linux/fs.h`；I2 | **M** | `dir_rename` | ❌ |
 | R-NS-09 | `tmpfile`（`O_TMPFILE`，glibc `tmpfile()`） | A: ext2 `ext2_tmpfile` | **M** | `.tmpfile` | ❌ |
 | R-NS-10 | `atomic_open`：可选优化；缺省退化为 lookup→create | A: `vfs.rst` | C | 不做 | ❌ |
-| R-NS-11 | `iterate_shared`（readdir）：cookie 续读、`.`/`..` **合成**；**单次 syscall 原子**（VFS 读锁），**跨调用不阻止并发修改**；cookie 失效 → 容错重扫（不崩/不死循环/不丢；允许重/跳） | A: `fs/readdir.c:103`；E4/I4 | **M** | `dir_context.pos` + `dir_emit`；cookie = 叶块号+槽号（**可校验可重定位**） | ❌ |
+| R-NS-11 | `iterate_shared`（readdir）：cookie 续读、`.`/`..` **合成**；**单次 syscall 内原子/稳定**（VFS `i_rwsem` 读锁）；**跨调用不保证原子/一致性**（锁按 syscall 持有→释放，不阻止并发修改）；cookie 失效 → 容错重扫（**不得崩/不得死循环**；允许重/跳） | A: `fs/readdir.c:103`；E4/I4 | **M** | `dir_context.pos` + `dir_emit`；cookie = 叶块号+槽号（**可校验可重定位**） | ❌ |
 | R-NS-12 | `permission`：缺省走 `generic_permission`（`fs/namei.c:521`），**不实现** | A: `vfs.rst` | C | 用缺省 | ✅ |
 | R-NS-13 | `d_revalidate`：本地磁盘 FS 不需要 | A: 惯例 | C | 不做 | ✅ |
 
 > **注 R-NS-11（readdir 并发模型）**：目录 `i_rwsem` = `lookup`/`readdir` **读**、改操作 **写**（`fs/namei.c:1935/2918`、`fs/readdir.c:103`）→ 读读并发、读写互斥。
-> 锁**按 syscall 持有** → **单次 `getdents` 内目录稳定**；**跨调用之间锁放掉 → 不阻止并发修改（保留别人原子删除的权利）**。⇒ cookie 只需「可校验 + 可重定位」。
+> **原子性范围 = 单次 syscall（2026-09-26 裁决）**：锁**按 syscall 持有→释放** → **单次 `getdents` 内目录稳定**；**跨调用之间不保证原子/一致性**（锁已放掉，不阻止并发修改，保留别人原子删除的权利）。⇒ cookie 只需「可校验 + 可重定位」；并发修改下的承诺**只到“不崩/不死循环”**，**允许重/跳**（**不承诺“不丢条”**）。
 
 ### 4.4 FD — 文件数据
 
@@ -247,7 +247,7 @@
 | `[12:64)` | `xattr_ptr` | **52 位块指针**（对齐 `ptr_in_idx.ptr:52`）→ 自描述 xattr 块；**无 xattr = 52 位全 1**（`PTR_INVALID` 约定，**禁用 0**） |
 
 > **恒等式**：`i_mode = (type<<12) | mode`（两切片**不相交**，拼回零冗余）。**建议改名 `mode_xattr`**。
-> **rdev（仅 chr/blk）**：存 `inline_data[0:4]`（`new_encode_dev`）——**ext2 先例**（存 `i_block[0]`，`fs/ext2/inode.c:1550`）；`size==0` ⇒ 该区对该类型定义性空闲。
+> **rdev（仅 chr/blk）**：存 `inline_data[0:4]` = **小端 u32**（`new_encode_dev`；12 位 major + 20 位 minor；上限若需更大 → `inline_data[0:8]` 小端 u64）——**ext2 先例**（存 `i_block[0]`，`fs/ext2/inode.c:1550`）；`size==0` ⇒ 该区对该类型定义性空闲。
 > **xattr = 单块指针（非三态）**：inode 只存一个 52 位指针 → 自描述块；上限 = 一个块（`h_blocks` 死字段，`fs/ext4/xattr.c:201` 硬断言 `==1`）；放不下 → `-E2BIG`。**故 inode 无 xattr 的 size/root/direct 字段，`padding[2]` 不动。**
 > **连带**：type 值域变 → god 全部 `INODE_TYPE_*`（0/1/2 → 8/4/10）与分派点；audit 增 xattr 块校验 + 无类型 inode 的 `inline_data` 第 3 释义 + rdev；mkfs 写新字段。**清单见 `disk_layout_v1.2_inode.md` §8.1。**
 
@@ -262,7 +262,7 @@
 | R-XA-03 | `system.posix_acl_access` / `posix_acl_default`（ACL **就是 xattr**） | A: 纲领 §1-C | **M** | `get_inode_acl`/`set_acl` + `posix_acl_*` | ❌ |
 | R-XA-04 | **盘面槽位（v1.2 已定）**：xattr 指针落 `permission_bits` 高 **52 位**（**不是 `padding`**）→ 不改 inode 尺寸 | A: `disk_layout_v1.2_inode.md` §2.2；E2 | **M** | 与 `type:6` 打包为一次 v1.2 | ⚠️ 待落地 |
 
-> **注 R-XA-04**：xattr 块 = **1 个 FS_block（4K）**（bh 天然粒度；8K 节点对齐是 B+tree 的，xattr 不受其约束）。命名空间 index 直接抄 ext4（`user=1, acl=2/3, trusted=4, security=6, system=7`）。`h_refcount` 留作将来共享（v1.2 恒 1）。
+> **注 R-XA-04**：xattr 块 = **1 个 FS_block（4K）**（bh 天然粒度；8K 节点对齐是 B+tree 的，xattr 不受其约束）。块头 `h_magic = 0x52465358`（"RFSX"，**仅识别、非校验和**；u32 足够——xattr 无容灾重建/全盘扫描需求）。命名空间 index 直接抄 ext4（`user=1, acl=2/3, trusted=4, security=6, system=7`）。`h_refcount` 留作将来共享（v1.2 恒 1）。
 
 ### 4.7 SP — 空间与规模
 
@@ -277,6 +277,8 @@
 | R-SP-07 | `ENOSPC`：空间耗尽返回干净错误，不损坏 | A: 不变量写序 | **M** | 分配失败上传 | ⚠️ |
 
 > **注 R-SP-06（E6）**：逻辑块号 = 2^40（可由 extent 键 `fblkbase:u64` 表示）；`sector_t`/`kstat.blocks`（512B 单位）= 2^43；全 ≤ `loff_t`。**「52」必须是字节**（52 位块 × 4K = 2^64 > `loff_t`，非法；`fs.h:1318` 明说 FS 必须让 `s_maxbytes ≤ MAX_LFS_FILESIZE`，否则 VM 出乱）。
+>
+> **注 R-SP-01（名字长度，2026-09-26 裁决 → 取 (a)）**：`name_heap` 的 552B 路径**保留、不丢弃**（v1.2 盘面不动）。**事实校正**：VFS 对单个组件名**没有** `NAME_MAX(255)` 硬拦截——实际上限是 `PATH_MAX` 量级（`fs/namei.c` 走 `EMBEDDED_NAME_MAX`；`fs/readdir.c::verify_dirent_name` 判 `len < PATH_MAX`），故“552 在 Linux 下自动成死代码”**不成立**。**决策（用户 2026-09-26）**：既然 syscall/VFS 层不拦，就**按 (a) 走上限** → **保留 552、`f_namelen=552`、>255 名为活路径且必须正确**；ko 不做 255 收口。⇒ R-SP-01 的 `f_namelen(552)` **定**。
 
 ### 4.8 SY — 同步与一致性
 
@@ -310,12 +312,15 @@
 |---|---|---|
 | R-DG-01 | `fiemap` | C |
 | R-DG-02 | `SEEK_HOLE`/`SEEK_DATA` | C |
-| R-DG-03 | `chattr`/`lsattr`（`fileattr_get/set`；v1.2 字段已留，实现仍降级） | C |
+| R-DG-03 | `chattr`/`lsattr`（`fileattr_get/set`；v1.2 字段已留，**当前版本不做** → `-EOPNOTSUPP`） | C |
 | R-DG-04 | `FITRIM`（discard） | C |
 | R-DG-05 | `i_version`/`btime` | C |
 | R-DG-06 | quota | C |
 | R-DG-07 | `FICLONE`（`remap_file_range`） | C |
-| R-DG-08 | journal / CoW / 在线碎片整理 / 动态 inode 分配 | 非需求（`plan.md`「不要做的事」） |
+| R-DG-08 | journal / CoW / 在线碎片整理 / 动态 inode 分配 | 非需求（架构边界；原 `plan.md` 已删，git 历史可溯） |
+
+> **注 §4.10（chattr 降级，2026-09-26 定）**：当前版本**不实现** `fileattr_get/set` → `chattr/lsattr` 直接 `-EOPNOTSUPP`；v1.2 `i_flags:57` 字段保留（将来实现**不动盘面**）。
+> **纪律（将来做时）**：**做则做真**——`S_IMMUTABLE`/`S_APPEND` 的强制由 **VFS 通用提供**（`fs/namei.c:641/3700`、`fs/file_attr.c:195` 的 `CAP_LINUX_IMMUTABLE`、`fs/inode.c:2276` 的 noatime），FS 只需 `inode_set_flags()` + `fileattr_get/set` 三件；**严禁“只存取不执行”的半开**（`chattr +i` 报成功却仍可写 = 欺骗）。ext 专有 flag（`-j/-e/-d/-s/-t`）永远 `-EOPNOTSUPP`。
 
 ### 4.11 IO — I/O 与缓存后端（**已定**）
 
@@ -323,7 +328,7 @@
 |---|---|---|---|---|
 | **R-IO-01a** | **inode 缓存 → VFS inode**：不移植 `inode_cache_radix`；`struct inode` 内嵌 FS 私有结构（ext2 `ext2_inode_info` 模式）；`iget_locked/ilookup` 取代缓存查找；三后端（no_cache/self_reliat/offload）消失 | A: `fs/ext2/ext2.h`；E1 | **M** | 连带 R-LM-01/02/03；`.dirty()`→`mark_inode_dirty` |
 | **R-IO-01b** | **元数据节点缓存 → Linux 页缓存**：不移植 `mdata_piece_caches`；8K 片走页缓存（4K 页 = 2 页/片）；RMW 采 **(A)**；机制 = **b1 buffer head** | A: E1/E8 | **M** | `sb_getblk`/`__bread_gfp`/`mark_buffer_dirty`；LBS 已排除 |
-| R-IO-02 | **块 I/O 后端**：`bio`/`submit_bio`（`sb->s_bdev`）替换用户态 `pread/pwrite` | A: `plan.md` Phase 3 | **M** | `io_backend.h` kernel 实现 |
+| R-IO-02 | **块 I/O 后端**：`bio`/`submit_bio`（`sb->s_bdev`）替换用户态 `pread/pwrite` | A: 架构收敛（E1） | **M** | `io_backend.h` kernel 实现 |
 
 > **注（架构收敛）**：god 的 `inode_cache_radix` / `mdata_piece_caches` / `cache_mgr_mode` 三件**不进 ko**；算法层对 inode 的访问改道 **`RAVENFS_I(inode)`** 适配层（`inum`↔`i_ino`）。
 > 仍在 god 层保留：`inode_alloc/inode_free`（**盘上槽位**位图分配，非缓存）、B+tree / name_heap / bitmap 算法本体。
@@ -370,16 +375,18 @@
 
 ## 7. 与现有文档的接口
 
-1. **纲领 §1**：本文件接管；纲领清单改为引用本文（**冻结时**执行）。
-2. 纲领引用的 `ravenfs-linux-ko-port-gaps.md` / `ravenfs-fsck-design.md` **仓库中不存在** → 缺口权威表 = 本文 §4「现状」列 + `disk_layout_v1.2_inode.md` §8.1；`fsck -n` 并入 `audit_inode_design.md`。
-3. **`disk_layout_v1.2_inode.md`** = v1.2 盘面权威详版（本文 §4.5.1 为摘要）。
+1. **纲领 §1**：本文件接管；纲领清单已改为**指向本文的指针**（2026-09-26 执行完毕）。**冲突一律以本文为准。**
+2. **`Docs/plan.md`（超远期路线规划）已删（2026-09-26）**：项目奠基期的分层规划在演进中系统性漂移，**不再作为真值源**；历史在 git 中可回溯。本文 R-IO-02 / R-DG-08 原引用其 Phase/清单，现已本地化，不再外部依赖。
+3. **真值源与角色（2026-09-26 定）**：**god（`juvenile_god/`）是参考实现，`ravenfs.ko` 是实际实现，本文是权威规格**。god 提供能力包线 + 参考语义 + helper 选型；**ko 不照搬 god 的代码结构**（缓存/IO 已下沉 Linux，见 R-IO-*）。
+4. 纲领引用的 `ravenfs-linux-ko-port-gaps.md` / `ravenfs-fsck-design.md` **仓库中不存在** → 缺口权威表 = 本文 §4「现状」列 + `disk_layout_v1.2_inode.md` §8.1；`fsck -n` 并入 `audit_inode_design.md`。
+5. **`disk_layout_v1.2_inode.md`** = v1.2 盘面权威详版（本文 §4.5.1 为摘要）；**v1.2 C/C++ 盘面头 = `include/disk_struct_v1.2.h`**（掩码+宏，无位域）。
 
 ---
 
 ## 8. 落地顺序（→ 开工）
 
 ```
-① 盘面：include/disk_struct_v1.1.hpp → v1.2 头（type:6/i_flags/mode_xattr/xattr 结构/常量/版本 3）
+① 盘面：v1.2 C/C++ 盘面头 `include/disk_struct_v1.2.h`（掩码+宏替代位域：type:6/i_flags/mode_xattr/xattr 结构/常量/版本 3）
    └ 按 disk_layout_v1.2_inode.md §8.1 啃 12 个语义点（god/audit/mkfs）
 ② mount 骨架：fs_type 注册 + sb 读校验 + alloc_inode/evict_inode/write_inode（R-KP/R-LM）
 ③ 只读映射：T0（mkfs + mount RO + audit_filesystem 全绿）

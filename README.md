@@ -21,7 +21,7 @@ Phase 2: ravendsrv — io_uring + NVMe SQ/CQ IPC
 Phase 3: ravenfs.ko + SparrowOS kmod
 ```
 
-详见 `Docs/plan.md`。
+详见 `Docs/linux/ravenfs-linux-ko-requirements-spec.md`（现行需求规格；原 `Docs/plan.md` 已删）。
 
 ## 构建
 
@@ -38,7 +38,7 @@ cmake .. && make
 ## 设计参考
 
 - `Docs/disk_layout_v1.md` — 磁盘布局
-- `Docs/plan.md` — 开发路线规划
+- `Docs/disk_layout_v1.2_inode.md` — v1.2 inode 盘面（权威）
 - `src/include/ravenfs/disk_struct.h` — 全端共用数据结构
 
 ## 设计参考

@@ -3,7 +3,8 @@
 > 2026-09-25 · Raven
 > **本文件基于「独立虚拟机系统」重写**：自有 QEMU + 自有磁盘，**不依赖 `VMtest.sh` 的任何资源**（只参考其思路：UEFI 固件 / 启动分区与主分区**分盘** / CPU 配置）。
 > **2026-09-25 修订**：① **T3 的"安装" = 把 Arch 系统（ravenfs 根）与 UEFI bootloader（`esp.img`）一次都装好** → **T4 自然水到渠成**；② **双根架构**（ext4 根 + ravenfs 根）；③ **T3 通过"在 ext4 根里 `insmod ravenfs.ko`"完成** → **ISO 修补路线作废**；④ T5/T6 暂缓另议；⑤ **元总则升级为「三层约束」**（正确性 / 框架优先 / 用户暴露）——原「两个约束 + 一张判据表」把「框架优先」与「用户暴露」混成一层。
-> 配套：缺口与决策 `ravenfs-linux-ko-port-gaps.md`；fsck 设计储备 `ravenfs-fsck-design.md`。
+> 配套：**需求规格 `ravenfs-linux-ko-requirements-spec.md`（第一约束实体化，权威真值源；冲突以 spec 为准）**；环境落地 `ravenfs-vm-env-notes.md`。
+> ~~缺口与决策 `ravenfs-linux-ko-port-gaps.md`；fsck 设计储备 `ravenfs-fsck-design.md`~~（两文件仓库中不存在，作废——缺口权威表见 spec §4「现状」列 + `disk_layout_v1.2_inode.md` §8.1）。
 
 ---
 
@@ -36,49 +37,30 @@
 **三条边界（总则管不到，显式豁免）**：
 1. **磁盘布局必须自创** → 风险只能靠 **§10 不变量 + audit** 兜。
 2. **性能不达标允许退回自创**，但要有退出条件：先框架 → 基准证明不足 → 才自创，且书面论证。
-3. **第一约束必须先变成可勾选清单**（见 §1），否则退化成口号。
+3. **第一约束必须先变成可勾选清单**（见 §1；§1 已冻结为指向 spec 的指针），否则退化成口号。
 
-**代价要写成决定**：会主动放弃 552B 名字、缓存控权、B+tree 某些激进度——"放弃"必须落成决定，不能留"以后再说"。
+**代价要写成决定**：会主动放弃**缓存控权**（E1：缓存/IO 全下沉 Linux）、B+tree 某些激进度——"放弃"必须落成决定，不能留"以后再说"。
+
+**552B 名字：保留（2026-09-26 裁决 → 取上限）**：`name_heap`/dentry 外置名路径**原样保留**（v1.2 盘面不动），**`f_namelen=552`，>255 名字为活路径且必须正确**。
+（依据：VFS 对单个组件名**没有** `NAME_MAX(255)` 硬拦截，实际上限是 `PATH_MAX` 量级——`fs/namei.c` 走 `EMBEDDED_NAME_MAX`、`fs/readdir.c::verify_dirent_name` 判 `len < PATH_MAX`；故不设 255 收口。）
 
 ---
 
 ## 1. 第一约束实体化：Arch 用户态规格清单
 
-> **M**=必须 / **L**=很可能（实测确认）/ **C**=可降级。
+> **【2026-09-26 · 本节已冻结并作废，改为指向需求规格】**
+> 本节内容由 **`ravenfs-linux-ko-requirements-spec.md`（第一约束需求规格书）** 接管。
+> **任何冲突以 spec 为准**（spec 是 09-26 决议收敛版，本节多处已被其覆盖/纠正：xattr 槽位、readdir 原子性范围、`s_maxbytes` 已定、`fallocate` 已入需求）。
+>
+> 原 A–E 分节与 spec 的对应（保留作指针，供旧引用解析）：
 
-### A. 元数据与权限（**M**）
-- [ ] **setuid / setgid / sticky 可持久**（`sudo`/`su`/`passwd`）→ `permission_bits` 必须带 `S_ISUID|S_ISGID|S_ISVTX`
-- [ ] **uid/gid 持久**（root:root + 999 系统账号 + 1000+）
-- [ ] **mode 位完整**（含 `S_IFMT` 常见类型）
-- [ ] **`fsync`/`fdatasync` 真持久 + 回报错误**（journald / pacman DB）
-- [ ] **`statfs` 可用且 `f_type` 唯一**（systemd / coreutils 查文件系统类型）
-- [ ] **`syncfs(2)`**
-- [ ] **目录 `nlink` 语义正确**（`find`/`du`/`systemd-tmpfiles`）→ 决策 C1 必须先拍
-
-### B. 名字空间与文件操作（**M**）
-- [ ] `lookup / create / mkdir / rmdir / unlink / rename / symlink / link / mknod`
-- [ ] **`renameat2`：`RENAME_NOREPLACE`（coreutils `mv`/`install`）+ `RENAME_EXCHANGE`**；未知 flag → `-EINVAL`
-- [ ] **`O_TMPFILE`**（glibc `tmpfile()`）
-- [ ] **`mmap`（含可写）+ 可执行映射**（动态加载器 mmap 全部 `.so`）
-- [ ] **sparse 文件 + 打洞**（`truncate`/`fallocate` 交互）
-- [ ] **`fallocate(2)` 普通预分配**（`systemd-journald` 预分配日志）—— ⚠️ **当前设计缺此接口**
-- [ ] **`copy_file_range`/`sendfile`/`splice`**（`cp`/`tar`/`pacman`）
-- [ ] **readdir cookie 并发修改下不崩、不丢条、不死循环**（`/usr/lib` 上千条）
-
-### C. xattr / ACL（**L**，最可能是硬需求）
-- [ ] **`security.capability`**（file capabilities，`setcap` 类包）
-- [ ] **`system.posix_acl_access` / `posix_acl_default`**（systemd-tmpfiles）
-- ⚠️ 实现 xattr 需要盘上槽位：`raven_Inode_t` 的 `padding[2]`（16B）可放 1 个 u64 指针 → **不涨 inode 尺寸，但盘格式变更（v1.2）**，与 `type` 扩 mknod 同类决定。
-
-### D. 容量/规模参数（**M**，否则装到一半 ENOSPC）
-- [ ] **inode 数**：Arch base + 常用包 ≈ 10 万+ 文件 → `inode_array_count` 按 **≥50 万~100 万** 规划
-- [ ] **卷大小**：`root-ravenfs.qcow2` 20–40GB
-- [ ] **单文件大小**：`linux-firmware` ~1GB 级
-- [ ] **单目录条目数**：`/usr/lib`、`/usr/share/man` 上千
-- [ ] `s_maxbytes`（决策未定）
-
-### E. 可降级（**C**，明确 `-EOPNOTSUPP`）
-`fiemap` · `SEEK_HOLE/DATA` · `chattr/lsattr` · `FITRIM` · `i_version`/`btime` · quota · `FICLONE`
+| 本节（作废） | 现指向 |
+|---|---|
+| A. 元数据与权限 | spec §4.5（R-MD-*）、§4.7（R-SP-*） |
+| B. 名字空间与文件操作 | spec §4.3（R-NS-*）、§4.4（R-FD-*） |
+| C. xattr / ACL | spec §4.6（R-XA-*）；**xattr 槽位 = `permission_bits` 高 52 位、单块指针、≤1 FS_block**（spec R-XA-04 / §4.5.1） |
+| D. 容量/规模参数 | spec §4.7（R-SP-*） |
+| E. 可降级 | spec §4.10（R-DG-*） |
 
 ---
 
@@ -159,7 +141,7 @@ root-ravenfs.qcow2   20–40GB    ravenfs        ← 试验组（被测对象）
 
 **关键纪律**：
 1. **金标准 ext4 Arch 必须用官方安装流程装**（不是 pacstrap 进 ravenfs 再克隆回来）→ 这样"差异只可能来自 ravenfs"。
-2. **克隆 = 对照的前提**：`rsync -aHAX --delete`（`-H` 硬链接 / `-A` ACL / `-X` xattr）→ **这本身就是最狠的功能测试**（ACL/xattr/硬链接/稀疏/大文件/setuid 全覆盖）；**不支持 xattr 时它会失败 → 正好暴露 §1-C 的缺口**。
+2. **克隆 = 对照的前提**：`rsync -aHAX --delete`（`-H` 硬链接 / `-A` ACL / `-X` xattr）→ **这本身就是最狠的功能测试**（ACL/xattr/硬链接/稀疏/大文件/setuid 全覆盖）；**不支持 xattr 时它会失败 → 正好暴露 spec §4.6 的缺口**。
 3. **对照纪律**：跑性能/行为对照时，两侧必须**同一镜像快照起点 + 同一 QEMU 参数**（用 qcow2 快照/commit 在宿主侧统一）。
 4. **默认 fallback 走 ext4**（保证永远能起来）。
 5. 无 sudo 建 ESP：`mformat`（mtools，出自 `PS_git/OS_pj_uefi/host_tools/mtools/`）写 FAT；分区表 `sgdisk -n 1:2048:+512M -t 1:ef00`（需装 `gptfdisk`，或用 guest 内工具）。
@@ -284,7 +266,7 @@ kexec -e
 | `ravenfs.ko` | ❌ 未开始（`ravenfs/linux/` 只有一行 TODO 的 Makefile） | **主体工作** |
 | ISO 修补链 | ✅ **已作废**（不需要） | `libisoburn` 已装；验证过但当前不采用 |
 | OVMF | ✅ 系统自带 | 不用 VMtest |
-| xattr / `fallocate` / `link` / `rename` / `readdir` / `getattr` / `setattr` | ❌ 设计缺或未实现 | 第一约束缺口表（§1） |
+| xattr / `fallocate` / `link` / `rename` / `readdir` / `getattr` / `setattr` | ❌ 设计缺或未实现 | 第一约束缺口表 → **spec §4** |
 
 ---
 
@@ -294,7 +276,7 @@ kexec -e
 ① 装金标准 ext4 根（测试矩阵之外，标准工具）        ← 环境准备
 T0 静态（mkfs + mount RO + audit）                 ← 最快闭环
 T1 xfstests -g quick                                ← 缺口表自动生成
-  ↑ 此处逐条补 §1 的 M 项（link/rename/readdir/getattr/setattr/fallocate/xattr）
+  ↑ 此处逐条补 **spec §4** 的 M 项（link/rename/readdir/getattr/setattr/fallocate/xattr）
 T2 fsx/fsstress + audit ×N
 T3 完整安装（insmod → mkfs → 克隆构建 ravenfs 根 + 装 bootloader）  ← §2.1 判据
 T4 从 ESP 启动 ravenfs 系统                          ← 水到渠成，§2.2 判据

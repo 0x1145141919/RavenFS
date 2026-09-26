@@ -1,13 +1,15 @@
 #pragma once
 
-#include "../include/disk_struct_v1.1.hpp"
+/* v1.2：mkfs 适配 v1.2 盘面（type:6 / mode_xattr:12|52 / xattr_ptr 哨兵 / version 3）
+ * 注：用户态上帝类（juvenile_god）**刻意暂不迁移**，仍用 disk_struct_v1.1.hpp；
+ *     mkfs 先行适配 v1.2（见 disk_layout_v1.2_inode.md §8）。 */
+#include "../include/disk_struct_v1.2.h"
 #include "../include/magics.h"
 
 #include <cstdint>
 #include <cstddef>
 
-/* 磁盘格式版本：v1=1，v1.1=2（disk_layout_v1.1.md §1：v1.1 起 bump） */
-constexpr uint32_t RAVENFS_VERSION = 2;
+/* 磁盘格式版本号由 disk_struct_v1.2.h 的 RAVENFS_VERSION 宏提供（v1.2 = 3） */
 
 struct MkfsParams {
     const char *device;

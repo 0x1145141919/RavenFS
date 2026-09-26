@@ -6,7 +6,7 @@
 
 - **学习性项目**（掌握度高，重点：AI 思维可见性）
 - 三端适配：host（用户态）/ sparrowos（内核 kmod）/ linux（内核模块），核心算法在 `core/` 共享
-- 配套规划：`Docs/plan.md`、`Docs/raven_toolchain.md`、`Docs/disk_layout_v1.md`
+- 配套规划：`Docs/raven_toolchain.md`、`Docs/disk_layout_v1.md`（原 `Docs/plan.md` 超远期规划已删，git 历史保留）
 
 ## AI 协作纪律
 

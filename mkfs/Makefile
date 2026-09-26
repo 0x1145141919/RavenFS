@@ -12,7 +12,7 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $^ $(LDLIBS)
 
-HEADERS = mkfs.hpp ../include/disk_struct_v1.1.hpp ../include/magics.h
+HEADERS = mkfs.hpp ../include/disk_struct_v1.2.h ../include/magics.h
 
 %.o: %.cpp $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<
