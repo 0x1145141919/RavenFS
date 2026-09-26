@@ -30,8 +30,6 @@
 
 #define RFS_PTR_INV_V		RFS_PTR_PACK(0, RFS_MASK52)
 
-#define NODE_DIRTY(ms)		do { (ms)->row->dirty = true; (ms)->row->stamp = ktime_get_ns(); } while (0)
-
 static inline void rfs_set_addr(struct ptr_in_idx *p, u64 addr)
 {
 	p->v = RFS_PTR_PACK(0, addr);

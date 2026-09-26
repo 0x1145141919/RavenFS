@@ -269,6 +269,13 @@ v1.2 形式：`uint64_t magics[4]` + `struct parent_ptr_t{uint64_t v}` + `struct
 2. **释放节点块前必须丢弃其 mdata 缓存行**（`ravenfs_mdata_drop`）：合并/根收缩把节点块 `block_free` 后，该块的缓存行若仍 `dirty`（早前写路径留下的），会在后续 `flush_all` 回写到「可能已被重新分配」的块 → 污染新节点。drop 语义：无人引用→直接丢弃；被引用→清 `dirty`（禁回写）。合并/根收缩释放邻居块/旧根前都调用。
 3. **create 的 owner 计数在驱动层维护**：ko `ravenfs_ddentry_insert` 只做树机械（与 god `dentry_leaf_entry_insert` 不同——god 把 inode/堆/计数下沉）。故 ko `create/unlink` 在 walk/insert/delete 前后自维护目录 `size++/--`、`link_count=size+2`。
 
+### E.6 内核版本/回调约定坑（2026-09-27）
+
+1. **`.mkdir` 在本内核（linux-7.2.3）返回 `struct dentry *`**（ext2 约定：成功 `d_instantiate` 后**返 `NULL`** 用原 dentry；失败 `ERR_PTR`）。**不是** `int`。（`.create`/`.rmdir`/`.unlink`/`.rename` 仍返 `int`。）
+2. **rename 的 VFS 分工**：VFS 已做 flag 合法性（`~NOREPLACE|EXCHANGE|WHITEOUT` → `-EINVAL`；NOREPLACE+EXCHANGE → `-EINVAL`）、祖先陷阱（`lock_rename` 的 trap → `-EINVAL`/`-ENOTEMPTY`）、EXCHANGE 目标必须存在、目标覆盖权限。ko `->rename` 只做盘上工作（+ 文件 ctime；目录跨父改 `..`）；**dcache 的 `d_move`/`d_exchange` 由 VFS 自做**（见 spec §4.11.3）。
+3. **EXCHANGE 语义**：两名都保留，仅**交换 `inode_ptr`**（name/hash/堆不动）；目录交换时两侧 `..` 互换。
+4. **测试注意**：M4（文件数据）未接 → **写文件内容 `-EINVAL`**；命名空间测试用 `touch`/`mv`/`stat`，勿用 `echo > f`。`mv -T` 才测「覆盖目录」；`mv`（无 -T）是「移入目录」。
+
 ---
 
 ## 附：god 写入路径调用链（一眼图）

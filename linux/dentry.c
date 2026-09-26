@@ -642,6 +642,267 @@ int ravenfs_rmdir(struct inode *dir, struct dentry *dentry)
 	return 0;
 }
 
+/* ── rename（VFS 自做 d_move/d_exchange 与 flag/祖先校验；ko 只需改盘上两条） ── */
+
+/* 目录 size 增减 + link_count=size+2 同步（delta 可负） */
+static int rfs_dir_adjust(struct super_block *sb, struct inode *dir, int delta)
+{
+	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, dir->i_ino);
+	struct raven_Inode_t *dr;
+	struct timespec64 now;
+
+	if (IS_ERR(ds))
+		return PTR_ERR(ds);
+	dr = ravenfs_session_inode(ds);
+	dr->size = (u64)((s64)dr->size + delta);
+	dr->link_count = (u32)dr->size + 2;
+	now = current_time(dir);
+	dr->mtime = now.tv_sec;
+	dr->m_ns_stamp = (u32)now.tv_nsec;
+	dr->ctime = now.tv_sec;
+	dr->c_ns_stamp = (u32)now.tv_nsec;
+	ds->row->dirty = true;
+	ds->row->stamp = ktime_get_ns();
+	dir->i_size = dr->size;
+	set_nlink(dir, dr->link_count);
+	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
+	inode_set_ctime(dir, now.tv_sec, now.tv_nsec);
+	mark_inode_dirty(dir);
+	return 0;
+}
+
+/* 目录是否为空（盘上 size==0；不用 dcache） */
+static int rfs_dir_is_empty(struct super_block *sb, struct inode *d)
+{
+	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, d->i_ino);
+
+	if (IS_ERR(s))
+		return PTR_ERR(s);
+	return ravenfs_session_inode(s)->size == 0;
+}
+
+/* 写目录的盘上父指针（根节点 ptrs[1] = ".."；叶/内根一致） */
+static int rfs_dir_set_dotdot(struct super_block *sb, u64 dir_ino, u64 parent_ino)
+{
+	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, dir_ino);
+	struct ravenfs_msession *ms __free(ravenfs_msession) = NULL;
+	struct Bptree_meta_t *m;
+	u64 root;
+
+	if (IS_ERR(ds))
+		return PTR_ERR(ds);
+	root = ravenfs_session_inode(ds)->data_root;
+	if (root == (u64)PTR_INVALID)
+		return -EIO;
+	ms = ravenfs_mdata_get(sb, root);
+	if (IS_ERR(ms))
+		return PTR_ERR(ms);
+	m = ravenfs_msession_node(ms);
+	m->ptrs[1].v = RFS_PTR_PACK(0, parent_ino);
+	ms->row->dirty = true;
+	ms->row->stamp = ktime_get_ns();
+	return 0;
+}
+
+/* 交换两条目的 inode_ptr（EXCHANGE）；两条可能共叶 */
+static int rfs_swap_entries(struct super_block *sb, const struct rfs_dpath *op,
+			    const struct rfs_dpath *np)
+{
+	u64 oblk = op->blk[op->depth - 1], nblk = np->blk[np->depth - 1];
+	u32 oi = op->cidx[op->depth - 1], ni = np->cidx[np->depth - 1];
+	struct ravenfs_msession *oms, *nms = NULL;
+	struct Bptree_ddentry_leaf_node_t *ol, *nl;
+	u64 tmp;
+
+	oms = ravenfs_mdata_get(sb, oblk);
+	if (IS_ERR(oms))
+		return PTR_ERR(oms);
+	ol = ravenfs_msession_node(oms);
+	if (oblk == nblk) {
+		tmp = ol->entries[oi].inode_ptr.v;
+		ol->entries[oi].inode_ptr.v = ol->entries[ni].inode_ptr.v;
+		ol->entries[ni].inode_ptr.v = tmp;
+		NODE_DIRTY(oms);
+		ravenfs_mdata_put(oms);
+		return 0;
+	}
+	nms = ravenfs_mdata_get(sb, nblk);
+	if (IS_ERR(nms)) {
+		ravenfs_mdata_put(oms);
+		return PTR_ERR(nms);
+	}
+	nl = ravenfs_msession_node(nms);
+	tmp = ol->entries[oi].inode_ptr.v;
+	ol->entries[oi].inode_ptr.v = nl->entries[ni].inode_ptr.v;
+	nl->entries[ni].inode_ptr.v = tmp;
+	NODE_DIRTY(oms);
+	NODE_DIRTY(nms);
+	ravenfs_mdata_put(nms);
+	ravenfs_mdata_put(oms);
+	return 0;
+}
+
+int ravenfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
+		   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags)
+{
+	struct super_block *sb = old_dir->i_sb;
+	struct inode *old_inode = d_inode(old_dentry);
+	struct inode *new_inode = d_inode(new_dentry);
+	struct rfs_dpath opath, npath;
+	struct rfs_delinfo dt, dro;
+	struct timespec64 now;
+	u32 onlen = old_dentry->d_name.len, nnlen = new_dentry->d_name.len;
+	u64 n_remain = (u64)PTR_INVALID;
+	bool old_is_dir, new_is_dir = false;
+	int err;
+
+	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
+		return -EINVAL;
+	if ((flags & RENAME_NOREPLACE) && (flags & RENAME_EXCHANGE))
+		return -EINVAL;
+	if (onlen == 0 || onlen > RAVENFS_MAX_NAME_LEN ||
+	    nnlen == 0 || nnlen > RAVENFS_MAX_NAME_LEN)
+		return -ENAMETOOLONG;
+	if (!old_inode)
+		return -ENOENT;
+	old_is_dir = S_ISDIR(old_inode->i_mode);
+
+	if (new_inode) {
+		new_is_dir = S_ISDIR(new_inode->i_mode);
+		if (flags & RENAME_NOREPLACE)
+			return -EEXIST;
+		if (!(flags & RENAME_EXCHANGE)) {
+			if (old_is_dir && !new_is_dir)
+				return -ENOTDIR;
+			if (!old_is_dir && new_is_dir)
+				return -EISDIR;
+		}
+	} else if (flags & RENAME_EXCHANGE) {
+		return -ENOENT;	/* EXCHANGE 需两侧都存在（VFS 应早拦） */
+	}
+
+	/* ── EXCHANGE：两名都在，交换 inode_ptr ── */
+	if (flags & RENAME_EXCHANGE) {
+		err = ravenfs_ddentry_walk(sb, old_dir->i_ino, old_dentry->d_name.name, onlen, &opath);
+		if (err)
+			return err;
+		if (!opath.hit)
+			return -ENOENT;
+		err = ravenfs_ddentry_walk(sb, new_dir->i_ino, new_dentry->d_name.name, nnlen, &npath);
+		if (err)
+			return err;
+		if (!npath.hit)
+			return -ENOENT;
+		err = rfs_swap_entries(sb, &opath, &npath);
+		if (err)
+			return err;
+		if (old_is_dir)
+			rfs_dir_set_dotdot(sb, old_inode->i_ino, new_dir->i_ino);
+		if (new_is_dir)
+			rfs_dir_set_dotdot(sb, new_inode->i_ino, old_dir->i_ino);
+		now = current_time(old_dir);
+		inode_set_ctime(old_inode, now.tv_sec, now.tv_nsec);
+		mark_inode_dirty(old_inode);
+		inode_set_ctime(new_inode, now.tv_sec, now.tv_nsec);
+		mark_inode_dirty(new_inode);
+		return 0;
+	}
+
+	/* ── 非 EXCHANGE：目标先删 → 删旧名 → 插新名 ── */
+	if (new_inode) {
+		if (new_is_dir) {
+			int e = rfs_dir_is_empty(sb, new_inode);
+
+			if (e < 0)
+				return e;
+			if (!e)
+				return -ENOTEMPTY;
+		}
+		err = ravenfs_ddentry_walk(sb, new_dir->i_ino, new_dentry->d_name.name, nnlen, &npath);
+		if (err)
+			return err;
+		if (!npath.hit)
+			return -ENOENT;
+		memset(&dt, 0, sizeof(dt));
+		dt.remain = (u64)PTR_INVALID;
+		err = ravenfs_ddentry_delete(sb, new_dir->i_ino, &npath, &dt);
+		if (err)
+			return err;
+		if (new_is_dir) {
+			struct ravenfs_session *t __free(ravenfs_session) =
+				ravenfs_session_get(sb, new_inode->i_ino);
+			u64 troot = (u64)PTR_INVALID;
+
+			if (!IS_ERR(t))
+				troot = ravenfs_session_inode(t)->data_root;
+			ravenfs_dir_name_heap_release(sb, new_inode->i_ino);
+			if (troot != (u64)PTR_INVALID) {
+				ravenfs_mdata_drop(sb, troot);
+				ravenfs_block_free(sb, troot, 2);
+			}
+			clear_nlink(new_inode);
+		} else {
+			if (dt.name_len > DENTRY_INLINE_NAME_MAX)
+				ravenfs_name_heap_free(sb, new_dir->i_ino, dt.name_len, dt.remain);
+			if (new_inode->i_nlink)
+				inode_dec_link_count(new_inode);
+		}
+		now = current_time(new_dir);
+		inode_set_ctime(new_inode, now.tv_sec, now.tv_nsec);
+	}
+
+	err = ravenfs_ddentry_walk(sb, old_dir->i_ino, old_dentry->d_name.name, onlen, &opath);
+	if (err)
+		return err;
+	if (!opath.hit)
+		return -ENOENT;
+	memset(&dro, 0, sizeof(dro));
+	dro.remain = (u64)PTR_INVALID;
+	err = ravenfs_ddentry_delete(sb, old_dir->i_ino, &opath, &dro);
+	if (err)
+		return err;
+	if (dro.name_len > DENTRY_INLINE_NAME_MAX)
+		ravenfs_name_heap_free(sb, old_dir->i_ino, dro.name_len, dro.remain);
+
+	if (nnlen > DENTRY_INLINE_NAME_MAX) {
+		err = ravenfs_name_heap_alloc(sb, new_dir->i_ino, nnlen, &n_remain);
+		if (err)
+			return err;
+		err = ravenfs_name_heap_write(sb, nnlen, n_remain,
+					      (const char *)new_dentry->d_name.name + DENTRY_INLINE_NAME_MAX);
+		if (err) {
+			ravenfs_name_heap_free(sb, new_dir->i_ino, nnlen, n_remain);
+			return err;
+		}
+	}
+	err = ravenfs_ddentry_walk(sb, new_dir->i_ino, new_dentry->d_name.name, nnlen, &npath);
+	if (err)
+		goto out_heap;
+	err = ravenfs_ddentry_insert(sb, new_dir->i_ino, &npath, new_dentry->d_name.name, nnlen,
+				     xxh64(new_dentry->d_name.name, nnlen, 0),
+				     old_inode->i_ino, n_remain);
+	if (err)
+		goto out_heap;
+
+	/* 计数：old_dir -1；new_dir = +1(新) - (目标?1:0) */
+	rfs_dir_adjust(sb, old_dir, -1);
+	rfs_dir_adjust(sb, new_dir, new_inode ? 0 : 1);
+
+	/* 跨目录移动目录 → 改盘上父指针 */
+	if (old_is_dir && old_dir != new_dir)
+		rfs_dir_set_dotdot(sb, old_inode->i_ino, new_dir->i_ino);
+
+	now = current_time(old_dir);
+	inode_set_ctime(old_inode, now.tv_sec, now.tv_nsec);
+	mark_inode_dirty(old_inode);
+	return 0;
+
+out_heap:
+	if (nnlen > DENTRY_INLINE_NAME_MAX)
+		ravenfs_name_heap_free(sb, new_dir->i_ino, nnlen, n_remain);
+	return err;
+}
+
 struct dentry *ravenfs_lookup(struct inode *dir, struct dentry *dentry,
 			      unsigned int flags)
 {

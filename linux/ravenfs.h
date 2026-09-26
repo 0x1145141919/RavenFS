@@ -135,6 +135,8 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir, struct 
 			     umode_t mode);
 int ravenfs_unlink(struct inode *dir, struct dentry *dentry);
 int ravenfs_rmdir(struct inode *dir, struct dentry *dentry);
+int ravenfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
+		   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags);
 
 /* 名字物化（≤40 内联 / >40 读名字堆尾段）—— 供 dentry_write.c 复合序比较用 */
 int ravenfs_ddentry_name(struct super_block *sb, const struct ddentry_t *e,
@@ -316,6 +318,10 @@ static inline void *ravenfs_msession_node(struct ravenfs_msession *s)
 {
 	return s->row->data;
 }
+
+/* 标记 mdata 行脏（回写交 flush_all；调用点需含 linux/timekeeping.h） */
+#define NODE_DIRTY(ms) \
+	do { (ms)->row->dirty = true; (ms)->row->stamp = ktime_get_ns(); } while (0)
 
 /* ── 自写 TTL 淘汰器（cache_ttl.c）── */
 struct ravenfs_ttl;

@@ -460,6 +460,7 @@ static const struct inode_operations ravenfs_dir_inode_operations = {
 	.mkdir		= ravenfs_mkdir,
 	.unlink		= ravenfs_unlink,
 	.rmdir		= ravenfs_rmdir,
+	.rename		= ravenfs_rename,
 	.getattr	= ravenfs_getattr,
 };
 
