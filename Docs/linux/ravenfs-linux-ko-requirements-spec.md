@@ -177,7 +177,7 @@
 | R-NS-10 | `atomic_open`：可选优化；缺省退化为 lookup→create | A: `vfs.rst` | C | 不做 | ❌ |
 | R-NS-11 | `iterate_shared`（readdir）：cookie 续读、`.`/`..` **合成**；**单次 syscall 内原子/稳定**（VFS `i_rwsem` 读锁）；**跨调用不保证原子/一致性**（锁按 syscall 持有→释放，不阻止并发修改）；cookie 失效 → 容错重扫（**不得崩/不得死循环**；允许重/跳） | A: `fs/readdir.c:103`；E4/I4 | **M** | `dir_context.pos` + `dir_emit`；cookie = 叶块号+槽号（**可校验可重定位**） | ❌ |
 | R-NS-12 | `permission`：缺省走 `generic_permission`（`fs/namei.c:521`），**不实现** | A: `vfs.rst` | C | 用缺省 | ✅ |
-| R-NS-13 | `d_revalidate`：本地磁盘 FS 不需要 | A: 惯例 | C | 不做 | ✅ |
+| R-NS-13 | `d_revalidate`：本地磁盘 FS 不需要（**一致性纪律见 §4.11.3**） | A: 惯例 | C | 不做 | ✅ |
 
 > **注 R-NS-11（readdir 并发模型）**：目录 `i_rwsem` = `lookup`/`readdir` **读**、改操作 **写**（`fs/namei.c:1935/2918`、`fs/readdir.c:103`）→ 读读并发、读写互斥。
 > **原子性范围 = 单次 syscall（2026-09-26 裁决）**：锁**按 syscall 持有→释放** → **单次 `getdents` 内目录稳定**；**跨调用之间不保证原子/一致性**（锁已放掉，不阻止并发修改，保留别人原子删除的权利）。⇒ cookie 只需「可校验 + 可重定位」；并发修改下的承诺**只到“不崩/不死循环”**，**允许重/跳**（**不承诺“不丢条”**）。
@@ -431,6 +431,58 @@
 **G. 回写语义（M3 必做，已定）**
 - `write_inode` = **同步 logical inode → mgr 行**（**仅 VFS 拥有的字段**：uid/gid/mode/nlink/size/时间戳[+ns]/rdev；**不动** data_root/inline_data/heaps/xattr_ptr 等**盘专有字段**）+ 行 `dirty=true`；**不做块 I/O**（logical inode 与盘 inode 解耦 → 写不出盘记录）。
 - **落盘路径收敛（唯一）**：`flush_all` —— ① `sync_fs`；② umount（`put_super`）；③ `fsync` 单 inode 行。**`write_inode` 永不落盘**；**TTL 淘汰永不写盘（只摘 clean 行，dirty 行跳过、等 flush）**。M3 不做周期 flusher（崩溃目标=不产生损坏）。
+
+### 4.11.3 VFS dcache ↔ 盘上 ddentry：一致性纪律（2026-09-27 定）
+
+> **背景**：readdir 直接读盘上 ddentry 树（mdata 片缓存），路径解析走 VFS dcache；两条路径的可见性来源不同，用户追问「rename/rmdir 时二者如何一致」。
+> **结论**：**刻意不造自有同步机制**；靠「VFS 变名 ⇒ 两层原子同改」+ 单挂载契约 + 一条不变量兜底。dcache 的所有权是 VFS 的，不是 ko 的。
+
+**三层解耦（已实现即此）**
+
+| 层 | 对象 | 载体/缓存 | 权威？ |
+|---|---|---|---|
+| ① VFS dcache | `struct dentry`（name→inode 加速器） | VFS 自管 | **投影**（随时可回收） |
+| ② 盘上 ddentry 树 | `ddentry_t`(64B) 藏在 B+tree 节点(8K) | `mdata_piece_cache_mgr`（8K 片） | **权威**（内存态） |
+| ③ 盘 | 8K 节点 = 2 连续 FS_block | — | 落盘 = `flush_all` |
+
+- **没有 dentry 专用缓存**：`Dentry_t` 嵌在 B+tree 节点里，天然单元 = 节点(8K) = 一个 mdata 片；`mdata_piece_cache_mgr` 是**内容无关的传输层**（只管 8K 片 + dirty + TTL），同时服务 ddentry 树节点与名字堆。
+- **权威 = 盘上 mdata 片**；VFS dcache 仅投影（本地盘 FS，无 `d_revalidate`，见 R-NS-13）。
+
+**内核「背着 ko 用 dcache」的时机（源码实证，`linux-7.2.3`）**
+
+1. **路径解析**：`lookup_fast()`（`fs/namei.c:1843`）命中 dcache 即返回；唯一回调 `d_revalidate`（`namei.c:1031`）在**无 `dentry_operations` 时恒返回 1**（`DCACHE_OP_REVALIDATE` 未置）→ ko 收不到。只有 dcache miss 才进 `->lookup`（`__lookup_slow`，`namei.c:2278`）。
+2. **负 dentry 缓存**：`lookup` 返 NULL → VFS 存负项 → 后续同名查找在 dcache 层短路（ENOENT），ko 的 `lookup` 收不到。
+3. **`stat`/`getattr`**：正 dentry → 内存 inode + `generic_fillattr`，不回盘。
+4. **`..` 解析**：`follow_dotdot` 用 **`d_parent`**（dcache 父子链），不读盘上 `parent_ptr`。**dcache 父关系与盘上父指针是两套独立表示。**
+5. **rename**：`vfs_rename` 在 fs 回调成功**之后**自己做手术（`namei.c:6084-6091`）：`d_move(old,new)` 或 `d_exchange`；目标目录另做 `shrink_dcache_parent`+`S_DEAD`+`dont_mount`+`detach_mounts`。
+6. **unlink/rmdir**：回调成功后 `d_delete_notify()`→`d_delete()`（`fs/dcache.c:2682`）摘链；refcount==1 且无别名 → 转负，否则只 unhash。
+
+**为什么不需要自有同步**
+
+- **任何经 VFS 的名字变更，VFS 两头都改**：盘上（调 ko 回调）+ dcache（`d_move`/`d_delete`/`d_instantiate` 由 VFS 自做）。ko **根本不需要碰 dcache**。
+- **并发正确性免费**：rename/rmdir 持目录 `i_rwsem` 写锁，readdir/lookup 持读锁 → 单挂载内「读到半改状态」被自动挡住（R-NS-11）。
+- **反面成本已付**：`d_revalidate` 跑在**每次路径解析**上（需 generation/版本号、RCU 回退、加延迟）——那是 **NFS/FUSE 这类「有外部写者」**才必须买的单。本地单挂载盘没有外部写者 ⇒ 不应买单。
+
+**成立的隐含契约（必须显式钉住，破了会静默崩）**
+
+| 契约 | 谁保证 | 破了会怎样 |
+|---|---|---|
+| **单挂载**（同一时刻只有一个写入 mount） | 流程约束 | dcache 每 mount 一套，两套间**无失效广播** |
+| **线下工具只在未挂载镜像上跑**（mkfs / audit_v1.2 / mkbigdir…） | 工具纪律 | 挂载期跑 → dcache 立刻骗人 |
+| **回调返回 0 ⇔ 盘上 ddentry 树已改完** | 写序纪律 | dcache 永久说谎，且无 revalidate **不可自愈** |
+
+> ⚠ **两个轴别混**：轴-1「dcache ↔ ddentry」是 **VFS 的活**（本节的纪律只要求「返回 0 ⇔ 落定」）；轴-2「ko 自有缓存（inode 行 / mdata 片 / TTL）↔ 盘」是 **ko 的活**（权威 = `flush_all`，§4.11.1/§4.11.2）。两轴都要求「返回成功前已落定」，但只有轴-2 是 ko 代码里要守的。
+
+**逃生口（记下，不实现）**：一旦契约破裂（多挂载 / 热工具），最便宜的升级 = 盘上加 **sb 级 generation**（每次变名 ++，随 flush 落），`.d_revalidate` 只比对 generation；或在变更后显式 `d_invalidate()` / `shrink_dcache_sb()`。**知道出口在哪即可。**
+
+**实现注意（M5 起）**
+
+- rename/rmdir **返回 0 前盘上必须落定**（内存行 + `dirty` 即可，读路径与 mdata 缓存同源已满足）。
+- rmdir 判空用**盘上 `size==0` / `link_count==2`**，**禁用** `simple_empty()`（那是读 dcache）。
+- rename 未知 flag → `-EINVAL`；`RENAME_EXCHANGE` 真交换盘上两条（R-NS-08）。
+- 跨目录 rename：盘上 dir 父指针（`parent_ptr.ptr`="..")要自己改（dcache 的 `d_parent` 由 VFS 改）。
+
+---
 
 ## 5. 追溯矩阵（Arch 组件 → syscall → VFS 回调 → 需求）
 
