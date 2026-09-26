@@ -244,8 +244,10 @@ struct Auditor {
 
     void parse_heaps(uint64_t inum, const raven_dir_Inode_t *d) {
         cur_heaps.clear();
-        for (int s = 0; s < 10; s++) {
-            const name_heap_controller_t &c = d->heaps[s];
+        for (int s = 0; s < (int)RFS_DIR_HEAP_COUNT; s++) {
+            const name_heap_controller_t *cp = rfs_dir_heap_c(d, (unsigned)s);
+            if (!cp) continue;
+            const name_heap_controller_t &c = *cp;
             uint64_t bmpb = RFS_NHC_BITMAP(c);
             uint64_t datab = RFS_NHC_DATA(c);
             uint8_t  gran = (uint8_t)RFS_NHC_GRAN(c);

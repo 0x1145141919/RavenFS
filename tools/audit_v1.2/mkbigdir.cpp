@@ -243,8 +243,8 @@ static void set_dir(raven_dir_Inode_t *d, uint64_t size, uint64_t data_root, uin
     d->mode_xattr = RFS_MODE_XATTR_PACK(mode, RFS_XATTR_NONE);
     d->size       = size;
     d->data_root  = data_root;
-    for (int i = 0; i < 10; i++)
-        RFS_NHC_SET(d->heaps[i], 0, 0, NAME_HEAP_INACTIVE, 0, NAME_HEAP_INACTIVE);
+    for (int i = 0; i < RFS_DIR_HEAP_COUNT; i++)
+        RFS_NHC_SET(*rfs_dir_heap(d, i), 0, 0, NAME_HEAP_INACTIVE, 0, NAME_HEAP_INACTIVE);
 }
 
 int main(int argc, char **argv) {

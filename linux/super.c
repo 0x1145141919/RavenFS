@@ -165,15 +165,19 @@ static u64 ravenfs_inode_blocks4k(struct super_block *sb, const struct raven_Ino
 
 		ravenfs_count_dentry_nodes(sb, r->data_root, 0, &nodes);
 		blks += nodes * 2;			/* dentry 树节点（8K/个） */
-		for (i = 0; i < 10; i++) {		/* name_heap：位图面 + 数据面 */
-			u64 bmp = RFS_NHC_BITMAP(d->heaps[i]);
-			u64 dat = RFS_NHC_DATA(d->heaps[i]);
+		for (i = 0; i < RFS_DIR_HEAP_COUNT; i++) {	/* name_heap：位图面 + 数据面 */
+			const struct name_heap_controller_t *h = rfs_dir_heap_c(d, i);
+			u64 bmp, dat;
 			u32 bits, gran;
 
+			if (!h)
+				continue;
+			bmp = RFS_NHC_BITMAP(*h);
+			dat = RFS_NHC_DATA(*h);
 			if (bmp == (u64)RFS_MASK52 && dat == (u64)RFS_MASK52)
 				continue;		/* 未激活 */
-			bits = RFS_NHC_BITS(d->heaps[i]);
-			gran = RFS_NHC_GRAN(d->heaps[i]);
+			bits = RFS_NHC_BITS(*h);
+			gran = RFS_NHC_GRAN(*h);
 			blks += (1ULL << bits) / RAVENFS_BITS_PER_BLOCK;
 			blks += 1ULL << (bits + gran - 12);
 		}

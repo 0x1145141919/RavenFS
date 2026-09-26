@@ -335,8 +335,8 @@ static void build_root_inode(raven_Inode_t *inode, uint64_t root_dentry_block) {
     inode->link_count              = 2;
     /* 名字堆 10 描述符：未激活哨兵（bitmap/data_base 双指针 52 位全 1） */
     raven_dir_Inode_t *dino = (raven_dir_Inode_t *)inode;
-    for (int i = 0; i < 10; i++)
-        RFS_NHC_SET(dino->heaps[i], 0, 0, NAME_HEAP_INACTIVE, 0, NAME_HEAP_INACTIVE);
+    for (int i = 0; i < RFS_DIR_HEAP_COUNT; i++)
+        RFS_NHC_SET(*rfs_dir_heap(dino, i), 0, 0, NAME_HEAP_INACTIVE, 0, NAME_HEAP_INACTIVE);
 }
 
 /* ═══════════════════════════════════════════════════════════════

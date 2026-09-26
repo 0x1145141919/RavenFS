@@ -127,8 +127,8 @@ static void set_common(raven_Inode_t *ino, uint32_t type, uint32_t direct, uint6
     ino->data_root  = data_root;
 }
 static void set_dir_heap_inactive(raven_dir_Inode_t *d) {
-    for (int i = 0; i < 10; i++)
-        RFS_NHC_SET(d->heaps[i], 0, 0, NAME_HEAP_INACTIVE, 0, NAME_HEAP_INACTIVE);
+    for (int i = 0; i < RFS_DIR_HEAP_COUNT; i++)
+        RFS_NHC_SET(*rfs_dir_heap(d, i), 0, 0, NAME_HEAP_INACTIVE, 0, NAME_HEAP_INACTIVE);
 }
 
 int main(int argc, char **argv) {
@@ -227,8 +227,8 @@ int main(int argc, char **argv) {
         d.mode_xattr = RFS_MODE_XATTR_PACK(0755, RFS_XATTR_NONE);
         set_dir_heap_inactive(&d);
         if (add_long) {
-            /* 激活 heaps[0] = 8B 粒度 / bits_log2=16（位图 2 块、数据 128 块） */
-            RFS_NHC_SET(d.heaps[0], 3, 16, blk_hb, 0, blk_hd);
+            /* 激活 heaps_8B_8k = 8B 粒度 / bits_log2=16（位图 2 块、数据 128 块） */
+            RFS_NHC_SET(*rfs_dir_heap(&d, 0), 3, 16, blk_hb, 0, blk_hd);
         }
         im.wr(&d, 256, blkoff(im.inode_array_base) + im.root_inode*256);
     }

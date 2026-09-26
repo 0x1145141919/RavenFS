@@ -36,6 +36,7 @@
 #  include <linux/types.h>   /* 内核：提供 u8..u64，并在 linux/types.h 里 typedef 到 uintN_t */
 #else
 #  include <stdint.h>        /* 用户态 / god / C++ */
+#  include <stddef.h>        /* NULL */
 #endif
 
 /* ─────────────────────────── 语言 / 编译器适配 ─────────────────────────── */
@@ -305,9 +306,59 @@ struct raven_dir_Inode_t {
     uint64_t  atime;
     uint64_t  data_root;        /* PTR_INVALID = inline */
     uint64_t  padding[2];       /* 未来预留 */
-    struct name_heap_controller_t heaps[10];  /* [96:256) 10 个堆描述符（8B×3 / 64B×2 / 128B×2 / 256B×2 / 512B×1） */
+    /* ── 名字堆：10 个描述符 **刻意展开命名**（与 v1.1 同构；**不用数组**，杜绝衰减/越界腐坏）。
+     * 粒度 × 位图档：8B{8k,16k,32k} · 64B{8k,16k} · 128B{8k,16k} · 256B{8k,16k} · 512B{8k}
+     * 尾段长度档（name_len-40）：≤40→8B堆；41–64→64B；65–128→128B；129–256→256B；257–512→512B。
+     * 懒激活：激活 = 位图面 + 数据面各一次连续分配（mdata_piece 硬 8k 对齐）。
+     * 按序访问用 rfs_dir_heap()/rfs_dir_heap_c()（有序索引 + **越界返回 NULL**）。 */
+    struct name_heap_controller_t heaps_8B_8k;   /* [96:112)  */
+    struct name_heap_controller_t heaps_8B_16k;  /* [112:128) */
+    struct name_heap_controller_t heaps_8B_32k;  /* [128:144) */
+    struct name_heap_controller_t heaps_64B_8k;  /* [144:160) */
+    struct name_heap_controller_t heaps_64B_16k; /* [160:176) */
+    struct name_heap_controller_t heaps_128B_8k; /* [176:192) */
+    struct name_heap_controller_t heaps_128B_16k;/* [192:208) */
+    struct name_heap_controller_t heaps_256B_8k; /* [208:224) */
+    struct name_heap_controller_t heaps_256B_16k;/* [224:240) */
+    struct name_heap_controller_t heaps_512B_8k; /* [240:256) */
 } RFS_PACKED;
 RFS_STATIC_ASSERT(sizeof(struct raven_dir_Inode_t) == 256, "raven_dir_Inode_t must be 256B");
+
+/* 名字堆描述符个数（访问器越界保护用） */
+#define RFS_DIR_HEAP_COUNT 10
+
+/*
+ * 有序索引访问（0..9）—— 刻意用 switch 而**不是**首地址+偏移：
+ *   · 越界 i ≥ 10 → 返回 NULL（调用方必检）；
+ *   · 不依赖“10 个字段连续”的实现细节；
+ *   · 用 offsetof 取址，避开 packed 成员的取址告警（-Waddress-of-packed-member）。
+ *   · C / C++ 双兼容。
+ */
+static inline const struct name_heap_controller_t *
+rfs_dir_heap_c(const struct raven_dir_Inode_t *d, unsigned int i)
+{
+    static const unsigned int off[RFS_DIR_HEAP_COUNT] = {
+        offsetof(struct raven_dir_Inode_t, heaps_8B_8k),
+        offsetof(struct raven_dir_Inode_t, heaps_8B_16k),
+        offsetof(struct raven_dir_Inode_t, heaps_8B_32k),
+        offsetof(struct raven_dir_Inode_t, heaps_64B_8k),
+        offsetof(struct raven_dir_Inode_t, heaps_64B_16k),
+        offsetof(struct raven_dir_Inode_t, heaps_128B_8k),
+        offsetof(struct raven_dir_Inode_t, heaps_128B_16k),
+        offsetof(struct raven_dir_Inode_t, heaps_256B_8k),
+        offsetof(struct raven_dir_Inode_t, heaps_256B_16k),
+        offsetof(struct raven_dir_Inode_t, heaps_512B_8k),
+    };
+
+    if (i >= RFS_DIR_HEAP_COUNT)
+        return NULL;
+    return (const struct name_heap_controller_t *)(const void *)((const char *)d + off[i]);
+}
+static inline struct name_heap_controller_t *
+rfs_dir_heap(struct raven_dir_Inode_t *d, unsigned int i)
+{
+    return (struct name_heap_controller_t *)rfs_dir_heap_c(d, i);
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Bptree_meta_t —— 节点元数据（独立 64B 头；ptrs[3] 按角色解码，见 v1.1 §4）
