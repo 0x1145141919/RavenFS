@@ -30,29 +30,35 @@
 
 /* ── 8K 节点读取已移至 mdata_cache.c（走 mdata_piece_cache_mgr + session） ── */
 
-/* 跨块读任意字节（off 为块内偏移） */
+/*
+ * 跨块读任意字节（off 为块内偏移）—— **走 mdata 8K 片缓存**（与写路径同源）。
+ * 为什么不直接 sb_bread：写路径改了 mdata 缓存但尚未落盘时，直接读盘会读到旧内容
+ * （外置名/堆数据“刚写完读不到”）；统一走缓存保证同源可见。
+ */
 static int ravenfs_read_bytes(struct super_block *sb, u64 fs_blk, u32 off,
 			      u32 len, void *out)
 {
-	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	u8 *p = out;
 
 	while (len) {
-		struct buffer_head *bh;
+		u64 piece = fs_blk & ~1ULL;
+		u32 in_piece = (u32)((fs_blk - piece) * RAVENFS_BLOCK_SIZE + off);
 		u32 n;
+		struct ravenfs_msession *ms __free(ravenfs_msession) =
+			ravenfs_mdata_get(sb, piece);
 
-		if (fs_blk >= sbi->total_blocks)
-			return -EIO;
-		bh = sb_bread(sb, ravenfs_dev_blk(sbi, fs_blk));
-		if (!bh)
-			return -EIO;
-		n = min_t(u32, len, RAVENFS_BLOCK_SIZE - off);
-		memcpy(p, bh->b_data + off, n);
-		brelse(bh);
+		if (IS_ERR(ms))
+			return PTR_ERR(ms);
+		n = min_t(u32, len, RAVENFS_MDATA_NODE_BYTES - in_piece);
+		memcpy(p, (char *)ravenfs_msession_node(ms) + in_piece, n);
 		p += n;
 		len -= n;
-		fs_blk++;
-		off = 0;
+		if (in_piece + n >= RAVENFS_MDATA_NODE_BYTES) {
+			fs_blk = piece + 2;
+			off = 0;
+		} else {
+			off = in_piece + n;
+		}
 	}
 	return 0;
 }
@@ -301,11 +307,12 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	struct timespec64 now;
 	struct inode *inode;
 	u64 inum, root_blk;
+	u64 remain_ptr = (u64)PTR_INVALID;
 	u32 nlen = dentry->d_name.len, cnt;
 	int err;
 
-	if (nlen == 0 || nlen > DENTRY_INLINE_NAME_MAX)
-		return -ENAMETOOLONG;		/* 外置名（name_heap）待 M3.4b */
+	if (nlen == 0 || nlen > RAVENFS_MAX_NAME_LEN)
+		return -ENAMETOOLONG;
 	if (!S_ISDIR(dir->i_mode))
 		return -ENOTDIR;
 
@@ -363,6 +370,22 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	ts->row->dirty = true;
 	ts->row->stamp = ktime_get_ns();
 
+	/* 长名（>40B）：尾段外置到目录名字堆 */
+	if (nlen > DENTRY_INLINE_NAME_MAX) {
+		err = ravenfs_name_heap_alloc(sb, dir->i_ino, nlen, &remain_ptr);
+		if (err) {
+			ravenfs_inode_reclaim(sb, inum);
+			return err;
+		}
+		err = ravenfs_name_heap_write(sb, nlen, remain_ptr,
+					      (const char *)dentry->d_name.name + DENTRY_INLINE_NAME_MAX);
+		if (err) {
+			ravenfs_name_heap_free(sb, dir->i_ino, nlen, remain_ptr);
+			ravenfs_inode_reclaim(sb, inum);
+			return err;
+		}
+	}
+
 	/* 叶插入 */
 	if (loc.idx > cnt)
 		loc.idx = cnt;
@@ -372,7 +395,7 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	memset(e, 0, sizeof(*e));
 	e->inode_ptr.v = RFS_PTR_PACK(nlen, inum);
 	e->hash = xxh64(dentry->d_name.name, nlen, 0);
-	e->full_char_remain_ptr = (u64)PTR_INVALID;
+	e->full_char_remain_ptr = remain_ptr;
 	memcpy(e->name, dentry->d_name.name, min_t(u32, nlen, (u32)DENTRY_INLINE_NAME_MAX));
 	meta->parent_ptr.v = RFS_PP_PACK(cnt + 1, RFS_PP_IS_INNER(meta->parent_ptr),
 					 RFS_PP_IS_ROOT(meta->parent_ptr), RFS_PP_PTR(meta->parent_ptr));
@@ -413,10 +436,12 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 	struct rfs_dloc loc;
 	struct timespec64 now;
 	u64 root_blk;
+	u64 rem_remain = (u64)PTR_INVALID;
 	u32 nlen = dentry->d_name.len, cnt;
+	u32 rem_name_len = 0;
 	int err;
 
-	if (nlen == 0 || nlen > DENTRY_INLINE_NAME_MAX)
+	if (nlen == 0 || nlen > RAVENFS_MAX_NAME_LEN)
 		return -ENAMETOOLONG;
 	ds = ravenfs_session_get(sb, dir->i_ino);
 	if (IS_ERR(ds))
@@ -442,6 +467,8 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 	cnt = RFS_PP_COUNT(meta->parent_ptr);
 	if (loc.idx >= cnt)
 		return -EIO;
+	rem_name_len = RFS_PTR_FREE(lf->entries[loc.idx].inode_ptr);
+	rem_remain = lf->entries[loc.idx].full_char_remain_ptr;
 	memmove(&lf->entries[loc.idx], &lf->entries[loc.idx + 1],
 		(size_t)(cnt - loc.idx - 1) * sizeof(struct Dentry_t));
 	memset(&lf->entries[cnt - 1], 0, sizeof(struct Dentry_t));
@@ -464,6 +491,14 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
 	inode_set_ctime(dir, now.tv_sec, now.tv_nsec);
 	mark_inode_dirty(dir);
+
+	/* 长名尾段：释放堆存储（失败仅告警：条目已移除；孤儿位 audit 不判损） */
+	if (rem_name_len > DENTRY_INLINE_NAME_MAX) {
+		int herr = ravenfs_name_heap_free(sb, dir->i_ino, rem_name_len, rem_remain);
+
+		if (herr)
+			pr_warn("ravenfs: name_heap_free(%u) failed: %d\n", rem_name_len, herr);
+	}
 
 	/* 目标 inode：nlink--（VFS 后续 evict → ravenfs_inode_reclaim 回收槽位） */
 	if (inode) {

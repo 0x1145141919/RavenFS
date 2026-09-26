@@ -6,7 +6,7 @@
 #   guest 内构建由 vm/share/install-ravenfs-module.sh 走 `make -C $KDIR M=<src>/linux modules`
 #
 obj-m += ravenfs.o
-ravenfs-y := super.o dentry.o inode_cache.o mdata_cache.o cache_ttl.o bitmap.o
+ravenfs-y := super.o dentry.o inode_cache.o mdata_cache.o cache_ttl.o bitmap.o name_heap.o
 
 # v1.2 盘面头在 ../include（C/C++ 双兼容，内部按 __KERNEL__ 选 linux/types.h）
 ccflags-y := -I$(src)/../include

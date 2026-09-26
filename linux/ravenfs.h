@@ -201,6 +201,14 @@ int  ravenfs_inode_sync_from_vfs(struct super_block *sb, struct inode *inode);
 void ravenfs_inode_mark_dirty(struct super_block *sb, u64 inum);
 void ravenfs_inode_reclaim(struct super_block *sb, u64 inum);
 
+/* ── 名字堆（name_heap.c）：长名（>40B）外置部分的 分配/写/释放 ── */
+int ravenfs_name_heap_alloc(struct super_block *sb, u64 dir_ino, u32 name_len,
+			    u64 *out_remain_ptr);
+int ravenfs_name_heap_write(struct super_block *sb, u32 name_len, u64 remain_ptr,
+			    const char *tail);
+int ravenfs_name_heap_free(struct super_block *sb, u64 dir_ino, u32 name_len,
+			   u64 remain_ptr);
+
 struct ravenfs_session *ravenfs_session_get(struct super_block *sb, u64 inum);
 void ravenfs_session_put(struct ravenfs_session *s);
 
