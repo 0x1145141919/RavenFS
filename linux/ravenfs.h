@@ -150,6 +150,15 @@ int ravenfs_ddentry_walk(struct super_block *sb, u64 dir_ino, const char *name, 
 int ravenfs_ddentry_insert(struct super_block *sb, u64 dir_ino, const struct rfs_dpath *p,
 			  const char *name, u32 nlen, u64 hash, u64 inum, u64 remain_ptr);
 
+/* 删除一个条目（含 balance/合并/抹匀/根收缩）；info 回传被删条目的下游资产信息 */
+struct rfs_delinfo {
+	u64	inum;		/* 目标 inode 编号（52 位形态） */
+	u32	name_len;	/* 全名长（RFS_PTR_FREE） */
+	u64	remain;		/* 长名尾段定位；短名 = PTR_INVALID */
+};
+int ravenfs_ddentry_delete(struct super_block *sb, u64 dir_ino, const struct rfs_dpath *p,
+			   struct rfs_delinfo *info);
+
 struct inode *ravenfs_iget(struct super_block *sb, u64 inum);
 int ravenfs_read_node(struct super_block *sb, u64 blk, void *buf);
 
@@ -289,6 +298,8 @@ int  ravenfs_mdata_writeback_all(struct super_block *sb);
 
 struct ravenfs_msession *ravenfs_mdata_get(struct super_block *sb, u64 blk);
 void ravenfs_mdata_put(struct ravenfs_msession *s);
+/* 释放节点块前丢弃其 mdata 缓存行（防陈旧脏行回写污染复用块） */
+void ravenfs_mdata_drop(struct super_block *sb, u64 blk);
 
 DEFINE_FREE(ravenfs_msession, struct ravenfs_msession *,
 	    if (!IS_ERR_OR_NULL(_T)) ravenfs_mdata_put(_T))

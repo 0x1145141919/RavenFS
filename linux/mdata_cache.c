@@ -260,6 +260,44 @@ void ravenfs_mdata_put(struct ravenfs_msession *s)
 	kfree(s);
 }
 
+/*
+ * 丢弃某节点块的缓存行（平衡/根收缩释放节点块时调用）。
+ * 该块内容已被搬走/作废 → 若仍缓存且无人引用则直接丢弃；若被引用则清 dirty
+ * （禁回写），防陈旧脏行在块被重新分配并写入新节点后回写污染。
+ */
+void ravenfs_mdata_drop(struct super_block *sb, u64 blk)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	struct ravenfs_mdata_cache *c = sbi ? sbi->mcache : NULL;
+	struct ravenfs_mdata_shard *sh;
+	struct ravenfs_mrow *row;
+	u64 node_idx;
+	unsigned long key;
+	u32 sh_idx;
+
+	if (!c)
+		return;
+	node_idx = blk >> 1;
+	if ((node_idx << 1) >= c->total_blocks)
+		return;
+	sh_idx = (u32)(node_idx >> c->shard_bits);
+	key = (unsigned long)node_idx & c->node_mask;
+	sh = &c->shards[sh_idx];
+
+	down_write(&sh->lock);
+	row = xa_load(&sh->rows, key);
+	if (row) {
+		if (refcount_read(&row->ref) <= 1) {
+			row = xa_erase(&sh->rows, key);
+			if (row)
+				ravenfs_mrow_free(c, row);
+		} else {
+			row->dirty = false;	/* 内容作废：禁回写 */
+		}
+	}
+	up_write(&sh->lock);
+}
+
 /* 兼容层：原 ravenfs_read_node() 现在走 mdata session（全 ko 节点读统一过大缓存） */
 int ravenfs_read_node(struct super_block *sb, u64 blk, void *buf)
 {

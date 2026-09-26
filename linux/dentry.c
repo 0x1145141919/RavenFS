@@ -215,82 +215,7 @@ static int ravenfs_dir_find(struct inode *dir, const char *name, u32 nlen, u64 *
 	return err;
 }
 
-/* ── create / unlink（M3.4a：REG，单叶目录 + 内联名；多级树/外置名/其他类型待 M5） ── */
-
-/* 目录项定位结果（名字 → 叶块号 + 位；found 区分命中/未命中） */
-struct rfs_dloc {
-	u64	blk;		/* 叶块号 */
-	u32	idx;		/* 命中位 / 插入位 */
-	u64	ino;
-	bool	found;
-};
-
-/* 在**单叶**目录内定位（叶子必须 ≤126 条且非内部；多级树待 M5）。0 = 已定位/<0 错误。 */
-static int ravenfs_leaf_locate(struct super_block *sb, u64 leaf_blk, const char *name,
-			       u32 nlen, struct rfs_dloc *loc)
-{
-	struct ravenfs_msession *ms __free(ravenfs_msession) = ravenfs_mdata_get(sb, leaf_blk);
-	const struct Bptree_ddentry_leaf_node_t *lf;
-	const struct Bptree_meta_t *m;
-	char *nm;
-	u32 i, cnt;
-	u64 hash;
-	int err = 0;
-
-	if (IS_ERR(ms))
-		return PTR_ERR(ms);
-	m = ravenfs_msession_node(ms);
-	if (m->magics[0] != DENTRY_MAGIC1 || m->magics[1] != DENTRY_MAGIC2 ||
-	    m->magics[2] != DENTRY_MAGIC3 || m->magics[3] != DENTRY_MAGIC4)
-		return -EIO;
-	if (RFS_PP_IS_INNER(m->parent_ptr))
-		return -EOPNOTSUPP;	/* M3.4a：多级树叶定位待 M5 */
-	cnt = RFS_PP_COUNT(m->parent_ptr);
-	if (cnt > 126)
-		return -EIO;
-	lf = ravenfs_msession_node(ms);
-	hash = xxh64(name, nlen, 0);
-	nm = kmalloc(RAVENFS_MAX_NAME_LEN, GFP_KERNEL);
-	if (!nm)
-		return -ENOMEM;
-	loc->blk = leaf_blk;
-	loc->idx = cnt;
-	loc->ino = (u64)PTR_INVALID;
-	loc->found = false;
-	for (i = 0; i < cnt; i++) {
-		const struct ddentry_t *e = &lf->entries[i];
-		unsigned int en;
-		int c, cmplen;
-
-		if (e->hash > hash) {		/* 越过 → 插在此位 */
-			loc->idx = i;
-			goto done;
-		}
-		if (e->hash != hash)
-			continue;
-		if (ravenfs_ddentry_name(sb, e, nm, &en)) {
-			err = -EIO;
-			goto done;
-		}
-		cmplen = min_t(int, en, (int)nlen);
-		c = memcmp(nm, name, cmplen);
-		if (c == 0)
-			c = (en < nlen) ? -1 : (en > nlen ? 1 : 0);
-		if (c == 0) {
-			loc->found = true;
-			loc->idx = i;
-			loc->ino = RFS_PTR_ADDR(e->inode_ptr);
-			goto done;
-		}
-		if (c > 0) {			/* 同名 hash 区，名字更大 → 插在此位 */
-			loc->idx = i;
-			goto done;
-		}
-	}
-done:
-	kfree(nm);
-	return err;
-}
+/* ── create / unlink（M5：多级 ddentry 树 walk / insert / delete） ── */
 
 int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 			  struct dentry *dentry, umode_t mode, bool excl)
@@ -298,17 +223,13 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	struct super_block *sb = dir->i_sb;
 	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
 	struct ravenfs_session *ts __free(ravenfs_session) = NULL;
-	struct ravenfs_msession *ms __free(ravenfs_msession) = NULL;
 	struct raven_Inode_t *dr, *tr;
-	struct Bptree_ddentry_leaf_node_t *lf;
-	struct Bptree_meta_t *meta;
-	struct ddentry_t *e;
-	struct rfs_dloc loc;
+	struct rfs_dpath path;
 	struct timespec64 now;
 	struct inode *inode;
-	u64 inum, root_blk;
+	u64 inum, root_blk, hash;
 	u64 remain_ptr = (u64)PTR_INVALID;
-	u32 nlen = dentry->d_name.len, cnt;
+	u32 nlen = dentry->d_name.len;
 	int err;
 
 	if (nlen == 0 || nlen > RAVENFS_MAX_NAME_LEN)
@@ -326,22 +247,13 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (root_blk == (u64)PTR_INVALID)
 		return -EIO;
 
-	err = ravenfs_leaf_locate(sb, root_blk, dentry->d_name.name, nlen, &loc);
+	/* 多级 walk：查重 + 定位插入位（内层 lower_bound / 叶层 GLB） */
+	err = ravenfs_ddentry_walk(sb, dir->i_ino, dentry->d_name.name, nlen, &path);
 	if (err)
 		return err;
-	if (loc.found)
+	if (path.hit)
 		return -EEXIST;
-
-	ms = ravenfs_mdata_get(sb, root_blk);
-	if (IS_ERR(ms))
-		return PTR_ERR(ms);
-	lf = ravenfs_msession_node(ms);
-	meta = &lf->meta;
-	if (RFS_PP_IS_INNER(meta->parent_ptr))
-		return -EOPNOTSUPP;		/* 多级树插入（hint 维护）待 M5 */
-	cnt = RFS_PP_COUNT(meta->parent_ptr);
-	if (cnt >= 126)
-		return -ENOSPC;			/* 叶满 → 分裂待 M5 */
+	hash = xxh64(dentry->d_name.name, nlen, 0);
 
 	inum = ravenfs_inode_alloc(sb);
 	if (inum == (u64)PTR_INVALID)
@@ -386,21 +298,15 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		}
 	}
 
-	/* 叶插入 */
-	if (loc.idx > cnt)
-		loc.idx = cnt;
-	memmove(&lf->entries[loc.idx + 1], &lf->entries[loc.idx],
-		(size_t)(cnt - loc.idx) * sizeof(struct ddentry_t));
-	e = &lf->entries[loc.idx];
-	memset(e, 0, sizeof(*e));
-	e->inode_ptr.v = RFS_PTR_PACK(nlen, inum);
-	e->hash = xxh64(dentry->d_name.name, nlen, 0);
-	e->full_char_remain_ptr = remain_ptr;
-	memcpy(e->name, dentry->d_name.name, min_t(u32, nlen, (u32)DENTRY_INLINE_NAME_MAX));
-	meta->parent_ptr.v = RFS_PP_PACK(cnt + 1, RFS_PP_IS_INNER(meta->parent_ptr),
-					 RFS_PP_IS_ROOT(meta->parent_ptr), RFS_PP_PTR(meta->parent_ptr));
-	ms->row->dirty = true;
-	ms->row->stamp = ktime_get_ns();
+	/* 多级叶插入（含叶裂 / 根升长 / 内裂 / hint 维护） */
+	err = ravenfs_ddentry_insert(sb, dir->i_ino, &path, dentry->d_name.name,
+				     nlen, hash, inum, remain_ptr);
+	if (err) {
+		if (nlen > DENTRY_INLINE_NAME_MAX)
+			ravenfs_name_heap_free(sb, dir->i_ino, nlen, remain_ptr);
+		ravenfs_inode_reclaim(sb, inum);
+		return err;
+	}
 
 	/* 父目录计数维护：size++ / link_count = size+2 */
 	dr->size += 1;
@@ -429,16 +335,12 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 	struct super_block *sb = dir->i_sb;
 	struct inode *inode = d_inode(dentry);
 	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
-	struct ravenfs_msession *ms __free(ravenfs_msession) = NULL;
 	struct raven_Inode_t *dr;
-	struct Bptree_ddentry_leaf_node_t *lf;
-	struct Bptree_meta_t *meta;
-	struct rfs_dloc loc;
+	struct rfs_dpath path;
+	struct rfs_delinfo di;
 	struct timespec64 now;
 	u64 root_blk;
-	u64 rem_remain = (u64)PTR_INVALID;
-	u32 nlen = dentry->d_name.len, cnt;
-	u32 rem_name_len = 0;
+	u32 nlen = dentry->d_name.len;
 	int err;
 
 	if (nlen == 0 || nlen > RAVENFS_MAX_NAME_LEN)
@@ -453,29 +355,17 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 	if (d_is_dir(dentry) && !simple_empty(dentry))
 		return -ENOTEMPTY;
 
-	err = ravenfs_leaf_locate(sb, root_blk, dentry->d_name.name, nlen, &loc);
+	err = ravenfs_ddentry_walk(sb, dir->i_ino, dentry->d_name.name, nlen, &path);
 	if (err)
 		return err;
-	if (!loc.found)
+	if (!path.hit)
 		return -ENOENT;
 
-	ms = ravenfs_mdata_get(sb, root_blk);
-	if (IS_ERR(ms))
-		return PTR_ERR(ms);
-	lf = ravenfs_msession_node(ms);
-	meta = &lf->meta;
-	cnt = RFS_PP_COUNT(meta->parent_ptr);
-	if (loc.idx >= cnt)
-		return -EIO;
-	rem_name_len = RFS_PTR_FREE(lf->entries[loc.idx].inode_ptr);
-	rem_remain = lf->entries[loc.idx].full_char_remain_ptr;
-	memmove(&lf->entries[loc.idx], &lf->entries[loc.idx + 1],
-		(size_t)(cnt - loc.idx - 1) * sizeof(struct ddentry_t));
-	memset(&lf->entries[cnt - 1], 0, sizeof(struct ddentry_t));
-	meta->parent_ptr.v = RFS_PP_PACK(cnt - 1, RFS_PP_IS_INNER(meta->parent_ptr),
-					 RFS_PP_IS_ROOT(meta->parent_ptr), RFS_PP_PTR(meta->parent_ptr));
-	ms->row->dirty = true;
-	ms->row->stamp = ktime_get_ns();
+	memset(&di, 0, sizeof(di));
+	di.remain = (u64)PTR_INVALID;
+	err = ravenfs_ddentry_delete(sb, dir->i_ino, &path, &di);
+	if (err)
+		return err;
 
 	now = current_time(dir);
 	dr->size -= 1;
@@ -493,11 +383,11 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 	mark_inode_dirty(dir);
 
 	/* 长名尾段：释放堆存储（失败仅告警：条目已移除；孤儿位 audit 不判损） */
-	if (rem_name_len > DENTRY_INLINE_NAME_MAX) {
-		int herr = ravenfs_name_heap_free(sb, dir->i_ino, rem_name_len, rem_remain);
+	if (di.name_len > DENTRY_INLINE_NAME_MAX) {
+		int herr = ravenfs_name_heap_free(sb, dir->i_ino, di.name_len, di.remain);
 
 		if (herr)
-			pr_warn("ravenfs: name_heap_free(%u) failed: %d\n", rem_name_len, herr);
+			pr_warn("ravenfs: name_heap_free(%u) failed: %d\n", di.name_len, herr);
 	}
 
 	/* 目标 inode：nlink--（VFS 后续 evict → ravenfs_inode_reclaim 回收槽位） */

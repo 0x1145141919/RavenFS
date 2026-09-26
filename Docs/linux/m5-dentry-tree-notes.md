@@ -263,6 +263,12 @@ v1.2 形式：`uint64_t magics[4]` + `struct parent_ptr_t{uint64_t v}` + `struct
 2. **`old_next` 读序**：叶分裂必须先读 `victim.ptrs[2]`（旧后继）再改写为 `new_blk`，否则拿到的「旧后继」是新叶自己 → 叶链自指/断链（`split:74`）。
 3. **52 位截断 + 内路由方向**：v1.1 位域 ptr 是 52 位，与 `PTR_INVALID`（64 位）比较恒不等 → 悬空判定/哨兵失效；且 dentry 用 `≥`、extent 用 `>`，抄错路由会选错子树。
 
+### E.5 ko 落地实测新增坑（2026-09-27，guest 实测）
+
+1. **分裂时「瞬时 count=127」不能被通用 meta 校验拒掉**：ko `rfs_meta_ok` 原把 `count>126` 当落盘污染 → 返回 `-EIO`；但 `rfs_leaf_split`/`rfs_inner_split` 正是要在 `count==127` 上工作。修法：加 `rfs_meta_ok_x(..., maxc)`，分裂传 `maxc = ORDER+1`（127），即时槽允许、其他调用点仍传 126。症状：第 127 条 create 返 `-EIO`，且**条目已插入但未分裂** → 叶 count=127、新 inode 已分配（create 错误路径又 reclaim 了它）→ audit 报 `count>126` + 悬挂引用。
+2. **释放节点块前必须丢弃其 mdata 缓存行**（`ravenfs_mdata_drop`）：合并/根收缩把节点块 `block_free` 后，该块的缓存行若仍 `dirty`（早前写路径留下的），会在后续 `flush_all` 回写到「可能已被重新分配」的块 → 污染新节点。drop 语义：无人引用→直接丢弃；被引用→清 `dirty`（禁回写）。合并/根收缩释放邻居块/旧根前都调用。
+3. **create 的 owner 计数在驱动层维护**：ko `ravenfs_ddentry_insert` 只做树机械（与 god `dentry_leaf_entry_insert` 不同——god 把 inode/堆/计数下沉）。故 ko `create/unlink` 在 walk/insert/delete 前后自维护目录 `size++/--`、`link_count=size+2`。
+
 ---
 
 ## 附：god 写入路径调用链（一眼图）
