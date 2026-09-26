@@ -491,7 +491,7 @@ static int rfs_apply_up(struct super_block *sb, u64 dir_ino, const struct rfs_dp
 		nd = ravenfs_msession_node(ms);
 		if (rfs_meta_ok(&nd->meta, &pcnt, &(u32){0}, &(u32){0}, &(u64){0}) ||
 		    !RFS_PP_IS_INNER(nd->meta.parent_ptr) ||
-		    idx >= pcnt || pcnt >= RFS_DENTRY_ORDER ||
+		    idx >= pcnt || pcnt > RFS_DENTRY_ORDER ||
 		    RFS_PTR_ADDR(nd->hints[idx].sub_ptr) != cur_victim) {
 			ravenfs_mdata_put(ms);
 			return -EIO;

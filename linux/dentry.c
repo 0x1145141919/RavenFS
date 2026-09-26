@@ -612,6 +612,10 @@ int ravenfs_rmdir(struct inode *dir, struct dentry *dentry)
 	if (err)
 		return err;
 
+	/* 被删条目自身的名字堆尾段（长名）也要释放（同 unlink；否则堆位泄漏、堆永不归还） */
+	if (di.name_len > DENTRY_INLINE_NAME_MAX)
+		ravenfs_name_heap_free(sb, dir->i_ino, di.name_len, di.remain);
+
 	/* 目标目录资源回收：名字堆（全归还）→ 树根 2 块 */
 	ravenfs_dir_name_heap_release(sb, target->i_ino);
 	ravenfs_mdata_drop(sb, t_root);
