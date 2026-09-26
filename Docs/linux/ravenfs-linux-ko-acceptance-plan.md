@@ -235,7 +235,7 @@ kexec -e
 | 1 | **"位图是派生数据、可重建"的退路失效** | **位图必须持久化正确**：每次 `alloc/free` 标脏 + **`sync_fs` 落盘**。从"可选优化"升级为 **必需** |
 | 2 | 孤儿块 / 孤儿 inode **永久泄漏** | 长跑有天花板（空间只减不增）；T5 的 soak 要标注 |
 | 3 | **验收目标换向** | 从"崩溃恢复"转为 **"不产生损坏"** → **写序 + flush 从"要定"变成"关键路径"**（D-C1） |
-| 4 | **替代 fsck 的内核惯例（框架优先）** | 自检发现不一致 → **`sb->s_flags \|= SB_RDONLY`（remount-ro）** + **`super_operations.report_error`**（你正好有这个钩子）→ 且**自检失败 = "我们自己 bug"的信号**，与优先级一致 |
+| 4 | **替代 fsck 的内核惯例（框架优先）** | 自检发现不一致 → **内部「停机」标志，所有操作返 `-EIO`**（xfs `force shutdown` 惯例）→ 管理员**彻底 umount + 重新 mount**（可 ro）。**不做在线 remount-ro**（裸置 `SB_RDONLY` 是内核明指的反模式，见 spec 注 R-LM-09）。`report_error` 仅作通知。且**自检失败 = "我们自己 bug"的信号**，与优先级一致 |
 | 5 | `fsck -n` 值得保留 | **只查 + 报告**成本极低（`audit_filesystem` 直接搬），且它正是"我们实现 bug"的探测器 → 只 stub 修复半部 |
 
 **崩溃点矩阵**（待 T5 启用；届时每轮跑 **`audit_filesystem`（只读）→ `pacman -Qkk`**，无 fsck 可跑）：

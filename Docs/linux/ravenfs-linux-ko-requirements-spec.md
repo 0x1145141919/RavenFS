@@ -27,7 +27,7 @@
 | **架构·机制** | R-IO-01b = **b1 buffer head**（E8） | `sb_getblk`/`__bread_gfp`/`mark_buffer_dirty`；bh 自带 `b_state` 锁 |
 | **架构·锁** | **模型 (A)** | B+tree 节点逻辑原子性靠自建 **node latch**（按块号索引的 latch 表）；页锁**逐页、绝不嵌套两页** |
 | **E2** | **v1.2 inode 盘面** | 第一字 `type:6｜direct:1｜i_flags:57`；`permission_bits → mode:12｜xattr_ptr:52`；rdev→`inline_data`；xattr=**单块自描述**。**字节布局不变**，但旧盘不兼容 → reformat + `RAVENFS_VERSION 2→3` |
-| **E3** | 目录 `nlink` | `i_nlink` **直接报 `size+2`**（`size`=条目数 ⇒ 恒过报；find 只失去优化、不漏） |
+| **E3** | 目录 `nlink` | 盘字段 `link_count` **同时维护 = `size+2`**（随条目增删 ±1），`i_nlink` 报该值（`size`=条目数 ⇒ 恒过报；find 只失去优化、不漏） |
 | **E4** | readdir cookie | **原子性只到单次 syscall**（VFS `i_rwsem` 读锁，本次调用内目录稳定）；**跨调用不保证原子/一致性**（锁已释放，不阻止并发修改）；并发下只承诺**不崩/不死循环**（允许重/跳）；cookie = 可校验+可重定位 |
 | **E5** | 时间戳 | **不自建触发表**（内核已定）→ mtime/ctime 由 `generic_file_write_iter` + **`filemap_page_mkwrite`（mmap）** 免费推；**FS 义务仅 3 处** |
 | **E6** | `s_maxbytes` | **`1<<52`（4 PiB，字节）**；≤ `MAX_LFS_FILESIZE` |
@@ -105,7 +105,7 @@
 | 域 | 编号段 | 条数 | 说明 |
 |---|---|---|---|
 | **KP** 模块与内核管线 | R-KP-01..05 | 5 | 模块注册、fs_type、initramfs 装载 |
-| **LM** 挂载与卷生命周期 | R-LM-01..12 | 12 | mount/umount、inode 生命周期、remount-ro |
+| **LM** 挂载与卷生命周期 | R-LM-01..12 | 12 | mount/umount、inode 生命周期、自检失败停机（remount-ro 不做） |
 | **NS** 命名空间与目录 | R-NS-01..13 | 13 | lookup/…/rename/link/symlink/**mknod**/tmpfile/readdir |
 | **FD** 文件数据 | R-FD-01..10 | 10 | 读写/mmap/fsync/splice/**fallocate**/打洞/稀疏 |
 | **MD** 元数据与属性 | R-MD-01..09 | 9 | getattr/setattr/权限位/时间戳/nlink/**i_flags** |
@@ -148,12 +148,16 @@
 | R-LM-06 | `statfs`：填 `struct kstatfs`（§4.7） | A: ext2 `ext2_statfs` | **M** | `fs_statfs` | ❌ |
 | R-LM-07 | `dirty_inode`/`drop_inode`：**均不实现**（`drop_inode` 必须 NULL——VFS inode 即缓存） | A: `vfs.rst`；ext2 无此二者 | C | 缺省 | ✅ 缺省即满足 |
 | R-LM-08 | `show_options`：`/proc/mounts` 输出挂载选项 | A: ext2 `ext2_show_options` | L | `seq_puts` | ❌ |
-| R-LM-09 | `report_error` + 自检失败 `sb->s_flags \|= SB_RDONLY`（remount-ro）：替代 fsck 的「不产生损坏」出口 | A: `super_types.h`（7.2.3，仅 xfs `fs/xfs/xfs_super.c:1349` 实现） | **M** | `report_error` + `sb_rdonly` | ❌ |
+| R-LM-09 | **自检失败 → 内部「停机」标志 → 所有操作 `-EIO`**；恢复 = **彻底 umount + 重新 mount**（可 ro）；**拒绝在线 remount（含 remount-ro）** | A: 惯例（xfs `xfs_force_shutdown`）；`super_types.h` | **M** | 自持 `RFS_SHUTDOWN` 标志（+ 可选 `report_error` 仅通知） | ❌ |
 | R-LM-10 | sb 关键字段：`s_magic`（**唯一**）、`s_maxbytes`（=§4.7）、`s_time_gran`、`s_op`、`s_flags` | A: `fs.h` | **M** | 分配唯一 magic；`s_maxbytes=RFS_MAX_FILESIZE` | ❌ magic 待定 |
 | R-LM-11 | 挂载语义：`ro`/`rw`、`rootflags`；根挂载由内核 `rootfstype=ravenfs` 走 `mount_root` | A: 纲领 §3.5 | **M** | 标准 `fs_context` | ❌ |
 | R-LM-12 | `freeze_super`/`thaw_super`：挂起/休眠 | B: `vfs.rst` | C | 可先 `-EOPNOTSUPP` | ❌ |
 
-> **注 R-LM-09**：`report_error`（`struct fserror_event`）是 7.2.3 提供的错误上报钩子——把「自检发现不一致 → 置只读 + 上报」的正规出口；**这是与「崩溃恢复」路线切割后的关键闭环**。
+> **注 R-LM-09（2026-09-26 重写：不做 remount-ro）**：**出口 = 停机 + 重挂，不是 remount-ro**。
+> · 反模式依据：内核**明令**不要在错误路径裸置 `SB_RDONLY`——ext4 原话：*"We don't set SB_RDONLY because that requires sb->s_umount semaphore and setting it without proper remount procedure is confusing code such as freeze_super() leading to deadlocks and other problems."*（`fs/ext4/super.c`）。
+> · 正确惯例 = xfs **force shutdown**（`xfs_force_shutdown`）：自持标志 → 所有入口立即 `-EIO` → 管理员 `umount`（走干净 `put_super`）后**重新 mount**（可 ro）。
+> · `report_error`（`fserror_worker` 回调）**仅作通知**（fsnotify/日志），**不承担改只读**——它是"报告错误"的钩子，不是 remount 手段（实测 `fs/fserror.c`：worker 先调 `s_op->report_error` 再 fsnotify；xfs 只转发 healthmon，不设 `SB_RDONLY`）。
+> · 停机态收到 remount 请求 → **直接拒绝**（`-EOPNOTSUPP`/`-EIO`）。
 
 ### 4.3 NS — 命名空间与目录操作
 
@@ -224,7 +228,9 @@
 > | **落盘** | FS `write_inode` | **要做** |
 > ⚠️ 「ctime 交 `alloc_inode`」**精神对、位置错**：初始 ctime 要在**创建路径**打，不能在 `alloc_inode`（后者随 iget 缓存 miss 反复触发）。
 >
-> **注 R-MD-07（nlink）**：盘面 `size`=dentry 条目数 ⇒ `size+2 ≥ 2+子目录数` ⇒ **恒过报**。find 的 leaf 优化仅在「已 stat 到 `nlink-2` 个子目录」后停 stat 剩余（`man find -noleaf`）→ **过报 = 失去优化（正确）；欠报才会漏**。⇒ 直接报 `size+2`，零成本、不改盘面、不扫树。代价仅 `ls -l` 数字偏大。
+> **注 R-MD-07（nlink，2026-09-26 定「同时维护」）**：v1.1 盘面 `size` = dentry 条目数 → dir inode 的 `link_count` **合法**（= `size+2`）。**决定：盘字段照旧维护**（dentry 条目增删/rename 时与 `size` 同步 ±1），**`getattr` 报该维护值**（等价 `size+2`）——即「**同时维护**」。
+> · 好处：audit 不变量（DIR `link_count == size+2`）继续有效；`find`/`ls -l` 看到真值；**不采用**"只报不算"的旁路，也不废盘字段。
+> · `size+2 ≥ 2+子目录数` ⇒ 恒过报：find 的 leaf 优化仅失去优化（正确），欠报才会漏（`man find -noleaf`）。
 
 #### 4.5.1 v1.2 inode 布局（E2）
 
@@ -290,7 +296,7 @@
 | R-SY-04 | **写序 + flush**（D-C1）：分配类「位图亮灯→数据落盘→inode 翻转」；删除类「先删引用→后计数」 | A: 不变量 20/25 | **M** | 照抄不变量；`blkdev_issue_flush` | ⚠️ |
 | R-SY-05 | flush 语义：`blkdev_issue_flush`/FUA，保证「fsync 返回即落盘」 | A: `vfs.rst` | **M** | `blkdev_issue_flush` | ❌ |
 | R-SY-06 | `put_super` 干净卸载（T3 判据） | A: 纲领 §2.1 | **M** | R-LM-04 | ❌ |
-| R-SY-07 | 崩溃目标 = **「不产生损坏 / 不放大损害」**（非「不丢数据」） | A: 纲领 §4 | **M** | 写序 + remount-ro（R-LM-09） | ❌ |
+| R-SY-07 | 崩溃目标 = **「不产生损坏 / 不放大损害」**（非「不丢数据」） | A: 纲领 §4 | **M** | 写序 + 自检失败停机（R-LM-09） | ❌ |
 
 ### 4.9 CO — 并发与锁
 
@@ -305,6 +311,20 @@
 > **VFS 已免费提供大半**：同 inode 的目录改操作/文件写由 `i_rwsem` 串行化 → 同 inode 的节点并发基本不用管。
 > **真正要自建锁的**：① 全局 bitmap/分配器（R-CO-03）；② **回写/evict/sync 线程**（在 syscall 的 `i_rwsem` 之外）→ node latch 必须能被这些路径获取；③ B+tree 分裂/合并多节点（dir/extent 树写入整段在 `i_rwsem` 写锁下 → 顺序问题大半被 VFS 掩盖，主要落在 ②）。
 > **latch 存储**：folio 会被回收 → latch **不能存节点内存里** → 用**按块号索引的 latch 表**（`xarray`/哈希）。b1 的 bh 自带 `b_state` 锁可复用，但 8K 跨两个 4K bh 仍需节点级 latch 罩住那一对。
+>
+> **选型定案（2026-09-26 · 源起 `mdata_piece_cache_mgr` 的"阴魂"）**：god 侧 `mdata_piece_caches_mgr` 把三件事捆在一起——① 8K 负载缓存（三后端 `no_cache`/`offload`/`self_reliat`+TTL）② 负载形状（偶数基址、2 连续块）③ 并发（分片 `std::shared_mutex`）。落 Linux 必须**拆开重新选型**：
+>
+> | god 旧件 | Linux 选型 | 依据 |
+> |---|---|---|
+> | `offload_cache`（mmap 页缓存） | **bdev page cache + bh**（R-IO-01b） | 框架优先；内核页缓存本就是这个 |
+> | `self_reliat`（用户态 TTL 缓存） | **不移植**（TTL 在内核无意义——页缓存有内存压力回收） | E1 |
+> | `no_cache`（临时 8K 缓冲直读） | 退化为「读改写暂存」可选 | — |
+> | 分片 `std::shared_mutex` | **`struct rw_semaphore`**（可睡眠读写锁，语义 1:1；**禁 spinlock**——持锁要等 I/O） | god 用可睡眠 shared_mutex |
+> | `slice_radix_tree`（分片基数树） | **`xarray`**（key = 节点起始块号/2 = piece 索引；radix tree 内核同族） | — |
+> | 负载形状（偶数基址/2 连续块） | **盘面不变量**（B+tree 节点恒 2 连续块） | disk_layout |
+>
+> ⇒ **节点 latch = 按 piece 索引的 `xarray<rw_semaphore>`**：罩住 2×4K bh 的逻辑原子性；bh 的 folio 锁管单页缓存一致性（**逐页，绝不嵌套两页**）。**latch 生命周期独立于 folio**（folio 会回收）→ 常驻不回收（元数据节点数千~数万 → 数 MB 量级）。
+> ← **唯一未定子项**：latch 回收策略（**常驻 vs 引用计数延迟回收**）——待选。
 
 ### 4.10 DG — 可降级 / 豁免（明确 `-EOPNOTSUPP`）
 
@@ -332,7 +352,10 @@
 
 > **注（架构收敛）**：god 的 `inode_cache_radix` / `mdata_piece_caches` / `cache_mgr_mode` 三件**不进 ko**；算法层对 inode 的访问改道 **`RAVENFS_I(inode)`** 适配层（`inum`↔`i_ino`）。
 > 仍在 god 层保留：`inode_alloc/inode_free`（**盘上槽位**位图分配，非缓存）、B+tree / name_heap / bitmap 算法本体。
-> **b1 注**：bh 自带 `b_state` 锁（合模型 A），但 bh=4K → 8K 节点 = 2 bh → **节点级 latch 表仍必需**。⚠️ 遗留实测：`buffer_head.b_size > PAGE_SIZE`（8K bh）是否支持（定 1 bh 还是 2 bh/节点）。
+> **b1 注（E8 实测收口，2026-09-26）**：bh 自带 `b_state` 锁（合模型 A）；**8K 节点 = 2 个连续 4K bh**（**不是 1×8K bh**）→ **节点级 latch 表仍必需**（罩住这一对）。
+> 源码依据（本机 `linux-7.2.3`）：① `sb_set_blocksize()` 对 `size > PAGE_SIZE` 强制要求 `FS_LBS`+THP（`block/bdev.c::sb_validate_large_blocksize`）→ 不设 `FS_LBS` → `s_blocksize` 恒 ≤4K；② bh 被 folio 封顶——`folio_alloc_buffers()` 以 `folio_size/size` 切 buffer，`size > folio_size` 时**切出 0 个**（返回 NULL，`fs/buffer.c`）→ 4K 页/folio 下 8K bh 无法存在。**故「8K 跨 2 页」既定**。
+> 可选实测：写个小模块对**未挂载**裸设备 `insmod` 后看 `getblk(size=8192)` 是否 NULL（源码依据已足够定论；实测仅为显式确认）。
+> ⇒ **E8 收口 = b1 buffer head + 8K 节点 = 2×4K bh**。
 
 ---
 
@@ -368,7 +391,7 @@
 | **E5** | 时间戳触发表 | **不自建**：采纳内核模型（含 mmap）；FS 义务仅 3 处 |
 | **E6** | `s_maxbytes` | **`1<<52`（4 PiB，字节）**；≤ `MAX_LFS_FILESIZE` |
 | **E7** | xattr 是否真需求 | **真需求**；单块上限 |
-| **E8** | R-IO-01b 机制 | **b1 buffer head**（遗留实测：8K bh 支持） |
+| **E8** | R-IO-01b 机制 | **b1 buffer head**；**8K 节点 = 2×4K bh**（实测：无 `FS_LBS` 时 8K bh 不可能，见 §4.11 b1 注） |
 | 附 | **LBS 排除** | `sb_set_blocksize(8192)` 合法（需 `FS_LBS`+THP，ext4/xfs 均声明，`block/bdev.c:219-246`），但 `s_blocksize`=分配单元=4K 与 8K 节点语义冲突 → **不适用**。故「8K 跨 2 页」既定，由 (A) 消化 |
 
 ---
