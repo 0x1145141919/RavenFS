@@ -119,7 +119,7 @@ sudo ls -laU /mnt/rfs; sudo stat -f /mnt/rfs; sudo dmesg | tail
 1. **TTL（主）**：`cache_ttl.c`，`ttl=2s`/周期 1s；条件 `ref==1 ∧ !dirty ∧ now-stamp>ttl`；`stamp` 每次 get 刷新。**只清 clean 行**。
 2. ~~压力兜底~~ → **压力 shrinker 已移除（2026-09-26 深夜）**：冷集淘汰只由 TTL 承担。
 3. **折构/卸载**：`put_super` → **先 `ravenfs_ttl_stop`** → `mdata/icache destroy`（内部 `flush_all`）。
-- **回写权威（M3 待接）**：`write_inode` = 更新 mgr 记录 + **`mark_inode_dirty(inode)`**（两者同置同清）；落盘只在 ① `sync_fs`→`flush_all` ② umount→`flush_all` ③（M3）flusher 触发 dirty 行 `write_inode`。**TTL 永不写盘（只摘 clean 行）。**
+- **回写权威（M3）**：`write_inode` = **logical inode → mgr 行同步**（只推 VFS 字段：uid/gid/mode/nlink/size/时间戳/rdev；**盘专有字段不动**）+ 行标 dirty —— **不落盘**（logical inode 与盘 inode 解耦，写不出盘记录）。落盘 = `flush_all`：① `sync_fs` ② umount ③ `fsync` 单行。**TTL 永不写盘（只摘 clean 行）。**
 - 源码事实（7.2.3）：内核 **TTL 只在回写层**（`dirty_expire_centisecs`=30s / `dirty_writeback_centisecs`=5s / `dirtytime_expire_seconds`=12h）；**回收无 TTL，只有压力**（`shrink_slab` 仅 vmscan 触发）。
 
 ---

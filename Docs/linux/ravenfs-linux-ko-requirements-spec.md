@@ -429,8 +429,8 @@
 - 持久化 = `sync_fs`/`put_super` **全量刷回**；写序仍守不变量 20/25（亮灯→数据落盘→inode 翻转）。
 
 **G. 回写语义（M3 必做，已定）**
-- `write_inode` = 更新 mgr 记录 + `mark_inode_dirty(inode)`（**两者必须同置同清**）；`write_inode` 落盘该行并清 `dirty`。
-- 落盘路径收敛：① `sync_fs` → `flush_all`；② umount → `flush_all`；③（M3）flusher：周期 TTL 触发 dirty 行的 `write_inode`。**TTL 淘汰永不写盘，只摘 clean 行**（dirty 行跳过、等 flush）。
+- `write_inode` = **同步 logical inode → mgr 行**（**仅 VFS 拥有的字段**：uid/gid/mode/nlink/size/时间戳[+ns]/rdev；**不动** data_root/inline_data/heaps/xattr_ptr 等**盘专有字段**）+ 行 `dirty=true`；**不做块 I/O**（logical inode 与盘 inode 解耦 → 写不出盘记录）。
+- **落盘路径收敛（唯一）**：`flush_all` —— ① `sync_fs`；② umount（`put_super`）；③ `fsync` 单 inode 行。**`write_inode` 永不落盘**；**TTL 淘汰永不写盘（只摘 clean 行，dirty 行跳过、等 flush）**。M3 不做周期 flusher（崩溃目标=不产生损坏）。
 
 ## 5. 追溯矩阵（Arch 组件 → syscall → VFS 回调 → 需求）
 

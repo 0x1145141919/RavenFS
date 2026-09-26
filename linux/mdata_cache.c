@@ -75,6 +75,62 @@ static void ravenfs_mrow_free(struct ravenfs_mdata_cache *c, struct ravenfs_mrow
 	kfree(row);
 }
 
+/* 脏节点落盘：节点 → 2 个连续 4K 块（尾部按 total_blocks 截断）。ro 挂载不得调用。 */
+static int ravenfs_mrow_write(struct super_block *sb, struct ravenfs_mdata_cache *c,
+			      struct ravenfs_mrow *row)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	u64 blk0 = row->node_idx << 1;
+	u32 nblk = RAVENFS_MDATA_BLK_PER_NODE, i;
+
+	if (blk0 >= c->total_blocks)
+		return -EIO;
+	if (blk0 + nblk > c->total_blocks)
+		nblk = (u32)(c->total_blocks - blk0);
+	for (i = 0; i < nblk; i++) {
+		struct buffer_head *bh = sb_bread(sb, ravenfs_dev_blk(sbi, blk0 + i));
+
+		if (!bh)
+			return -EIO;
+		memcpy(bh->b_data, (char *)row->data + (u64)i * RAVENFS_BLOCK_SIZE,
+		       RAVENFS_BLOCK_SIZE);
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
+		brelse(bh);
+	}
+	return 0;
+}
+
+int ravenfs_mdata_writeback_all(struct super_block *sb)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	struct ravenfs_mdata_cache *c = sbi ? sbi->mcache : NULL;
+	int err = 0;
+	u32 i;
+
+	if (!c || !ravenfs_sb_writable(sb))
+		return 0;
+	for (i = 0; i < c->n_slices; i++) {
+		struct ravenfs_mdata_shard *sh = &c->shards[i];
+		unsigned long key;
+		void *e;
+
+		down_write(&sh->lock);
+		xa_for_each(&sh->rows, key, e) {
+			struct ravenfs_mrow *row = e;
+
+			if (!row->dirty)
+				continue;
+			if (ravenfs_mrow_write(sb, c, row))
+				err = -EIO;
+			else
+				row->dirty = false;
+		}
+		up_write(&sh->lock);
+	}
+	return err;
+}
+
 /*
  * 慢路径：独占装载一个节点。
  *
@@ -262,6 +318,7 @@ void ravenfs_mdata_flush_all(struct super_block *sb)
 
 	if (!c)
 		return;
+	ravenfs_mdata_writeback_all(sb);	/* 脏节点先落盘（ro 挂载 no-op） */
 	for (i = 0; i < c->n_slices; i++) {
 		struct ravenfs_mdata_shard *sh = &c->shards[i];
 		unsigned long victim[64];
@@ -277,8 +334,6 @@ void ravenfs_mdata_flush_all(struct super_block *sb)
 
 				if (nv >= ARRAY_SIZE(victim))
 					break;
-				if (row->dirty)
-					WARN_ON_ONCE(1);	/* M3：先回写 */
 				if (refcount_read(&row->ref) != 1)
 					pr_warn_ratelimited("ravenfs: mdata node %llu 仍被引用(%u)\n",
 							    (unsigned long long)row->node_idx,

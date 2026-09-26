@@ -109,6 +109,32 @@ static void ravenfs_row_free(struct ravenfs_cache *c, struct ravenfs_row *row)
 	kfree(row);
 }
 
+/* 脏行落盘：行 → row_blocks 个连续 4K 块（尾部按 array 末尾截断）。ro 挂载不得调用。 */
+static int ravenfs_row_write(struct super_block *sb, struct ravenfs_cache *c,
+			     struct ravenfs_row *row)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	u64 blk0 = sbi->inode_array_base + row->line * c->row_blocks;
+	u32 nblk = c->row_blocks, i;
+
+	if (row->line * c->row_blocks >= sbi->inode_blocks)
+		return -EIO;
+	if (blk0 + nblk > sbi->inode_array_base + sbi->inode_blocks)
+		nblk = (u32)(sbi->inode_array_base + sbi->inode_blocks - blk0);
+	for (i = 0; i < nblk; i++) {
+		struct buffer_head *bh = sb_bread(sb, ravenfs_dev_blk(sbi, blk0 + i));
+
+		if (!bh)
+			return -EIO;
+		memcpy(bh->b_data, (char *)row->data + (u64)i * RAVENFS_BLOCK_SIZE,
+		       RAVENFS_BLOCK_SIZE);
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);		/* 确定性：返回即落盘 */
+		brelse(bh);
+	}
+	return 0;
+}
+
 /*
  * 慢路径：独占装载一行。**尾部行截断**：只读到 inode array 实际存在处，
  * 余下零填充（行缓冲恒为 row_size 字节，行内槽位寻址恒定）。
@@ -242,6 +268,113 @@ void ravenfs_session_put(struct ravenfs_session *s)
 	kfree(s);
 }
 
+/* ── 写回（M3）：脏行落盘（sync_fs / umount / fsync 调用；ro 挂载 no-op） ── */
+
+static inline bool ravenfs_writable(struct super_block *sb)
+{
+	return !(sb->s_flags & SB_RDONLY);
+}
+
+int ravenfs_cache_writeback_all(struct super_block *sb)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	struct ravenfs_cache *c = sbi ? sbi->icache : NULL;
+	int err = 0;
+	u32 i;
+
+	if (!c || !ravenfs_writable(sb))
+		return 0;
+	for (i = 0; i < c->n_slices; i++) {
+		struct ravenfs_shard *sh = &c->shards[i];
+		unsigned long key;
+		void *e;
+
+		down_write(&sh->lock);
+		xa_for_each(&sh->rows, key, e) {
+			struct ravenfs_row *row = e;
+
+			if (!row->dirty)
+				continue;
+			if (ravenfs_row_write(sb, c, row))
+				err = -EIO;
+			else
+				row->dirty = false;
+		}
+		up_write(&sh->lock);
+	}
+	return err;
+}
+
+/* 单 inode 行落盘（fsync 用） */
+int ravenfs_inode_flush(struct super_block *sb, u64 inum)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	struct ravenfs_cache *c = sbi ? sbi->icache : NULL;
+	struct ravenfs_session *s __free(ravenfs_session) = NULL;
+	int err = 0;
+
+	if (!c || !ravenfs_writable(sb))
+		return 0;
+	s = ravenfs_session_get(sb, inum);
+	if (IS_ERR(s))
+		return PTR_ERR(s);
+	if (s->row->dirty) {
+		err = ravenfs_row_write(sb, c, s->row);
+		if (!err)
+			s->row->dirty = false;
+	}
+	return err;
+}
+
+/*
+ * `write_inode` 的实现：**logical inode → mgr 行同步**（不落盘）。
+ * 只推 **VFS 拥有的字段**；**盘专有字段**（data_root / inline_data / heaps / xattr_ptr / type / direct）
+ * 一律不动（logical inode 不持有它们，扫写会毁盘）。
+ */
+int ravenfs_inode_sync_from_vfs(struct super_block *sb, struct inode *inode)
+{
+	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, inode->i_ino);
+	struct raven_Inode_t *r;
+	struct timespec64 ts;
+
+	if (IS_ERR(s))
+		return PTR_ERR(s);
+	r = ravenfs_session_inode(s);
+	r->uid = i_uid_read(inode);
+	r->gid = i_gid_read(inode);
+	r->mode_xattr = (r->mode_xattr & ~RFS_MODE_MASK) | (inode->i_mode & 0o7777);
+	r->link_count = inode->i_nlink;
+	r->size = inode->i_size;
+	ts = inode_get_mtime(inode);
+	r->mtime = ts.tv_sec;
+	r->m_ns_stamp = (u32)ts.tv_nsec;
+	ts = inode_get_ctime(inode);
+	r->ctime = ts.tv_sec;
+	r->c_ns_stamp = (u32)ts.tv_nsec;
+	ts = inode_get_atime(inode);
+	r->atime = ts.tv_sec;
+	r->a_ns_stamp = (u32)ts.tv_nsec;
+	if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode)) {
+		__le32 rdev_le = cpu_to_le32(new_encode_dev(inode->i_rdev));
+
+		memcpy(r->inline_data, &rdev_le, sizeof(rdev_le));
+	}
+	s->row->dirty = true;
+	s->row->stamp = ktime_get_ns();
+	return 0;
+}
+
+/* FS 内部改完盘记录后：标行脏（落盘仍交 flush_all） */
+void ravenfs_inode_mark_dirty(struct super_block *sb, u64 inum)
+{
+	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, inum);
+
+	if (IS_ERR_OR_NULL(s))
+		return;
+	s->row->dirty = true;
+	s->row->stamp = ktime_get_ns();
+}
+
 /* ── TTL 淘汰（cache_ttl.c 周期调用）：只收 refcount==1 ∧ !dirty ∧ stamp<cutoff ── */
 long ravenfs_cache_reap_expired(struct ravenfs_cache *c, u64 cutoff_ns)
 {
@@ -290,6 +423,7 @@ void ravenfs_cache_flush_all(struct super_block *sb)
 
 	if (!c)
 		return;
+	ravenfs_cache_writeback_all(sb);	/* 脏行先落盘（ro 挂载 no-op） */
 	for (i = 0; i < c->n_slices; i++) {
 		struct ravenfs_shard *sh = &c->shards[i];
 		unsigned long victim[64];
@@ -305,8 +439,6 @@ void ravenfs_cache_flush_all(struct super_block *sb)
 
 				if (nv >= ARRAY_SIZE(victim))
 					break;
-				if (row->dirty)
-					WARN_ON_ONCE(1);	/* M3：先回写 */
 				if (refcount_read(&row->ref) != 1)
 					pr_warn_ratelimited("ravenfs: inode row %llu 仍被引用(%u)\n",
 							    (unsigned long long)row->line,

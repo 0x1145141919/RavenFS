@@ -192,6 +192,10 @@ int  ravenfs_cache_create(struct super_block *sb, unsigned int row_size);
 void ravenfs_cache_destroy(struct super_block *sb);
 void ravenfs_cache_flush_all(struct super_block *sb);
 long ravenfs_cache_reap_expired(struct ravenfs_cache *c, u64 cutoff_ns);
+int  ravenfs_cache_writeback_all(struct super_block *sb);
+int  ravenfs_inode_flush(struct super_block *sb, u64 inum);
+int  ravenfs_inode_sync_from_vfs(struct super_block *sb, struct inode *inode);
+void ravenfs_inode_mark_dirty(struct super_block *sb, u64 inum);
 
 struct ravenfs_session *ravenfs_session_get(struct super_block *sb, u64 inum);
 void ravenfs_session_put(struct ravenfs_session *s);
@@ -251,6 +255,7 @@ int  ravenfs_mdata_cache_create(struct super_block *sb);
 void ravenfs_mdata_cache_destroy(struct super_block *sb);
 long ravenfs_mdata_reap_expired(struct ravenfs_mdata_cache *c, u64 cutoff_ns);
 void ravenfs_mdata_flush_all(struct super_block *sb);
+int  ravenfs_mdata_writeback_all(struct super_block *sb);
 
 struct ravenfs_msession *ravenfs_mdata_get(struct super_block *sb, u64 blk);
 void ravenfs_mdata_put(struct ravenfs_msession *s);
@@ -270,6 +275,12 @@ static inline void *ravenfs_msession_node(struct ravenfs_msession *s)
 struct ravenfs_ttl;
 int  ravenfs_ttl_start(struct super_block *sb);
 void ravenfs_ttl_stop(struct super_block *sb);
+
+/* 元数据可写？（ro 挂载不得写盘） */
+static inline bool ravenfs_sb_writable(const struct super_block *sb)
+{
+	return !(sb->s_flags & SB_RDONLY);
+}
 
 /* ── 双位图分片分配器（bitmap.c）── */
 struct ravenfs_bitmap_mgr;

@@ -26,6 +26,7 @@
 #include <linux/blkdev.h>
 #include <linux/slab.h>
 #include <linux/statfs.h>
+#include <linux/pagemap.h>
 #include <linux/fs_parser.h>
 #include <linux/bitmap.h>
 #include <linux/crc32.h>
@@ -40,6 +41,7 @@ static const struct file_operations ravenfs_dir_operations;
 static const struct file_operations ravenfs_file_operations;
 static const struct fs_context_operations ravenfs_context_ops;
 static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc);
+static int ravenfs_sync_fs(struct super_block *sb, int wait);
 
 static struct kmem_cache *ravenfs_inode_cachep;
 static struct file_system_type ravenfs_fs_type;
@@ -399,8 +401,8 @@ static int ravenfs_parse_param(struct fs_context *fc, struct fs_parameter *param
 
 static int ravenfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
-	/* TODO(M2)：内存 inode → 盘（i_{m,c,a}time + ns） */
-	return 0;
+	/* 不落盘：把 VFS 字段同步进 mgr 行 + 标 dirty（盘专有字段不动）；落盘交 flush_all */
+	return ravenfs_inode_sync_from_vfs(inode->i_sb, inode);
 }
 
 static void ravenfs_evict_inode(struct inode *inode)
@@ -423,6 +425,17 @@ static void ravenfs_put_super(struct super_block *sb)
 	sb->s_fs_info = NULL;
 }
 
+/* 卷级同步（sync(1)/syncfs(2)）：脏元数据行 + 位图 全量刷回；ro 挂载 no-op */
+static int ravenfs_sync_fs(struct super_block *sb, int wait)
+{
+	if (!ravenfs_sb_writable(sb))
+		return 0;
+	ravenfs_cache_writeback_all(sb);
+	ravenfs_mdata_writeback_all(sb);
+	ravenfs_bitmap_flush(sb);
+	return 0;
+}
+
 static const struct super_operations ravenfs_sops = {
 	.alloc_inode	= ravenfs_alloc_inode,
 	.destroy_inode	= ravenfs_destroy_inode,
@@ -430,6 +443,7 @@ static const struct super_operations ravenfs_sops = {
 	.evict_inode	= ravenfs_evict_inode,
 	.put_super	= ravenfs_put_super,
 	.statfs		= ravenfs_statfs,
+	.sync_fs	= ravenfs_sync_fs,
 };
 
 static const struct inode_operations ravenfs_dir_inode_operations = {
@@ -447,8 +461,26 @@ static const struct file_operations ravenfs_dir_operations = {
 	.iterate_shared	= ravenfs_iterate,
 };
 
+static int ravenfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+{
+	struct inode *inode = file_inode(file);
+	int err;
+
+	err = filemap_write_and_wait_range(inode->i_mapping, start, end);
+	if (err)
+		return err;
+	if (!ravenfs_sb_writable(inode->i_sb))
+		return 0;
+	/* 数据路径未接（M4）；此处落该 inode 行 + 位图（fsync 的元数据义务） */
+	err = ravenfs_inode_flush(inode->i_sb, inode->i_ino);
+	if (!err)
+		ravenfs_bitmap_flush(inode->i_sb);
+	return err;
+}
+
 static const struct file_operations ravenfs_file_operations = {
 	.llseek		= generic_file_llseek,
+	.fsync		= ravenfs_fsync,
 	/* read_iter/write_iter/mmap：M4（需 a_ops 落点） */
 };
 
