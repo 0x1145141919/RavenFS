@@ -22,6 +22,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/xxhash.h>
+#include <linux/timekeeping.h>
 
 #include "ravenfs.h"
 
@@ -206,6 +207,271 @@ static int ravenfs_dir_find(struct inode *dir, const char *name, u32 nlen, u64 *
 	}
 	kfree(buf);
 	return err;
+}
+
+/* ── create / unlink（M3.4a：REG，单叶目录 + 内联名；多级树/外置名/其他类型待 M5） ── */
+
+/* 目录项定位结果（名字 → 叶块号 + 位；found 区分命中/未命中） */
+struct rfs_dloc {
+	u64	blk;		/* 叶块号 */
+	u32	idx;		/* 命中位 / 插入位 */
+	u64	ino;
+	bool	found;
+};
+
+/* 在**单叶**目录内定位（叶子必须 ≤126 条且非内部；多级树待 M5）。0 = 已定位/<0 错误。 */
+static int ravenfs_leaf_locate(struct super_block *sb, u64 leaf_blk, const char *name,
+			       u32 nlen, struct rfs_dloc *loc)
+{
+	struct ravenfs_msession *ms __free(ravenfs_msession) = ravenfs_mdata_get(sb, leaf_blk);
+	const struct Bptree_dentry_leaf_node_t *lf;
+	const struct Bptree_meta_t *m;
+	char *nm;
+	u32 i, cnt;
+	u64 hash;
+	int err = 0;
+
+	if (IS_ERR(ms))
+		return PTR_ERR(ms);
+	m = ravenfs_msession_node(ms);
+	if (m->magics[0] != DENTRY_MAGIC1 || m->magics[1] != DENTRY_MAGIC2 ||
+	    m->magics[2] != DENTRY_MAGIC3 || m->magics[3] != DENTRY_MAGIC4)
+		return -EIO;
+	if (RFS_PP_IS_INNER(m->parent_ptr))
+		return -EOPNOTSUPP;	/* M3.4a：多级树叶定位待 M5 */
+	cnt = RFS_PP_COUNT(m->parent_ptr);
+	if (cnt > 126)
+		return -EIO;
+	lf = ravenfs_msession_node(ms);
+	hash = xxh64(name, nlen, 0);
+	nm = kmalloc(RAVENFS_MAX_NAME_LEN, GFP_KERNEL);
+	if (!nm)
+		return -ENOMEM;
+	loc->blk = leaf_blk;
+	loc->idx = cnt;
+	loc->ino = (u64)PTR_INVALID;
+	loc->found = false;
+	for (i = 0; i < cnt; i++) {
+		const struct Dentry_t *e = &lf->entries[i];
+		unsigned int en;
+		int c, cmplen;
+
+		if (e->hash > hash) {		/* 越过 → 插在此位 */
+			loc->idx = i;
+			goto done;
+		}
+		if (e->hash != hash)
+			continue;
+		if (ravenfs_dentry_name(sb, e, nm, &en)) {
+			err = -EIO;
+			goto done;
+		}
+		cmplen = min_t(int, en, (int)nlen);
+		c = memcmp(nm, name, cmplen);
+		if (c == 0)
+			c = (en < nlen) ? -1 : (en > nlen ? 1 : 0);
+		if (c == 0) {
+			loc->found = true;
+			loc->idx = i;
+			loc->ino = RFS_PTR_ADDR(e->inode_ptr);
+			goto done;
+		}
+		if (c > 0) {			/* 同名 hash 区，名字更大 → 插在此位 */
+			loc->idx = i;
+			goto done;
+		}
+	}
+done:
+	kfree(nm);
+	return err;
+}
+
+int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
+			  struct dentry *dentry, umode_t mode, bool excl)
+{
+	struct super_block *sb = dir->i_sb;
+	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
+	struct ravenfs_session *ts __free(ravenfs_session) = NULL;
+	struct ravenfs_msession *ms __free(ravenfs_msession) = NULL;
+	struct raven_Inode_t *dr, *tr;
+	struct Bptree_dentry_leaf_node_t *lf;
+	struct Bptree_meta_t *meta;
+	struct Dentry_t *e;
+	struct rfs_dloc loc;
+	struct timespec64 now;
+	struct inode *inode;
+	u64 inum, root_blk;
+	u32 nlen = dentry->d_name.len, cnt;
+	int err;
+
+	if (nlen == 0 || nlen > DENTRY_INLINE_NAME_MAX)
+		return -ENAMETOOLONG;		/* 外置名（name_heap）待 M3.4b */
+	if (!S_ISDIR(dir->i_mode))
+		return -ENOTDIR;
+
+	ds = ravenfs_session_get(sb, dir->i_ino);
+	if (IS_ERR(ds))
+		return PTR_ERR(ds);
+	dr = ravenfs_session_inode(ds);
+	if (RFS_INO1_GET_TYPE(dr->word1) != INODE_TYPE_DIR)
+		return -ENOTDIR;
+	root_blk = dr->data_root;
+	if (root_blk == (u64)PTR_INVALID)
+		return -EIO;
+
+	err = ravenfs_leaf_locate(sb, root_blk, dentry->d_name.name, nlen, &loc);
+	if (err)
+		return err;
+	if (loc.found)
+		return -EEXIST;
+
+	ms = ravenfs_mdata_get(sb, root_blk);
+	if (IS_ERR(ms))
+		return PTR_ERR(ms);
+	lf = ravenfs_msession_node(ms);
+	meta = &lf->meta;
+	if (RFS_PP_IS_INNER(meta->parent_ptr))
+		return -EOPNOTSUPP;		/* 多级树插入（hint 维护）待 M5 */
+	cnt = RFS_PP_COUNT(meta->parent_ptr);
+	if (cnt >= 126)
+		return -ENOSPC;			/* 叶满 → 分裂待 M5 */
+
+	inum = ravenfs_inode_alloc(sb);
+	if (inum == (u64)PTR_INVALID)
+		return -ENOSPC;
+	ts = ravenfs_session_get(sb, inum);
+	if (IS_ERR(ts)) {
+		ravenfs_inode_free(sb, inum);
+		return PTR_ERR(ts);
+	}
+	tr = ravenfs_session_inode(ts);
+	now = current_time(dir);
+	memset(tr, 0, RAVENFS_INODE_SIZE);
+	tr->word1 = RFS_INO1_PACK(INODE_TYPE_REGULAR, 0, 0);
+	tr->uid = i_uid_read(dir);
+	tr->gid = i_gid_read(dir);
+	tr->mode_xattr = RFS_MODE_XATTR_PACK(mode & 0o7777, RFS_XATTR_NONE);
+	tr->link_count = 1;
+	tr->size = 0;
+	tr->data_root = (u64)PTR_INVALID;
+	tr->mtime = now.tv_sec;
+	tr->m_ns_stamp = (u32)now.tv_nsec;
+	tr->ctime = now.tv_sec;
+	tr->c_ns_stamp = (u32)now.tv_nsec;
+	tr->atime = now.tv_sec;
+	tr->a_ns_stamp = (u32)now.tv_nsec;
+	ts->row->dirty = true;
+	ts->row->stamp = ktime_get_ns();
+
+	/* 叶插入 */
+	if (loc.idx > cnt)
+		loc.idx = cnt;
+	memmove(&lf->entries[loc.idx + 1], &lf->entries[loc.idx],
+		(size_t)(cnt - loc.idx) * sizeof(struct Dentry_t));
+	e = &lf->entries[loc.idx];
+	memset(e, 0, sizeof(*e));
+	e->inode_ptr.v = RFS_PTR_PACK(nlen, inum);
+	e->hash = xxh64(dentry->d_name.name, nlen, 0);
+	e->full_char_remain_ptr = (u64)PTR_INVALID;
+	memcpy(e->name, dentry->d_name.name, min_t(u32, nlen, (u32)DENTRY_INLINE_NAME_MAX));
+	meta->parent_ptr.v = RFS_PP_PACK(cnt + 1, RFS_PP_IS_INNER(meta->parent_ptr),
+					 RFS_PP_IS_ROOT(meta->parent_ptr), RFS_PP_PTR(meta->parent_ptr));
+	ms->row->dirty = true;
+	ms->row->stamp = ktime_get_ns();
+
+	/* 父目录计数维护：size++ / link_count = size+2 */
+	dr->size += 1;
+	dr->link_count = (u32)dr->size + 2;
+	dr->mtime = now.tv_sec;
+	dr->m_ns_stamp = (u32)now.tv_nsec;
+	dr->ctime = now.tv_sec;
+	dr->c_ns_stamp = (u32)now.tv_nsec;
+	ds->row->dirty = true;
+	ds->row->stamp = ktime_get_ns();
+	dir->i_size = dr->size;
+	set_nlink(dir, dr->link_count);
+	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
+	inode_set_ctime(dir, now.tv_sec, now.tv_nsec);
+	mark_inode_dirty(dir);
+
+	inode = ravenfs_iget(sb, inum);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
+{
+	struct super_block *sb = dir->i_sb;
+	struct inode *inode = d_inode(dentry);
+	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
+	struct ravenfs_msession *ms __free(ravenfs_msession) = NULL;
+	struct raven_Inode_t *dr;
+	struct Bptree_dentry_leaf_node_t *lf;
+	struct Bptree_meta_t *meta;
+	struct rfs_dloc loc;
+	struct timespec64 now;
+	u64 root_blk;
+	u32 nlen = dentry->d_name.len, cnt;
+	int err;
+
+	if (nlen == 0 || nlen > DENTRY_INLINE_NAME_MAX)
+		return -ENAMETOOLONG;
+	ds = ravenfs_session_get(sb, dir->i_ino);
+	if (IS_ERR(ds))
+		return PTR_ERR(ds);
+	dr = ravenfs_session_inode(ds);
+	root_blk = dr->data_root;
+	if (root_blk == (u64)PTR_INVALID)
+		return -EIO;
+	if (d_is_dir(dentry) && !simple_empty(dentry))
+		return -ENOTEMPTY;
+
+	err = ravenfs_leaf_locate(sb, root_blk, dentry->d_name.name, nlen, &loc);
+	if (err)
+		return err;
+	if (!loc.found)
+		return -ENOENT;
+
+	ms = ravenfs_mdata_get(sb, root_blk);
+	if (IS_ERR(ms))
+		return PTR_ERR(ms);
+	lf = ravenfs_msession_node(ms);
+	meta = &lf->meta;
+	cnt = RFS_PP_COUNT(meta->parent_ptr);
+	if (loc.idx >= cnt)
+		return -EIO;
+	memmove(&lf->entries[loc.idx], &lf->entries[loc.idx + 1],
+		(size_t)(cnt - loc.idx - 1) * sizeof(struct Dentry_t));
+	memset(&lf->entries[cnt - 1], 0, sizeof(struct Dentry_t));
+	meta->parent_ptr.v = RFS_PP_PACK(cnt - 1, RFS_PP_IS_INNER(meta->parent_ptr),
+					 RFS_PP_IS_ROOT(meta->parent_ptr), RFS_PP_PTR(meta->parent_ptr));
+	ms->row->dirty = true;
+	ms->row->stamp = ktime_get_ns();
+
+	now = current_time(dir);
+	dr->size -= 1;
+	dr->link_count = (u32)dr->size + 2;
+	dr->mtime = now.tv_sec;
+	dr->m_ns_stamp = (u32)now.tv_nsec;
+	dr->ctime = now.tv_sec;
+	dr->c_ns_stamp = (u32)now.tv_nsec;
+	ds->row->dirty = true;
+	ds->row->stamp = ktime_get_ns();
+	dir->i_size = dr->size;
+	set_nlink(dir, dr->link_count);
+	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
+	inode_set_ctime(dir, now.tv_sec, now.tv_nsec);
+	mark_inode_dirty(dir);
+
+	/* 目标 inode：nlink--（VFS 后续 evict → ravenfs_inode_reclaim 回收槽位） */
+	if (inode) {
+		inode_set_ctime(inode, now.tv_sec, now.tv_nsec);
+		if (inode->i_nlink)
+			inode_dec_link_count(inode);
+	}
+	return 0;
 }
 
 struct dentry *ravenfs_lookup(struct inode *dir, struct dentry *dentry,

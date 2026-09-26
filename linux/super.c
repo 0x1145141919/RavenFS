@@ -407,9 +407,13 @@ static int ravenfs_write_inode(struct inode *inode, struct writeback_control *wb
 
 static void ravenfs_evict_inode(struct inode *inode)
 {
+	struct super_block *sb = inode->i_sb;
+
+	/* nlink==0 → 回收：记录清零 + 位图槽位（M3 仅 REG inline，无数据块） */
+	if (!inode->i_nlink)
+		ravenfs_inode_reclaim(sb, inode->i_ino);
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
-	/* TODO(M2)：nlink==0 → 回收数据 + inode 槽位 + 位图（R-LM-03） */
 }
 
 static void ravenfs_put_super(struct super_block *sb)
@@ -448,6 +452,8 @@ static const struct super_operations ravenfs_sops = {
 
 static const struct inode_operations ravenfs_dir_inode_operations = {
 	.lookup		= ravenfs_lookup,
+	.create		= ravenfs_create,
+	.unlink		= ravenfs_unlink,
 	.getattr	= ravenfs_getattr,
 };
 
@@ -631,14 +637,6 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 static int ravenfs_get_tree(struct fs_context *fc)
 {
-	/*
-	 * M1 无写路径：强制只读，避免"能挂 rw 但写坏盘"的半开。
-	 * （write_inode/evict 回收/位图持久化 = M2 落地后才解除）
-	 */
-	if (!(fc->sb_flags & SB_RDONLY))
-		pr_warn("ravenfs: M1 无写路径，强制只读挂载（禁止 rw）\n");
-	fc->sb_flags |= SB_RDONLY;
-
 	return get_tree_bdev(fc, ravenfs_fill_super);
 }
 

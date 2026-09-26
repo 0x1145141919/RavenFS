@@ -129,6 +129,9 @@ static inline u64 ravenfs_inode_bm_blocks(u64 inode_count)
 struct dentry *ravenfs_lookup(struct inode *dir, struct dentry *dentry,
 			      unsigned int flags);
 int ravenfs_iterate(struct file *file, struct dir_context *ctx);
+int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry,
+		   umode_t mode, bool excl);
+int ravenfs_unlink(struct inode *dir, struct dentry *dentry);
 struct inode *ravenfs_iget(struct super_block *sb, u64 inum);
 int ravenfs_read_node(struct super_block *sb, u64 blk, void *buf);
 
@@ -196,6 +199,7 @@ int  ravenfs_cache_writeback_all(struct super_block *sb);
 int  ravenfs_inode_flush(struct super_block *sb, u64 inum);
 int  ravenfs_inode_sync_from_vfs(struct super_block *sb, struct inode *inode);
 void ravenfs_inode_mark_dirty(struct super_block *sb, u64 inum);
+void ravenfs_inode_reclaim(struct super_block *sb, u64 inum);
 
 struct ravenfs_session *ravenfs_session_get(struct super_block *sb, u64 inum);
 void ravenfs_session_put(struct ravenfs_session *s);

@@ -375,6 +375,22 @@ void ravenfs_inode_mark_dirty(struct super_block *sb, u64 inum)
 	s->row->stamp = ktime_get_ns();
 }
 
+/*
+ * nlink==0 的 inode 回收（evict_inode 调用）：记录清零（防脏行回写复活）+ 位图槽回收。
+ * M3 仅 REG inline → 无数据块可回；extent/direct 数据回收待 M4。
+ */
+void ravenfs_inode_reclaim(struct super_block *sb, u64 inum)
+{
+	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, inum);
+
+	if (!IS_ERR_OR_NULL(s)) {
+		memset(ravenfs_session_inode(s), 0, RAVENFS_INODE_SIZE);
+		s->row->dirty = true;
+		s->row->stamp = ktime_get_ns();
+	}
+	ravenfs_inode_free(sb, inum);	/* 位图槽回收（持久化交 sync/umount flush） */
+}
+
 /* ── TTL 淘汰（cache_ttl.c 周期调用）：只收 refcount==1 ∧ !dirty ∧ stamp<cutoff ── */
 long ravenfs_cache_reap_expired(struct ravenfs_cache *c, u64 cutoff_ns)
 {
