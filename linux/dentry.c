@@ -64,7 +64,7 @@ static int ravenfs_read_bytes(struct super_block *sb, u64 fs_blk, u32 off,
 }
 
 /* 物化 dentry 名字：≤40 内联；>40 从名字堆读尾部（full_char_remain_ptr 给物理位置） */
-static int ravenfs_dentry_name(struct super_block *sb, const struct Dentry_t *e,
+int ravenfs_dentry_name(struct super_block *sb, const struct Dentry_t *e,
 			       char *out, unsigned int *out_len)
 {
 	u32 nlen = RFS_PTR_FREE(e->inode_ptr);
