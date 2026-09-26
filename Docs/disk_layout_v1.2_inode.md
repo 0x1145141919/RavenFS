@@ -120,6 +120,7 @@
 - inode 侧只有 **一个 52 位块指针**（`permission_bits.xattr_ptr`）；**块自描述** → inode 无需 xattr 的 size/root/direct 字段。
 - **单块**（ext2/4 的 `h_blocks` 是死字段：`fs/ext4/xattr.c:201` 硬断言 `!= 1` 即报错，`:2025` 写入恒 1）→ 上限 = 一块；放不下 → `-E2BIG`。
 - 块尺寸：**1 个 FS_block（4096B）**——**2026-09-26 定：统一 4K，非 8K piece**。不受 8K 节点对齐约束（8K 是 B+tree 节点形状，xattr 是独立结构；且 R-IO-01b 已弃 8K piece 缓存，b1 buffer_head 天然 4K）。
+- **净容量** = `RFS_XATTR_USABLE` = 4096 − 32（块头）− 4（终止零）= **4060B**（条目区 + 值区共存于一块；超出 → `-E2BIG`）。
 
 ### 5.2 块头（建议 32B，对齐 ext 形状）
 ```c
@@ -134,17 +135,29 @@ struct rfs_xattr_block_hdr {   // 32B
 
 > **为何 xattr magic 只给 u32（2026-09-26 定）**：B+tree 节点用 256-bit 强魔数，是为**容灾重建**——全盘扫描时低误报识别节点类型。而**灾难场景关心的是文件组织 + 目录树**，没人会去重建 xattr → xattr 块**无扫描级强度需求**，一个 u32 token（`"RFSX"`）意思意思即可；且 xattr 只经 inode 指针可达，指针跟随后的轻识别足够。
 
-### 5.3 条目（紧凑变长，4B 对齐）
+### 5.3 条目（**抄 ext4**：显式 `e_value_offs` + 值区从块尾向下 + 首个 u32==0 终止）
+> **2026-09-26 裁定（用户）**：硬上限仍为 **1 个 FS_block**，但**头部允许加字段**，其余**抄 ext4**。
+> 动机：原设计「value 紧随 name 内联 + 隐式推进/终止」对**对齐/终止规则留有歧义**（读/写不同实现会分叉）；ext4 用**显式值偏移**根治。
+
 ```c
-struct rfs_xattr_entry {           // 8B 定长头 + 变长数据
+struct rfs_xattr_entry {           // 8B 定长头；名字紧随其后（4B 对齐）；值在 e_value_offs 处
     uint8_t  e_name_len;           // 名字后缀长（不含命名空间前缀）
     uint8_t  e_name_index;         // 命名空间索引（见下，抄 ext4）
-    uint16_t e_value_len;
-    uint32_t e_reserved;           // 保留（置 0）——凑齐 8B 自然对齐
-    char     e_name[e_name_len];   // 名字后缀
-    uint8_t  e_value[e_value_len]; // 值（紧随 name，按 4B 对齐）
-};                                 // 扫描终止：剩余 < 8B 或全 0 区
+    uint16_t e_value_offs;         // 值在块内偏移（u16；块 ≤4K 够）；e_value_size==0 时忽略
+    uint32_t e_value_size;         // 值长（字节）
+    // char e_name[e_name_len];    —— 名字后**不内联 value**
+};
+#define RFS_XATTR_LEN(nl)      (((nl) + 3 + 8) & ~3ULL)     // 条目占位（名字 + 尾对齐），抄 ext4 EXT4_XATTR_LEN
+#define RFS_XATTR_IS_LAST(e)   (*(const uint32_t *)(e) == 0u) // 终止：首个 u32 == 0（抄 ext4）
 ```
+
+**两大区域（同一块内相向生长）**：
+- **条目区**：从 `[32)` 起向高地址增长；每条 = `RFS_XATTR_LEN(e_name_len)`；**末条后补 4B 零**作为终止（`RFS_XATTR_IS_LAST`）。
+- **值区**：从块尾 `4096` 向低地址堆叠，每个值 **4B 对齐**（`e_value_offs = down_align4(floor − size)`）；值区最低地址须 **≥ 条目区末端**。
+- 自洽校验：`e_value_offs ∈ [32, 4096–size]` 且 4B 对齐；**值区间互不重叠**；条目区末端 ≤ 值区最低地址。
+
+**相对 ext4 的删减**：无 `e_value_inum`（我们无「值外置 inode」；单块内联）；无 `e_hash`（v1.2 无共享）。⇒ 定长头 **8B**（vs ext4 16B）。
+
 **命名空间索引**（直接抄 ext4 `fs/ext4/xattr.h:19`，省存前缀）：`user=1`、`posix_acl_access=2`、`posix_acl_default=3`、`trusted=4`、`security=6`、`system=7`。
 **完整键** = `<前缀(index)><e_name>`。名长 ≤ `XATTR_NAME_MAX`(255)、值长受单块限制。
 
@@ -152,7 +165,15 @@ struct rfs_xattr_entry {           // 8B 定长头 + 变长数据
 `h_refcount`/`h_hash` 仅为**将来**「相同 xattr 集共享一块」预留；v1.2 `refcount=1`、`hash=0`。启动共享需全局 find-or-create + 缓存，v1.2 不做。
 
 ### 5.5 audit 规则
-`xattr_ptr ≠ 哨兵` ⇒ 认领该块 + 校验 `h_magic` / `h_refcount==1` / `h_blocks==1` / 条目在块内不越界 / `e_name_index` 合法 / 总长 ≤ 块；且该块在全局 bitmap 亮灯、被**恰一个** inode 认领。
+`xattr_ptr ≠ 哨兵` ⇒ 认领该块 + 校验：`h_magic` / `h_refcount==1` / `h_blocks==1` / `h_hash==0` / 条目越界 / `e_name_index` 合法 / `e_name_len>0` / **终止符（首个 u32==0）存在** / **值偏移合法且 4B 对齐、值区间互不重叠、条目区末端 ≤ 值区最低地址** / 总长 ≤ 块；且该块在全局 bitmap 亮灯、被**恰一个** inode 认领。
+
+### 5.6 存储契约完备性（VFS 驱动，待落地到 ko）
+> 以下为**盘面外**但必须写进 ko 契约的行为（xattr 面），本节仅登记：
+- **限额映射**：`size==0` 查询返回所需长度；`size<需要 → -ERANGE`；值放不进一块 → **`-E2BIG`**；`listxattr` 缓冲不足 → `-ERANGE`（内核 `XATTR_NAME_MAX=255 / XATTR_SIZE_MAX=65536 / XATTR_LIST_MAX=65536`）。
+- **旗标**：`XATTR_CREATE`（在存在→`-EEXIST`）/`XATTR_REPLACE`（不存在→`-ENODATA`）⇒ 盘面保证 **同一 `(index,name)` 至多一条**。
+- **生命周期**：重复 set → 覆盖（就地换值或重写块）；删最后一条 → **释放块 + 指针回哨兵**；**空 xattr 块禁止留盘**。
+- **值语义**：ACL/capability **opaque 存**（FS 不翻译内容）；`system.posix_acl_*` 必须走 ACL 回调（不入通用 setxattr）。
+- **不要求条目排序**（ext4 亦不要求）。
 
 ---
 

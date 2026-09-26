@@ -281,7 +281,7 @@ static void build_superblock(RavenSuperblock *sb, const MkfsParams &p,
     sb->world_base_lba = p.world_base_lba;
     sb->total_blocks   = geo.total_blocks;
     sb->inode_array_count = p.inode_count;
-    sb->root_inode     = 0;
+    sb->root_inode     = RAVENFS_ROOT_INODE;
     memcpy(sb->uuid, p.uuid, 16);
     memcpy(sb->volume_name, p.label, sizeof(sb->volume_name));
     sb->backup_prev  = PTR_INVALID;
@@ -302,22 +302,23 @@ static void build_superblock(RavenSuperblock *sb, const MkfsParams &p,
 /* 52 位指针空间无效哨兵（PTR_INVALID 的 52 位截断形态；v1.2 用掩码+宏访问 ptr） */
 static constexpr uint64_t PTR52_INVALID = RFS_MASK52;
 
-static void build_root_dentry_node(Bptree_dentry_leaf_node_t *node)
+static void build_root_dentry_node(Bptree_dentry_leaf_node_t *node, uint64_t root_ino)
 {
-    /* v1.1 根叶子（Bptree_dentry_leaf_node_t）：
-     *   parent_ptr  = {entry_count:0, is_inner:0, is_root:1, ptr=0}  → . = 根 inode 自身
-     *   ptrs[1]     = .. inode（根目录的父亲是自己 = inode 0）
+    /* v1.2 根叶子（Bptree_dentry_leaf_node_t）：
+     *   parent_ptr  = {entry_count:0, is_inner:0, is_root:1, ptr=root_ino}  → "." = 根 inode 自身
+     *   ptrs[1]     = ".." = 根 inode（根目录的父亲是自己）
      *   ptrs[0]/[2] = 预留（52 位全 1 = 无效）
-     *   entries     = 全空 — . / .. 由 parent_ptr / ptrs[1] 提供 */
+     *   entries     = 全空 — . / .. 由 parent_ptr / ptrs[1] 提供
+     * ⚠️ v1.2：root_ino = RAVENFS_ROOT_INODE(16)，不再是 0（改 root 索引时必须同步此处） */
     memset(node, 0, sizeof(*node));
     node->meta.magics[0] = DENTRY_MAGIC1;
     node->meta.magics[1] = DENTRY_MAGIC2;
     node->meta.magics[2] = DENTRY_MAGIC3;
     node->meta.magics[3] = DENTRY_MAGIC4;
-    node->meta.parent_ptr.v = RFS_PP_PACK(0, 0, 1, 0);          /* . = 根 inode 自身 */
-    node->meta.ptrs[0].v = RFS_PTR_PACK(0, PTR52_INVALID);      /* 预留 */
-    node->meta.ptrs[1].v = RFS_PTR_PACK(0, 0);                  /* .. = 根 inode（根的父亲是自己） */
-    node->meta.ptrs[2].v = RFS_PTR_PACK(0, PTR52_INVALID);      /* 预留 */
+    node->meta.parent_ptr.v = RFS_PP_PACK(0, 0, 1, root_ino);       /* . = 根 inode 自身 */
+    node->meta.ptrs[0].v = RFS_PTR_PACK(0, PTR52_INVALID);          /* 预留 */
+    node->meta.ptrs[1].v = RFS_PTR_PACK(0, root_ino);              /* .. = 根 inode（根的父亲是自己） */
+    node->meta.ptrs[2].v = RFS_PTR_PACK(0, PTR52_INVALID);          /* 预留 */
     /* entries[127] 全零（memset） */
 }
 
@@ -478,7 +479,7 @@ int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
     uint64_t dn_off  = block_to_offset(root_dentry_block, params);
 
     Bptree_dentry_leaf_node_t dentry_node;
-    build_root_dentry_node(&dentry_node);
+    build_root_dentry_node(&dentry_node, RAVENFS_ROOT_INODE);
 
     raven_Inode_t root_inode;
     build_root_inode(&root_inode, root_dentry_block);
@@ -495,9 +496,9 @@ int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
         bitmap.mark_backup(backup_blocks, bc);
         bitmap.mark_tail();
 
-        inodes.set(0, &root_inode);
+        inodes.set(RAVENFS_ROOT_INODE, &root_inode);
 
-        ibitmap.mark(0);
+        ibitmap.mark(RAVENFS_ROOT_INODE);
         ibitmap.mark_tail();
 
         // Root dentry + Backup SBs（显式写）

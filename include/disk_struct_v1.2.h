@@ -379,15 +379,29 @@ struct Bptree_dentry_inner_node_t {
 } RFS_PACKED;
 RFS_STATIC_ASSERT(sizeof(struct Bptree_dentry_inner_node_t) == 8192, "dentry inner node must be 8192B");
 
-/* ═══════════════════════════════════════════════════════════════════════════
+/* ═════════════════════════════════════════════════════════════════════════════
  * xattr 块（v1.2 新增）—— 单块自描述
- *   块头 32B；条目紧凑变长（4B 对齐）；整套 ≤ 1 个 FS_block(4096B)，超限 → -E2BIG
+ *   块头 32B；整套 ≤ **1 个 FS_block(4096B)**（硬上限，放不下 → -E2BIG）
  *   命名空间索引抄 ext4（省存前缀）；完整键 = <前缀> <e_name>
- * ═══════════════════════════════════════════════════════════════════════════ */
+ *
+ *   【布局 2026-09-26 定：**抄 ext4**】ext4 用**显式 `e_value_offs`** 定位值 →
+ *   条目本身**不含 value**；值从**块尾向下**堆叠（4B 对齐）；条目区从块头后向高地址
+ *   增长，以**首个 u32 == 0** 终止（ext4 `IS_LAST_ENTRY`）→ 消除“推进/终止”歧义。
+ *   相对 ext4 的删减：无 `e_value_inum`（我们无「值外置 inode」）、无 `e_hash`（无共享）。
+ * ═════════════════════════════════════════════════════════════════════════════ */
 #define RFS_XATTR_BLOCK_SIZE   4096u
 #define RFS_XATTR_HDR_SIZE     32u
-#define RFS_XATTR_ENTRY_HDR_SIZE 8u      /* 8B：e_name_len(1)+e_name_index(1)+e_value_len(2)+e_reserved(4) */
-#define RFS_XATTR_ALIGN4(n)    (((n) + 3u) & ~3u)
+#define RFS_XATTR_ENTRY_HDR_SIZE 8u      /* = sizeof(struct rfs_xattr_entry) */
+#define RFS_XATTR_PAD          4u
+#define RFS_XATTR_ROUND        (RFS_XATTR_PAD - 1u)   /* = 3 */
+#define RFS_XATTR_ALIGN(n)     (((n) + RFS_XATTR_ROUND) & ~(uint64_t)RFS_XATTR_ROUND)
+#define RFS_XATTR_ALIGN4(n)    RFS_XATTR_ALIGN(n)     /* 别名（兼容旧引用） */
+/* 条目占位（含名字 + 尾对齐）—— 抄 ext4 EXT4_XATTR_LEN */
+#define RFS_XATTR_LEN(nl)      (((nl) + RFS_XATTR_ROUND + RFS_XATTR_ENTRY_HDR_SIZE) & ~(uint64_t)RFS_XATTR_ROUND)
+#define RFS_XATTR_NEXT(e)      ((struct rfs_xattr_entry *)((char *)(e) + RFS_XATTR_LEN((e)->e_name_len)))
+#define RFS_XATTR_IS_LAST(e)   (*(const uint32_t *)(e) == 0u)   /* 终止：首个 u32==0（抄 ext4） */
+/* 块内净可用（块 − 块头 − 终止 4B 零；值区从块尾向下，不额外占位） */
+#define RFS_XATTR_USABLE       (RFS_XATTR_BLOCK_SIZE - RFS_XATTR_HDR_SIZE - 4u)
 
 /* xattr 块识别魔数：仅“意思意思”的 u32 token（**2026-09-26 定**）。
  * 对比：B+tree 节点用 256-bit 强魔数，是为**容灾重建**（全盘扫描低误报识别节点类型）；
@@ -412,14 +426,14 @@ struct rfs_xattr_block_hdr {        /* 32B */
 } RFS_PACKED;
 RFS_STATIC_ASSERT(sizeof(struct rfs_xattr_block_hdr) == 32, "xattr block hdr must be 32B");
 
-struct rfs_xattr_entry_hdr {        /* 8B 定长头（变长数据紧随其后，4B 对齐） */
+struct rfs_xattr_entry {            /* 8B 定长头；名字紧随其后（4B 对齐）；**值在 e_value_offs 处** */
     uint8_t  e_name_len;            /* 名字后缀长（不含命名空间前缀） */
     uint8_t  e_name_index;          /* 命名空间索引（RFS_XATTR_INDEX_*） */
-    uint16_t e_value_len;           /* 值长 */
-    uint32_t e_reserved;            /* 保留（置 0） */
-    /* char e_name[e_name_len]; uint8_t e_value[RFS_XATTR_ALIGN4(e_value_len)]; */
+    uint16_t e_value_offs;          /* 值在块内偏移（u16；块 ≤4K 足够）；e_value_size==0 时忽略 */
+    uint32_t e_value_size;          /* 值长（字节） */
+    /* char e_name[e_name_len]; —— 名字后**不内联 value**（value 在 e_value_offs 处） */
 } RFS_PACKED;
-RFS_STATIC_ASSERT(sizeof(struct rfs_xattr_entry_hdr) == 8, "xattr entry hdr must be 8B");
+RFS_STATIC_ASSERT(sizeof(struct rfs_xattr_entry) == 8, "xattr entry must be 8B");
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * RavenSuperblock（Primary & Backup，4096B）

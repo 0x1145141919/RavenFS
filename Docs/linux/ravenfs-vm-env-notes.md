@@ -58,6 +58,25 @@
 
 ---
 
+## 6. M1 阶段新增实测坑（2026-09-26，ko 挂载骨架实跑）
+
+> 场景：在 ext4 金标准 guest 内**就地编译并 insmod ravenfs.ko**（宿主 sudo 不可用，全程 guest root）。
+
+1. **ko 必须在 guest 内编译**：guest 内核 `7.2.6-arch2-1` ≠ 宿主 `7.2.3-1-vfio` → 宿主编的 `.ko` 会被 vermagic 拒。
+   命令：`make -C /usr/lib/modules/$(uname -r)/build M=/opt/ravenfs/linux modules`。
+2. ⚠️ **别用 `pacman -Sy`**：会把 `linux-headers` 拉到最新（实测 7.2.7）≠ 运行内核 7.2.6 → `build/` 目录版本不匹配。
+   正解：从归档装对齐版 `pacman -U https://archive.archlinux.org/packages/l/linux-headers/linux-headers-7.2.6.arch2-1-x86_64.pkg.tar.zst`。
+3. guest minimal `base` **没有 make/gcc** → 补 `pacman -S --needed make gcc binutils`（不必 `base-devel` 全家桶）。
+4. ⚠️ **9p 大批量读会挂死**：`cp -a` / `tar -C /rfssrc ...` 连续读多文件直接卡在 `D` 态（单文件 `cat` 正常）。
+   正解：源码投递改 **ssh-pipe tar**：`tar -C <repo> ... -cf - linux include mkfs | ssh guest 'sudo tar -C dest -xf -'`。
+   另：**投递时务必排除 `linux/vm`**（qcow2 表观 32G，一次 `tar` 灌了 19G 进 guest）。
+5. ⚠️ `/sys/block/*/device/serial` 内容**带尾部空格**：直接 `[ "$(cat ...)" = deadbeef ]` 会失败 → 需 `tr -d '[:space:]'`。
+6. 自动化便利：给 guest 的 `raven` 加 `NOPASSWD` sudo + 装宿主公钥（都为免密跑批；仅测试 VM 内）。
+
+**M1 结论**：`insmod` → `/proc/filesystems` 有 ravenfs；`mount -t ravenfs /dev/nvme1n1 /mnt/rfs` 成功（ro）；空根 `ls`/`stat -f`/`stat` 全对；真实 NVMe 512B LBA 路径（`world_base_lba=8`→`blk0_off=4096`）通过。
+
+---
+
 ## 4. 验收证据（对齐 §2.1/§2.2 中不依赖 `ravenfs.ko` 的项）
 
 - `test -f /boot/EFI/BOOT/BOOTX64.EFI` ✅（fallback）

@@ -23,7 +23,7 @@
 
 | # | 决议 | 一句话 |
 |---|---|---|
-| **架构·缓存/IO** | **全部下沉 Linux** | inode 缓存 → **VFS inode**（R-IO-01a）；元数据节点 → **页缓存**（R-IO-01b）；块 I/O → **bio**（R-IO-02）。god 的 `inode_cache_radix` / `mdata_piece_caches` / `cache_mgr_mode` **不进 ko** |
+| **架构·缓存/IO** | 元数据/块 I/O 下沉 Linux；**inode 记录进 ko** | 逻辑 inode → **VFS inode**；**盘 inode 记录 → ko 侧 `inode_cache_mgr`(XArray)+`inode_session`**（R-IO-01a，**2026-09-26 修订**）；元数据节点 → **页缓存**（R-IO-01b）；块 I/O → **bio**（R-IO-02）。god 的 `mdata_piece_caches` / `cache_mgr_mode` **不进 ko**（但 `inode_cache` 现在要） |
 | **架构·机制** | R-IO-01b = **b1 buffer head**（E8） | `sb_getblk`/`__bread_gfp`/`mark_buffer_dirty`；bh 自带 `b_state` 锁 |
 | **架构·锁** | **模型 (A)** | B+tree 节点逻辑原子性靠自建 **node latch**（按块号索引的 latch 表）；页锁**逐页、绝不嵌套两页** |
 | **E2** | **v1.2 inode 盘面** | 第一字 `type:6｜direct:1｜i_flags:57`；`permission_bits → mode:12｜xattr_ptr:52`；rdev→`inline_data`；xattr=**单块自描述**。**字节布局不变**，但旧盘不兼容 → reformat + `RAVENFS_VERSION 2→3` |
@@ -140,7 +140,7 @@
 
 | ID | 需求 | 依据 | 优先 | 框架优先落点 | 现状 |
 |---|---|---|---|---|---|
-| R-LM-01 | `alloc_inode`/`destroy_inode`：分配 **FS 私有结构**（内嵌 `struct inode` + 盘 inode 视图） | A: `fs/ext2/ext2.h`；R-IO-01a | **M** | `alloc_inode_sb`（`fs.h:3037`）+ `RAVENFS_I()` | ❌ |
+| R-LM-01 | `alloc_inode`/`destroy_inode`：FS 私有 inode 结构**不再内嵌盘 inode 视图**（盘记录归 mgr）；需要私有字段时再补骨架 | A: `fs/ext2/ext2.h`；R-IO-01a | **M** | `alloc_inode_sb`（`fs.h:3037`） | ❌ |
 | R-LM-02 | `write_inode`：内存 inode → 盘（含 `i_{m,c,a}time`+ns） | A: ext2 `ext2_write_inode` | **M** | 映射 god `inode_write` | ❌ |
 | R-LM-03 | `evict_inode`：**唯一** inode 回收入口；`nlink==0` 回收数据+inode+位图 | A: 不变量 17/20；`vfs.rst` | **M** | `regular_file_reclaim`/dir 回收 + **自调 `truncate_inode_pages_final()`** | ⚠️ 用户态有，无 VFS 钩 |
 | R-LM-04 | `put_super`：卸载析构（位图 flush）；干净卸载（T3 判据） | A: 纲领 §2.1；I8 | **M** | god 析构 + 位图落盘 | ❌ |
@@ -149,7 +149,7 @@
 | R-LM-07 | `dirty_inode`/`drop_inode`：**均不实现**（`drop_inode` 必须 NULL——VFS inode 即缓存） | A: `vfs.rst`；ext2 无此二者 | C | 缺省 | ✅ 缺省即满足 |
 | R-LM-08 | `show_options`：`/proc/mounts` 输出挂载选项 | A: ext2 `ext2_show_options` | L | `seq_puts` | ❌ |
 | R-LM-09 | **自检失败 → 内部「停机」标志 → 所有操作 `-EIO`**；恢复 = **彻底 umount + 重新 mount**（可 ro）；**拒绝在线 remount（含 remount-ro）** | A: 惯例（xfs `xfs_force_shutdown`）；`super_types.h` | **M** | 自持 `RFS_SHUTDOWN` 标志（+ 可选 `report_error` 仅通知） | ❌ |
-| R-LM-10 | sb 关键字段：`s_magic`（**唯一**）、`s_maxbytes`（=§4.7）、`s_time_gran`、`s_op`、`s_flags` | A: `fs.h` | **M** | 分配唯一 magic；`s_maxbytes=RFS_MAX_FILESIZE` | ❌ magic 待定 |
+| R-LM-10 | sb 关键字段：`s_magic`（**唯一**）、`s_maxbytes`（=§4.7）、`s_time_gran`、`s_op`、`s_flags` | A: `fs.h` | **M** | `s_magic = SUPERBLOCK_MAGIC`（**与 mkfs 盘上 SB 魔数同源**，2026-09-26 裁）；`s_maxbytes=RFS_MAX_FILESIZE` | ✅ 已定 |
 | R-LM-11 | 挂载语义：`ro`/`rw`、`rootflags`；根挂载由内核 `rootfstype=ravenfs` 走 `mount_root` | A: 纲领 §3.5 | **M** | 标准 `fs_context` | ❌ |
 | R-LM-12 | `freeze_super`/`thaw_super`：挂起/休眠 | B: `vfs.rst` | C | 可先 `-EOPNOTSUPP` | ❌ |
 
@@ -292,7 +292,7 @@
 |---|---|---|---|---|---|
 | R-SY-01 | `fsync`/`fdatasync` 真持久 + 错误回报（卷级见 `sync_fs`） | A: ext2 | **M** | `sync_fs`→`fs_sync` | ❌ |
 | R-SY-02 | `syncfs(2)`：遍历卷内 inode 落盘 | A: `vfs.rst` | **M** | `sync_filesystem` | ❌ |
-| R-SY-03 | **位图持久化**：每次 `alloc/free` 标脏 + `sync_fs` 落盘（fsck 空实现下的硬约束） | A: 纲领 §4 | **M** | god 位图 flush | ⚠️ 仅 umount flush |
+| R-SY-03 | **位图持久化**：每次 `alloc/free` 标脏 + `sync_fs` 落盘（fsck 空实现下的硬约束） | A: 纲领 §4 | **M** | **位图=全量内存分片**（学 god）；`sync_fs`/`put_super` 全量刷回 | ⚠️ M3 |
 | R-SY-04 | **写序 + flush**（D-C1）：分配类「位图亮灯→数据落盘→inode 翻转」；删除类「先删引用→后计数」 | A: 不变量 20/25 | **M** | 照抄不变量；`blkdev_issue_flush` | ⚠️ |
 | R-SY-05 | flush 语义：`blkdev_issue_flush`/FUA，保证「fsync 返回即落盘」 | A: `vfs.rst` | **M** | `blkdev_issue_flush` | ❌ |
 | R-SY-06 | `put_super` 干净卸载（T3 判据） | A: 纲领 §2.1 | **M** | R-LM-04 | ❌ |
@@ -324,7 +324,7 @@
 > | 负载形状（偶数基址/2 连续块） | **盘面不变量**（B+tree 节点恒 2 连续块） | disk_layout |
 >
 > ⇒ **节点 latch = 按 piece 索引的 `xarray<rw_semaphore>`**：罩住 2×4K bh 的逻辑原子性；bh 的 folio 锁管单页缓存一致性（**逐页，绝不嵌套两页**）。**latch 生命周期独立于 folio**（folio 会回收）→ 常驻不回收（元数据节点数千~数万 → 数 MB 量级）。
-> ← **唯一未定子项**：latch 回收策略（**常驻 vs 引用计数延迟回收**）——待选。
+> **→ 决议（2026-09-26 深夜，用户裁）：M2.4 node_latch *不做*** —— 片级睡眠 `rw_semaphore` 已提供互斥（“已经有互斥锁了”），且已有**专属 TTL 淘汰器**掌握行生命周期 ⇒ 无需独立 latch 表；本节「latch 回收策略」未定项随之**关闭**。
 
 ### 4.10 DG — 可降级 / 豁免（明确 `-EOPNOTSUPP`）
 
@@ -346,7 +346,7 @@
 
 | ID | 需求 | 依据 | 优先 | 说明 |
 |---|---|---|---|---|
-| **R-IO-01a** | **inode 缓存 → VFS inode**：不移植 `inode_cache_radix`；`struct inode` 内嵌 FS 私有结构（ext2 `ext2_inode_info` 模式）；`iget_locked/ilookup` 取代缓存查找；三后端（no_cache/self_reliat/offload）消失 | A: `fs/ext2/ext2.h`；E1 | **M** | 连带 R-LM-01/02/03；`.dirty()`→`mark_inode_dirty` |
+| **R-IO-01a** | **盘 inode 记录 → ko 侧 `inode_cache_mgr`（XArray 分片）+ `inode_session`**：接口对齐 god（`self_reliat_get/put/mark_dirty`、`flush_all`），内部 = 分片 `xarray` + **片级睡眠 `rw_semaphore`** + 4K 行(16 inode)；**逻辑 inode 只存 `i_ino=inode_idx`**；盘记录经 session 访问（`__free()` 自动 put）；`write_inode` = 更新 mgr + `mark_dirty`（落盘交 shrinker/`flush_all`） | A: `inode_cache_radix.hpp`；**2026-09-26 修订**（反转原 E1） | **M** | 连带 R-LM-01/02/03；详见 **§4.11.1** |
 | **R-IO-01b** | **元数据节点缓存 → Linux 页缓存**：不移植 `mdata_piece_caches`；8K 片走页缓存（4K 页 = 2 页/片）；RMW 采 **(A)**；机制 = **b1 buffer head** | A: E1/E8 | **M** | `sb_getblk`/`__bread_gfp`/`mark_buffer_dirty`；LBS 已排除 |
 | R-IO-02 | **块 I/O 后端**：`bio`/`submit_bio`（`sb->s_bdev`）替换用户态 `pread/pwrite` | A: 架构收敛（E1） | **M** | `io_backend.h` kernel 实现 |
 
@@ -357,7 +357,80 @@
 > 可选实测：写个小模块对**未挂载**裸设备 `insmod` 后看 `getblk(size=8192)` 是否 NULL（源码依据已足够定论；实测仅为显式确认）。
 > ⇒ **E8 收口 = b1 buffer head + 8K 节点 = 2×4K bh**。
 
+### 4.11.1 基调修订（2026-09-26 晚）：`inode_cache_mgr` + `inode_session` **进 ko**
+
+> **本修订反转了原 E1 的「god 的 inode_cache_radix 不进 ko」**。用户裁定：ko 侧**移植** god 的 `Inode_cache_mgr_t` **接口**与 `InodeSession` **抽象**；差别在**内部实现**与**驱逐策略**。
+
+**两层对象（解耦，互不蕴含）**
+- **logical inode**（`struct inode` + 回调）：VFS 管；**只存 `i_ino = inode_idx`**，**不内嵌盘 inode**。
+- **disk_inode_cache**（mgr）：只管**盘 inode 热数据集**（256B 记录；装载粒度 = 4K 行 = 16 inode/块）。
+
+**接口（对齐 god，内部换实现）**
+
+| god | ko |
+|---|---|
+| `self_reliat_get(inum,&tok) → raven_Inode_t*` | `ravenfs_inode_get(sb, idx, &tok)` |
+| `self_reliat_put` / `mark_dirty` | 同名对应 |
+| `flush_all()` | 同（`sync_fs` / `put_super` 同步点） |
+| `slice_radix_tree × 2^w0`，每片 `shared_mutex` | **每片 `struct xarray` + 片级睡眠 `rw_semaphore`** |
+| `read_line/write_line` 回调 | ko 内实现（读 = `sb_bread` 4K 行） |
+| `InodeSession`（C++ RAII） | C 侧 `DEFINE_FREE(ravenfs_session, struct ravenfs_session *, …)` + `__free(ravenfs_session)` |
+
+**语义（圈定死）**
+1. **对象边界**：mgr 不持有、不感知 `struct inode`。
+2. **session 契约**：一次 FS 操作 = 一个 session（`get`→用→`put`，`__free` 自动 put）；`get` 保证记录在 session 内**地址稳定、内容自洽**；**不承诺跨 session 的可见性时序**。
+3. **写回权威**：`write_inode` = 更新 mgr 记录 + `mark_dirty`；**落盘只发生在 `flush_all`**（`sync_fs` / `put_super`）。`fsync`/`sync_fs` 语义必须与此接通（`sync_fs`→`flush_all`；文件 `fsync` 须保证其 inode 记录落盘）—— M3 必做。
+4. **锁（无全局锁）**：`xa_store/xa_erase` 内部 `xa_lock`（自旋）**只护索引映射**；**片级睡眠 `rw_semaphore`** 护**行生命周期 + 行内容 RMW**（可跨 I/O，`xa_lock` 不能跨睡眠）。VFS `i_rwsem` 管 FS 逻辑 —— 不同层。
+5. **分片几何（2^n inode/片，O(1) 位切定位）**：`bits_len = ceil_log2(inode_count)`；`w0` = 分片选择位宽（**默认 7 → ≤128 片**）；`shard = inum >> (bits_len - w0)`；片内行键 = `(inum >> 4) & (2^(bits_len-w0-4) - 1)`；`row_bits = 4`（16 inode/4K）。每片 inode 数 = `2^(bits_len - w0)`。
+6. **驱逐（三路，各管一事）**：
+   - **冷工作集 → 自写 TTL 淘汰器（主）**：`linux/cache_ttl.c`（独立文件）。**2026-09-26 深夜用户裁定**：token 经济性/路线可靠性 → **自写 TTL**，不指望内核压力回收做冷集淘汰。参数暂对齐上帝类：**TTL=2s**（`ravenfs_ttl_seconds`）、周期 1s（`ravenfs_reap_ms`）；淘汰条件 = `refcount==1 ∧ !dirty ∧ now-stamp>ttl`；行 `stamp` 每次 get 刷新（对齐 god `accss_stamp`）。
+   - **压力 shrinker：已移除（2026-09-26 深夜）** —— 冷集淘汰**只由 TTL 承担**（内核压力回收不再介入本缓存）。⚠️ 副作用：`ttl_seconds=0`（关 TTL）时缓存行将直到卸载才释放。
+   - **折构/卸载 → 主动 `flush_all()` 全量刷回**（与 god 被动 TTL 不同）。
+   - 澄清（源码实证，7.2.3）：**内核的 TTL 只在“回写”层存在**（`dirty_expire_centisecs` 30s / `dirty_writeback_centisecs` 5s / `dirtytime_expire_seconds` 12h）；**“回收/淘汰”层只有压力驱动**（`shrink_slab` 仅由 vmscan 触发）→ 这也是要自写 TTL 的原因。
+   - **logical inode 驱逐（`evict_inode`）与两个缓存的行驱逐互不蕴含。**
+
+
 ---
+
+### 4.11.2 M2.2–M2.5 已落地实现（2026-09-26 深夜）
+
+> 以下是 §4.11.1 之后的实现级契约增补（**已编码并实测**）；进度/证据见交接文档 `ravenfs-linux-ko-handover.md`。
+
+**A. 缓存行尺寸解耦（M2.2）**
+- inode 行尺寸由 **mount option `row_size=`** 决定，支持 **4K/8K/16K/32K/64K**（默认 4K）；行 = `row_size/4096` 个**连续 4K FS_block**；行内槽位 = `inum & (inodes_per_row-1)`。
+- **行缓冲 = 伙伴系统页块**（2026-09-26 深夜）：`alloc_pages(GFP_KERNEL_ACCOUNT|__GFP_ZERO, order)`，`order = log2(row_size/4K)`（4K→0 … 64K→4）；访问用**直映射物理指针** `page_address(page)`；淘汰/卸载 `__free_pages(page, order)` 归还伙伴系统。**不再经 slab**。
+- `w0`（分片选择位宽）**自适应**：`w0 = min(7, bits_len - row_bits)`，保证每片容量 ≥ 行容量（否则 64K 行会被迫收窄）。
+- **尾部不完全行**：行首必须落在 inode array 内；越界时**截断读取**（只读实际存在的块）+ **零填充**。
+- 行尺寸**只是内核装载粒度**，盘面不变 ⇒ **同一镜像在 5 档下均可读**（实测）。
+
+**B. `mdata_piece_cache_mgr` + `mdata_session`（M2.3）**
+- 独立文件 `linux/mdata_cache.c`，**技术路线完全仿 inode_cache**（分片 xarray + 片级睡眠 rwsem + `__free()` session + TTL 淘汰 + `flush_all` + **伙伴系统页行缓冲**）。
+- granule **固定 8K** = 1 个 B+tree 节点（2×4K）；键 = `blk>>1`；尾部节点按 `total_blocks` 截断。
+- **`ravenfs_read_node()` 改为「mdata session 取 → memcpy → put」** ⇒ 全 ko 节点读（lookup 下行 / readdir 走叶 / extent 计数 / i_blocks）统一走此缓存。
+
+**C. 内存记账 / 观测面（改伙伴系统后）**
+- 页来自伙伴系统，用 `GFP_KERNEL_ACCOUNT` 保持 **memcg 记账**；但**不再计入 `SReclaimable`**（页非 slab 对象），`/proc/slabinfo` 不再出现 ravenfs 行。
+- 观测面：dmesg **TTL reap 日志**（`freed=`/`total=`）+ `/proc/buddyinfo` 页阶变化 + `/proc/slabinfo`（仅 `ravenfs_inode_cache` = VFS inode）。（压力 shrinker 移除后，不再有 `sb-ravenfs` 的 shrinker debugfs 计数。）
+- 附带好处：不再有「两个 8K cache 被 slab 合并」的观测困扰。
+
+**D. 自写 TTL 淘汰器（M2.5）**
+- 独立文件 `linux/cache_ttl.c`；`ravenfs_ttl_seconds`（默认 **2**，0=关）/ `ravenfs_reap_ms`（默认 1000）。
+- 淘汰条件：`refcount==1 ∧ !dirty ∧ now-stamp > ttl`；`stamp` 每次 `get` 刷新。
+- 生命周期：挂载后 `ravenfs_ttl_start`；**`put_super` 先 `ravenfs_ttl_stop` 再销毁缓存**。
+- **实测**（无内存压力）：354 行被 TTL 回收，随后重读正确。
+
+**E. 锁与并发的当前实现**
+- 现为「分片 xarray + **片级睡眠 rw_semaphore** + refcount」：读锁 ⊃ 「查表 + `refcount_inc`」；写锁 ⊃ 「摘表 + 释放」；TTL 只收 `refcount==1 ∧ !dirty`。
+- **M2.4 决议（2026-09-26 深夜，用户裁）：不做 node_latch** —— 片级 `rw_semaphore` 已足；且 TTL 淘汰器掌握生命周期 ⇒ §4.9 未定项关闭。
+- **⭐ 锁纪律（2026-09-26 深夜）**：`kzalloc`/`alloc_pages`/`sb_bread` 等**睡眠分配 + 块 I/O 一律在分片锁外完成**（装载走「锁外分配+读盘 → 临界区双检插入」）。既避免持锁做重活，也免受「分配→direct reclaim→重入本缓存取锁」类自锁死（压力 shrinker 已于同轮移除，纪律保留作护栏）。
+
+**F. 位图（R-SY）—— 决议（2026-09-26 深夜，用户裁）**
+- **位图 = 全量常驻内存分片**（学 god `bitmap_slices`：片级锁 + 内存位图）。**不做**「bh + `mark_buffer_dirty` 增量/页缓存推进」那一套（位图内存占用本就小，不值得苦哈）。
+- 持久化 = `sync_fs`/`put_super` **全量刷回**；写序仍守不变量 20/25（亮灯→数据落盘→inode 翻转）。
+
+**G. 回写语义（M3 必做，已定）**
+- `write_inode` = 更新 mgr 记录 + `mark_inode_dirty(inode)`（**两者必须同置同清**）；`write_inode` 落盘该行并清 `dirty`。
+- 落盘路径收敛：① `sync_fs` → `flush_all`；② umount → `flush_all`；③（M3）flusher：周期 TTL 触发 dirty 行的 `write_inode`。**TTL 淘汰永不写盘，只摘 clean 行**（dirty 行跳过、等 flush）。
 
 ## 5. 追溯矩阵（Arch 组件 → syscall → VFS 回调 → 需求）
 
@@ -384,7 +457,7 @@
 
 | # | 议题 | 决议 |
 |---|---|---|
-| **E1** | 缓存/IO 后端 | **全部下沉 Linux**（E1 → R-IO-01a/01b/02 + 锁模型 (A)）；机制子决策 **E8** |
+| **E1** | 缓存/IO 后端 | 元数据节点/块 I/O 下沉 Linux（R-IO-01b/02 + 锁模型 (A)）；**inode 缓存：ko 侧移植 `inode_cache_mgr`(XArray)+`inode_session`（2026-09-26 修订，见 R-IO-01a / §4.11.1）**；机制子决策 **E8** |
 | **E2** | 盘格式 v1.2 | **已收敛**：见 §4.5.1（`type:6｜direct:1｜i_flags:57`；`mode:12｜xattr_ptr:52`；rdev→`inline_data`；xattr=单块）；**字节 offset 不变、旧盘不兼容** |
 | **E3** | 目录 nlink 语义 | **报 `size+2`**（过报安全、零成本；`man find -noleaf`） |
 | **E4** | readdir cookie 并发 | **单次 syscall 原子**（读锁）；**跨调用不阻止并发修改**；cookie 容错重扫 |

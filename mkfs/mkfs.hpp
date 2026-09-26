@@ -11,6 +11,11 @@
 
 /* 磁盘格式版本号由 disk_struct_v1.2.h 的 RAVENFS_VERSION 宏提供（v1.2 = 3） */
 
+/* 根目录 inode 索引（2026-09-26 用户裁定：硬编码 16，不用 0）
+ * 理由：用户态 st_ino=0 在 POSIX 语义下 = “已删除”；0 也常作无效哨兵。
+ * 约定：0..15 不分配（保留位），根目录恒落在 index 16。 */
+#define RAVENFS_ROOT_INODE 16ULL
+
 struct MkfsParams {
     const char *device;
     uint64_t    inode_ratio;     // 每 inode 管辖的 FS_block 数（默认 8）

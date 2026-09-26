@@ -68,7 +68,7 @@
 
 | 层 | 内容 | 验收判据 | 状态 |
 |---|---|---|---|
-| **T0** | 静态：`mkfs.ravenfs` 产物 → 只读挂载 → **`audit_filesystem`** 全绿 | 不变量 §10 零违例 | 在范围 |
+| **T0** | 静态：`mkfs.ravenfs` 产物 → 只读挂载 → 契约校验员全绿 | 不变量 §10 + v1.2 §7 零违例 | **✅ 2026-09-26 达成**（校验员=`tools/audit_v1.2`） |
 | **T1** | **xfstests `./check -g quick`（generic 组）** | 通过率；失败清单 = 第一约束缺口表 | 在范围 |
 | **T2** | 压力：`fsx` / `fsstress` / `fs_mark`；**每轮跑 audit** | 无静默损坏 | 在范围 |
 | **T3** | **完整安装**：在 ext4 根里 `insmod` 后构建 Arch 系统（ravenfs 根）+ 装 UEFI bootloader | 见 §2.1 | 在范围 |
@@ -77,6 +77,39 @@
 | T6 | 性能基线 vs ext4（`fio`/`bonnie++`/`systemd-analyze`） | 先定可接受倍率 | **暂缓，另议** |
 
 > **「测试矩阵之外」的含义**：**装 ext4 根不算测试步骤**（它是环境准备，用标准工具走标准流程）。测试矩阵从 **"在 ext4 根里 `insmod ravenfs.ko`"** 才开始。
+
+### 2.0 实现进度与工具链（2026-09-26）
+
+> **接手请先读 `ravenfs-linux-ko-handover.md`（交接文档，自包含）。**
+
+| 里程碑 | 内容 | 状态 |
+|---|---|---|
+| M0 | 模块骨架：`fs_type` 注册 + kbuild 外部模块 | ✅ |
+| M1 | SB 读+校验(magic/ver/crc32) + 几何 + root iget + 只读 mount + 空目录 readdir/lookup/getattr/statfs | ✅ |
+| M2 | dentry B+tree 遍历（lookup hash 下行 / readdir 全量 + 名字堆长名）+ `getattr.blocks` | ✅ |
+| M2.1 | readdir cookie → (叶块号,槽) + 叶链续读（大目录 O(log n) 定位 + O(产出)）；`i_blocks` 诚实化 | ✅ |
+| M2.2 | 缓存行尺寸解耦（4K/8K/16K/32K/64K，mount `row_size=`，尾行截断） | ✅ |
+| M2.3 | `mdata_piece_cache_mgr`+`mdata_session`（8K 固定 granule）；`ravenfs_read_node` 改走 session | ✅ |
+| M2.4 | ~~锁层改 node_latch~~ → **不做**（片级 rw_semaphore + 专属 TTL 已足；关闭 spec §4.9 未定项） | **✅ 决议** |
+| M2.5 | 自写 TTL 淘汰器（`cache_ttl.c`，2s，对齐 god）——**压力 shrinker 已移除**，TTL 为唯一冷集淘汰 | ✅ |
+| M2.5b | 行缓冲改**伙伴系统页**（`order=log2(row/4K)`，直映射访问，淘汰归还）；**分片锁重入死锁根治**（锁外分配+I/O） | ✅ 实测 |
+| **T0** | mkfs + 只读挂载 + `audit_v1.2` 全绿 | **✅ 达成** |
+| M3 | 元数据写路径：`write_inode` 落盘 + `mark_inode_dirty` 绑定 / `sync_fs`→`flush_all` / `fsync` / dirty 回写 / **位图持久化（全量内存分片 + 全量刷回）** / 取消强制 RO + **最小写操作**（create/unlink） | **下一步** |
+| M3.5 | 一致性/崩溃窗口验証（写序 + 非干净卸载后 audit） | 待 M3 |
+| M4 | 文件数据：`a_ops` + extent 树对接 + truncate/punch/fallocate + `i_blocks` 更新 | 待 M3 |
+| M5 | 命名空间全量：mkdir/rmdir/link/symlink(`get_link`)/rename/mknod/tmpfile + **dentry 分裂与叶链维护** | 待 M3（T1 缺口主源） |
+| M6 | xattr/ACL：4 回调 + `SB_POSIXACL` + `posix_acl_create` + `security.capability` | 待 M3/M5 |
+| M7 | 加固：停机标志（`RFS_SHUTDOWN`）/ 并发（回写·evict·sync vs 前台）/ fsync 全覆盖 / ENOSPC 干净（~~node_latch~~ 已裁不做） | 待 M3–M6 |
+| M8 | 预演最狠测试：`rsync -aHAX` 克隆 + `pacman -Qkk`（T3 前哨） | 待 M4+M5+M6 |
+| T1 | xfstests `-g quick`（generic） → **缺口表**（前置：xfstests 工具链进 guest 尚未解决） | 待 M3–M7 |
+| T1.5 | 按缺口表逐条补 spec §4 的 **M** 项，重跑 T1 至收敛 | 待 T1 |
+| T2 | 压力：`fsx`/`fsstress`/`fs_mark`，**每轮 audit** | 待 T1.5 |
+
+> **子阶段的目标/出口判据/依赖/需求映射**详见交接文档 `ravenfs-linux-ko-handover.md` **§6 里程碑路线图**。
+
+**工具链（host 侧）**：`mkfs/mkfs.ravenfs`（v1.2，root inode=16）· `tools/audit_v1.2/`：`audit_v1.2`（递归只读校验 + 叶链校验）· `mkcontent` / `mkbigdir`（内容/大目录靶子）· `dents_dump`（getdents64 小缓冲续读压测）· `linux/tools/check_super.py`（SB 快速校验）。
+
+**验证环境**：独立 QEMU VM（`linux/vm/`，ext4 金标准 + ESP）——详见 `ravenfs-vm-env-notes.md` 与交接文档的「构建/测试流水线」。
 
 ### 2.1 T3「完整安装」判据
 - [ ] `modprobe ravenfs` 后 `/proc/filesystems` 出现 ravenfs

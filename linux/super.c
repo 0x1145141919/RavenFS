@@ -1,0 +1,673 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * super.c —— RavenFS Linux KO：模块注册 + 挂载骨架（M1）
+ *
+ * 里程碑 M1：register_filesystem → get_tree_bdev → SB 读+校验(magic/version/crc32)
+ *            → 几何推导 → root inode(iget) → 只读挂载 + 空目录 readdir/lookup/getattr/statfs
+ *
+ * 依据：Docs/linux/ravenfs-linux-ko-requirements-spec.md
+ *   R-KP-01/02/03 模块与 fs_type 注册、bdev 绑定、SB 校验
+ *   R-LM-01/02/10 inode 分配 / write_inode / sb 关键字段
+ *   R-NS-01/11    lookup / iterate_shared
+ *   R-MD-01       getattr
+ *   R-SP-01/06    statfs / s_maxbytes
+ *
+ * 【M1 诚实边界（勿当成品）】
+ *   · 非空目录的 dentry 树遍历未实现 → lookup/iterate 显式 -EOPNOTSUPP（拒绝而非静默漏）
+ *   · 文件数据路径（a_ops / extent 树）完全未接
+ *   · 写路径（write_inode 落盘 / evict 回收 / 位图持久化）未接 → 强制只读挂载
+ */
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/fs.h>
+#include <linux/fs_context.h>
+#include <linux/buffer_head.h>
+#include <linux/blkdev.h>
+#include <linux/slab.h>
+#include <linux/statfs.h>
+#include <linux/fs_parser.h>
+#include <linux/bitmap.h>
+#include <linux/crc32.h>
+#include <linux/string.h>
+
+#include "ravenfs.h"
+
+/* ── 前向声明（ops 表在 read_inode 里被引用） ── */
+static const struct inode_operations ravenfs_dir_inode_operations;
+static const struct inode_operations ravenfs_file_inode_operations;
+static const struct file_operations ravenfs_dir_operations;
+static const struct file_operations ravenfs_file_operations;
+static const struct fs_context_operations ravenfs_context_ops;
+static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc);
+
+static struct kmem_cache *ravenfs_inode_cachep;
+static struct file_system_type ravenfs_fs_type;
+
+/* ═══════════════════════════════════════════════════════════════════
+ * inode 生命周期（R-LM-01）
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static struct inode *ravenfs_alloc_inode(struct super_block *sb)
+{
+	struct ravenfs_inode_info *ri;
+
+	ri = alloc_inode_sb(sb, ravenfs_inode_cachep, GFP_KERNEL);
+	if (!ri)
+		return NULL;
+	inode_init_once(&ri->vfs_inode);
+	return &ri->vfs_inode;
+}
+
+static void ravenfs_free_inode(struct inode *inode)
+{
+	kmem_cache_free(ravenfs_inode_cachep, RAVENFS_I(inode));
+}
+
+static void ravenfs_destroy_inode(struct inode *inode)
+{
+	ravenfs_free_inode(inode);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 盘 inode → 内存 inode（R-LM-02 读侧）
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* 块统计（M2.1）见下方 ravenfs_inode_blocks4k */
+
+/* 块统计（M2.1）：4K 块数。**诚实**：数据块 + 元数据块（8K 节点计 2 块）均计；
+ * DIR 含 dentry 树节点 + name_heap（位图+数据面）；xattr 块也计。 */
+
+static void ravenfs_count_extent(struct super_block *sb, u64 root, u32 depth,
+				 u64 *data, u64 *nodes)
+{
+	const struct Bptree_meta_t *m;
+	void *buf;
+	u32 cnt, i;
+
+	if (depth > 32 || root == (u64)PTR_INVALID)
+		return;
+	buf = kmalloc(RAVENFS_NODE_BYTES, GFP_KERNEL);
+	if (!buf)
+		return;
+	if (ravenfs_read_node(sb, root, buf)) {
+		kfree(buf);
+		return;
+	}
+	m = buf;
+	if (m->magics[0] != BPTREE_MAGIC1 || m->magics[1] != BPTREE_MAGIC2 ||
+	    m->magics[2] != BPTREE_MAGIC3 || m->magics[3] != BPTREE_MAGIC4) {
+		kfree(buf);
+		return;
+	}
+	(*nodes)++;					/* 每个 extent 节点 = 2 个 4K 块（调用方 ×2） */
+	cnt = RFS_PP_COUNT(m->parent_ptr);
+	if (RFS_PP_IS_INNER(m->parent_ptr)) {
+		const struct Bptree_extent_inner_node_t *nd = buf;
+
+		for (i = 0; i < cnt && i < 338; i++)
+			ravenfs_count_extent(sb, RFS_PTR_ADDR(nd->extents[i].sub_node_ptr),
+					     depth + 1, data, nodes);
+	} else {
+		const struct Bptree_extent_leaf_node_t *lf = buf;
+
+		for (i = 0; i < cnt && i < 338; i++)
+			*data += lf->extents[i].length;
+	}
+	kfree(buf);
+}
+
+static void ravenfs_count_dentry_nodes(struct super_block *sb, u64 blk, u32 depth, u64 *nodes)
+{
+	const struct Bptree_meta_t *m;
+	void *buf;
+	u32 cnt, i;
+
+	if (depth > 32)
+		return;
+	buf = kmalloc(RAVENFS_NODE_BYTES, GFP_KERNEL);
+	if (!buf)
+		return;
+	if (ravenfs_read_node(sb, blk, buf)) {
+		kfree(buf);
+		return;
+	}
+	m = buf;
+	if (m->magics[0] != DENTRY_MAGIC1 || m->magics[1] != DENTRY_MAGIC2 ||
+	    m->magics[2] != DENTRY_MAGIC3 || m->magics[3] != DENTRY_MAGIC4) {
+		kfree(buf);
+		return;
+	}
+	(*nodes)++;
+	cnt = RFS_PP_COUNT(m->parent_ptr);
+	if (RFS_PP_IS_INNER(m->parent_ptr)) {
+		const struct Bptree_dentry_inner_node_t *nd = buf;
+
+		for (i = 0; i < cnt && i < 127; i++)
+			ravenfs_count_dentry_nodes(sb, RFS_PTR_ADDR(nd->hints[i].sub_ptr),
+						   depth + 1, nodes);
+	}
+	kfree(buf);
+}
+
+static u64 ravenfs_inode_blocks4k(struct super_block *sb, const struct raven_Inode_t *r, u32 type)
+{
+	u64 blks = 0, i;
+
+	if (RFS_XATTRPTR_GET(r->mode_xattr) != (u64)RFS_XATTR_NONE)
+		blks += 1;				/* xattr 块（1 个 4K） */
+
+	if (type == INODE_TYPE_DIR) {
+		const struct raven_dir_Inode_t *d = (const struct raven_dir_Inode_t *)r;
+		u64 nodes = 0;
+
+		ravenfs_count_dentry_nodes(sb, r->data_root, 0, &nodes);
+		blks += nodes * 2;			/* dentry 树节点（8K/个） */
+		for (i = 0; i < 10; i++) {		/* name_heap：位图面 + 数据面 */
+			u64 bmp = RFS_NHC_BITMAP(d->heaps[i]);
+			u64 dat = RFS_NHC_DATA(d->heaps[i]);
+			u32 bits, gran;
+
+			if (bmp == (u64)RFS_MASK52 && dat == (u64)RFS_MASK52)
+				continue;		/* 未激活 */
+			bits = RFS_NHC_BITS(d->heaps[i]);
+			gran = RFS_NHC_GRAN(d->heaps[i]);
+			blks += (1ULL << bits) / RAVENFS_BITS_PER_BLOCK;
+			blks += 1ULL << (bits + gran - 12);
+		}
+	} else if (type == INODE_TYPE_REGULAR || type == INODE_TYPE_SOFT_SYM) {
+		if (r->size > 160) {
+			if (RFS_INO1_GET_DIRECT(r->word1)) {
+				blks += (r->size + RAVENFS_BLOCK_SIZE - 1) /
+					RAVENFS_BLOCK_SIZE;		/* direct：全覆盖 */
+			} else {
+				u64 data = 0, nodes = 0;
+
+				ravenfs_count_extent(sb, r->data_root, 0, &data, &nodes);
+				blks += data + nodes * 2;	/* 数据 + extent 树节点 */
+			}
+		}
+	}
+	return blks;
+}
+
+static int ravenfs_read_inode(struct inode *inode)
+{
+	struct super_block *sb = inode->i_sb;
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
+	const struct raven_Inode_t *r;
+	u64 inum = inode->i_ino;
+	u32 type, perm;
+
+	if (inum >= sbi->inode_count)
+		return -EIO;
+
+	ses = ravenfs_session_get(sb, inum);	/* 经 disk_inode_cache_mgr + session 取盘记录 */
+	if (IS_ERR(ses))
+		return PTR_ERR(ses);
+	r = ravenfs_session_inode(ses);
+
+	type = RFS_INO1_GET_TYPE(r->word1);
+	perm = RFS_MODE_GET(r->mode_xattr);
+	if (!ravenfs_type_valid(type)) {
+		pr_err("ravenfs: inode %llu bad type %u\n", inum, type);
+		return -EIO;
+	}
+
+	inode->i_mode = RFS_IMODE_BUILD(type, perm);
+	i_uid_write(inode, r->uid);
+	i_gid_write(inode, r->gid);
+	set_nlink(inode, r->link_count ? r->link_count : 1);
+	inode->i_size = r->size;
+	inode_set_mtime(inode, r->mtime, r->m_ns_stamp);
+	inode_set_ctime(inode, r->ctime, r->c_ns_stamp);
+	inode_set_atime(inode, r->atime, r->a_ns_stamp);
+	/* 已分配块数（512B 单位）：数据块 + 元数据块（见 ravenfs_inode_blocks4k） */
+	inode->i_blocks = ravenfs_inode_blocks4k(sb, r, type) *
+			  (RAVENFS_BLOCK_SIZE / 512);
+
+	switch (type) {
+	case INODE_TYPE_DIR:
+		inode->i_op = &ravenfs_dir_inode_operations;
+		inode->i_fop = &ravenfs_dir_operations;
+		break;
+	case INODE_TYPE_REGULAR:
+	case INODE_TYPE_SOFT_SYM:
+		inode->i_op = &ravenfs_file_inode_operations;
+		inode->i_fop = &ravenfs_file_operations;
+		break;
+	case INODE_TYPE_CHR:
+	case INODE_TYPE_BLK: {
+		/* rdev = inline_data[0:4] 小端 u32（v1.2 §4） */
+		__le32 rdev_le;
+		memcpy(&rdev_le, r->inline_data, sizeof(rdev_le));
+		init_special_inode(inode, inode->i_mode,
+				   new_decode_dev(le32_to_cpu(rdev_le)));
+		break;
+	}
+	default:	/* FIFO / SOCK */
+		init_special_inode(inode, inode->i_mode, 0);
+		break;
+	}
+	return 0;
+}
+
+struct inode *ravenfs_iget(struct super_block *sb, u64 inum)
+{
+	struct inode *inode;
+	int err;
+
+	inode = iget_locked(sb, inum);
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+	if (!(inode_state_read_once(inode) & I_NEW))
+		return inode;
+
+	err = ravenfs_read_inode(inode);
+	if (err) {
+		iget_failed(inode);
+		return ERR_PTR(err);
+	}
+	unlock_new_inode(inode);
+	return inode;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 目录操作（M1：空目录正确；非空目录显式拒绝）
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* 目录操作（lookup / iterate）实现在 dentry.c；M2 起为真正的 dentry 树遍历 */
+
+/* ═══════════════════════════════════════════════════════════════════
+ * getattr / statfs
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static int ravenfs_getattr(struct mnt_idmap *idmap, const struct path *path,
+			   struct kstat *stat, u32 request_mask,
+			   unsigned int query_flags)
+{
+	struct inode *inode = d_inode(path->dentry);
+
+	/* R-MD-01：内存 inode 直填（rdev 已由 i_rdev 提供；dir nlink 即盘上 size+2） */
+	generic_fillattr(idmap, request_mask, inode, stat);
+	return 0;
+}
+
+/* 位图区间内已亮灯比特数（bit = 已用）；读失败退化为 0 已用 */
+static u64 ravenfs_bitmap_used(struct super_block *sb, u64 start, u64 nblocks,
+			       u64 total_bits)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	u64 used = 0, i, base = 0;
+	struct buffer_head *bh;
+
+	for (i = 0; i < nblocks && base < total_bits; i++, base += RAVENFS_BITS_PER_BLOCK) {
+		u64 nbits = min_t(u64, RAVENFS_BITS_PER_BLOCK, total_bits - base);
+
+		bh = sb_bread(sb, ravenfs_dev_blk(sbi, start + i));
+		if (!bh)
+			return 0;
+		used += bitmap_weight((const unsigned long *)bh->b_data, nbits);
+		brelse(bh);
+	}
+	return used;
+}
+
+static int ravenfs_statfs(struct dentry *dentry, struct kstatfs *buf)
+{
+	struct super_block *sb = dentry->d_sb;
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	u64 used_blk, used_ino;
+
+	used_blk = ravenfs_bitmap_used(sb, sbi->bitmap_start, sbi->bitmap_blocks,
+				       sbi->total_blocks);
+	used_ino = ravenfs_bitmap_used(sb, sbi->inode_bm_base, sbi->inode_bm_blocks,
+				       sbi->inode_count);
+
+	buf->f_type = RAVENFS_SUPER_MAGIC;
+	buf->f_bsize = sb->s_blocksize;
+	buf->f_frsize = sb->s_blocksize;
+	buf->f_blocks = sbi->total_blocks;
+	buf->f_bfree = sbi->total_blocks > used_blk ? sbi->total_blocks - used_blk : 0;
+	buf->f_bavail = buf->f_bfree;
+	buf->f_files = sbi->inode_count;
+	buf->f_ffree = sbi->inode_count > used_ino ? sbi->inode_count - used_ino : 0;
+	buf->f_namelen = RAVENFS_MAX_NAME_LEN;
+	buf->f_fsid.val[0] = RAVENFS_SUPER_MAGIC;
+	buf->f_fsid.val[1] = (u32)(sbi->total_blocks ^ sbi->inode_count);
+	return 0;
+}
+
+struct ravenfs_fs_context {
+	unsigned int	row_size;	/* 0 = 默认 4K；mount option `row_size=` */
+};
+
+enum ravenfs_param {
+	Opt_row_size,
+};
+
+static const struct fs_parameter_spec ravenfs_fs_parameters[] = {
+	fsparam_string("row_size", Opt_row_size),
+	{}
+};
+
+/* 接受 4k/8k/16k/32k/64k（大小写）与纯数字 4096..65536 */
+static bool ravenfs_row_size_str(const char *s, unsigned int *out)
+{
+	static const unsigned int tbl[] = { 4096, 8192, 16384, 32768, 65536 };
+	static const char *nm[] = { "4k", "8k", "16k", "32k", "64k" };
+	unsigned int v;
+	int i;
+
+	if (!kstrtouint(s, 0, &v)) {
+		for (i = 0; i < 5; i++)
+			if (v == tbl[i]) { *out = v; return true; }
+		return false;
+	}
+	for (i = 0; i < 5; i++) {
+		if (strlen(s) != strlen(nm[i]))
+			continue;
+		if (!strncasecmp(s, nm[i], strlen(nm[i]))) {
+			*out = tbl[i];
+			return true;
+		}
+	}
+	return false;
+}
+
+static int ravenfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+{
+	struct ravenfs_fs_context *ctx = fc->fs_private;
+	struct fs_parse_result result;
+	unsigned int sz;
+	int opt = fs_parse(fc, ravenfs_fs_parameters, param, &result);
+
+	if (opt < 0)
+		return opt;
+	switch (opt) {
+	case Opt_row_size:
+		if (!ravenfs_row_size_str(param->string, &sz)) {
+			pr_err("ravenfs: invalid row_size= (支持 4k/8k/16k/32k/64k)\n");
+			return -EINVAL;
+		}
+		ctx->row_size = sz;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int ravenfs_write_inode(struct inode *inode, struct writeback_control *wbc)
+{
+	/* TODO(M2)：内存 inode → 盘（i_{m,c,a}time + ns） */
+	return 0;
+}
+
+static void ravenfs_evict_inode(struct inode *inode)
+{
+	truncate_inode_pages_final(&inode->i_data);
+	clear_inode(inode);
+	/* TODO(M2)：nlink==0 → 回收数据 + inode 槽位 + 位图（R-LM-03） */
+}
+
+static void ravenfs_put_super(struct super_block *sb)
+{
+	ravenfs_ttl_stop(sb);		/* 先停 TTL 淘汰器（避免与折构竞争） */
+	ravenfs_mdata_cache_destroy(sb);	/* 折构：主动全量刷回/释放（§4.11.1 ②） */
+	ravenfs_cache_destroy(sb);
+	kfree(sb->s_fs_info);
+	sb->s_fs_info = NULL;
+}
+
+static const struct super_operations ravenfs_sops = {
+	.alloc_inode	= ravenfs_alloc_inode,
+	.destroy_inode	= ravenfs_destroy_inode,
+	.write_inode	= ravenfs_write_inode,
+	.evict_inode	= ravenfs_evict_inode,
+	.put_super	= ravenfs_put_super,
+	.statfs		= ravenfs_statfs,
+};
+
+static const struct inode_operations ravenfs_dir_inode_operations = {
+	.lookup		= ravenfs_lookup,
+	.getattr	= ravenfs_getattr,
+};
+
+static const struct inode_operations ravenfs_file_inode_operations = {
+	.getattr	= ravenfs_getattr,
+};
+
+static const struct file_operations ravenfs_dir_operations = {
+	.llseek		= generic_file_llseek,
+	.read		= generic_read_dir,
+	.iterate_shared	= ravenfs_iterate,
+};
+
+static const struct file_operations ravenfs_file_operations = {
+	.llseek		= generic_file_llseek,
+	/* read_iter/write_iter/mmap：M4（需 a_ops 落点） */
+};
+
+/* ═══════════════════════════════════════════════════════════════════
+ * SB 读 + 校验 + 几何（R-KP-03）
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static int ravenfs_parse_superblock(struct super_block *sb, const void *buf,
+				    unsigned int row_size)
+{
+	const struct RavenSuperblock *dsb = buf;
+	struct ravenfs_sb_info *sbi;
+	u32 crc_stored, crc_calc;
+	void *tmp;
+
+	if (le64_to_cpu(dsb->magic) != (u64)SUPERBLOCK_MAGIC) {
+		pr_err("ravenfs: bad superblock magic\n");
+		return -EINVAL;
+	}
+	if (le32_to_cpu(dsb->version) != RAVENFS_VERSION) {
+		pr_err("ravenfs: version %u != expected %u\n",
+		       le32_to_cpu(dsb->version), RAVENFS_VERSION);
+		return -EINVAL;
+	}
+
+	/* crc32：覆盖整个 4096B，计算时 crc32 字段置 0（与 mkfs 一致） */
+	crc_stored = le32_to_cpu(dsb->crc32);
+	tmp = kmalloc(RAVENFS_BLOCK_SIZE, GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
+	memcpy(tmp, buf, RAVENFS_BLOCK_SIZE);
+	memset(tmp + offsetof(struct RavenSuperblock, crc32), 0, sizeof(u32));
+	crc_calc = crc32_le(~0U, tmp, RAVENFS_BLOCK_SIZE) ^ ~0U;
+	kfree(tmp);
+	if (crc_stored != crc_calc) {
+		pr_err("ravenfs: sb crc mismatch (stored %08x calc %08x)\n",
+		       crc_stored, crc_calc);
+		return -EINVAL;
+	}
+
+	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
+	if (!sbi)
+		return -ENOMEM;
+
+	sbi->total_blocks = le64_to_cpu(dsb->total_blocks);
+	sbi->inode_count = le64_to_cpu(dsb->inode_array_count);
+	sbi->root_ino = le64_to_cpu(dsb->root_inode);
+
+	if (!sbi->total_blocks || !sbi->inode_count) {
+		pr_err("ravenfs: zero geometry\n");
+		goto bad;
+	}
+
+	/* blk0_off = world_base_lba × 设备逻辑块大小；约定恒 = 4096
+	 * （mkfs 把 Primary SB 放在设备字节 0，FS_block[0] 紧随其后 4096） */
+	sbi->blk0_off = (u64)le64_to_cpu(dsb->world_base_lba) *
+			bdev_logical_block_size(sb->s_bdev);
+	if (sbi->blk0_off != RAVENFS_BLOCK_SIZE) {
+		pr_err("ravenfs: blk0_off=%llu != %u (lba/base mismatch)\n",
+		       sbi->blk0_off, RAVENFS_BLOCK_SIZE);
+		goto bad;
+	}
+
+	sbi->bitmap_blocks = ravenfs_bitmap_blocks(sbi->total_blocks);
+	sbi->bitmap_start = sbi->total_blocks - sbi->bitmap_blocks;
+	sbi->inode_blocks = ravenfs_inode_array_blocks(sbi->inode_count);
+	sbi->inode_array_base = sbi->bitmap_start - sbi->inode_blocks;
+	sbi->inode_bm_blocks = ravenfs_inode_bm_blocks(sbi->inode_count);
+	sbi->inode_bm_base = sbi->inode_array_base - sbi->inode_bm_blocks;
+
+	if (sbi->inode_bm_base <= 2) {
+		pr_err("ravenfs: geometry underflow\n");
+		goto bad;
+	}
+
+	sb->s_fs_info = sbi;
+	if (ravenfs_cache_create(sb, row_size) ||	/* disk_inode_cache_mgr（§4.11.1/M2.2） */
+	    ravenfs_mdata_cache_create(sb)) {	/* mdata_piece_cache_mgr（8K 节点） */
+		ravenfs_cache_destroy(sb);
+		sb->s_fs_info = NULL;
+		kfree(sbi);
+		return -ENOMEM;
+	}
+	if (ravenfs_ttl_start(sb)) {	/* 自写 TTL 淘汰器（cache_ttl.c） */
+		ravenfs_mdata_cache_destroy(sb);
+		ravenfs_cache_destroy(sb);
+		sb->s_fs_info = NULL;
+		kfree(sbi);
+		return -ENOMEM;
+	}
+	return 0;
+bad:
+	kfree(sbi);
+	return -EINVAL;
+}
+
+static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
+{
+	struct ravenfs_fs_context *ctx = fc->fs_private;
+	struct ravenfs_sb_info *sbi;
+	struct buffer_head *bh;
+	struct inode *root;
+	unsigned int row_size = (ctx && ctx->row_size) ? ctx->row_size : RAVENFS_ROW_DEFAULT;
+	int err;
+
+	sb_set_blocksize(sb, RAVENFS_BLOCK_SIZE);
+	sb->s_magic = RAVENFS_SUPER_MAGIC;
+	sb->s_maxbytes = RAVENFS_MAX_FILESIZE;
+	sb->s_time_gran = 1;
+	sb->s_op = &ravenfs_sops;
+
+	/* SB 在设备起始 4K（FS_block 世界之外 → bdev 块 0） */
+	bh = sb_bread(sb, 0);
+	if (!bh) {
+		pr_err("ravenfs: cannot read superblock\n");
+		return -EIO;
+	}
+	err = ravenfs_parse_superblock(sb, bh->b_data, row_size);
+	brelse(bh);
+	if (err)
+		return err;
+
+	sbi = sb->s_fs_info;
+	root = ravenfs_iget(sb, sbi->root_ino);
+	if (IS_ERR(root))
+		return PTR_ERR(root);
+
+	sb->s_root = d_make_root(root);
+	if (!sb->s_root)
+		return -ENOMEM;
+
+	pr_info("ravenfs: mounted blocks=%llu inodes=%llu root_ino=%llu\n",
+		sbi->total_blocks, sbi->inode_count, sbi->root_ino);
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * fs_context / fs_type（R-KP-01/02）
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static int ravenfs_get_tree(struct fs_context *fc)
+{
+	/*
+	 * M1 无写路径：强制只读，避免"能挂 rw 但写坏盘"的半开。
+	 * （write_inode/evict 回收/位图持久化 = M2 落地后才解除）
+	 */
+	if (!(fc->sb_flags & SB_RDONLY))
+		pr_warn("ravenfs: M1 无写路径，强制只读挂载（禁止 rw）\n");
+	fc->sb_flags |= SB_RDONLY;
+
+	return get_tree_bdev(fc, ravenfs_fill_super);
+}
+
+static int ravenfs_init_fs_context(struct fs_context *fc)
+{
+	struct ravenfs_fs_context *ctx;
+
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+	fc->fs_private = ctx;
+	fc->ops = &ravenfs_context_ops;
+	return 0;
+}
+
+static void ravenfs_fc_free(struct fs_context *fc)
+{
+	kfree(fc->fs_private);
+	fc->fs_private = NULL;
+}
+
+static const struct fs_context_operations ravenfs_context_ops = {
+	.free		= ravenfs_fc_free,
+	.parse_param	= ravenfs_parse_param,
+	.get_tree	= ravenfs_get_tree,
+};
+
+static struct file_system_type ravenfs_fs_type = {
+	.owner			= THIS_MODULE,
+	.name			= "ravenfs",
+	.fs_flags		= FS_REQUIRES_DEV,
+	.init_fs_context	= ravenfs_init_fs_context,
+	.kill_sb		= kill_block_super,
+};
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 模块 init/exit
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static int __init ravenfs_init(void)
+{
+	int err;
+
+	ravenfs_inode_cachep = kmem_cache_create("ravenfs_inode_cache",
+					sizeof(struct ravenfs_inode_info), 0,
+					SLAB_HWCACHE_ALIGN | SLAB_RECLAIM_ACCOUNT,
+					NULL);
+	if (!ravenfs_inode_cachep)
+		return -ENOMEM;
+
+	err = register_filesystem(&ravenfs_fs_type);
+	if (err) {
+		kmem_cache_destroy(ravenfs_inode_cachep);
+		ravenfs_inode_cachep = NULL;
+		return err;
+	}
+	pr_info("ravenfs: module loaded\n");
+	return 0;
+}
+
+static void __exit ravenfs_exit(void)
+{
+	unregister_filesystem(&ravenfs_fs_type);
+	rcu_barrier();
+	kmem_cache_destroy(ravenfs_inode_cachep);
+	ravenfs_inode_cachep = NULL;
+	pr_info("ravenfs: module unloaded\n");
+}
+
+module_init(ravenfs_init);
+module_exit(ravenfs_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("RavenFS - block filesystem (linux ko, M1 mount skeleton)");
+MODULE_AUTHOR("Sparrow");
+MODULE_ALIAS_FS("ravenfs");

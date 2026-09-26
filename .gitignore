@@ -16,6 +16,12 @@ stress_mkdir
 ravenfs_cli
 test_mount_bitmap
 
+# tools/audit_v1.2 产物（只提交源码）
+tools/audit_v1.2/audit_v1.2
+tools/audit_v1.2/dents_dump
+tools/audit_v1.2/mkbigdir
+tools/audit_v1.2/mkcontent
+
 # IDE / 编辑器
 .vscode/
 .idea/
@@ -31,6 +37,16 @@ ravenfs_log.txt
 
 # kernel 测试素材（SparrowOS 侧资源，勿入 ravenfs 仓库）
 imgs/
+
+# linux ko 构建输出（kbuild 外部模块）
+linux/*.ko
+linux/*.mod
+linux/*.mod.c
+linux/Module.symvers
+linux/modules.order
+linux/.*.cmd
+linux/.module-common.o
+linux/ravenfs.o
 
 # 独立虚拟机环境（脚本 + 磁盘镜像，不随仓库走）
 linux/vm/
