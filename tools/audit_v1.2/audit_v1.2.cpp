@@ -302,7 +302,7 @@ struct Auditor {
     }
 
     /* 读长名尾部（>40）；返回 false = 失败 */
-    bool read_long_name(const Dentry_t &e, uint16_t name_len, char *full) {
+    bool read_long_name(const ddentry_t &e, uint16_t name_len, char *full) {
         uint64_t ptr  = e.full_char_remain_ptr;
         uint64_t fblk = ptr >> 12;
         uint32_t off  = (uint32_t)(ptr & 0xFFF);
@@ -397,9 +397,9 @@ uint64_t Auditor::dentry_node(uint64_t blk, uint64_t owner, uint64_t expect_pare
         cur_leaf_links.push_back(LeafLink{ blk,
             RFS_PTR_ADDR(meta->ptrs[0]), RFS_PTR_ADDR(meta->ptrs[1]),
             RFS_PTR_ADDR(meta->ptrs[2]), (bool)isroot });
-        const Bptree_dentry_leaf_node_t *leaf = (const Bptree_dentry_leaf_node_t *)nbuf.data();
+        const Bptree_ddentry_leaf_node_t *leaf = (const Bptree_ddentry_leaf_node_t *)nbuf.data();
         for (uint32_t i = 0; i < cnt; i++) {
-            const Dentry_t &e = leaf->entries[i];
+            const ddentry_t &e = leaf->entries[i];
             uint16_t nlen = (uint16_t)RFS_PTR_FREE(e.inode_ptr);
             uint64_t target = RFS_PTR_ADDR(e.inode_ptr);
 
@@ -488,7 +488,7 @@ uint64_t Auditor::dentry_node(uint64_t blk, uint64_t owner, uint64_t expect_pare
     }
 
     /* inner */
-    const Bptree_dentry_inner_node_t *nd = (const Bptree_dentry_inner_node_t *)nbuf.data();
+    const Bptree_ddentry_inner_node_t *nd = (const Bptree_ddentry_inner_node_t *)nbuf.data();
     uint64_t prev_key = 0, ret = 0;
     bool first = true;
     for (uint32_t i = 0; i < cnt; i++) {

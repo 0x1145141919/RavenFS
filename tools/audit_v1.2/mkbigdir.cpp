@@ -192,10 +192,10 @@ static uint64_t build_dir_tree(Img &im, uint64_t owner, uint64_t dotdot,
                 meta->ptrs[1].v = RFS_PTR_PACK(0, prev);
                 meta->ptrs[2].v = RFS_PTR_PACK(0, next);
             }
-            auto *leaf = (Bptree_dentry_leaf_node_t *)buf.data();
+            auto *leaf = (Bptree_ddentry_leaf_node_t *)buf.data();
             for (size_t i = nd.begin; i < nd.end; i++) {
                 const Ent &e = ents[i];
-                Dentry_t de;
+                ddentry_t de;
                 memset(&de, 0, sizeof(de));
                 de.inode_ptr.v = RFS_PTR_PACK((uint16_t)e.name.size(), e.inode);
                 de.hash = H(e.name);
@@ -209,7 +209,7 @@ static uint64_t build_dir_tree(Img &im, uint64_t owner, uint64_t dotdot,
             meta->ptrs[0].v = RFS_PTR_PACK(0, PTR52);
             meta->ptrs[1].v = nd.is_root ? RFS_PTR_PACK(0, dotdot) : RFS_PTR_PACK(0, PTR52);
             meta->ptrs[2].v = RFS_PTR_PACK(0, PTR52);
-            auto *inner = (Bptree_dentry_inner_node_t *)buf.data();
+            auto *inner = (Bptree_ddentry_inner_node_t *)buf.data();
             for (size_t i = 0; i < nd.children.size(); i++) {
                 inner->hints[i].sub_ptr.v = RFS_PTR_PACK(0, nd.children[i].first);
                 inner->hints[i].hash_max   = nd.children[i].second;

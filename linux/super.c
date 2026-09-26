@@ -119,7 +119,7 @@ static void ravenfs_count_extent(struct super_block *sb, u64 root, u32 depth,
 	kfree(buf);
 }
 
-static void ravenfs_count_dentry_nodes(struct super_block *sb, u64 blk, u32 depth, u64 *nodes)
+static void ravenfs_count_ddentry_nodes(struct super_block *sb, u64 blk, u32 depth, u64 *nodes)
 {
 	const struct Bptree_meta_t *m;
 	void *buf;
@@ -143,10 +143,10 @@ static void ravenfs_count_dentry_nodes(struct super_block *sb, u64 blk, u32 dept
 	(*nodes)++;
 	cnt = RFS_PP_COUNT(m->parent_ptr);
 	if (RFS_PP_IS_INNER(m->parent_ptr)) {
-		const struct Bptree_dentry_inner_node_t *nd = buf;
+		const struct Bptree_ddentry_inner_node_t *nd = buf;
 
 		for (i = 0; i < cnt && i < 127; i++)
-			ravenfs_count_dentry_nodes(sb, RFS_PTR_ADDR(nd->hints[i].sub_ptr),
+			ravenfs_count_ddentry_nodes(sb, RFS_PTR_ADDR(nd->hints[i].sub_ptr),
 						   depth + 1, nodes);
 	}
 	kfree(buf);
@@ -163,7 +163,7 @@ static u64 ravenfs_inode_blocks4k(struct super_block *sb, const struct raven_Ino
 		const struct raven_dir_Inode_t *d = (const struct raven_dir_Inode_t *)r;
 		u64 nodes = 0;
 
-		ravenfs_count_dentry_nodes(sb, r->data_root, 0, &nodes);
+		ravenfs_count_ddentry_nodes(sb, r->data_root, 0, &nodes);
 		blks += nodes * 2;			/* dentry 树节点（8K/个） */
 		for (i = 0; i < RFS_DIR_HEAP_COUNT; i++) {	/* name_heap：位图面 + 数据面 */
 			const struct name_heap_controller_t *h = rfs_dir_heap_c(d, i);

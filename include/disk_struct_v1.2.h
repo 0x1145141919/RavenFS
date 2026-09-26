@@ -117,7 +117,7 @@ enum rfs_inode_type {
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * ptr_in_idx —— 通用指针：free:12 | ptr:52
- *   free_to_use 语义由上下文定义（Dentry_t: 存 name_len）
+ *   free_to_use 语义由上下文定义（ddentry_t: 存 name_len）
  * ═══════════════════════════════════════════════════════════════════════════ */
 struct ptr_in_idx {
     uint64_t v;                     /* [0:12)=free_to_use  [12:64)=ptr(52) */
@@ -386,16 +386,18 @@ struct extent_hint_t {
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 目录项 Dentry_t / 路由 hint（hash 路由，上界 hash_max）
+ * 目录项 ddentry_t / 路由 hint（hash 路由，上界 hash_max）
  * ═══════════════════════════════════════════════════════════════════════════ */
-struct Dentry_t {
+/* 命名约定（2026-09-27）：**盘上目录项条目 = ddentry_t**（on-disk dentry entry）；
+ * VFS 的 struct dentry（dcache）是另一回事，勿混。dentry 树节点/魔数沿用旧名。 */
+struct ddentry_t {
     struct ptr_in_idx inode_ptr;        /* free_to_use = name_len（全名长度） */
     uint64_t hash;                      /* 名字 64 位 hash（查找主键；算法待定） */
     uint64_t full_char_remain_ptr;      /* name_len>40: 外置名物理定位；否则 PTR_INVALID */
     char     name[DENTRY_INLINE_NAME_MAX];
 };
 
-struct Dentry_hint_t {
+struct ddentry_hint_t {
     struct ptr_in_idx sub_ptr;
     uint64_t hash_max;
 };
@@ -417,18 +419,18 @@ struct Bptree_extent_leaf_node_t {
 } RFS_PACKED;
 RFS_STATIC_ASSERT(sizeof(struct Bptree_extent_leaf_node_t) == 8192, "extent leaf node must be 8192B");
 
-struct Bptree_dentry_leaf_node_t {
+struct Bptree_ddentry_leaf_node_t {
     struct Bptree_meta_t meta;
-    struct Dentry_t entries[127];
+    struct ddentry_t entries[127];
 } RFS_PACKED;
-RFS_STATIC_ASSERT(sizeof(struct Bptree_dentry_leaf_node_t) == 8192, "dentry leaf node must be 8192B");
+RFS_STATIC_ASSERT(sizeof(struct Bptree_ddentry_leaf_node_t) == 8192, "dentry leaf node must be 8192B");
 
-struct Bptree_dentry_inner_node_t {
+struct Bptree_ddentry_inner_node_t {
     struct Bptree_meta_t meta;
-    struct Dentry_hint_t hints[127];
+    struct ddentry_hint_t hints[127];
     uint64_t padding[762];
 } RFS_PACKED;
-RFS_STATIC_ASSERT(sizeof(struct Bptree_dentry_inner_node_t) == 8192, "dentry inner node must be 8192B");
+RFS_STATIC_ASSERT(sizeof(struct Bptree_ddentry_inner_node_t) == 8192, "dentry inner node must be 8192B");
 
 /* ═════════════════════════════════════════════════════════════════════════════
  * xattr 块（v1.2 新增）—— 单块自描述

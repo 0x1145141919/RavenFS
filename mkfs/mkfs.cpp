@@ -302,9 +302,9 @@ static void build_superblock(RavenSuperblock *sb, const MkfsParams &p,
 /* 52 位指针空间无效哨兵（PTR_INVALID 的 52 位截断形态；v1.2 用掩码+宏访问 ptr） */
 static constexpr uint64_t PTR52_INVALID = RFS_MASK52;
 
-static void build_root_dentry_node(Bptree_dentry_leaf_node_t *node, uint64_t root_ino)
+static void build_root_dentry_node(Bptree_ddentry_leaf_node_t *node, uint64_t root_ino)
 {
-    /* v1.2 根叶子（Bptree_dentry_leaf_node_t）：
+    /* v1.2 根叶子（Bptree_ddentry_leaf_node_t）：
      *   parent_ptr  = {entry_count:0, is_inner:0, is_root:1, ptr=root_ino}  → "." = 根 inode 自身
      *   ptrs[1]     = ".." = 根 inode（根目录的父亲是自己）
      *   ptrs[0]/[2] = 预留（52 位全 1 = 无效）
@@ -478,7 +478,7 @@ int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
     uint64_t ibm_off = block_to_offset(geo.inode_array_bitmap_base, params);
     uint64_t dn_off  = block_to_offset(root_dentry_block, params);
 
-    Bptree_dentry_leaf_node_t dentry_node;
+    Bptree_ddentry_leaf_node_t dentry_node;
     build_root_dentry_node(&dentry_node, RAVENFS_ROOT_INODE);
 
     raven_Inode_t root_inode;

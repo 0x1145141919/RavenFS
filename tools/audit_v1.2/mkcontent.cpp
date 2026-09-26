@@ -100,9 +100,9 @@ static void build_dentry_node(std::vector<uint8_t> &node, uint64_t owner_inum,
     meta->ptrs[0].v = RFS_PTR_PACK(0, PTR52);
     meta->ptrs[1].v = RFS_PTR_PACK(0, dotdot_inum);
     meta->ptrs[2].v = RFS_PTR_PACK(0, PTR52);
-    auto *leaf = (Bptree_dentry_leaf_node_t *)node.data();
+    auto *leaf = (Bptree_ddentry_leaf_node_t *)node.data();
     for (size_t i = 0; i < ents.size(); i++) {
-        Dentry_t de;
+        ddentry_t de;
         memset(&de, 0, sizeof(de));
         de.inode_ptr.v = RFS_PTR_PACK(ents[i].name.size(), ents[i].inode);
         de.hash = (uint64_t)XXH64(ents[i].name.data(), ents[i].name.size(), 0);

@@ -64,7 +64,7 @@ static int ravenfs_read_bytes(struct super_block *sb, u64 fs_blk, u32 off,
 }
 
 /* 物化 dentry 名字：≤40 内联；>40 从名字堆读尾部（full_char_remain_ptr 给物理位置） */
-int ravenfs_dentry_name(struct super_block *sb, const struct Dentry_t *e,
+int ravenfs_ddentry_name(struct super_block *sb, const struct ddentry_t *e,
 			       char *out, unsigned int *out_len)
 {
 	u32 nlen = RFS_PTR_FREE(e->inode_ptr);
@@ -115,7 +115,7 @@ static unsigned int ravenfs_dt(struct super_block *sb, u64 inum)
 /* ── lookup：hash 引导下行到叶，再按 (hash,name) 精确匹配 ── */
 
 static int ravenfs_leaf_lookup(struct super_block *sb,
-			       const struct Bptree_dentry_leaf_node_t *leaf,
+			       const struct Bptree_ddentry_leaf_node_t *leaf,
 			       u32 cnt, const char *name, u32 nlen, u64 hash, u64 *ino)
 {
 	char *nm = kmalloc(RAVENFS_MAX_NAME_LEN, GFP_KERNEL);
@@ -125,7 +125,7 @@ static int ravenfs_leaf_lookup(struct super_block *sb,
 		return -ENOMEM;
 	*ino = (u64)PTR_INVALID;
 	for (i = 0; i < cnt; i++) {
-		const struct Dentry_t *e = &leaf->entries[i];
+		const struct ddentry_t *e = &leaf->entries[i];
 		unsigned int en;
 		int c, cmplen;
 
@@ -133,7 +133,7 @@ static int ravenfs_leaf_lookup(struct super_block *sb,
 			break;
 		if (e->hash != hash)
 			continue;
-		if (ravenfs_dentry_name(sb, e, nm, &en)) {
+		if (ravenfs_ddentry_name(sb, e, nm, &en)) {
 			kfree(nm);
 			return -EIO;
 		}
@@ -197,7 +197,7 @@ static int ravenfs_dir_find(struct inode *dir, const char *name, u32 nlen, u64 *
 			break;
 		}
 		{
-			const struct Bptree_dentry_inner_node_t *nd = buf;
+			const struct Bptree_ddentry_inner_node_t *nd = buf;
 			u32 sel = cnt;		/* cnt = 无匹配 */
 
 			for (i = 0; i < cnt; i++) {
@@ -230,7 +230,7 @@ static int ravenfs_leaf_locate(struct super_block *sb, u64 leaf_blk, const char 
 			       u32 nlen, struct rfs_dloc *loc)
 {
 	struct ravenfs_msession *ms __free(ravenfs_msession) = ravenfs_mdata_get(sb, leaf_blk);
-	const struct Bptree_dentry_leaf_node_t *lf;
+	const struct Bptree_ddentry_leaf_node_t *lf;
 	const struct Bptree_meta_t *m;
 	char *nm;
 	u32 i, cnt;
@@ -258,7 +258,7 @@ static int ravenfs_leaf_locate(struct super_block *sb, u64 leaf_blk, const char 
 	loc->ino = (u64)PTR_INVALID;
 	loc->found = false;
 	for (i = 0; i < cnt; i++) {
-		const struct Dentry_t *e = &lf->entries[i];
+		const struct ddentry_t *e = &lf->entries[i];
 		unsigned int en;
 		int c, cmplen;
 
@@ -268,7 +268,7 @@ static int ravenfs_leaf_locate(struct super_block *sb, u64 leaf_blk, const char 
 		}
 		if (e->hash != hash)
 			continue;
-		if (ravenfs_dentry_name(sb, e, nm, &en)) {
+		if (ravenfs_ddentry_name(sb, e, nm, &en)) {
 			err = -EIO;
 			goto done;
 		}
@@ -300,9 +300,9 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	struct ravenfs_session *ts __free(ravenfs_session) = NULL;
 	struct ravenfs_msession *ms __free(ravenfs_msession) = NULL;
 	struct raven_Inode_t *dr, *tr;
-	struct Bptree_dentry_leaf_node_t *lf;
+	struct Bptree_ddentry_leaf_node_t *lf;
 	struct Bptree_meta_t *meta;
-	struct Dentry_t *e;
+	struct ddentry_t *e;
 	struct rfs_dloc loc;
 	struct timespec64 now;
 	struct inode *inode;
@@ -390,7 +390,7 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (loc.idx > cnt)
 		loc.idx = cnt;
 	memmove(&lf->entries[loc.idx + 1], &lf->entries[loc.idx],
-		(size_t)(cnt - loc.idx) * sizeof(struct Dentry_t));
+		(size_t)(cnt - loc.idx) * sizeof(struct ddentry_t));
 	e = &lf->entries[loc.idx];
 	memset(e, 0, sizeof(*e));
 	e->inode_ptr.v = RFS_PTR_PACK(nlen, inum);
@@ -431,7 +431,7 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
 	struct ravenfs_msession *ms __free(ravenfs_msession) = NULL;
 	struct raven_Inode_t *dr;
-	struct Bptree_dentry_leaf_node_t *lf;
+	struct Bptree_ddentry_leaf_node_t *lf;
 	struct Bptree_meta_t *meta;
 	struct rfs_dloc loc;
 	struct timespec64 now;
@@ -470,8 +470,8 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 	rem_name_len = RFS_PTR_FREE(lf->entries[loc.idx].inode_ptr);
 	rem_remain = lf->entries[loc.idx].full_char_remain_ptr;
 	memmove(&lf->entries[loc.idx], &lf->entries[loc.idx + 1],
-		(size_t)(cnt - loc.idx - 1) * sizeof(struct Dentry_t));
-	memset(&lf->entries[cnt - 1], 0, sizeof(struct Dentry_t));
+		(size_t)(cnt - loc.idx - 1) * sizeof(struct ddentry_t));
+	memset(&lf->entries[cnt - 1], 0, sizeof(struct ddentry_t));
 	meta->parent_ptr.v = RFS_PP_PACK(cnt - 1, RFS_PP_IS_INNER(meta->parent_ptr),
 					 RFS_PP_IS_ROOT(meta->parent_ptr), RFS_PP_PTR(meta->parent_ptr));
 	ms->row->dirty = true;
@@ -594,7 +594,7 @@ static int ravenfs_leftmost_leaf(struct super_block *sb, u64 blk, u64 *leaf)
 			break;
 		}
 		if (n == 0 || n > 126) { err = -EIO; break; }
-		blk = RFS_PTR_ADDR(((const struct Bptree_dentry_inner_node_t *)buf)->hints[0].sub_ptr);
+		blk = RFS_PTR_ADDR(((const struct Bptree_ddentry_inner_node_t *)buf)->hints[0].sub_ptr);
 	}
 	kfree(buf);
 	return err;
@@ -605,18 +605,18 @@ static int ravenfs_emit_leaf(struct super_block *sb, const void *buf, u64 blk, u
 			     u32 from, struct dir_context *ctx, bool *stopped)
 {
 	char *nm = kmalloc(RAVENFS_MAX_NAME_LEN, GFP_KERNEL);
-	const struct Bptree_dentry_leaf_node_t *lf = buf;
+	const struct Bptree_ddentry_leaf_node_t *lf = buf;
 	u32 i;
 	int err = 0;
 
 	if (!nm)
 		return -ENOMEM;
 	for (i = from; i < cnt; i++) {
-		const struct Dentry_t *e = &lf->entries[i];
+		const struct ddentry_t *e = &lf->entries[i];
 		unsigned int en;
 		u64 ino = RFS_PTR_ADDR(e->inode_ptr);
 
-		err = ravenfs_dentry_name(sb, e, nm, &en);
+		err = ravenfs_ddentry_name(sb, e, nm, &en);
 		if (err)
 			break;
 		if (!dir_emit(ctx, nm, en, ino, ravenfs_dt(sb, ino))) {

@@ -134,7 +134,7 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *de
 int ravenfs_unlink(struct inode *dir, struct dentry *dentry);
 
 /* 名字物化（≤40 内联 / >40 读名字堆尾段）—— 供 dentry_write.c 复合序比较用 */
-int ravenfs_dentry_name(struct super_block *sb, const struct Dentry_t *e,
+int ravenfs_ddentry_name(struct super_block *sb, const struct ddentry_t *e,
 		       char *out, unsigned int *out_len);
 
 /* ── dentry B+树 写入（dentry_write.c）：多级 walk + 插入（含分裂/升根） ── */
@@ -145,9 +145,9 @@ struct rfs_dpath {
 	bool	hit;
 	u32	ins_idx;
 };
-int ravenfs_dentry_walk(struct super_block *sb, u64 dir_ino, const char *name, u32 nlen,
+int ravenfs_ddentry_walk(struct super_block *sb, u64 dir_ino, const char *name, u32 nlen,
 			struct rfs_dpath *p);
-int ravenfs_dentry_insert(struct super_block *sb, u64 dir_ino, const struct rfs_dpath *p,
+int ravenfs_ddentry_insert(struct super_block *sb, u64 dir_ino, const struct rfs_dpath *p,
 			  const char *name, u32 nlen, u64 hash, u64 inum, u64 remain_ptr);
 
 struct inode *ravenfs_iget(struct super_block *sb, u64 inum);

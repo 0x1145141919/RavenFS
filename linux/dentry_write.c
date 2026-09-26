@@ -74,8 +74,8 @@ static u64 rfs_node_max(const void *node, u32 inner, u32 count)
 	if (count == 0)
 		return 0;
 	if (inner)
-		return ((const struct Bptree_dentry_inner_node_t *)m)->hints[count - 1].hash_max;
-	return ((const struct Bptree_dentry_leaf_node_t *)m)->entries[count - 1].hash;
+		return ((const struct Bptree_ddentry_inner_node_t *)m)->hints[count - 1].hash_max;
+	return ((const struct Bptree_ddentry_leaf_node_t *)m)->entries[count - 1].hash;
 }
 
 /* 读节点（拷贝）取 max */
@@ -103,7 +103,7 @@ out:
 }
 
 /* 叶内 GLB：复合序 (hash,name) 的最大下界；无 → GLB_NONE；hit=精确命中 */
-static int rfs_leaf_glb(struct super_block *sb, const struct Bptree_dentry_leaf_node_t *lf,
+static int rfs_leaf_glb(struct super_block *sb, const struct Bptree_ddentry_leaf_node_t *lf,
 			u32 cnt, u64 hash, const char *name, u32 nlen, u32 *glb, bool *hit)
 {
 	char *nm = kmalloc(RAVENFS_MAX_NAME_LEN, GFP_KERNEL);
@@ -115,7 +115,7 @@ static int rfs_leaf_glb(struct super_block *sb, const struct Bptree_dentry_leaf_
 		return -ENOMEM;
 	*hit = false;
 	for (i = 0; i < cnt; i++) {
-		const struct Dentry_t *e = &lf->entries[i];
+		const struct ddentry_t *e = &lf->entries[i];
 		int c;
 		unsigned int en;
 		int cmplen;
@@ -126,7 +126,7 @@ static int rfs_leaf_glb(struct super_block *sb, const struct Bptree_dentry_leaf_
 		}
 		if (e->hash > hash)
 			break;
-		err = ravenfs_dentry_name(sb, e, nm, &en);
+		err = ravenfs_ddentry_name(sb, e, nm, &en);
 		if (err)
 			goto out;
 		cmplen = min_t(int, en, (int)nlen);
@@ -150,7 +150,7 @@ out:
 }
 
 /* ══ 多级 walk：填 path（blk/cidx）、hit、插入位 ══ */
-int ravenfs_dentry_walk(struct super_block *sb, u64 dir_ino, const char *name, u32 nlen,
+int ravenfs_ddentry_walk(struct super_block *sb, u64 dir_ino, const char *name, u32 nlen,
 			struct rfs_dpath *p)
 {
 	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, dir_ino);
@@ -191,7 +191,7 @@ int ravenfs_dentry_walk(struct super_block *sb, u64 dir_ino, const char *name, u
 			break;
 		}
 		{
-			const struct Bptree_dentry_inner_node_t *nd = buf;
+			const struct Bptree_ddentry_inner_node_t *nd = buf;
 			u32 i, sel = cnt;
 
 			for (i = 0; i < cnt; i++)
@@ -218,7 +218,7 @@ static int rfs_propagate(struct super_block *sb, const struct rfs_dpath *p, u32 
 
 	for (lvl = (int)child_level - 1; lvl >= 0; lvl--) {
 		struct ravenfs_msession *ms = ravenfs_mdata_get(sb, p->blk[lvl]);
-		struct Bptree_dentry_inner_node_t *nd;
+		struct Bptree_ddentry_inner_node_t *nd;
 		u32 cnt, idx = p->cidx[lvl];
 
 		if (IS_ERR(ms))
@@ -248,7 +248,7 @@ static int rfs_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 {
 	struct ravenfs_msession *vms = ravenfs_mdata_get(sb, victim_blk);
 	struct ravenfs_msession *nms = NULL;
-	struct Bptree_dentry_leaf_node_t *vl, *nl;
+	struct Bptree_ddentry_leaf_node_t *vl, *nl;
 	u32 cnt, inner, root;
 	u64 pptr, parent, old_next, new_blk = (u64)PTR_INVALID;
 	bool was_root;
@@ -286,7 +286,7 @@ static int rfs_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 	nl = ravenfs_msession_node(nms);
 
 	rfs_node_init(nl, 64, 0, 0, parent);
-	memcpy(&nl->entries[0], &vl->entries[63], 64 * sizeof(struct Dentry_t));
+	memcpy(&nl->entries[0], &vl->entries[63], 64 * sizeof(struct ddentry_t));
 	rfs_set_addr(&nl->meta.ptrs[1], victim_blk);			/* prev */
 	nl->meta.ptrs[2].v = was_root ? RFS_PTR_INV_V : RFS_PTR_PACK(0, old_next);
 
@@ -323,7 +323,7 @@ static int rfs_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 {
 	struct ravenfs_msession *vms = ravenfs_mdata_get(sb, victim_blk);
 	struct ravenfs_msession *nms = NULL;
-	struct Bptree_dentry_inner_node_t *vi, *ni;
+	struct Bptree_ddentry_inner_node_t *vi, *ni;
 	u32 cnt, inner, root, i;
 	u64 pptr, parent, new_blk = (u64)PTR_INVALID;
 	int err;
@@ -358,7 +358,7 @@ static int rfs_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 	ni = ravenfs_msession_node(nms);
 
 	rfs_node_init(ni, 64, 1, 0, parent);
-	memcpy(&ni->hints[0], &vi->hints[63], 64 * sizeof(struct Dentry_hint_t));
+	memcpy(&ni->hints[0], &vi->hints[63], 64 * sizeof(struct ddentry_hint_t));
 	vi->meta.parent_ptr.v = RFS_PP_PACK(63, 1, root, parent);
 	NODE_DIRTY(vms);
 	NODE_DIRTY(nms);
@@ -377,7 +377,7 @@ static int rfs_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 
 		{
 			struct ravenfs_msession *tms = ravenfs_mdata_get(sb, new_blk);
-			const struct Bptree_dentry_inner_node_t *tin;
+			const struct Bptree_ddentry_inner_node_t *tin;
 
 			if (IS_ERR(tms))
 				return PTR_ERR(tms);
@@ -408,7 +408,7 @@ static int rfs_new_root_inner(struct super_block *sb, u64 dir_ino, u64 left_blk,
 {
 	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, dir_ino);
 	struct ravenfs_msession *rms = NULL;
-	struct Bptree_dentry_inner_node_t *ri;
+	struct Bptree_ddentry_inner_node_t *ri;
 	u64 root_blk;
 	int err = 0;
 
@@ -477,7 +477,7 @@ static int rfs_apply_up(struct super_block *sb, u64 dir_ino, const struct rfs_dp
 {
 	for (;;) {
 		struct ravenfs_msession *ms = ravenfs_mdata_get(sb, p->blk[level]);
-		struct Bptree_dentry_inner_node_t *nd;
+		struct Bptree_ddentry_inner_node_t *nd;
 		u32 pcnt, idx = child_idx, new_cnt;
 		u32 is_root;
 		int err = 0;
@@ -494,7 +494,7 @@ static int rfs_apply_up(struct super_block *sb, u64 dir_ino, const struct rfs_dp
 		}
 		nd->hints[idx].hash_max = low_max;
 		memmove(&nd->hints[idx + 2], &nd->hints[idx + 1],
-			(size_t)(pcnt - idx - 1) * sizeof(struct Dentry_hint_t));
+			(size_t)(pcnt - idx - 1) * sizeof(struct ddentry_hint_t));
 		rfs_set_addr(&nd->hints[idx + 1].sub_ptr, new_blk);
 		nd->hints[idx + 1].hash_max = high_max;
 		new_cnt = pcnt + 1;
@@ -530,7 +530,7 @@ static int rfs_apply_up(struct super_block *sb, u64 dir_ino, const struct rfs_dp
 }
 
 /* ══ 插入条目到叶（walk 定位后调用）；含分裂/升根/hint 维护 ══ */
-int ravenfs_dentry_insert(struct super_block *sb, u64 dir_ino, const struct rfs_dpath *p,
+int ravenfs_ddentry_insert(struct super_block *sb, u64 dir_ino, const struct rfs_dpath *p,
 			  const char *name, u32 nlen, u64 hash, u64 inum, u64 remain_ptr)
 {
 	u64 leaf_blk = p->blk[p->depth - 1];
@@ -540,8 +540,8 @@ int ravenfs_dentry_insert(struct super_block *sb, u64 dir_ino, const struct rfs_
 
 	{
 		struct ravenfs_msession *ms = ravenfs_mdata_get(sb, leaf_blk);
-		struct Bptree_dentry_leaf_node_t *lf;
-		struct Dentry_t *e;
+		struct Bptree_ddentry_leaf_node_t *lf;
+		struct ddentry_t *e;
 		u32 c, inner, root;
 		u64 pptr;
 
@@ -556,7 +556,7 @@ int ravenfs_dentry_insert(struct super_block *sb, u64 dir_ino, const struct rfs_
 			idx = c;
 		old_max = (c > 0) ? lf->entries[c - 1].hash : 0;
 		memmove(&lf->entries[idx + 1], &lf->entries[idx],
-			(size_t)(c - idx) * sizeof(struct Dentry_t));
+			(size_t)(c - idx) * sizeof(struct ddentry_t));
 		e = &lf->entries[idx];
 		memset(e, 0, sizeof(*e));
 		e->inode_ptr.v = RFS_PTR_PACK(nlen, inum);
