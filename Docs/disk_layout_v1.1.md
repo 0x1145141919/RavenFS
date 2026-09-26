@@ -79,6 +79,9 @@ entry_count:10 | is_inner_node:1 | is_root_node:1 | ptr:52
 
 ## 3. Inode（256B，尺寸不变）
 
+> ⚠️ **增量已出（2026-09-26）**：inode 布局有 **v1.2 改造**（第一字 `type:6｜direct:1｜i_flags:57`；`permission_bits → mode:12｜xattr_ptr:52`；无数据类型 + 设备号存 `inline_data`；新增 xattr 块）→ 见 **`disk_layout_v1.2_inode.md`**。
+> 本文 §3 为 **v1.1 现行格式**；v1.2 冻结后由其替代（**v1.1 盘不兼容**，需 reformat）。
+
 ### 3.1 结构分型与首 64 位
 
 inode 槽按 `type` 选择解码结构（两结构均 256B packed，前 96B 布局一致）：
