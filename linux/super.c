@@ -469,6 +469,7 @@ static const struct inode_operations ravenfs_dir_inode_operations = {
 
 static const struct inode_operations ravenfs_file_inode_operations = {
 	.getattr	= ravenfs_getattr,
+	.setattr	= ravenfs_setattr,			/* M4.3：truncate（ATTR_SIZE）; M4.4 补 attr */
 };
 
 static const struct file_operations ravenfs_dir_operations = {
@@ -499,6 +500,7 @@ static const struct file_operations ravenfs_file_operations = {
 	.read_iter	= ravenfs_file_read_iter,		/* M4.1（自写壳 → generic_file_read_iter） */
 	.write_iter	= ravenfs_file_write_iter,		/* M4.2（自写壳 → iomap_file_buffered_write，立刻分配） */
 	.mmap_prepare	= ravenfs_file_mmap_prepare,		/* M4.2：可写 mmap 立刻分配（D-M4-12）*/
+	.fallocate	= ravenfs_fallocate,			/* M4.3（R-FD-07；D-M4-11 拒纯 KEEP_SIZE） */
 	.splice_read	= filemap_splice_read,
 	.splice_write	= iter_file_splice_write,
 	.fsync		= ravenfs_fsync,

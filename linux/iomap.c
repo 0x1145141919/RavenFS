@@ -288,7 +288,6 @@ static int ravenfs_iomap_begin_write(struct inode *inode, loff_t pos, loff_t len
 
 	if (flags & IOMAP_DIRECT)
 		return -EOPNOTSUPP;		/* O_DIRECT 后置（D-M4-5） */
-
 	ses = ravenfs_session_get(sb, inode->i_ino);
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
@@ -414,7 +413,8 @@ int ravenfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 
 	if (flags & IOMAP_REPORT)
 		return -EOPNOTSUPP;		/* FIEMAP 后置 */
-	if (flags & IOMAP_WRITE)
+	/* IOMAP_WRITE 或 IOMAP_ZERO（iomap_zero_range = fallocate/ZERO_RANGE/残块清零）→ 写向 */
+	if (flags & (IOMAP_WRITE | IOMAP_ZERO))
 		return ravenfs_iomap_begin_write(inode, pos, length, flags, iomap, srcmap);
 
 	memset(iomap, 0, sizeof(*iomap));

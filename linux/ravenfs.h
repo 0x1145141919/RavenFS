@@ -189,12 +189,23 @@ int ravenfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 /* ── M4.2 写数据路径（extent_write.c / iomap.c / file.c） ── */
 ssize_t ravenfs_file_write_iter(struct kiocb *iocb, struct iov_iter *iter);
 
+/* ── M4.3 truncate / punch / fallocate（file.c） ── */
+long ravenfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
+int ravenfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr);
+
 /* 区段树写机械（extent_write.c）：查找 / 插入（含叶裂升根）/ 计数 */
 int ravenfs_extent_lookup(struct super_block *sb, u64 root, u64 target,
 			  struct extent_t *out, u64 *next);
 int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
 			  const struct extent_t *ext);
 int ravenfs_extent_count(struct super_block *sb, u64 root, u64 *data, u64 *nodes);
+
+/* ── M4.3 区段树删除/平衡（extent_write.c）── */
+/* 空根叶（direct→extent 物化 / 空树终态） */
+int ravenfs_extent_new_root_leaf(struct super_block *sb, u64 ino, u64 *root_io);
+/* 子集撤销（loose）；根更迭旧根经 old_root 上抛（延迟 free，调用方在 inode 提交后 free） */
+int ravenfs_extent_unmap_loose(struct super_block *sb, u64 ino, u64 *root_io,
+			       const struct extent_t *ext, u64 *old_root);
 
 /* ── disk_inode_cache_mgr（§4.11.1 + M2.2 行尺寸解耦）── */
 #define RAVENFS_SHARD_SEL_BITS	7	/* 分片选择位宽：≤128 片（>4096 inode 时生效） */
