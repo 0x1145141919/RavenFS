@@ -6,7 +6,7 @@ LDLIBS    = -lxxhash
 TARGET    = audit_v1.2
 SRCS      = audit_v1.2.cpp
 
-all: $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w
+all: $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t
 
 $(TARGET): $(SRCS) ../../include/disk_struct_v1.2.h ../../include/magics.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $(SRCS) $(LDLIBS)
@@ -35,7 +35,11 @@ readback: readback.cpp m41_expect.h ../../include/disk_struct_v1.2.h
 mkstates_w: mkstates_w.cpp m42_fill.h m41_expect.h ../../include/disk_struct_v1.2.h ../../include/magics.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ mkstates_w.cpp $(LDLIBS)
 
+# M4.3 靶子构造器（deep 多级树 / punch / truncate / fallocate；写副本 + 出 .expect/.wexpect/.plan）
+mkstates_t: mkstates_t.cpp m42_fill.h m41_expect.h ../../include/disk_struct_v1.2.h ../../include/magics.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ mkstates_t.cpp $(LDLIBS)
+
 clean:
-	rm -f $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w
+	rm -f $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t
 
 .PHONY: all clean

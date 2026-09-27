@@ -6,11 +6,17 @@
  *
  * ── 目的 ─────────────────────────────────────────────────────────────────
  * M4.2 的 buffered 写 = `write_iter` + `iomap_begin(WRITE)` 立刻分配（D-M4-6）+
- * 三态迁移（inline↔extent，D-M4-8）+ `i_blocks` 随写更新。此压测在挂载点内对若干文件
- * 做 N 轮随机 `write/pwrite`，并用 **影子模型**（每文件一份期望字节缓冲 + 一个「写过」位图）
- * 记录期望内容；每轮结束 `pread` 回读逐字节比对（写过区=填充字节，未写区=洞=0）。
+ * 三态迁移（inline↔extent，D-M4-8）+ `i_blocks` 随写更新。M4.3 追加 **truncate / punch_hole**
+ * （`punch_truncate_pread_spec.md`；D-M4-11 拒 KEEP_SIZE 纯预留）。此压测在挂载点内对若干
+ * 文件做 N 轮随机 `write/pwrite` + `ftruncate` + `fallocate(PUNCH_HOLE|KEEP_SIZE)`，并用
+ * **影子模型**（每文件一份期望字节缓冲 + 一个「写过」位图）记录期望内容；每轮结束 `pread`
+ * 回读逐字节比对（写过区=填充字节，未写区=洞/被 punch/截断区=0）。
  *
- * 覆盖形态：空文件增长、跨块写、>64K 大文件、稀疏洞（随机 offset 造洞）、重复覆盖写。
+ * 覆盖形态：空文件增长、跨块写、>64K 大文件、稀疏洞（随机 offset 造洞）、重复覆盖写、
+ *           随机 truncate（缩/增）、随机 punch（打洞）。
+ *
+ * 兼容：truncate / punch 会先做**能力探测**；若目标 ko 尚未实现（-EOPNOTSUPP/-ENOSYS/
+ *       -EINVAL），自动**关闭**该类操作并打印说明 —— 故本工具在 M4.2 内核上仍可用。
  *
  * ── 纪律（镜像 rfsdirchurn.c）────────────────────────────────────────────
  *   1) 入参仅 1 个待测目录；其余常量编译期内定（可加 ROUNDS/NFILES 两个可选覆盖）。
@@ -64,6 +70,12 @@ static unsigned char churn_byte(const char *name, unsigned long long off)
 	return (unsigned char)x;
 }
 
+/* M4.3 追加：操作计数
+ *   · tr_writes   = ftruncate 次数
+ *   · punch_ops   = 成功 punch 次数（EOPNOTSUPP 时自动关闭）
+ */
+static unsigned long long g_truncs, g_punches;
+
 /* ── PCG-ish RNG（固定种子，可复现）────────────────────────────────────── */
 static unsigned long long rng_state = 0x9E3779B97F4A7C15ULL;
 static unsigned long long rng(void)
@@ -97,6 +109,11 @@ static int fs_is_ravenfs(const char *dir)
 {
 	struct statfs sf;
 
+	/* 仅 host 自测：允许在非 ravenfs（如 ext4）目录上跑影子模型，验证操作/回读逻辑 */
+	if (getenv("RFSCHURN_ANYFS")) {
+		fprintf(stderr, "⚠ RFSCHURN_ANYFS 已设：跳过 ravenfs 校验（**仅限 host 自测**）\n");
+		return 1;
+	}
 	if (statfs(dir, &sf) != 0) {
 		perror("statfs");
 		return 0;
@@ -156,6 +173,65 @@ static int do_write(struct fchurn *fc, unsigned long long off, unsigned long lon
 	return 0;
 }
 
+/* ── M4.3：ftruncate（影子同步）──
+ * 缩：丢尾部；增：新区为洞（期望 0）。两向都更新 size 与「写过」位图。
+ * 返回 0 成功；-1 硬失败。
+ */
+static int do_truncate(struct fchurn *fc, unsigned long long newlen)
+{
+	unsigned long long old = fc->size;
+
+	if (newlen > MAXSZ)
+		newlen = MAXSZ;
+	if (ftruncate(fc->fd, (off_t)newlen) != 0) {
+		fprintf(stderr, "✗ ftruncate %s->%llu: %s\n", fc->name, newlen, strerror(errno));
+		return -1;
+	}
+	/* 影子：两端被影响的区间一律视为洞（期望 0）*/
+	if (newlen < old) {
+		for (unsigned long long i = newlen; i < old; i++) {
+			fc->data[i] = 0;
+			fc->written[i] = 0;
+		}
+	} else if (newlen > old) {
+		for (unsigned long long i = old; i < newlen; i++) {
+			fc->data[i] = 0;
+			fc->written[i] = 0;
+		}
+	}
+	fc->size = newlen;
+	g_truncs++;
+	return 0;
+}
+
+/* ── M4.3：punch_hole（FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE；影子同步）──
+ * 无 size 变更；洞内读 0。EOPNOTSUPP/ENOSYS 视为「未实现」→ 返回 1（调用方关闭该操作）。
+ * 其它错误 → -1。成功 → 0。
+ */
+static int do_punch(struct fchurn *fc, unsigned long long off, unsigned long long len)
+{
+	if (off >= fc->size)
+		return 0;                                   /* offset ≥ size：no-op */
+	if (off + len > fc->size)
+		len = fc->size - off;                       /* clamp 到 EOF */
+	if (len == 0)
+		return 0;
+
+	if (fallocate(fc->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+		      (off_t)off, (off_t)len) != 0) {
+		if (errno == EOPNOTSUPP || errno == ENOSYS || errno == EINVAL)
+			return 1;                           /* 未实现 → 调用方降级 */
+		fprintf(stderr, "✗ punch %s@%llu+%llu: %s\n", fc->name, off, len, strerror(errno));
+		return -1;
+	}
+	for (unsigned long long i = off; i < off + len; i++) {
+		fc->data[i] = 0;
+		fc->written[i] = 0;
+	}
+	g_punches++;
+	return 0;
+}
+
 /* 回读全量比对：写过区=data[]，未写区=0 */
 static int verify(struct fchurn *fc, int round, int quiet)
 {
@@ -196,6 +272,7 @@ int main(int argc, char **argv)
 	int rounds = DEF_ROUNDS, nfiles = DEF_NFILES;
 	struct fchurn *fc;
 	int i, r, fail = 0;
+	int trunc_enabled = 1, punch_enabled = 1;
 	unsigned long long total_bytes = 0;
 
 	if (argc < 2 || argc > 4) {
@@ -232,6 +309,22 @@ int main(int argc, char **argv)
 	}
 	printf("created %d files\n", nfiles);
 
+	/* ── M4.3 能力探测：truncate / punch（未实现则降级关闭，保 M4.2 兼容）── */
+	if (ftruncate(fc[0].fd, 0) != 0) {
+		trunc_enabled = 0;
+		printf("note: ftruncate 不可用（%s）→ 关闭 truncate 随机操作\n", strerror(errno));
+	}
+	{
+		int pr = fallocate(fc[0].fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 4096);
+
+		if (pr != 0 && (errno == EOPNOTSUPP || errno == ENOSYS || errno == EINVAL)) {
+			punch_enabled = 0;
+			printf("note: PUNCH_HOLE 不可用（%s）→ 关闭 punch 随机操作\n", strerror(errno));
+		}
+	}
+	printf("ops: write=on truncate=%s punch=%s\n",
+	       trunc_enabled ? "on" : "off", punch_enabled ? "on" : "off");
+
 	for (r = 1; r <= rounds; r++) {
 		int op;
 		double t0 = now_s();
@@ -239,10 +332,26 @@ int main(int argc, char **argv)
 		for (op = 0; op < OPS_PER_ROUND; op++) {
 			int f = (int)rng_range((unsigned long long)nfiles);
 			unsigned long long off, len, span;
+			int slots = 3 + (trunc_enabled ? 1 : 0) + (punch_enabled ? 1 : 0);
+
+			/* 档位：0/1/2 = 写（小/跨块/大块）；3 = truncate（若启用）；4 = punch（若启用）*/
+			unsigned long long mode = rng_range((unsigned long long)slots);
+
+			if (mode == 3 && trunc_enabled) {
+				if (do_truncate(&fc[f], rng_range(MAXSZ + 1)) != 0) { fail = 1; break; }
+				continue;
+			}
+			if (mode == 4 && punch_enabled) {
+				int pr = do_punch(&fc[f], rng_range(MAXSZ), 1 + rng_range(32768));
+
+				if (pr < 0) { fail = 1; break; }
+				if (pr == 1) { punch_enabled = 0; printf("note: punch 运行期不可用 → 关闭\n"); }
+				continue;
+			}
+			if (mode == 3 || mode == 4)          /* 该档被禁用 → 退化为写 */
+				mode = rng_range(3);
 
 			/* 三档混合：小随机写 / 中等跨块写 / 大块（含 >64K）增长写 */
-			unsigned long long mode = rng_range(3);
-
 			if (mode == 0) {		/* 小随机写：[1,4K] */
 				len = 1 + rng_range(4095);
 				off = rng_range(MAXSZ > len ? MAXSZ - len : 1);
@@ -288,8 +397,8 @@ int main(int argc, char **argv)
 		printf("\nFAIL: 有写/读回不符\n");
 		return 1;
 	}
-	printf("\nPASS: %d 轮 × %d 文件（共写 %.1f MiB），逐轮影子比对一致；sync 后复检一致\n",
-	       rounds, nfiles, (double)total_bytes / (1024.0 * 1024.0));
+	printf("\nPASS: %d 轮 × %d 文件（写 %.1f MiB / truncate %llu / punch %llu），逐轮影子比对一致；sync 后复检一致\n",
+	       rounds, nfiles, (double)total_bytes / (1024.0 * 1024.0), g_truncs, g_punches);
 	printf("提示：可 `sync` 后跑 audit_v1.2 <device> 做结构自洽审计\n");
 	return 0;
 }

@@ -22,6 +22,7 @@ tools/audit_v1.2/dents_dump
 tools/audit_v1.2/mkbigdir
 tools/audit_v1.2/mkcontent
 tools/audit_v1.2/mkstates
+tools/audit_v1.2/mkstates_t
 tools/audit_v1.2/mkstates_w
 tools/audit_v1.2/readback
 
