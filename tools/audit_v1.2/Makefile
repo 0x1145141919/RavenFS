@@ -6,7 +6,7 @@ LDLIBS    = -lxxhash
 TARGET    = audit_v1.2
 SRCS      = audit_v1.2.cpp
 
-all: $(TARGET) mkcontent mkbigdir dents_dump
+all: $(TARGET) mkcontent mkbigdir dents_dump mkstates readback
 
 $(TARGET): $(SRCS) ../../include/disk_struct_v1.2.h ../../include/magics.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $(SRCS) $(LDLIBS)
@@ -23,7 +23,15 @@ mkbigdir: mkbigdir.cpp ../../include/disk_struct_v1.2.h ../../include/magics.h
 dents_dump: dents_dump.cpp
 	$(CXX) $(CXXFLAGS) -o $@ dents_dump.cpp
 
+# M4.1 只读靶子构造器（三态 / >4K / 稀疏洞 / 2 级 extent 树；写副本 + 出 .expect）
+mkstates: mkstates.cpp m41_expect.h ../../include/disk_struct_v1.2.h ../../include/magics.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ mkstates.cpp $(LDLIBS)
+
+# M4.1 回放/校验器（dump 期望内容 / verify 镜像；host 独立于 ko）
+readback: readback.cpp m41_expect.h ../../include/disk_struct_v1.2.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ readback.cpp $(LDLIBS)
+
 clean:
-	rm -f $(TARGET) mkcontent mkbigdir dents_dump
+	rm -f $(TARGET) mkcontent mkbigdir dents_dump mkstates readback
 
 .PHONY: all clean

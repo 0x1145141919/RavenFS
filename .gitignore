@@ -21,6 +21,8 @@ tools/audit_v1.2/audit_v1.2
 tools/audit_v1.2/dents_dump
 tools/audit_v1.2/mkbigdir
 tools/audit_v1.2/mkcontent
+tools/audit_v1.2/mkstates
+tools/audit_v1.2/readback
 
 # IDE / 编辑器
 .vscode/
