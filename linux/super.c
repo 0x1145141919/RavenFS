@@ -384,6 +384,11 @@ static int ravenfs_read_inode(struct inode *inode)
 			inode->i_link = ri->symlink_target;
 			inode->i_op = &ravenfs_fast_symlink_inode_operations;
 		} else {
+			/* slow：page_get_link 直接映射 folio，而 __page_get_link 有
+			 * `BUG_ON(mapping_gfp_mask(mapping) & __GFP_HIGHMEM)`（无 highmem
+			 * 才能直映射）→ slow 态须清 highmem（照抄 ext2_symlink 的
+			 * inode_nohighmem；否则 readlink 必在 __page_get_link 里 BUG）。 */
+			inode_nohighmem(inode);
 			inode->i_op = &ravenfs_symlink_inode_operations;
 		}
 		break;
@@ -966,9 +971,15 @@ static int __init ravenfs_init(void)
 {
 	int err;
 
-	ravenfs_inode_cachep = kmem_cache_create("ravenfs_inode_cache",
+	/* R-NS-06 fast symlink：`i_link` 指向本对象内的 `symlink_target`，readlink(2)
+	 * 经 copy_to_user 从该 slab 对象导出 → 必须给该字段一条 usercopy 白名单，
+	 * 否则 hardened usercopy 判「从无白名单 SLUB 对象导出」直接 BUG（照抄 ext2/ufs：
+	 * fs/ext2/super.c kmem_cache_create_usercopy(…, offsetof(i_data), sizeof(i_data))）。 */
+	ravenfs_inode_cachep = kmem_cache_create_usercopy("ravenfs_inode_cache",
 					sizeof(struct ravenfs_inode_info), 0,
 					SLAB_HWCACHE_ALIGN | SLAB_RECLAIM_ACCOUNT,
+					offsetof(struct ravenfs_inode_info, symlink_target),
+					sizeof_field(struct ravenfs_inode_info, symlink_target),
 					NULL);
 	if (!ravenfs_inode_cachep)
 		return -ENOMEM;

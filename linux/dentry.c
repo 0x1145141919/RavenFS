@@ -1179,6 +1179,16 @@ int ravenfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 			iput(inode);
 			return err;
 		}
+		/* slow 态须清 `i_link`：iget 时盘记录 size 仍为 0 → read_inode 曾按
+		 * **fast** 装了 i_link = symlink_target（空串）。若不清，vfs_readlink 的
+		 * fast 快捷路径（`link = READ_ONCE(inode->i_link)`）会直接复制这个空串，
+		 * 永远不走 page_get_link → readlink 返 0 字节（M5 残 slow 实测缺陷）。 */
+		inode->i_link = NULL;
+		/* slow 态还须清 mapping 的 __GFP_HIGHMEM：page_get_link 要直映射
+		 * folio，而 __page_get_link 内 `BUG_ON(mapping_gfp_mask & __GFP_HIGHMEM)`
+		 * （ext2_symlink 同款 inode_nohighmem）。iget 走的是 size=0 的 fast
+		 * 分支，未设过，故此处补。 */
+		inode_nohighmem(inode);
 		inode->i_op = &ravenfs_symlink_inode_operations;
 	}
 
