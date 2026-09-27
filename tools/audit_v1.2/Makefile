@@ -6,7 +6,7 @@ LDLIBS    = -lxxhash
 TARGET    = audit_v1.2
 SRCS      = audit_v1.2.cpp
 
-all: $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t mkstates_a m44_attrcmp
+all: $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t mkstates_a m44_attrcmp mkstates_s
 
 $(TARGET): $(SRCS) ../../include/disk_struct_v1.2.h ../../include/magics.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $(SRCS) $(LDLIBS)
@@ -47,7 +47,11 @@ mkstates_a: mkstates_a.cpp m42_fill.h m41_expect.h ../../include/disk_struct_v1.
 m44_attrcmp: m44_attrcmp.cpp ../../include/disk_struct_v1.2.h ../../include/magics.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ m44_attrcmp.cpp
 
+# M4.5 深层 extent 树靶子构造器（3 层区段树 / 大面积 extent 删除；写副本 + 出 .expect/.wexpect/.plan）
+mkstates_s: mkstates_s.cpp m42_fill.h m41_expect.h ../../include/disk_struct_v1.2.h ../../include/magics.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ mkstates_s.cpp $(LDLIBS)
+
 clean:
-	rm -f $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t mkstates_a m44_attrcmp
+	rm -f $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t mkstates_a m44_attrcmp mkstates_s
 
 .PHONY: all clean
