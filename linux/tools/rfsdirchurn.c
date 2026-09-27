@@ -277,6 +277,13 @@ int main(int argc, char **argv)
 	       total, peak);
 
 	/* ── 3. 基线 + inode 预检 ───────────────────────────────────────── */
+	/* ⚠ statfs 读的是**盘上位图**（ioctl/sb_bread，只有 sync_fs 才落盘）→
+	   先把当前挂载态刷盘，否则「基线」漏掉尚未落盘的分配（典型：刚 mkdir 的
+	   测试目录自身 = 1 inode + 2 块）→ 首轮 syncfs 后凭空出现 Δ-2 块/Δ-1 inode 假泄漏。 */
+	{
+		int sfd = open(base, O_RDONLY | O_DIRECTORY);
+		if (sfd >= 0) { syncfs(sfd); close(sfd); }
+	}
 	if (fs_snap(base, &base_fs) != 0) {
 		perror("statfs(baseline)");
 		return 1;

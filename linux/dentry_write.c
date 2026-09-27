@@ -247,15 +247,16 @@ static int rfs_propagate(struct super_block *sb, const struct rfs_dpath *p, u32 
 	return 0;
 }
 
-/* 叶分裂：victim(count=127) → 左 63 / 右 64；维护叶链；返回 low/high max + 新叶块号 */
+/* 叶分裂：victim(count=127) → 左 63 / 右 64；维护叶链；返回 low/high max + 新叶块号
+ * out_dotdot：旧根叶的 `..`（仅 was_root 有意义；升根时继承，非根 = RFS_MASK52） */
 static int rfs_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
-			  u64 *out_low, u64 *out_high, bool *out_was_root)
+			  u64 *out_low, u64 *out_high, bool *out_was_root, u64 *out_dotdot)
 {
 	struct ravenfs_msession *vms = ravenfs_mdata_get(sb, victim_blk);
 	struct ravenfs_msession *nms = NULL;
 	struct Bptree_ddentry_leaf_node_t *vl, *nl;
 	u32 cnt, inner, root;
-	u64 pptr, parent, old_next, new_blk = (u64)PTR_INVALID;
+	u64 pptr, parent, old_next, dotdot, new_blk = (u64)PTR_INVALID;
 	bool was_root;
 	int err;
 
@@ -270,6 +271,8 @@ static int rfs_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 	was_root = root != 0;
 	parent = pptr;
 	old_next = RFS_PTR_ADDR(vl->meta.ptrs[2]);	/* ⚠ 先读后写 */
+	dotdot = was_root ? RFS_PTR_ADDR(vl->meta.ptrs[1]) : (u64)RFS_MASK52;	/* ⚠ ".." 先读后写 */
+	*out_dotdot = dotdot;
 	ravenfs_mdata_put(vms);
 
 	new_blk = ravenfs_block_alloc(sb, 2, 1);	/* 2 块连续、2^1 对齐 */
@@ -324,7 +327,7 @@ static int rfs_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 
 /* 内分裂：victim(count=127) → 左 63 / 右 64；右半孩子 reparent → 新内块 */
 static int rfs_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
-			   u64 *out_low, u64 *out_high)
+			   u64 *out_low, u64 *out_high, u64 *out_dotdot)
 {
 	struct ravenfs_msession *vms = ravenfs_mdata_get(sb, victim_blk);
 	struct ravenfs_msession *nms = NULL;
@@ -342,6 +345,7 @@ static int rfs_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 		return err ? err : -EIO;
 	}
 	parent = pptr;
+	*out_dotdot = (root != 0) ? RFS_PTR_ADDR(vi->meta.ptrs[1]) : (u64)RFS_MASK52;	/* ⚠ 先读后写 */
 	ravenfs_mdata_put(vms);
 
 	new_blk = ravenfs_block_alloc(sb, 2, 1);
@@ -409,7 +413,7 @@ static int rfs_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 
 /* 新建根内（根升长）；⭐ 显式写 ptrs[] + root ".." */
 static int rfs_new_root_inner(struct super_block *sb, u64 dir_ino, u64 left_blk, u64 left_max,
-			      u64 right_blk, u64 right_max)
+			      u64 right_blk, u64 right_max, u64 dotdot)
 {
 	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, dir_ino);
 	struct ravenfs_msession *rms = NULL;
@@ -432,7 +436,7 @@ static int rfs_new_root_inner(struct super_block *sb, u64 dir_ino, u64 left_blk,
 	ri = ravenfs_msession_node(rms);
 	rfs_node_init(ri, 2, 1, 1, dir_ino);
 	rfs_set_addr(&ri->meta.ptrs[0], RFS_MASK52);	/* 预留 */
-	rfs_set_addr(&ri->meta.ptrs[1], dir_ino);	/* `..` = 目录自身 */
+	rfs_set_addr(&ri->meta.ptrs[1], dotdot);	/* `..` 继承自旧根（非根目录 = 父目录 inum；根目录 = 自身） */
 	rfs_set_addr(&ri->meta.ptrs[2], RFS_MASK52);
 	rfs_set_addr(&ri->hints[0].sub_ptr, left_blk);
 	ri->hints[0].hash_max = left_max;
@@ -515,13 +519,13 @@ static int rfs_apply_up(struct super_block *sb, u64 dir_ino, const struct rfs_dp
 		}
 		/* 父溢出 → 内裂 */
 		{
-			u64 rblk, lmx, hmx;
+			u64 rblk, lmx, hmx, dotdot;
 
-			err = rfs_inner_split(sb, p->blk[level], &rblk, &lmx, &hmx);
+			err = rfs_inner_split(sb, p->blk[level], &rblk, &lmx, &hmx, &dotdot);
 			if (err)
 				return err;
 			if (is_root)
-				return rfs_new_root_inner(sb, dir_ino, p->blk[level], lmx, rblk, hmx);
+				return rfs_new_root_inner(sb, dir_ino, p->blk[level], lmx, rblk, hmx, dotdot);
 			if (level == 0)
 				return -EIO;
 			cur_victim = p->blk[level];
@@ -582,14 +586,14 @@ int ravenfs_ddentry_insert(struct super_block *sb, u64 dir_ino, const struct rfs
 	}
 	/* 叶溢出 → 分裂 */
 	{
-		u64 new_blk, low_max, high_max;
+		u64 new_blk, low_max, high_max, dotdot;
 		bool was_root;
 
-		err = rfs_leaf_split(sb, leaf_blk, &new_blk, &low_max, &high_max, &was_root);
+		err = rfs_leaf_split(sb, leaf_blk, &new_blk, &low_max, &high_max, &was_root, &dotdot);
 		if (err)
 			return err;
 		if (p->depth == 1)
-			return rfs_new_root_inner(sb, dir_ino, leaf_blk, low_max, new_blk, high_max);
+			return rfs_new_root_inner(sb, dir_ino, leaf_blk, low_max, new_blk, high_max, dotdot);
 		return rfs_apply_up(sb, dir_ino, p, p->depth - 2, p->cidx[p->depth - 2],
 				    leaf_blk, low_max, new_blk, high_max);
 	}
@@ -924,12 +928,12 @@ static int rfs_root_shrink(struct super_block *sb, u64 dir_ino)
 		struct Bptree_ddentry_leaf_node_t *cl = ravenfs_msession_node(cms);
 
 		rfs_set_addr(&cl->meta.ptrs[0], RFS_MASK52);
-		rfs_set_addr(&cl->meta.ptrs[1], dir_ino);	/* ".." */
+		rfs_set_addr(&cl->meta.ptrs[1], RFS_PTR_ADDR(rm->ptrs[1]));	/* ".." 继承自旧根 */
 		rfs_set_addr(&cl->meta.ptrs[2], RFS_MASK52);
 	} else {
 		struct Bptree_ddentry_inner_node_t *cin = ravenfs_msession_node(cms);
 
-		rfs_set_addr(&cin->meta.ptrs[1], dir_ino);	/* ".." */
+		rfs_set_addr(&cin->meta.ptrs[1], RFS_PTR_ADDR(rm->ptrs[1]));	/* ".." 继承自旧根 */
 	}
 	NODE_DIRTY(cms);
 
