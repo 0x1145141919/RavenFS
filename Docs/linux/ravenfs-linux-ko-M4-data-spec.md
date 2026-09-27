@@ -324,9 +324,9 @@ mmap      → filemap_fault → a_ops->read_folio ──────────
 | **O-13** | **（新，M4.2 实测暴露）可写 mmap 落在「未分配洞」上 → 静默丢数据** | `mmap` 写 → `page_mkwrite` 脏页 → 回写期 `iomap_begin` 见 HOLE → iomap 跳过（不写）→ 数据丢（`write()` 走立刻分配故无此问题） | (a) 现在做 `page_mkwrite` → 立刻分配（正解）；(b) 过渡护栏：`mmap_prepare` 拒 `VM_MAYWRITE`；(c) 暂接受 | **已落**：`page_mkwrite` 立刻分配 → **D-M4-12**（提交 `f23b933`，实测 PASS） |
 | **O-14** | **（新，page_mkwrite 实测暴露）inline 态（size≤160）的可写 mmap 未闭环** | mmap 写 inline 文件 → iomap 不物化 `IOMAP_INLINE` → 写只进页缓存；回写期 `writeback_range` 见非 MAPPED/HOLE 返 `-EIO` → `msync` 报 EIO（**硬失败，未静默丢**；但用户态 write 到页缓存看似成功） | (a) `page_mkwrite`/`iomap_end(FAULT)` 把页回灌 `inline_data`；(b) `mmap_prepare` 对 inline 文件拒可写映射；(c) 接受当前硬失败 | **已落（M4.3 首项）→ D-M4-14**：回灌 inline_data；**不升格**；超 size 静默丢弃（Linux 常规） |
 | **O-15** | **（新，M4.3 已知）`rfs_fl_add` 释放账本上限 1024 条** | 相邻合并的释放账本固定 1024；极端碎片化的超大 punch/truncate 可能溢出 → **静默泄漏**（audit 以「已分配未认领」暴露） | (a) 账本动态增长/分块；(b) 溢出即报错中止（硬失败 > 泄漏）；(c) 接受（测试量级未触及） | **待裁决** |
-| **O-16** | **（新，M4.3 已知）`i_blocks` 未随 truncate/punch/fallocate 即时更新** | 仅 iomap 写路径更新 `i_blocks`；三接口后同挂载期 `stat -c %b` 可能**滞后**（remount 后纠正） | (a) 三接口收尾统一刷 `i_blocks`；(b) 接受（归 M4.5 收尾总刷） | **待裁决** |
+| **O-16** | **（新，M4.3 已知）`i_blocks` 未随 truncate/punch/fallocate 即时更新** | 仅 iomap 写路径更新 `i_blocks`；三接口后同挂载期 `stat -c %b` 可能**滞后**（remount 后 iget 重算纠正） | (a) 三接口收尾统一刷 `i_blocks`；(b) 接受 | **已裁 = 放一马**：作为**明确 known defect** 记录、暂不修（remount 自动纠正；将来在提交点 `rfs_commit_inode` 加一行刷新即可一处解决） |
 
-> **一句话**：O-1/O-4/O-5 已裁并回填（**D-M4-6/7/8**）；O-2/O-3 随 O-4 消解；O-6/O-7/O-8/O-9 按建议采纳；O-11 = **D-M4-10**（b + `evict_inode` 清算）；O-12 = **D-M4-11**（拒 `FALLOC_FL_KEEP_SIZE`）；O-13 = **D-M4-12**（已落 `f23b933`）；**碎片化暂接受为特性（D-M4-13）**；**O-14 = D-M4-14**（M4.3 首项，inline 可写 mmap 回灌）→ 闭环；**O-15（释放账本 1024 上限）/ O-16（`i_blocks` 滞后）待裁**。
+> **一句话**：O-1/O-4/O-5 已裁并回填（**D-M4-6/7/8**）；O-2/O-3 随 O-4 消解；O-6/O-7/O-8/O-9 按建议采纳；O-11 = **D-M4-10**（b + `evict_inode` 清算）；O-12 = **D-M4-11**（拒 `FALLOC_FL_KEEP_SIZE`）；O-13 = **D-M4-12**（已落 `f23b933`）；**碎片化暂接受为特性（D-M4-13）**；**O-14 = D-M4-14**（M4.3 首项，inline 可写 mmap 回灌）→ 闭环；**O-15 已解（动态 freelist，无上限）**；**O-16 = 明确 known defect（暂不修，remount 纠正）**。
 >
 > **M4.3 测试覆盖缺口（记）**：深层（≥2 层）内平衡 / mid-overflow 叶裂未实测；无断电注入验证；`rfs_commit_inode` 每次全量 `mdata_writeback_all`（偏重，未测并发多写者）。
 
