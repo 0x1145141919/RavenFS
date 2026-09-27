@@ -25,6 +25,7 @@
 #include <linux/writeback.h>
 #include <linux/timekeeping.h>
 #include <linux/falloc.h>
+#include <linux/posix_acl.h>	/* M6：posix_acl_chmod（chmod 同步 access ACL mask）*/
 
 #include "ravenfs.h"
 
@@ -1099,6 +1100,10 @@ int ravenfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr
 			return err;
 	}
 	setattr_copy(idmap, inode, attr);
+	/* M6（R-XA-03）：chmod 须同步 access ACL 的 mask/group_obj（posix_acl_chmod）。
+	 * 无 access ACL 时它内部返 0（get_inode_acl → NULL）。*/
+	if (attr->ia_valid & ATTR_MODE)
+		err = posix_acl_chmod(idmap, dentry, inode->i_mode);
 	mark_inode_dirty(inode);		/* VFS → 盘记录（mode/uid/gid/times/size）经 write_inode 同步 */
-	return 0;
+	return err;
 }

@@ -97,6 +97,11 @@ struct ravenfs_inode_info {
 	 * 盘记录 inline_data 随缓存行可被淘汰 → 不能直接作 inode->i_link；
 	 * read_inode 在此拷贝 target 并补 NUL，simple_get_link 返回此指针。 */
 	char			symlink_target[RAVENFS_SYMLINK_INLINE_MAX + 1];
+	/* M6（R-XA-01/03）：per-inode xattr 串行。
+	 * set/ACL 走 xattr 块「读-改-写」，VFS 的 inode_lock 只覆盖 set 路径；
+	 * get/list 无 inode_lock → 需自持锁防「并发 set 期间读到半改块 / 块被 free」。
+	 * 锁序：inode_lock（VFS，set 路径持有）→ xattr_sem（本锁）；get/list 仅持本锁。 */
+	struct rw_semaphore	xattr_sem;
 };
 
 static inline struct ravenfs_inode_info *RAVENFS_I(struct inode *inode)
@@ -469,6 +474,25 @@ void ravenfs_force_shutdown(struct super_block *sb, const char *why);
 /* ── R-SY-05：设备 flush 屏障（保证「返回即落盘」）──
  * 无 bdev / ro 挂载 → no-op 返 0。 */
 int ravenfs_issue_flush(struct super_block *sb);
+
+/* ── M6：xattr / ACL（xattr.c）──
+ * s_xattr 处理器表（user / security / system；**trusted 不注册 → 拒绝**）。
+ * ACL（system.posix_acl_access/default）不进 s_xattr，由 VFS 特殊路径转发到
+ * i_op->get_inode_acl/set_acl（见 fs/xattr.c is_posix_acl_xattr）。 */
+struct xattr_handler;
+extern const struct xattr_handler * const ravenfs_xattr_handlers[];
+
+int  ravenfs_xattr_get(struct inode *inode, int name_index, const char *name,
+		       void *buffer, size_t size);
+int  ravenfs_xattr_set(struct inode *inode, int name_index, const char *name,
+		       const void *value, size_t size, int flags);
+ssize_t ravenfs_listxattr(struct dentry *dentry, char *buffer, size_t size);
+/* ACL（R-XA-03）：值 opaque（内核通用 posix_acl_xattr v2 格式），默认 ACL 继承 */
+struct posix_acl;
+struct posix_acl *ravenfs_get_inode_acl(struct inode *inode, int type, bool rcu);
+int  ravenfs_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+		     struct posix_acl *acl, int type);
+int  ravenfs_init_acl(struct inode *inode, struct inode *dir);
 
 /* ── 双位图分片分配器（bitmap.c）── */
 struct ravenfs_bitmap_mgr;

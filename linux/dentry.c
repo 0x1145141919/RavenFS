@@ -326,6 +326,12 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	inode = ravenfs_iget(sb, inum);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
+	/* M6（R-XA-03）：默认 ACL 继承 + umask（SB_POSIXACL ⇒ VFS 不再代剥 umask）。
+	 * 失败为 best-effort（名字/记录已落盘，不因 ACL 回滚整个 create）。 */
+	err = ravenfs_init_acl(inode, dir);
+	if (err)
+		pr_warn("ravenfs: init_acl ino=%llu failed: %d (best-effort)\n",
+			(unsigned long long)inum, err);
 	d_instantiate(dentry, inode);
 	return 0;
 }
@@ -539,6 +545,11 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	inode = ravenfs_iget(sb, inum);
 	if (IS_ERR(inode))
 		return ERR_CAST(inode);
+	/* M6（R-XA-03）：默认 ACL 继承（子目录：default + access；best-effort）*/
+	err = ravenfs_init_acl(inode, dir);
+	if (err)
+		pr_warn("ravenfs: init_acl(mkdir) ino=%llu failed: %d (best-effort)\n",
+			(unsigned long long)inum, err);
 	d_instantiate(dentry, inode);
 	return NULL;		/* 用原 dentry（VFS 约定：非 NULL 才替换） */
 
@@ -1234,6 +1245,11 @@ int ravenfs_mknod(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	inode = ravenfs_iget(sb, inum);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
+	/* M6（R-XA-03）：默认 ACL 继承（best-effort）*/
+	err = ravenfs_init_acl(inode, dir);
+	if (err)
+		pr_warn("ravenfs: init_acl(mknod) ino=%llu failed: %d (best-effort)\n",
+			(unsigned long long)inum, err);
 	d_instantiate(dentry, inode);
 	return 0;
 }
@@ -1264,6 +1280,11 @@ int ravenfs_tmpfile(struct mnt_idmap *idmap, struct inode *dir, struct file *fil
 		ravenfs_inode_reclaim(sb, inum);
 		return err;
 	}
+	/* M6（R-XA-03）：默认 ACL 继承（best-effort）*/
+	err = ravenfs_init_acl(inode, dir);
+	if (err)
+		pr_warn("ravenfs: init_acl(tmpfile) ino=%llu failed: %d (best-effort)\n",
+			(unsigned long long)inum, err);
 	d_tmpfile(file, inode);		/* nlink 1→0；匿名 dentry 接管 inode（final close → reclaim） */
 	return finish_open_simple(file, 0);
 }

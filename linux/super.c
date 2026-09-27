@@ -185,6 +185,7 @@ static struct inode *ravenfs_alloc_inode(struct super_block *sb)
 	if (!ri)
 		return NULL;
 	inode_init_once(&ri->vfs_inode);
+	init_rwsem(&ri->xattr_sem);	/* M6：per-inode xattr 串行 */
 	return &ri->vfs_inode;
 }
 
@@ -592,10 +593,12 @@ static void ravenfs_evict_inode(struct inode *inode)
 	if (!inode->i_nlink) {
 		struct ravenfs_session *s __free(ravenfs_session) =
 			ravenfs_session_get(sb, inode->i_ino);
+		u64 xptr = (u64)RFS_XATTR_NONE;
 
 		if (!IS_ERR_OR_NULL(s)) {
 			struct raven_Inode_t *r = ravenfs_session_inode(s);
 
+			xptr = RFS_XATTRPTR_GET(r->mode_xattr);	/* M6：xattr 块指针 */
 			if (r->size > 160 &&
 			    (S_ISREG(inode->i_mode) || S_ISLNK(inode->i_mode))) {
 				data_root = r->data_root;
@@ -605,6 +608,9 @@ static void ravenfs_evict_inode(struct inode *inode)
 			}
 		}
 		ravenfs_inode_reclaim(sb, inode->i_ino);
+		/* M6：释放 xattr 块（先 inode 后 free：记录已清零，引用先消失）*/
+		if (xptr != (u64)RFS_XATTR_NONE)
+			ravenfs_block_free(sb, xptr, 1);
 		if (has_data)
 			ravenfs_release_inode_data(sb, data_root, data_size, data_direct);
 	}
@@ -705,6 +711,10 @@ static const struct inode_operations ravenfs_dir_inode_operations = {
 	.rename		= ravenfs_rename,
 	.tmpfile	= ravenfs_tmpfile,		/* M5 残 R-NS-09 */
 	.getattr	= ravenfs_getattr,
+	.setattr	= ravenfs_setattr,		/* M6：chmod 同步 access ACL（同 file i_op）*/
+	.listxattr	= ravenfs_listxattr,	/* M6 R-XA-01 */
+	.get_inode_acl	= ravenfs_get_inode_acl,	/* M6 R-XA-03 */
+	.set_acl	= ravenfs_set_acl,
 	.fileattr_get	= ravenfs_fileattr_get,	/* R-MD-09：chattr/lsattr → -EOPNOTSUPP */
 	.fileattr_set	= ravenfs_fileattr_set,
 };
@@ -712,6 +722,9 @@ static const struct inode_operations ravenfs_dir_inode_operations = {
 static const struct inode_operations ravenfs_file_inode_operations = {
 	.getattr	= ravenfs_getattr,
 	.setattr	= ravenfs_setattr,			/* M4.4：chmod/chown/utimes/truncate（全属性） */
+	.listxattr	= ravenfs_listxattr,	/* M6 R-XA-01 */
+	.get_inode_acl	= ravenfs_get_inode_acl,	/* M6 R-XA-03 */
+	.set_acl	= ravenfs_set_acl,
 	.fileattr_get	= ravenfs_fileattr_get,	/* R-MD-09：chattr/lsattr → -EOPNOTSUPP */
 	.fileattr_set	= ravenfs_fileattr_set,
 };
@@ -933,6 +946,14 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	brelse(bh);
 	if (err)
 		return err;
+
+	/* M6（R-XA-01/02）：s_xattr 处理器（user/security/system；trusted 不注册 → 拒）。
+	 * 注册即置 IOP_XATTR（fs/inode.c），set 路径 inode_lock 已由 VFS 把持。 */
+	sb->s_xattr = ravenfs_xattr_handlers;
+	/* M6（R-XA-03）：POSIX ACL —— 置 SB_POSIXACL 后 VFS 把 umask 剥离推迟给
+	 * posix_acl_create（namei.h mode_strip_umask），故 creat/mknod 路径必须调
+	 * ravenfs_init_acl（否则 umask 失效）。 */
+	sb->s_flags |= SB_POSIXACL;
 
 	sbi = sb->s_fs_info;
 	root = ravenfs_iget(sb, sbi->root_ino);
