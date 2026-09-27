@@ -296,7 +296,7 @@ mmap      → filemap_fault → a_ops->read_folio ──────────
 |---|---|---|
 | **M4.1 只读** | `a_ops.read_folio/readahead`（**iomap 默认**，D-M4-7）+ `read_iter` + `mmap` | guest `dd/cat/head` 往返一致（三态 / >4K / 稀疏洞）；mmap 读/执行通 —— ✅ **2026-09-27 通过**（提交 `791ad02`；验收 `Docs/linux/ravenfs-linux-ko-M4.1-acceptance.md`） |
 | **M4.2 写数据** | `write_iter` + `iomap_begin(WRITE)` **立刻分配（D-M4-6）** + extent 树移植 + 三态迁移（inline→extent 默认，D-M4-8）+ `i_blocks` | `dd` 写→读往返；`stat.blocks` 吻合；audit 全绿 —— ✅ **2026-09-27 通过**（提交 `e61c398`；验收 `Docs/linux/ravenfs-linux-ko-M4.2-acceptance.md`；已知缺口见 §12 O-13） |
-| **M4.3 truncate/punch/fallocate** | 按 `punch_truncate_pread_spec.md` | spec §8 矩阵 |
+| **M4.3 truncate/punch/fallocate** | 按 `punch_truncate_pread_spec.md` | spec §8 矩阵 —— ✅ **2026-09-27 通过**（提交 `1735552`；验收 `Docs/linux/ravenfs-linux-ko-M4.3-acceptance.md`；O-14 inline mmap 一并闭环；缺口见 §12 O-15/O-16） |
 | **M4.4 setattr + 时间戳** | `inode_operations.setattr`；时间戳走 generic | `chmod/chown/utimes/truncate` |
 | **M4.5 收尾** | `fsync` 落数据 / 写序（**经典形态**，§8）/ `root_shrink` 延迟 free | `sync` 往返 + 崩溃窗口（§8 / handover §6.1 设计特性） |
 | ~~O_DIRECT（C）~~ | **后置独立里程碑**（D-M4-5，M4 不做） | — |
@@ -322,9 +322,13 @@ mmap      → filemap_fault → a_ops->read_folio ──────────
 | **O-11** | **（新）`iomap_end` 里「已分配但未写完」区间（短写/失败）如何处置** | 立刻分配引出：写时已真分配，但 `iomap_end` 的 `written` 可能 < length | (a) 对 `[pos+written, pos+length)` 已分配块**即刻 free**（干净，需拆 extent）；(b) 保留（浪费但简单）；(c) free 整段并回滚 size | **(b) + evict 清算**：短期保留浪费；**evict 时秋后算账** trim 尾块 → **D-M4-10** |
 | **O-12** | **（新）`evict_inode` 清算如何区分「意外短写尾」vs「fallocate 有意预留」** | 两者都是「已分配但超出 `size`」；若一律 trim，会误删 `FALLOC_FL_KEEP_SIZE` 预分配（R-FD-07） | (a) **盘面标记**（预留记 `unwritten`，加第四态——改动大）；(b) **内存标记**（write 路径短写时给 inode 记「待清算尾」，`evict_inode` 见标记才 trim；不动盘面；删除路径本就整 inode 释放）；(c) `fallocate` 放弃 KEEP_SIZE（违背 R-FD-07） | **消解**：`FALLOC_FL_KEEP_SIZE` 拒绝受理（保留 `PUNCH_HOLE\|KEEP_SIZE` 例外）→ 盘上无「已分配 > `size`」的 fallocate 预留 → evict trim 无歧义 → **D-M4-11** |
 | **O-13** | **（新，M4.2 实测暴露）可写 mmap 落在「未分配洞」上 → 静默丢数据** | `mmap` 写 → `page_mkwrite` 脏页 → 回写期 `iomap_begin` 见 HOLE → iomap 跳过（不写）→ 数据丢（`write()` 走立刻分配故无此问题） | (a) 现在做 `page_mkwrite` → 立刻分配（正解）；(b) 过渡护栏：`mmap_prepare` 拒 `VM_MAYWRITE`；(c) 暂接受 | **已落**：`page_mkwrite` 立刻分配 → **D-M4-12**（提交 `f23b933`，实测 PASS） |
-| **O-14** | **（新，page_mkwrite 实测暴露）inline 态（size≤160）的可写 mmap 未闭环** | mmap 写 inline 文件 → iomap 不物化 `IOMAP_INLINE` → 写只进页缓存；回写期 `writeback_range` 见非 MAPPED/HOLE 返 `-EIO` → `msync` 报 EIO（**硬失败，未静默丢**；但用户态 write 到页缓存看似成功） | (a) `page_mkwrite`/`iomap_end(FAULT)` 把页回灌 `inline_data`；(b) `mmap_prepare` 对 inline 文件拒可写映射；(c) 接受当前硬失败 | **(a) 现在做（M4.3 首项）→ D-M4-14**：回灌 inline_data；**不升格**；超 size 静默丢弃（Linux 常规） |
+| **O-14** | **（新，page_mkwrite 实测暴露）inline 态（size≤160）的可写 mmap 未闭环** | mmap 写 inline 文件 → iomap 不物化 `IOMAP_INLINE` → 写只进页缓存；回写期 `writeback_range` 见非 MAPPED/HOLE 返 `-EIO` → `msync` 报 EIO（**硬失败，未静默丢**；但用户态 write 到页缓存看似成功） | (a) `page_mkwrite`/`iomap_end(FAULT)` 把页回灌 `inline_data`；(b) `mmap_prepare` 对 inline 文件拒可写映射；(c) 接受当前硬失败 | **已落（M4.3 首项）→ D-M4-14**：回灌 inline_data；**不升格**；超 size 静默丢弃（Linux 常规） |
+| **O-15** | **（新，M4.3 已知）`rfs_fl_add` 释放账本上限 1024 条** | 相邻合并的释放账本固定 1024；极端碎片化的超大 punch/truncate 可能溢出 → **静默泄漏**（audit 以「已分配未认领」暴露） | (a) 账本动态增长/分块；(b) 溢出即报错中止（硬失败 > 泄漏）；(c) 接受（测试量级未触及） | **待裁决** |
+| **O-16** | **（新，M4.3 已知）`i_blocks` 未随 truncate/punch/fallocate 即时更新** | 仅 iomap 写路径更新 `i_blocks`；三接口后同挂载期 `stat -c %b` 可能**滞后**（remount 后纠正） | (a) 三接口收尾统一刷 `i_blocks`；(b) 接受（归 M4.5 收尾总刷） | **待裁决** |
 
-> **一句话**：O-1/O-4/O-5 已裁并回填（**D-M4-6/7/8**）；O-2/O-3 随 O-4 消解；O-6/O-7/O-8/O-9 按建议采纳；O-11 = **D-M4-10**（b + `evict_inode` 清算）；O-12 = **D-M4-11**（拒 `FALLOC_FL_KEEP_SIZE`）；O-13 = **D-M4-12**（已落 `f23b933`）；**碎片化暂接受为特性（D-M4-13）**；**O-14 = D-M4-14**（M4.3 首项，inline 可写 mmap 回灌）→ 闭环。
+> **一句话**：O-1/O-4/O-5 已裁并回填（**D-M4-6/7/8**）；O-2/O-3 随 O-4 消解；O-6/O-7/O-8/O-9 按建议采纳；O-11 = **D-M4-10**（b + `evict_inode` 清算）；O-12 = **D-M4-11**（拒 `FALLOC_FL_KEEP_SIZE`）；O-13 = **D-M4-12**（已落 `f23b933`）；**碎片化暂接受为特性（D-M4-13）**；**O-14 = D-M4-14**（M4.3 首项，inline 可写 mmap 回灌）→ 闭环；**O-15（释放账本 1024 上限）/ O-16（`i_blocks` 滞后）待裁**。
+>
+> **M4.3 测试覆盖缺口（记）**：深层（≥2 层）内平衡 / mid-overflow 叶裂未实测；无断电注入验证；`rfs_commit_inode` 每次全量 `mdata_writeback_all`（偏重，未测并发多写者）。
 
 ---
 
