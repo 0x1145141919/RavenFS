@@ -256,12 +256,35 @@ unlink/rmdir → dir_remove: walk(命中) → ddentry_delete(= 物理删 + 出 f
 | **G8** | **ACL（M6）** | 无 | `SB_POSIXACL` + `.get_inode_acl/.set_acl` + `posix_acl_create`（默认 ACL 继承） | G7 | R-NS-12、R-XA-* |
 | **G9** | **capability（M6）** | 无 | 经 G7 的 `security.capability` xattr | G7 | R-XA-02 |
 | **G10** | **加固（M7）** | 无停机标志；**无周期回写**（dirty mdata 累积）；并发面（bitmap/alloc、回写/evict/sync vs 前台）未系统化；`fsync` 只落元数据不落数据；ENOSPC 路径未系统验 | `RFS_SHUTDOWN` 自检失败→全局 `-EIO`；周期回写；`fsync` 全覆盖；错误路径 | M3–G9 | R-LM-09、R-CO-02/04、R-SY-05 |
-| **G11** | **一致性/崩溃窗口（M3.5）** | 未做非干净卸载 + 写序验证 | 非干净卸载后 `audit_v1.2` 判「不产生损坏」 | M3 | §验收 m3.5 |
+| **G11** | **一致性/崩溃窗口（M3.5）** | **已实测**：flush 外（非干净卸载）PASS；**flush 中途崩溃 → dangling**（写序问题，见 **§6.1**） | 需用户裁决（(a) 接受限制 / (b) 收窄 / (c) 依赖序 flush） | M3 | §验收 m3.5、R-SY-04/05/07 |
 | **G12** | **M8 预演最狠测试** | 未做 | `rsync -aHAX` ext4→ravenfs 克隆 + `pacman -Qkk` | G1+G3..G9 | T3 前哨 |
 | **G13** | **xfstests 工具链（T1 前置）** | **未解决**（guest 无 git/编译链预算） | 宿主下载源码 → 投递 → guest 编译；或宿主预编 | — | T1 |
 | **G14** | **fsck** | **空实现**（`-n` 只查由 audit 承担） | 保留 stub；不修 | — | §4 |
 
 **一句话缺口**：**文件数据（G1）+ setattr（G2）是「能读写文件」的硬缺口；link/symlink/mknod/tmpfile（G3–G6）是「Arch 安装/运行」的硬缺口；xattr/ACL（G7–G9）是「pacman/rsync -aHAX 保真」的硬缺口；加固（G10）是「不静默损坏」的底线。**
+
+### 6.1 M3.5 崩溃窗口实测（2026-09-27 · 证据）
+
+**方法**：guest `echo b > /proc/sysrq-trigger`（非干净关机，**不走 `put_super`**）→ 重启 → `audit_v1.2 <dev>`（按 serial `deadbeef` 认盘）。工具：工作区 `ravenfs-linux-test/tmp/crash{A,B,C}.sh`。
+
+| 用例 | 内容 | 结果 |
+|---|---|---|
+| **A 同步后崩溃** | 造 400 条目 → `sync` → sysrq-b | **PASS**（全部落盘、0 BAD） |
+| **B 未同步崩溃** | 造 100 条目（不 sync）→ sysrq-b | **PASS**（未落盘改动全丢、盘 == 上次落盘态、0 BAD） |
+| **C flush 中途崩溃** | 6 万子目录（dirty ≈480MB）→ `sync &; sleep 0.x; sysrq-b`（0.3s / 0.8s 两测） | **FAIL**：`dentry → inode N 未分配（悬挂）` + `inode N 被引用但 inode bitmap 未亮`（dangling_refs=1） |
+
+**结论**：崩在 `flush_all` **之外**（A/B = 绝大多数时刻）→ **不产生损坏**（判据满足）；崩在 `flush_all` **之中**（C）→ 产生**悬挂引用**，重启后该目录后续操作返 `-EIO`（无 fsck → 实为「需重装」）。
+
+**根因（写序）**：`ravenfs_sync_fs`（及 `put_super`）的落盘顺序 = ① inode 记录行 → ② mdata 树节点 → ③ **位图（最后）**。阶段 ② 落盘的树**引用**本批次新分配的 inode/块，而 ③ 未落 → 「被引用但位图未亮」= 悬挂。方向与**不变量 25（亮灯 → 数据/节点落盘 → inode 翻转）相反**。（`fsync` 路径 = 单 inode 行 + 位图、跳 mdata，另有一致性面。）
+
+**为何单一排序修不干净**：一部位图全量刷 —— 分配类要求「亮灯在前」、删除类要求「回收在后」，单序两难兼顾。更深：即便位图提前，「父目录 `size` 必须晚于其树」与「子 inode 记录必须早于引用它的树」是一对**互相冲突**的依赖 → 需**按依赖分阶段刷 inode 行**（≈ 迷你 journal）才能做到中途任意点无损。另：各阶段间**无 `blkdev_issue_flush` 屏障**（R-SY-05 ❌）→ 设备可乱序，连「按顺序调用」都保证不了。
+
+**未决（待用户裁决）**：
+- **(a) 接受并文档化**：把「flush 中途崩溃」列为已知限制（无 journal 的代价），M3.5 验收只覆盖 flush 外的崩溃（A/B）；
+- **(b) 收窄窗口**：按不变量 25 顺序（位图**最先**）调整——消除本用例的 dangling，但仍有 inode 行阶段的窗口，且需补 `blkdev_issue_flush` 屏障（R-SY-05）才谈得上「顺序」；
+- **(c) 真修**：依赖序 flush（分配亮灯先 / 删除回收后 / 父子 inode 分阶段）——成本最高，属 M7 加固范畴。
+
+> 相关：**G10（M7 加固）**、**R-SY-04/05/07**。定论前 M3.5 不视为「验收通过」，但 A/B 已为正结果。
 
 ---
 
@@ -269,7 +292,7 @@ unlink/rmdir → dir_remove: walk(命中) → ddentry_delete(= 物理删 + 出 f
 
 > 纪律：**每阶段必须「可测」才算完成**（audit / guest 挂载实测 / dents_dump / xfstests）；**阶段内禁止越级**（T1 缺口表出来前不碰 T3）。
 
-- **M3.5 一致性/崩溃窗口**（不新增功能，只加证据）：按 spec 不变量验证写序（亮灯→落盘→翻转）；非干净卸载（`echo b > /proc/sysrq-trigger`/kexec）后 audit。判据 = **不产生损坏**（孤儿可被审计标出）。
+- **M3.5 一致性/崩溃窗口**（不新增功能，只加证据）：非干净卸载（`echo b > /proc/sysrq-trigger`/kexec）后 audit。判据 = **不产生损坏**（孤儿可被审计标出）。**已实测（见 §6.1）：flush 外 PASS；flush 中途 → dangling（写序问题，**待用户裁决 (a)/(b)/(c)**）。**
 - **M4 文件数据**（**下一步**，G1/G2）：a_ops + `read_iter/write_iter/mmap` + extent 树 + 三态迁移 + `truncate/punch/fallocate` + `setattr`。判据：`dd/cat/head` 往返一致（跨态、>4K、稀疏洞）；`stat.blocks` 吻合；audit 全绿。
 - **M5 残**（G3–G6）：link / symlink+get_link / mknod / tmpfile。判据：`ln/ln -s/readlink/mknod` 往返；大目录分裂后 `dents_dump` 仍 `DUP=0 MISSING=0`；audit `chain_bad=0`。
 - **M6 xattr/ACL/capability**（G7–G9）：4 回调 + `SB_POSIXACL` + 默认 ACL 继承 + `security.capability`；xattr 块分配/释放。判据：`setfattr/setfacl/setcap` 往返；**`rsync -aHAX` 保留 ACL+xattr**；audit xattr 校验通过。
