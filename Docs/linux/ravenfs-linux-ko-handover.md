@@ -256,7 +256,7 @@ unlink/rmdir → dir_remove: walk(命中) → ddentry_delete(= 物理删 + 出 f
 | **G8** | **ACL（M6）** | 无 | `SB_POSIXACL` + `.get_inode_acl/.set_acl` + `posix_acl_create`（默认 ACL 继承） | G7 | R-NS-12、R-XA-* |
 | **G9** | **capability（M6）** | 无 | 经 G7 的 `security.capability` xattr | G7 | R-XA-02 |
 | **G10** | **加固（M7）** | 无停机标志；**无周期回写**（dirty mdata 累积）；并发面（bitmap/alloc、回写/evict/sync vs 前台）未系统化；`fsync` 只落元数据不落数据；ENOSPC 路径未系统验 | `RFS_SHUTDOWN` 自检失败→全局 `-EIO`；周期回写；`fsync` 全覆盖；错误路径 | M3–G9 | R-LM-09、R-CO-02/04、R-SY-05 |
-| **G11** | **一致性/崩溃窗口（M3.5）** | **已实测**：flush 外（非干净卸载）PASS；**flush 中途崩溃 → dangling**（写序问题，见 **§6.1**） | 需用户裁决（(a) 接受限制 / (b) 收窄 / (c) 依赖序 flush） | M3 | §验收 m3.5、R-SY-04/05/07 |
+| **G11** | **一致性/崩溃窗口（M3.5）** | **已定（2026-09-27）**：flush 外不产生损坏（A/B 实测 PASS）；flush **中途**崩溃的 dangling 判为**设计特性**（无 journal 边界）→ 不修（见 **§6.1**） | — | M3 | §验收 m3.5、R-SY-04/05/07 |
 | **G12** | **M8 预演最狠测试** | 未做 | `rsync -aHAX` ext4→ravenfs 克隆 + `pacman -Qkk` | G1+G3..G9 | T3 前哨 |
 | **G13** | **xfstests 工具链（T1 前置）** | **未解决**（guest 无 git/编译链预算） | 宿主下载源码 → 投递 → guest 编译；或宿主预编 | — | T1 |
 | **G14** | **fsck** | **空实现**（`-n` 只查由 audit 承担） | 保留 stub；不修 | — | §4 |
@@ -279,12 +279,9 @@ unlink/rmdir → dir_remove: walk(命中) → ddentry_delete(= 物理删 + 出 f
 
 **为何单一排序修不干净**：一部位图全量刷 —— 分配类要求「亮灯在前」、删除类要求「回收在后」，单序两难兼顾。更深：即便位图提前，「父目录 `size` 必须晚于其树」与「子 inode 记录必须早于引用它的树」是一对**互相冲突**的依赖 → 需**按依赖分阶段刷 inode 行**（≈ 迷你 journal）才能做到中途任意点无损。另：各阶段间**无 `blkdev_issue_flush` 屏障**（R-SY-05 ❌）→ 设备可乱序，连「按顺序调用」都保证不了。
 
-**未决（待用户裁决）**：
-- **(a) 接受并文档化**：把「flush 中途崩溃」列为已知限制（无 journal 的代价），M3.5 验收只覆盖 flush 外的崩溃（A/B）；
-- **(b) 收窄窗口**：按不变量 25 顺序（位图**最先**）调整——消除本用例的 dangling，但仍有 inode 行阶段的窗口，且需补 `blkdev_issue_flush` 屏障（R-SY-05）才谈得上「顺序」；
-- **(c) 真修**：依赖序 flush（分配亮灯先 / 删除回收后 / 父子 inode 分阶段）——成本最高，属 M7 加固范畴。
+**裁决（2026-09-27，用户）**：**作为设计特性（feature）接受**。理由：`flush_all` 只在 sync/syncfs/fsync/umount 跑，随机断电绝大多数落在 flush **之外**（A/B 安全）；窗口宽度 = 该次 flush 耗时（脏集越大越宽，无周期回写 → 可到秒级）。⇒ **M3.5 判据 = flush 之外的崩溃不产生损坏**（A/B 已证）；flush 中途的 dangling 记在案、**不修**（(b)/(c) 均不做）。
 
-> 相关：**G10（M7 加固）**、**R-SY-04/05/07**。定论前 M3.5 不视为「验收通过」，但 A/B 已为正结果。
+> 相关：**G10（M7 加固）**、**R-SY-04/05/07**。上文分析保留，供将来若要做 (b)/(c) 时参考。
 
 ---
 
@@ -292,7 +289,7 @@ unlink/rmdir → dir_remove: walk(命中) → ddentry_delete(= 物理删 + 出 f
 
 > 纪律：**每阶段必须「可测」才算完成**（audit / guest 挂载实测 / dents_dump / xfstests）；**阶段内禁止越级**（T1 缺口表出来前不碰 T3）。
 
-- **M3.5 一致性/崩溃窗口**（不新增功能，只加证据）：非干净卸载（`echo b > /proc/sysrq-trigger`/kexec）后 audit。判据 = **不产生损坏**（孤儿可被审计标出）。**已实测（见 §6.1）：flush 外 PASS；flush 中途 → dangling（写序问题，**待用户裁决 (a)/(b)/(c)**）。**
+- **M3.5 一致性/崩溃窗口** —— ✅ **已实测收口（§6.1）**：非干净卸载（`echo b > /proc/sysrq-trigger`）后 audit，flush **之外**不产生损坏（A/B PASS）；flush **中途**崩溃的 dangling = **设计特性（无 journal 边界）**，2026-09-27 用户裁决**接受、不修**。
 - **M4 文件数据**（**下一步**，G1/G2）：a_ops + `read_iter/write_iter/mmap` + extent 树 + 三态迁移 + `truncate/punch/fallocate` + `setattr`。判据：`dd/cat/head` 往返一致（跨态、>4K、稀疏洞）；`stat.blocks` 吻合；audit 全绿。
 - **M5 残**（G3–G6）：link / symlink+get_link / mknod / tmpfile。判据：`ln/ln -s/readlink/mknod` 往返；大目录分裂后 `dents_dump` 仍 `DUP=0 MISSING=0`；audit `chain_bad=0`。
 - **M6 xattr/ACL/capability**（G7–G9）：4 回调 + `SB_POSIXACL` + 默认 ACL 继承 + `security.capability`；xattr 块分配/释放。判据：`setfattr/setfacl/setcap` 往返；**`rsync -aHAX` 保留 ACL+xattr**；audit xattr 校验通过。
@@ -310,7 +307,7 @@ unlink/rmdir → dir_remove: walk(命中) → ddentry_delete(= 物理删 + 出 f
 
 - 文件读/写 → `-EINVAL`（G1）；`readlink` → `-EINVAL`（G4，**T3 前必补**）。
 - **无周期回写线程** → 无人 sync 时 dirty mdata 行持续累积，直到 `syncfs`/umount 才吐（M7）。**位图同理：全量内存态，异常断电 = 需重装（无 fsck）**。
-- `i_blocks` 口径 = **数据块 + 元数据块**（dentry 节点×2、名字堆 位图面+数据面、xattr 块 1）。
+- `i_blocks` 口径 = **数据块 + 元数据块**（dentry 节点×2、**extent 节点×2**、名字堆 位图面+数据面、xattr 块 1、数据块）。
 - 行缓冲是**伙伴页**（非 slab）：观测用 dmesg TTL reap + `/proc/buddyinfo`；`/proc/slabinfo` 已无 `ravenfs_inode_row`/`ravenfs_mdata_node`。
 - **已根治**：分片锁重入死锁（装载=锁外分配+I/O）。
 - `pr_info_ratelimited` 的 TTL 日志会节流，不是漏打。
@@ -328,4 +325,53 @@ unlink/rmdir → dir_remove: walk(命中) → ddentry_delete(= 物理删 + 出 f
 
 ---
 
-> **一句话交接**：读 spec §4.11.1/§4.11.2/§4.11.3 → guest 内编译 ko（§2.2）→ `insmod` + `mount -t ravenfs`（认 serial `deadbeef`）→ 跑 `audit_v1.2` + `rfsdirchurn` 验证 → 然后开 **M4（G1/G2）**。
+## 10. M4 交接（**文件数据路径 —— 新会话从这里开**）
+
+> 2026-09-27 · M4 = 文件数据（G1/G2）。**ko 侧完全从头**（`linux/` 无任何 extent 代码）；机械在 god + 下面几份权威文档。
+> 纪律：**小步快跑**（§9）——切成 M4.1..M4.5，每步「编译 + guest 实测」可验收才算完成。
+
+### 10.1 权威文档（M4 必读）
+- `Docs/linux/ravenfs-linux-ko-requirements-spec.md` §4.4（FD：R-FD-01..10）/ §4.5（MD：R-MD-01..06）/ §4.8（SY：R-SY-01..07）。
+- **`Docs/pwrite_pipeline.md`** —— **五段写管线**（phase1 预分配 → 1.5 形态判别 → 2 物化+map → 3 写数据 → 4 inode 一次写=提交点 + 出口坍缩）。三态迁移 / 融合 / 回滚账本全在此。
+- **`Docs/punch_truncate_pread_spec.md`** —— pread/punch_hole/truncate 三接口契约（Linux 对照、形态×操作矩阵 §8、崩溃纪律 §5.5/§6.4、既有缺口 §7）。
+- `Docs/disk_layout_v1.1.md` §5（**区段树** extent B+tree 几何/路由）+ §10 不变量 **22–25**（三态判据 / 迁移 / 翻转写序）。
+- 本文 §3（缓存/回写契约）、**§4（ddentry 树写入机械——extent 与其几乎同构，可对照）**、§6.1（崩溃窗口）。
+- god 参考：`juvenile_god/extent_{walk_lookup,split,balance,map_unmap,rebuild,iterator}.cpp`（v1.1 盘面，理念参考）。
+
+### 10.2 架构落点（ko）
+| 层 | 载体 | 说明 |
+|---|---|---|
+| **文件内容** | **Linux 页缓存 + `address_space_operations`** | E1：缓存/IO 下沉 Linux。`read_folio`/`readahead`/`write_begin`/`write_end`/`dirty_folio`/`writepages`/`invalidate_folio`/`migrate_folio` |
+| `file_operations` | `read_iter`/`write_iter`=`generic_file_*`；`mmap`=`generic_file_mmap`；`fallocate`；`splice`（借）；`fsync`（末补数据） | R-FD-01/02/03/05/07/08 |
+| `inode_operations` | `.setattr`（chmod/chown/utimes/truncate） | R-MD-02 |
+| **extent 树节点（8K）** | **走 `mdata_piece_cache`**（与 ddentry / 名字堆**同规格同路线**，§3.2） | ⚠️ spec R-IO-01b 旧文说「8K 节点走页缓存」——**已被 M2.3/M2.5 的自写 `mdata_cache` 取代，以现实现为准** |
+| inode 记录 | `inode_cache`（现有） | data_root / size / direct_bit 经 session 改 |
+
+**三态**（不变量 22，判据 **size 优先**）：`size≤160` inline（`inline_data`）/ `size>160 ∧ direct_bit=1` direct（连续 run）/ `size>160 ∧ direct_bit=0` extent（B+tree，节点 8K=338 条）。
+
+### 10.3 M4 建议切分
+1. **M4.1 只读数据**：`a_ops`(read_folio/readahead) + `.read_iter`/`.mmap`（generic）→ `dd/cat/head` 往返一致（三态 / >4K / 稀疏洞）。**先读后写**。
+2. **M4.2 写数据**：`.write_iter`（generic）+ `a_ops.write_begin/write_end/dirty_folio/writepages` + **extent 树移植**（walk/insert/split/balance/map）+ 三态迁移（inline→direct/extent、direct→extent）+ `i_blocks` 更新。
+3. **M4.3 truncate/punch/fallocate**：按 `punch_truncate_pread_spec.md`（含 ≤160 强制回迁 inline、出口坍缩、KEEP_SIZE）。
+4. **M4.4 setattr + 时间戳**：`.setattr`（`setattr_prepare` + size→truncate + `setattr_copy`）；时间戳走 generic 路径 + `write_inode` 落盘（R-MD-06）。
+5. **收尾**：`fsync` 落数据（R-FD-04）、写序/flush（R-SY-04/05）、`extent_root_shrink` 旧根延迟 free（见下）。
+
+### 10.4 M4 开工前必须处理的既有缺口（否则会踩）
+1. **`extent_root_shrink` 旧根 free 时序**（`punch_truncate_pread_spec.md` §7.1 / **P10✓ 定案**）：更迭时旧根**不 free**，随 `root_blk&` 上抛，调用方在 inode 提交**之后**统一 free → 窗口从「悬挂」劣化为「孤儿 2 块」。**移植 extent 平衡链时必须一并落地**（同 ddentry 的 `ravenfs_mdata_drop` 坑：free 块前必须 drop 其脏行，§4.4-坑2）。
+2. **写序**：extent 分配走**同一套**「位图亮灯 → 节点/数据落盘 → inode 翻转」（不变量 25）；崩溃窗口=孤儿（§6.1 已述 flush 中途窗口=设计特性）。
+3. **`i_blocks`** = 数据块 + 元数据块（dentry 节点×2、**extent 节点×2**、名字堆 位图面+数据面、xattr 块 1、数据块）→ 随写更新、诚实化。
+4. **readonly 挂载写拒绝**未接线（`ravenfs_sb_writable` / READ_ONLY_MASK）——写接口入口需检查。
+
+### 10.5 测试流水线（M4 复用；含 2026-09-27 新增坑）
+- 投递+编译：工作区 `ravenfs-linux-test/tmp/m1c3.sh`（ssh-pipe tar，**排除 `linux/vm`**）→ guest 内编译（**宿主 ko 不 insmod**）。
+- **认盘按 serial**：⚠️ **NVMe 枚举跨重启会变**（同一 QEMU 参数，sysrq-b 重启后 `nvmeNn1` 索引会换）→ 一律：`for d in /sys/block/nvme*n1; do [ "$(tr -d '[:space:]' < $d/device/serial)" = deadbeef ] && DEV=/dev/$(basename $d); done`。ESP=`beefdead` / ext4=`cafebabe`。
+- **重启后**：模块不自动载 → `insmod /opt/ravenfs/linux/ravenfs.ko`；9p `/rfssrc`（ro 源码）+ `/host` 要**重挂**。
+- audit：`/rfssrc/tools/audit_v1.2/audit_v1.2 <dev>`（**含 extent 树校验**：`extent_node`/`size_bound`/节点重入）；靶子 `mkcontent`/`mkbigdir`（host 侧，写副本）。
+- 崩溃工具：`tmp/crash{A,B,C}.sh`（§6.1）；观察：`/proc/buddyinfo`（行=伙伴页）、dmesg TTL reap；`stat.blocks` 对 `i_blocks`。
+
+### 10.6 一句话开工
+读 spec §4.4/§4.5 + `pwrite_pipeline.md` + `punch_truncate_pread_spec.md` → 从 **M4.1 只读（`a_ops.read_folio` + generic `read_iter`/`mmap`）** 拉起，guest `dd` 往返三态验证 → 再写。
+
+---
+
+> **一句话交接**：M0–M3.4b + M5（create/unlink/mkdir/rmdir/rename）已实测；M3.5 收口（flush 外不损坏；中途=设计特性）；**下一步 = M4 文件数据（G1/G2），见 §10**。开 M4 先读 §10.1 四份文档 → guest 内编译 ko（§2.2，认 serial `deadbeef`）→ audit_v1.2 + rfsdirchurn 基线 → **M4.1 只读数据**。

@@ -105,7 +105,7 @@
 | **T0** | mkfs + 只读挂载 + `audit_v1.2` 全绿 | **✅ 达成** |
 | M3.1/M3.2 | 双位图分片分配器 / 写回路径（`write_inode` 行同步 + `flush_all` 落盘 + `sync_fs`/`fsync`） | ✅ |
 | M3 | 元数据写路径：取消强制 RO（rw 挂载）+ `create(REG,inline)`/`unlink` + 位图持久化（全量内存分片+全量刷回） | ✅ 实测 |
-| M3.5 | 一致性/崩溃窗口验证（写序 + 非干净卸载后 audit） | ⚠️ 已实测：flush 外 PASS；flush 中途 dangling（handover §6.1）→ **待用户裁决** |
+| M3.5 | 一致性/崩溃窗口验证（写序 + 非干净卸载后 audit） | ✅ 已收口：flush 外不产生损坏（A/B 实测 PASS）；flush 中途 dangling = **设计特性**（无 journal 边界，2026-09-27 裁决）——见 handover §6.1 / §10 |
 | M4 | 文件数据：`a_ops` + extent 树对接 + truncate/punch/fallocate + `i_blocks` 更新 + **`setattr`** | **下一步** |
 | M5a/M5b | dentry 树写入机构（多级 walk + 叶裂/升根/内裂 + 合并/抹匀/根收缩） | ✅ `716e372`/`678a983` |
 | M5 | mkdir/rmdir + `dir_name_heap_release` + rename(replace/NOREPLACE/EXCHANGE + 跨目录) + 名字堆 5 组精准压测 | ✅ `8d745ae`/`612626a`/`7447eea`/`c50a1e8` |
