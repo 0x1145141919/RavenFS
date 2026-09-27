@@ -366,12 +366,26 @@ static int ravenfs_read_inode(struct inode *inode)
 		inode->i_fop = &ravenfs_dir_operations;
 		break;
 	case INODE_TYPE_REGULAR:
-	case INODE_TYPE_SOFT_SYM:
 		inode->i_op = &ravenfs_file_inode_operations;
 		inode->i_fop = &ravenfs_file_operations;
 		/* M4.1：REG 数据路径走 iomap a_ops（mmap/read_folio 前置，D-M4-1） */
-		if (type == INODE_TYPE_REGULAR)
-			inode->i_data.a_ops = &ravenfs_aops;
+		inode->i_data.a_ops = &ravenfs_aops;
+		break;
+	case INODE_TYPE_SOFT_SYM:
+		/* R-NS-06：fast（≤160 内联 → simple_get_link）/ slow（page_get_link）双态分派。
+		 * a_ops 供 slow 态 read_mapping_folio 读 target（fast 态不用页缓存）。 */
+		inode->i_data.a_ops = &ravenfs_aops;
+		if (r->size <= RAVENFS_SYMLINK_INLINE_MAX) {
+			struct ravenfs_inode_info *ri = RAVENFS_I(inode);
+			u32 tl = min_t(u64, r->size, RAVENFS_SYMLINK_INLINE_MAX);
+
+			memcpy(ri->symlink_target, r->inline_data, tl);
+			ri->symlink_target[tl] = '\0';
+			inode->i_link = ri->symlink_target;
+			inode->i_op = &ravenfs_fast_symlink_inode_operations;
+		} else {
+			inode->i_op = &ravenfs_symlink_inode_operations;
+		}
 		break;
 	case INODE_TYPE_CHR:
 	case INODE_TYPE_BLK: {
@@ -651,10 +665,14 @@ static const struct super_operations ravenfs_sops = {
 static const struct inode_operations ravenfs_dir_inode_operations = {
 	.lookup		= ravenfs_lookup,
 	.create		= ravenfs_create,
+	.link		= ravenfs_link,		/* M5 残 R-NS-05 */
+	.symlink	= ravenfs_symlink,		/* M5 残 R-NS-06 */
 	.mkdir		= ravenfs_mkdir,
 	.unlink		= ravenfs_unlink,
 	.rmdir		= ravenfs_rmdir,
+	.mknod		= ravenfs_mknod,		/* M5 残 R-NS-07 */
 	.rename		= ravenfs_rename,
+	.tmpfile	= ravenfs_tmpfile,		/* M5 残 R-NS-09 */
 	.getattr	= ravenfs_getattr,
 	.fileattr_get	= ravenfs_fileattr_get,	/* R-MD-09：chattr/lsattr → -EOPNOTSUPP */
 	.fileattr_set	= ravenfs_fileattr_set,
@@ -664,6 +682,26 @@ static const struct inode_operations ravenfs_file_inode_operations = {
 	.getattr	= ravenfs_getattr,
 	.setattr	= ravenfs_setattr,			/* M4.4：chmod/chown/utimes/truncate（全属性） */
 	.fileattr_get	= ravenfs_fileattr_get,	/* R-MD-09：chattr/lsattr → -EOPNOTSUPP */
+	.fileattr_set	= ravenfs_fileattr_set,
+};
+
+/* R-NS-06：符号链接双态 i_op（装配点在 ravenfs_read_inode）。
+ * fast：target 内联在 inode 私有区（simple_get_link 直接返回 i_link）；
+ * slow：target 为文件数据（page_get_link 经页缓存读）。
+ * 非 static：namei（dentry.c）在 symlink 建完 slow 数据后需装配。 */
+const struct inode_operations ravenfs_fast_symlink_inode_operations = {
+	.get_link	= simple_get_link,
+	.getattr	= ravenfs_getattr,
+	.setattr	= ravenfs_setattr,
+	.fileattr_get	= ravenfs_fileattr_get,
+	.fileattr_set	= ravenfs_fileattr_set,
+};
+
+const struct inode_operations ravenfs_symlink_inode_operations = {
+	.get_link	= page_get_link,
+	.getattr	= ravenfs_getattr,
+	.setattr	= ravenfs_setattr,
+	.fileattr_get	= ravenfs_fileattr_get,
 	.fileattr_set	= ravenfs_fileattr_set,
 };
 

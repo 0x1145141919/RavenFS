@@ -23,6 +23,8 @@
 #include <linux/string.h>
 #include <linux/xxhash.h>
 #include <linux/timekeeping.h>
+#include <linux/kdev_t.h>		/* new_encode_dev（CHR/BLK rdev） */
+#include <linux/iomap.h>		/* R-NS-06 slow symlink：复用 iomap 写路径 */
 
 #include "ravenfs.h"
 
@@ -899,6 +901,361 @@ out_heap:
 	if (nnlen > DENTRY_INLINE_NAME_MAX)
 		ravenfs_name_heap_free(sb, new_dir->i_ino, nnlen, n_remain);
 	return err;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * M5 残（R-NS-05/06/07/09）：link / symlink+get_link / mknod / tmpfile
+ * 规格：不变量 17–21（link_count 契约、link(2) 前置、先删 dentry 后计数）；
+ *   disk_layout_v1.2_inode.md §3/§4（type 值域、rdev@inline_data[0:4] 小端 u32）；
+ *   ko-requirements-spec §4.3（get_link fast/slow 双态）。
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* 在 dir 下插入「名字 → inum」条目，并维护父目录 size/link_count（=size+2）/时间戳。
+ * 含长名（>40）名字堆分配；任何失败自回滚名字堆，零残留（对应 create/mkdir 的同款纪律）。 */
+static int rfs_dir_link_inode(struct super_block *sb, struct inode *dir,
+			      const struct dentry *dentry, u64 inum)
+{
+	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
+	struct raven_Inode_t *dr;
+	struct rfs_dpath path;
+	struct timespec64 now;
+	const char *name = dentry->d_name.name;
+	u32 nlen = dentry->d_name.len;
+	u64 hash, remain_ptr = (u64)PTR_INVALID;
+	int err;
+
+	if (nlen == 0 || nlen > RAVENFS_MAX_NAME_LEN)
+		return -ENAMETOOLONG;
+	ds = ravenfs_session_get(sb, dir->i_ino);
+	if (IS_ERR(ds))
+		return PTR_ERR(ds);
+	dr = ravenfs_session_inode(ds);
+	if (RFS_INO1_GET_TYPE(dr->word1) != INODE_TYPE_DIR)
+		return -ENOTDIR;
+
+	err = ravenfs_ddentry_walk(sb, dir->i_ino, name, nlen, &path);
+	if (err)
+		return err;
+	if (path.hit)
+		return -EEXIST;		/* 不变量 19-4：目标名不存在 */
+	hash = xxh64(name, nlen, 0);
+
+	if (nlen > DENTRY_INLINE_NAME_MAX) {
+		err = ravenfs_name_heap_alloc(sb, dir->i_ino, nlen, &remain_ptr);
+		if (err)
+			return err;
+		err = ravenfs_name_heap_write(sb, nlen, remain_ptr,
+					      name + DENTRY_INLINE_NAME_MAX);
+		if (err) {
+			ravenfs_name_heap_free(sb, dir->i_ino, nlen, remain_ptr);
+			return err;
+		}
+	}
+	err = ravenfs_ddentry_insert(sb, dir->i_ino, &path, name, nlen, hash, inum, remain_ptr);
+	if (err) {
+		if (nlen > DENTRY_INLINE_NAME_MAX)
+			ravenfs_name_heap_free(sb, dir->i_ino, nlen, remain_ptr);
+		return err;
+	}
+
+	now = current_time(dir);
+	dr->size += 1;
+	dr->link_count = (u32)dr->size + 2;
+	dr->mtime = now.tv_sec;
+	dr->m_ns_stamp = (u32)now.tv_nsec;
+	dr->ctime = now.tv_sec;
+	dr->c_ns_stamp = (u32)now.tv_nsec;
+	RFS_ROW_MARK_DIRTY(ds->row);
+	dir->i_size = dr->size;
+	set_nlink(dir, dr->link_count);
+	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
+	inode_set_ctime(dir, now.tv_sec, now.tv_nsec);
+	mark_inode_dirty(dir);
+	return 0;
+}
+
+/* 分配 + 初始化一个子 inode 的盘记录（不含 dentry 插入、不含数据体）；
+ * type/mode/rdev 由调用方给。成功后调方须 session 写回脏标记（本函数已标 dirty）。 */
+static int rfs_new_inode_record(struct super_block *sb, struct inode *dir, u32 type,
+				umode_t mode, dev_t rdev, u64 *inum_out)
+{
+	struct ravenfs_session *ts __free(ravenfs_session) = NULL;
+	struct raven_Inode_t *tr;
+	struct timespec64 now;
+	u64 inum;
+
+	inum = ravenfs_inode_alloc(sb);
+	if (inum == (u64)PTR_INVALID)
+		return -ENOSPC;
+	ts = ravenfs_session_get(sb, inum);
+	if (IS_ERR(ts)) {
+		ravenfs_inode_free(sb, inum);
+		return PTR_ERR(ts);
+	}
+	tr = ravenfs_session_inode(ts);
+	now = current_time(dir);
+	memset(tr, 0, RAVENFS_INODE_SIZE);
+	tr->word1 = RFS_INO1_PACK(type, 0, 0);
+	tr->uid = i_uid_read(dir);
+	tr->gid = i_gid_read(dir);
+	tr->mode_xattr = RFS_MODE_XATTR_PACK(mode & 0o7777, RFS_XATTR_NONE);
+	tr->link_count = 1;
+	tr->size = 0;
+	tr->data_root = (u64)PTR_INVALID;
+	tr->mtime = now.tv_sec;
+	tr->m_ns_stamp = (u32)now.tv_nsec;
+	tr->ctime = now.tv_sec;
+	tr->c_ns_stamp = (u32)now.tv_nsec;
+	tr->atime = now.tv_sec;
+	tr->a_ns_stamp = (u32)now.tv_nsec;
+	/* 不变量 26：rdev 仅 CHR/BLK 有效，存 inline_data[0:4] 小端 u32（new_encode_dev）；
+	 * 其余类型该区置 0（memset 已零）——防 getattr 带出垃圾。 */
+	if (type == INODE_TYPE_CHR || type == INODE_TYPE_BLK) {
+		__le32 rdev_le = cpu_to_le32(new_encode_dev(rdev));
+
+		memcpy(tr->inline_data + RFS_INODE_RDEV_OFF, &rdev_le, sizeof(rdev_le));
+	}
+	RFS_ROW_MARK_DIRTY(ts->row);
+	*inum_out = inum;
+	return 0;
+}
+
+/* R-NS-05：硬链接。前置全过才 ++（不变量 19）；目录禁链（防环）。
+ * dcache 交 VFS（vfs_link 已做 S_ISDIR/EMLINK/may_create 预检 + 持源 inode 锁）。 */
+int ravenfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *dentry)
+{
+	struct inode *inode = d_inode(old_dentry);
+	struct super_block *sb = dir->i_sb;
+	struct ravenfs_session *ts __free(ravenfs_session) = NULL;
+	struct raven_Inode_t *tr;
+	struct timespec64 now;
+	int err;
+
+	if (ravenfs_is_shutdown(sb))
+		return -EIO;
+	if (sb_rdonly(sb))
+		return -EROFS;
+	if (!inode)
+		return -ENOENT;
+	if (!S_ISDIR(dir->i_mode))
+		return -ENOTDIR;
+	if (S_ISDIR(inode->i_mode))
+		return -EPERM;
+
+	/* 不变量 19 前置：源已分配、type ≠ DIR、link_count < UINT32_MAX */
+	ts = ravenfs_session_get(sb, inode->i_ino);
+	if (IS_ERR(ts))
+		return PTR_ERR(ts);
+	tr = ravenfs_session_inode(ts);
+	if (RFS_INO1_GET_TYPE(tr->word1) == INODE_TYPE_DIR)
+		return -EPERM;
+	if (tr->link_count >= (u32)-1)
+		return -EMLINK;
+
+	/* 目标名不存在（内部 walk 查重）→ 插 dentry + 父目录 size/link_count */
+	err = rfs_dir_link_inode(sb, dir, dentry, inode->i_ino);
+	if (err)
+		return err;
+
+	/* 盘上 link_count++（与 dentry 条目同步）；源 ctime 更新（POSIX link 改源 ctime） */
+	tr->link_count += 1;
+	now = current_time(inode);
+	tr->ctime = now.tv_sec;
+	tr->c_ns_stamp = (u32)now.tv_nsec;
+	RFS_ROW_MARK_DIRTY(ts->row);
+
+	inode_inc_link_count(inode);
+	inode_set_ctime(inode, now.tv_sec, now.tv_nsec);
+	mark_inode_dirty(inode);
+	ihold(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+/* 把 [src, src+len) 按设备字节偏移 dev_byte 直接写入块设备（symlink slow 物化；len ≤ 1 块）。
+ * 与 iomap.c 同源的 sb_bread + sync_dirty_buffer 路径（不绕页缓存）。 */
+static int rfs_pwrite_dev(struct super_block *sb, u64 dev_byte, const void *src, u32 len)
+{
+	u32 done = 0;
+
+	while (done < len) {
+		u64 pos = dev_byte + done;
+		u64 blk = pos >> 12;			/* sb_bread 以 sb_blocksize(4K) 为单位 */
+		u32 off = (u32)(pos & (RAVENFS_BLOCK_SIZE - 1));
+		u32 n = min_t(u32, len - done, RAVENFS_BLOCK_SIZE - off);
+		struct buffer_head *bh = sb_bread(sb, blk);
+
+		if (!bh)
+			return -EIO;
+		memcpy(bh->b_data + off, (const char *)src + done, n);
+		mark_buffer_dirty(bh);
+		sync_dirty_buffer(bh);
+		brelse(bh);
+		done += n;
+	}
+	return 0;
+}
+
+/* R-NS-06 slow：target 写为 LNK inode 的**文件数据** —— 复用既有 iomap 写路径：
+ * ravenfs_iomap_begin(WRITE) 做 inline→extent 迁移并提交 data_root/direct/size，
+ * 本处仅把 target 字节物化到已分配的映射块，再 iomap_end 提交 i_size/i_blocks。
+ * len ∈ (160, 4096] → 单块。 */
+static int rfs_write_symlink_target(struct inode *inode, const char *target, u32 len)
+{
+	struct super_block *sb = inode->i_sb;
+	struct iomap iomap, srcmap;
+	int err;
+
+	memset(&iomap, 0, sizeof(iomap));
+	err = ravenfs_iomap_ops.iomap_begin(inode, 0, (loff_t)len, IOMAP_WRITE,
+					    &iomap, &srcmap);
+	if (err)
+		return err;
+	if (iomap.type != IOMAP_MAPPED || iomap.addr == IOMAP_NULL_ADDR) {
+		err = -EIO;			/* len>160 必落外置态；否则记录异常 */
+		goto out;
+	}
+	err = rfs_pwrite_dev(sb, iomap.addr, target, len);
+out:
+	i_size_write(inode, len);
+	ravenfs_iomap_ops.iomap_end(inode, 0, (loff_t)len, (ssize_t)len,
+				    IOMAP_WRITE, &iomap);
+	return err;
+}
+
+/* R-NS-06：symlink。≤160 → fast（target 内联盘记录，simple_get_link）；
+ * >160 → slow（target 写为文件数据，page_get_link 读）。 */
+int ravenfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+		    struct dentry *dentry, const char *symname)
+{
+	struct super_block *sb = dir->i_sb;
+	struct ravenfs_session *ts __free(ravenfs_session) = NULL;
+	struct raven_Inode_t *tr;
+	struct inode *inode;
+	u32 len = (u32)strlen(symname);
+	u64 inum;
+	int err;
+
+	if (ravenfs_is_shutdown(sb))
+		return -EIO;
+	if (sb_rdonly(sb))
+		return -EROFS;
+	if (!S_ISDIR(dir->i_mode))
+		return -ENOTDIR;
+	if (len > RAVENFS_SYMLINK_MAX)
+		return -ENAMETOOLONG;
+
+	err = rfs_new_inode_record(sb, dir, INODE_TYPE_SOFT_SYM, 0777, 0, &inum);
+	if (err)
+		return err;
+
+	/* fast：target 内联入盘记录（不变量 22：size ≤ 160 ⇒ inline） */
+	if (len <= RAVENFS_SYMLINK_INLINE_MAX) {
+		ts = ravenfs_session_get(sb, inum);
+		if (IS_ERR(ts)) {
+			ravenfs_inode_reclaim(sb, inum);
+			return PTR_ERR(ts);
+		}
+		tr = ravenfs_session_inode(ts);
+		memcpy(tr->inline_data, symname, len);
+		tr->size = len;
+		RFS_ROW_MARK_DIRTY(ts->row);
+		ravenfs_session_put(ts);
+		ts = NULL;
+	}
+
+	inode = ravenfs_iget(sb, inum);
+	if (IS_ERR(inode)) {
+		err = PTR_ERR(inode);
+		ravenfs_inode_reclaim(sb, inum);
+		return err;
+	}
+
+	/* slow：写文件数据，再切 page_get_link 态（read_inode 此前按 size=0 装了 fast） */
+	if (len > RAVENFS_SYMLINK_INLINE_MAX) {
+		err = rfs_write_symlink_target(inode, symname, len);
+		if (err) {
+			clear_nlink(inode);	/* nlink=0 → evict → inode_reclaim */
+			iput(inode);
+			return err;
+		}
+		inode->i_op = &ravenfs_symlink_inode_operations;
+	}
+
+	err = rfs_dir_link_inode(sb, dir, dentry, inum);
+	if (err) {
+		clear_nlink(inode);
+		iput(inode);
+		return err;
+	}
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+/* R-NS-07：mknod。VFS 四型（FIFO/CHR/BLK/SOCK）都走此回调；CHR/BLK 写 rdev。 */
+int ravenfs_mknod(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry,
+		  umode_t mode, dev_t rdev)
+{
+	struct super_block *sb = dir->i_sb;
+	struct inode *inode;
+	u32 type = ((u32)mode & S_IFMT) >> 12;
+	u64 inum;
+	int err;
+
+	if (ravenfs_is_shutdown(sb))
+		return -EIO;
+	if (sb_rdonly(sb))
+		return -EROFS;
+	if (!S_ISDIR(dir->i_mode))
+		return -ENOTDIR;
+	if (!ravenfs_type_valid(type) || type == INODE_TYPE_DIR)
+		return -EINVAL;
+
+	err = rfs_new_inode_record(sb, dir, type, mode, rdev, &inum);
+	if (err)
+		return err;
+
+	/* 先插名字后 iget（同 create：iget 失败极少且仅 I/O 级，此处不额外回滚） */
+	err = rfs_dir_link_inode(sb, dir, dentry, inum);
+	if (err) {
+		ravenfs_inode_reclaim(sb, inum);
+		return err;
+	}
+	inode = ravenfs_iget(sb, inum);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+/* R-NS-09：tmpfile（O_TMPFILE）。建匿名 REG inode（nlink→0，d_tmpfile），依赖 M4 数据路径。 */
+int ravenfs_tmpfile(struct mnt_idmap *idmap, struct inode *dir, struct file *file,
+		    umode_t mode)
+{
+	struct super_block *sb = dir->i_sb;
+	struct inode *inode;
+	u64 inum;
+	int err;
+
+	if (ravenfs_is_shutdown(sb))
+		return -EIO;
+	if (sb_rdonly(sb))
+		return -EROFS;
+	if (!S_ISDIR(dir->i_mode))
+		return -ENOTDIR;
+
+	err = rfs_new_inode_record(sb, dir, INODE_TYPE_REGULAR, mode, 0, &inum);
+	if (err)
+		return err;
+
+	inode = ravenfs_iget(sb, inum);
+	if (IS_ERR(inode)) {
+		err = PTR_ERR(inode);
+		ravenfs_inode_reclaim(sb, inum);
+		return err;
+	}
+	d_tmpfile(file, inode);		/* nlink 1→0；匿名 dentry 接管 inode（final close → reclaim） */
+	return finish_open_simple(file, 0);
 }
 
 struct dentry *ravenfs_lookup(struct inode *dir, struct dentry *dentry,

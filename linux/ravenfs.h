@@ -81,12 +81,22 @@ struct ravenfs_sb_info {
 	bool	shutdown;	/* RFS_SHUTDOWN（R-LM-09）：自检 / 元数据 I/O 失败 → 全局停机，入口返 -EIO */
 };
 
+/* fast symlink target 内联上限（不变量 22：size ≤ 160 = 内联态）；
+ * == REG 内联上限，便于三态判据复用。 */
+#define RAVENFS_SYMLINK_INLINE_MAX	160U
+/* slow symlink target 总上限（单块，对齐 ext2 sb_blocksize 口径） */
+#define RAVENFS_SYMLINK_MAX		4096U
+
 struct ravenfs_inode_info {
 	struct inode		vfs_inode;	/* 骨架：盘记录归 mgr（§4.11.1）；此处仅备将来私有字段 */
 	/* M4.1：REG/SYM inline 态（size ≤ 160）数据镜像。
 	 * iomap->inline_data 须在 iomap_begin 返回后持续有效，而盘记录位于会随会话
 	 * 释放的缓存行中 → 在此留稳定副本（iomap.c 在 inline 分支拷贝）。 */
 	u8			inline_data[160];
+	/* M5 残（R-NS-06）：fast symlink（≤160 内联）target 的内存稳定副本。
+	 * 盘记录 inline_data 随缓存行可被淘汰 → 不能直接作 inode->i_link；
+	 * read_inode 在此拷贝 target 并补 NUL，simple_get_link 返回此指针。 */
+	char			symlink_target[RAVENFS_SYMLINK_INLINE_MAX + 1];
 };
 
 static inline struct ravenfs_inode_info *RAVENFS_I(struct inode *inode)
@@ -145,6 +155,20 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry);
 int ravenfs_rmdir(struct inode *dir, struct dentry *dentry);
 int ravenfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
 		   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags);
+
+/* M5 残（R-NS-05/06/07/09）：硬链接 / 符号链接 / 特殊节点 / O_TMPFILE */
+int ravenfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *dentry);
+int ravenfs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry,
+		    const char *symname);
+int ravenfs_mknod(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry,
+		  umode_t mode, dev_t rdev);
+int ravenfs_tmpfile(struct mnt_idmap *idmap, struct inode *dir, struct file *file,
+		    umode_t mode);
+
+/* symlink 双态 i_op（R-NS-06）：fast = simple_get_link / slow = page_get_link。
+ * 定义在 super.c（与 getattr/setattr/fileattr 回调同编译单元），namei 侧装配引用。 */
+extern const struct inode_operations ravenfs_fast_symlink_inode_operations;
+extern const struct inode_operations ravenfs_symlink_inode_operations;
 
 /* 名字物化（≤40 内联 / >40 读名字堆尾段）—— 供 dentry_write.c 复合序比较用 */
 int ravenfs_ddentry_name(struct super_block *sb, const struct ddentry_t *e,
