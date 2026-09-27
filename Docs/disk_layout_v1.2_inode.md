@@ -165,7 +165,7 @@ struct rfs_xattr_entry {           // 8B 定长头；名字紧随其后（4B 对
 `h_refcount`/`h_hash` 仅为**将来**「相同 xattr 集共享一块」预留；v1.2 `refcount=1`、`hash=0`。启动共享需全局 find-or-create + 缓存，v1.2 不做。
 
 ### 5.5 audit 规则
-`xattr_ptr ≠ 哨兵` ⇒ 认领该块 + 校验：`h_magic` / `h_refcount==1` / `h_blocks==1` / `h_hash==0` / 条目越界 / `e_name_index` 合法 / `e_name_len>0` / **终止符（首个 u32==0）存在** / **值偏移合法且 4B 对齐、值区间互不重叠、条目区末端 ≤ 值区最低地址** / 总长 ≤ 块；且该块在全局 bitmap 亮灯、被**恰一个** inode 认领。
+`xattr_ptr ≠ 哨兵` ⇒ 认领该块 + 校验：`h_magic` / `h_refcount==1` / `h_blocks==1` / `h_hash==0` / 条目越界 / `e_name_index` 合法 / **`e_name_len` 规则**（`e_name_index ∈ {2,3}`=ACL → 后缀必须为空（`e_name_len==0`，ACL 键即前缀）；其余命名空间 → `e_name_len>0`；**抄 ext4**） / **终止符（首个 u32==0）存在** / **值偏移合法且 4B 对齐、值区间互不重叠、条目区末端 ≤ 值区最低地址** / 总长 ≤ 块；且该块在全局 bitmap 亮灯、被**恰一个** inode 认领。
 
 ### 5.6 存储契约完备性（VFS 驱动，待落地到 ko）
 > 以下为**盘面外**但必须写进 ko 契约的行为（xattr 面），本节仅登记：
