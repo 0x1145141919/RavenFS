@@ -23,7 +23,7 @@
 | **D-M4-7** | **读粒度 = iomap 默认** | **已决（2026-09-27，O-5）** | 不做自研「64K 单元 / 大 folio」；用 iomap 默认（`read_folio` + readahead）。**后续有时间/token 再研究** |
 | **D-M4-8** | **三态迁移基调 = inline 默认升格 extent** | **已决（2026-09-27，O-1）** | inline 写越 160 → **默认升格为 extent**；**direct 仅作出口坍缩的收敛态**（末尾发现单 extent 覆盖 `[0,size)` 再缩 direct），**不作初始分配态** |
 | **D-M4-9** | **不做 `iomap_write_ops.iomap_valid`** | **已决（2026-09-27，O-10）** | 因 O-4 立刻分配 → 映射**自创建起稳定**，无 stale 窗口；单挂载 + VFS `inode_lock` 串行化已足 |
-| **D-M4-10** | **短写尾巴：保留 + evict 清算** | **已决（2026-09-27，O-11=(b)）** | `iomap_end` 对「已分配但未写完」区间 **不 free**（短期浪费可接受）；改在 **inode 回收（`evict_inode`）/行淘汰时「秋后算账」** trim 超出 `size` 的意外尾块。⚠ 与 fallocate 预留的区分见 §12 **O-12** |
+| **D-M4-10** | **短写尾巴：保留 + `evict_inode` 清算** | **已决（2026-09-27，O-11=(b)）** | `iomap_end` 对「已分配但未写完」区间 **不 free**（短期浪费可接受）；改在 **VFS `evict_inode`（inode 驱逐）时「秋后算账」** trim 超出 `size` 的意外尾块。⇒ 常驻文件的尾巴挂到 **unlink / umount** 才清算（可接受，见 §8）。⚠ 与 fallocate 预留的区分见 §12 **O-12** |
 | **D-M4-5** | **O_DIRECT（C 真兑现）后置** | 范围（**已决**，见 §7.4） | god 的 `pwrite_pipeline` 复杂度已致恶心；M4 不碰直写，放最后/独立里程碑 |
 | **路线** | **走 iomap** | 框架选择 | 取代 buffer_head/`generic_perform_write` 路线（E1「缓存/IO 下沉 Linux」的现代落地） |
 
@@ -241,7 +241,7 @@ mmap      → filemap_fault → a_ops->read_folio ──────────
 | readonly | 写入口 `RAVENFS_SB(inode->i_sb)` 检查 | 必落 |
 | `i_blocks` | 数据块 + extent 节点×2 + … 诚实化 | 必落 |
 | 部分块写清零 | 新分配块被部分写 → 依 iomap `IOMAP_F_NEW` **零填**未写部分（不得读出旧块内容） | `iomap_begin` 写向新分配时置 `IOMAP_F_NEW` |
-| 短写尾巴 | `iomap_end` **不** free 未写完区间（D-M4-10(b)，短期浪费）；**evict 时清算** trim 尾块（超越 `size` 的意外分配） | 必落（O-11/O-12） |
+| 短写尾巴 | `iomap_end` **不** free 未写完区间（D-M4-10(b)）；**VFS `evict_inode` 时清算** trim 超越 `size` 的意外分配。⇒ 常驻文件挂到 unlink/umount（短命文件/umount 全清） | 必落（O-11/O-12） |
 
 > **撤销记录（D-M4-4 原定案后果，作废）**：原「写时 `IOMAP_DELALLOC` / 回写期真分配 / 提交点搬到回写 / `writepages` 承担真分配」**全部作废**——O-4 选择强同步立刻分配（位图纯内存 → 无推迟动机），`write(2)` 即可返 ENOSPC。**O-2/O-3（回写期形态、提交点搬家窗口）随之消解**。
 > **新增待定（立即分配的岔口）**：`iomap_end` 里「已分配但未写完」区间（短写/失败）如何处理 → 见 §12 **O-11**。
@@ -313,9 +313,9 @@ mmap      → filemap_fault → a_ops->read_folio ──────────
 | **O-9** | **hash 算法自相矛盾** | v1.1 §9 写「XXH64（已定）」；头文件/§6.1 写「待定」 | 统一为 XXH64(seed=0)，或明确 SipHash-2-4 升级路径 | 统一 XXH64（**不属 M4，顺带清**） |
 | **O-10** | **`iomap_write_ops.iomap_valid` 是否实现** | 长写期间 extent 映射可能变（并发/恢复）→ 需 validity_cookie 检测 stale | (a) M4 不做（单挂载 + VFS `inode_lock` 串行化写）；(b) 做（存 data_root 版本号） | **不做**（O-4 立刻分配 → 映射稳定）→ D-M4-9 |
 | **O-11** | **（新）`iomap_end` 里「已分配但未写完」区间（短写/失败）如何处置** | 立刻分配引出：写时已真分配，但 `iomap_end` 的 `written` 可能 < length | (a) 对 `[pos+written, pos+length)` 已分配块**即刻 free**（干净，需拆 extent）；(b) 保留（浪费但简单）；(c) free 整段并回滚 size | **(b) + evict 清算**：短期保留浪费；**evict 时秋后算账** trim 尾块 → **D-M4-10** |
-| **O-12** | **（新）evict 清算如何区分「意外短写尾」vs「fallocate 有意预留」** | 两者都是「已分配但超出 `size`」；若 evict 一律 trim，会误删 `fallocate KEEP_SIZE` 预分配（R-FD-07） | (a) 标记位区分（预留区间记 unwritten，仅 `fallocate` 置位）；(b) 只 trim「无 fallocate 记录」的尾；(c) fallocate 允许被 trim（放弃 KEEP_SIZE 语义） | **待裁决** |
+| **O-12** | **（新）`evict_inode` 清算如何区分「意外短写尾」vs「fallocate 有意预留」** | 两者都是「已分配但超出 `size`」；若一律 trim，会误删 `FALLOC_FL_KEEP_SIZE` 预分配（R-FD-07） | (a) **盘面标记**（预留记 `unwritten`，加第四态——改动大）；(b) **内存标记**（write 路径短写时给 inode 记「待清算尾」，`evict_inode` 见标记才 trim；不动盘面；删除路径本就整 inode 释放）；(c) `fallocate` 放弃 KEEP_SIZE（违背 R-FD-07） | **倾向 (b)**：`evict_inode` 在 umount 时跑、内存态尚在 ⇒ 内存标记够用、零盘面改动。**待确认** |
 
-> **一句话**：O-1/O-4/O-5 已裁并回填（**D-M4-6/7/8**）；O-2/O-3 随 O-4 消解；O-6/O-7/O-8/O-9 按建议采纳；O-11 已裁 = **D-M4-10**（b + evict 清算）；**剩 O-12（evict 清算 vs fallocate 预留的区分）待裁**。
+> **一句话**：O-1/O-4/O-5 已裁并回填（**D-M4-6/7/8**）；O-2/O-3 随 O-4 消解；O-6/O-7/O-8/O-9 按建议采纳；O-11 已裁 = **D-M4-10**（b + **`evict_inode`** 清算）；**剩 O-12（区分 short-write 尾 vs fallocate 预留）—— 倾向 (b) 内存标记，待确认**。
 
 ---
 
