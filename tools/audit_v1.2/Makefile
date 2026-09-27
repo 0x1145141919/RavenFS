@@ -6,7 +6,7 @@ LDLIBS    = -lxxhash
 TARGET    = audit_v1.2
 SRCS      = audit_v1.2.cpp
 
-all: $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t mkstates_a m44_attrcmp mkstates_s
+all: $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t mkstates_a m44_attrcmp mkstates_s mkstates_x m6_xattr_dump
 
 $(TARGET): $(SRCS) ../../include/disk_struct_v1.2.h ../../include/magics.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $(SRCS) $(LDLIBS)
@@ -51,7 +51,15 @@ m44_attrcmp: m44_attrcmp.cpp ../../include/disk_struct_v1.2.h ../../include/magi
 mkstates_s: mkstates_s.cpp m42_fill.h m41_expect.h ../../include/disk_struct_v1.2.h ../../include/magics.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ mkstates_s.cpp $(LDLIBS)
 
+# M6 xattr/ACL/capability 靶子构造器（xattr 块：user.*/capability/ACL access+default；写副本 + 出 .cexpect/.xexpect）
+mkstates_x: mkstates_x.cpp m6_xexpect.h m42_fill.h m41_expect.h ../../include/disk_struct_v1.2.h ../../include/magics.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ mkstates_x.cpp $(LDLIBS)
+
+# M6 host 侧 xattr 只读回放/校验器（dump/verify/list；独立解析，自证独立）
+m6_xattr_dump: m6_xattr_dump.cpp m6_xexpect.h ../../include/disk_struct_v1.2.h ../../include/magics.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ m6_xattr_dump.cpp $(LDLIBS)
+
 clean:
-	rm -f $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t mkstates_a m44_attrcmp mkstates_s
+	rm -f $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t mkstates_a m44_attrcmp mkstates_s mkstates_x m6_xattr_dump
 
 .PHONY: all clean

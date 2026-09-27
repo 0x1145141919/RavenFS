@@ -725,16 +725,30 @@ void Auditor::audit_xattr(uint64_t inum, uint64_t xptr) {
     uint64_t off = RFS_XATTR_HDR_SIZE;
     uint64_t entry_end = off;
     uint32_t nent = 0;
+    bool terminated = false;
     std::vector<std::pair<uint64_t, uint64_t>> vranges;   /* (offs, size) */
-    while (off + RFS_XATTR_ENTRY_HDR_SIZE <= FS_BLOCK_BYTES) {
+    /* 终止符只占 4B → 读满 4B 即可判 IS_LAST；条目头需 8B（仅真实条目要求） */
+    while (off + 4 <= FS_BLOCK_BYTES) {
         const rfs_xattr_entry *e = (const rfs_xattr_entry *)(buf.data() + off);
-        if (RFS_XATTR_IS_LAST(e)) break;                      /* 终止：首个 u32==0（ext4） */
+        if (RFS_XATTR_IS_LAST(e)) { terminated = true; break; }   /* 终止：首个 u32==0（ext4） */
+        if (off + RFS_XATTR_ENTRY_HDR_SIZE > FS_BLOCK_BYTES) {
+            bad("inode %llu xattr 条目 %u 头部越界 (off=%llu 余 <8B)",
+                (unsigned long long)inum, nent, (unsigned long long)off);
+            break;
+        }
         uint8_t idx = e->e_name_index;
         bool idx_ok = (idx == RFS_XATTR_INDEX_USER || idx == RFS_XATTR_INDEX_POSIX_ACL_ACCESS ||
                        idx == RFS_XATTR_INDEX_POSIX_ACL_DEFAULT || idx == RFS_XATTR_INDEX_TRUSTED ||
                        idx == RFS_XATTR_INDEX_SECURITY || idx == RFS_XATTR_INDEX_SYSTEM);
         if (!idx_ok) bad("inode %llu xattr 条目 %u e_name_index=%u 非法", (unsigned long long)inum, nent, idx);
-        if (e->e_name_len == 0) bad("inode %llu xattr 条目 %u e_name_len==0（空名非法）", (unsigned long long)inum, nent);
+        /* 空名规则（抄 ext4）：ACL(index=2/3) 全键即命名空间前缀 → 后缀**必须**为空；
+         * 其余命名空间的后缀**必须**非空（空名 = 无键）。 */
+        bool is_acl = (idx == RFS_XATTR_INDEX_POSIX_ACL_ACCESS || idx == RFS_XATTR_INDEX_POSIX_ACL_DEFAULT);
+        if (is_acl && e->e_name_len != 0)
+            bad("inode %llu xattr 条目 %u ACL(index=%u) e_name_len=%u != 0（ACL 键即前缀，抄 ext4）",
+                (unsigned long long)inum, nent, idx, e->e_name_len);
+        else if (!is_acl && e->e_name_len == 0)
+            bad("inode %llu xattr 条目 %u e_name_len==0（仅 ACL 允许空后缀）", (unsigned long long)inum, nent);
         uint64_t ent_len = RFS_XATTR_LEN(e->e_name_len);
         if (off + ent_len > FS_BLOCK_BYTES) {
             bad("inode %llu xattr 条目 %u 越界 (off=%llu name_len=%u)", (unsigned long long)inum, nent, (unsigned long long)off, e->e_name_len);
@@ -751,6 +765,9 @@ void Auditor::audit_xattr(uint64_t inum, uint64_t xptr) {
         entry_end = off;
         nent++;
     }
+    if (!terminated)
+        bad("inode %llu xattr 块 %llu 缺少终止符（条目区未以首个 u32==0 结束）",
+            (unsigned long long)inum, (unsigned long long)xptr);
     if (h->h_hash != 0)
         warn("inode %llu xattr 块 %llu h_hash=%u != 0（v1.2 应置 0）", (unsigned long long)inum, (unsigned long long)xptr, h->h_hash);
     /* 条目区末端 ≤ 值区最低地址 */

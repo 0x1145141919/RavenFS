@@ -28,6 +28,8 @@ tools/audit_v1.2/readback
 tools/audit_v1.2/mkstates_a
 tools/audit_v1.2/mkstates_s
 tools/audit_v1.2/m44_attrcmp
+tools/audit_v1.2/mkstates_x
+tools/audit_v1.2/m6_xattr_dump
 
 # IDE / 编辑器
 .vscode/
