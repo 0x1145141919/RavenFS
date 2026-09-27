@@ -27,6 +27,7 @@
 | **D-M4-11** | **`fallocate` 拒绝 `FALLOC_FL_KEEP_SIZE`（纯预留）** | **已决（2026-09-27，O-12）** | `.fallocate` **只受理 `flags==0` 的普通预分配**（会抬 `size`）；**`FALLOC_FL_KEEP_SIZE`（纯预留、不抬 size）→ `-EOPNOTSUPP`**（第二约束「降级」路径）⇒ 盘上**永无「已分配但 > `size`」的 fallocate 预留** → **O-12 消解**。**例外**：`FALLOC_FL_PUNCH_HOLE\|FALLOC_FL_KEEP_SIZE`（打洞，R-FD-08，**该位是 ABI 强制**）与 `FALLOC_FL_ZERO_RANGE` **照常受理** |
 | **D-M4-12** | **`mmap` 写必须立刻分配（`page_mkwrite`）** | **已决+已落（2026-09-27，O-13=(a)）** | `vm_ops.page_mkwrite = ravenfs_filemap_page_mkwrite → iomap_page_mkwrite(vmf, &ravenfs_iomap_ops, NULL)`；`iomap_begin` 收 `IOMAP_WRITE\|IOMAP_FAULT` 时**立刻分配**（与 `write()` 同源）。堵住「mmap 洞写静默丢数据」。**M4.2 内补**（**不**推迟到 M4.3；**不**设拒写护栏）。**✅ 已落（提交 `f23b933`；guest mmap 洞写→msync→逐出读回→remount 实测 PASS）** |
 | **D-M4-13** | **碎片化：暂接受为特性** | **已决（2026-09-27，用户）** | 「**能跑是第一要务**」；M4.2 不做合并/删除 → 随机写会碎片化，**暂当 feature**。**后续学习方向**：在 Linux 规则（分配器/位图/写回）下压低碎片（occupy 尾延展 / 批量连续分配 / 融合 / 重建） |
+| **D-M4-14** | **inline 可写 mmap：回灌 `inline_data`（不升格、不静默丢）** | **已决（2026-09-27，O-14=(a)；M4.3 首项）** | 行为规范：mmap 写**不改 size**；`[0,size)` 内字节**持久化到 `inline_data`**；**超出 size 的字节按 Linux 常规刻意静默丢弃**（不报错、**不升格** inline→extent）；**不得**再让 `msync` 返 `EIO` |
 | **D-M4-5** | **O_DIRECT（C 真兑现）后置** | 范围（**已决**，见 §7.4） | god 的 `pwrite_pipeline` 复杂度已致恶心；M4 不碰直写，放最后/独立里程碑 |
 | **路线** | **走 iomap** | 框架选择 | 取代 buffer_head/`generic_perform_write` 路线（E1「缓存/IO 下沉 Linux」的现代落地） |
 
@@ -321,9 +322,9 @@ mmap      → filemap_fault → a_ops->read_folio ──────────
 | **O-11** | **（新）`iomap_end` 里「已分配但未写完」区间（短写/失败）如何处置** | 立刻分配引出：写时已真分配，但 `iomap_end` 的 `written` 可能 < length | (a) 对 `[pos+written, pos+length)` 已分配块**即刻 free**（干净，需拆 extent）；(b) 保留（浪费但简单）；(c) free 整段并回滚 size | **(b) + evict 清算**：短期保留浪费；**evict 时秋后算账** trim 尾块 → **D-M4-10** |
 | **O-12** | **（新）`evict_inode` 清算如何区分「意外短写尾」vs「fallocate 有意预留」** | 两者都是「已分配但超出 `size`」；若一律 trim，会误删 `FALLOC_FL_KEEP_SIZE` 预分配（R-FD-07） | (a) **盘面标记**（预留记 `unwritten`，加第四态——改动大）；(b) **内存标记**（write 路径短写时给 inode 记「待清算尾」，`evict_inode` 见标记才 trim；不动盘面；删除路径本就整 inode 释放）；(c) `fallocate` 放弃 KEEP_SIZE（违背 R-FD-07） | **消解**：`FALLOC_FL_KEEP_SIZE` 拒绝受理（保留 `PUNCH_HOLE\|KEEP_SIZE` 例外）→ 盘上无「已分配 > `size`」的 fallocate 预留 → evict trim 无歧义 → **D-M4-11** |
 | **O-13** | **（新，M4.2 实测暴露）可写 mmap 落在「未分配洞」上 → 静默丢数据** | `mmap` 写 → `page_mkwrite` 脏页 → 回写期 `iomap_begin` 见 HOLE → iomap 跳过（不写）→ 数据丢（`write()` 走立刻分配故无此问题） | (a) 现在做 `page_mkwrite` → 立刻分配（正解）；(b) 过渡护栏：`mmap_prepare` 拒 `VM_MAYWRITE`；(c) 暂接受 | **已落**：`page_mkwrite` 立刻分配 → **D-M4-12**（提交 `f23b933`，实测 PASS） |
-| **O-14** | **（新，page_mkwrite 实测暴露）inline 态（size≤160）的可写 mmap 未闭环** | mmap 写 inline 文件 → iomap 不物化 `IOMAP_INLINE` → 写只进页缓存；回写期 `writeback_range` 见非 MAPPED/HOLE 返 `-EIO` → `msync` 报 EIO（**硬失败，未静默丢**；但用户态 write 到页缓存看似成功） | (a) `page_mkwrite`/`iomap_end(FAULT)` 把页回灌 `inline_data`；(b) `mmap_prepare` 对 inline 文件拒可写映射；(c) 接受当前硬失败 | **待裁决** |
+| **O-14** | **（新，page_mkwrite 实测暴露）inline 态（size≤160）的可写 mmap 未闭环** | mmap 写 inline 文件 → iomap 不物化 `IOMAP_INLINE` → 写只进页缓存；回写期 `writeback_range` 见非 MAPPED/HOLE 返 `-EIO` → `msync` 报 EIO（**硬失败，未静默丢**；但用户态 write 到页缓存看似成功） | (a) `page_mkwrite`/`iomap_end(FAULT)` 把页回灌 `inline_data`；(b) `mmap_prepare` 对 inline 文件拒可写映射；(c) 接受当前硬失败 | **(a) 现在做（M4.3 首项）→ D-M4-14**：回灌 inline_data；**不升格**；超 size 静默丢弃（Linux 常规） |
 
-> **一句话**：O-1/O-4/O-5 已裁并回填（**D-M4-6/7/8**）；O-2/O-3 随 O-4 消解；O-6/O-7/O-8/O-9 按建议采纳；O-11 = **D-M4-10**（b + `evict_inode` 清算）；O-12 = **D-M4-11**（拒 `FALLOC_FL_KEEP_SIZE`）；O-13 = **D-M4-12**（已落 `f23b933`）；**碎片化暂接受为特性（D-M4-13）**；**O-14（inline 可写 mmap）待裁**。
+> **一句话**：O-1/O-4/O-5 已裁并回填（**D-M4-6/7/8**）；O-2/O-3 随 O-4 消解；O-6/O-7/O-8/O-9 按建议采纳；O-11 = **D-M4-10**（b + `evict_inode` 清算）；O-12 = **D-M4-11**（拒 `FALLOC_FL_KEEP_SIZE`）；O-13 = **D-M4-12**（已落 `f23b933`）；**碎片化暂接受为特性（D-M4-13）**；**O-14 = D-M4-14**（M4.3 首项，inline 可写 mmap 回灌）→ 闭环。
 
 ---
 
