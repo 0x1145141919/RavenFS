@@ -795,6 +795,9 @@ int ravenfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry
 			rfs_dir_set_dotdot(sb, old_inode->i_ino, new_dir->i_ino);
 		if (new_is_dir)
 			rfs_dir_set_dotdot(sb, new_inode->i_ino, old_dir->i_ino);
+		/* R-MD-06(b)：条目“改”（EXCHANGE）也要推父目录 mtime/ctime（delta=0 只走时间戳） */
+		rfs_dir_adjust(sb, old_dir, 0);
+		rfs_dir_adjust(sb, new_dir, 0);
 		now = current_time(old_dir);
 		inode_set_ctime(old_inode, now.tv_sec, now.tv_nsec);
 		mark_inode_dirty(old_inode);

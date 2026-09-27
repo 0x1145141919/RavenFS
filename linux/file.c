@@ -232,6 +232,13 @@ ssize_t ravenfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (ret)
 		goto out;
 
+	/* 时间戳义务（R-MD-06）：自写壳绕开了 __generic_file_write_iter，
+	 * 其 file_update_time（mm/filemap.c:4462）不再免费 ⇒ 必须自己打
+	 * mtime/ctime（atime 走 file_accessed，read 路径免费）。 */
+	ret = file_update_time(iocb->ki_filp);
+	if (ret)
+		goto out;
+
 	ret = iomap_file_buffered_write(iocb, from, &ravenfs_iomap_ops, NULL, NULL);
 out:
 	inode_unlock(inode);

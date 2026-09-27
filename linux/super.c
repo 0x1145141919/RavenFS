@@ -31,6 +31,7 @@
 #include <linux/bitmap.h>
 #include <linux/crc32.h>
 #include <linux/string.h>
+#include <linux/fileattr.h>
 
 #include "ravenfs.h"
 
@@ -303,6 +304,23 @@ static int ravenfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 	return 0;
 }
 
+/*
+ * R-MD-09 / R-DG-03：`i_flags` 语义不实现（字段保留、写 0）。
+ * 不挂默认 → `vfs_fileattr_get()` 返 `-ENOIOCTLCMD`，`lsattr/chattr` 只会得到
+ * `-ENOTTY` 且**语义含糊**。显式返 `-EOPNOTSUPP` 才符合「降级」口径
+ * （`chattr +i` 必须被拒且**绝不**出现「报成功却仍可写」的半开）。
+ */
+static int ravenfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
+{
+	return -EOPNOTSUPP;
+}
+
+static int ravenfs_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
+				struct file_kattr *fa)
+{
+	return -EOPNOTSUPP;
+}
+
 /* 位图区间内已亮灯比特数（bit = 已用）；读失败退化为 0 已用 */
 static u64 ravenfs_bitmap_used(struct super_block *sb, u64 start, u64 nblocks,
 			       u64 total_bits)
@@ -465,11 +483,15 @@ static const struct inode_operations ravenfs_dir_inode_operations = {
 	.rmdir		= ravenfs_rmdir,
 	.rename		= ravenfs_rename,
 	.getattr	= ravenfs_getattr,
+	.fileattr_get	= ravenfs_fileattr_get,	/* R-MD-09：chattr/lsattr → -EOPNOTSUPP */
+	.fileattr_set	= ravenfs_fileattr_set,
 };
 
 static const struct inode_operations ravenfs_file_inode_operations = {
 	.getattr	= ravenfs_getattr,
-	.setattr	= ravenfs_setattr,			/* M4.3：truncate（ATTR_SIZE）; M4.4 补 attr */
+	.setattr	= ravenfs_setattr,			/* M4.4：chmod/chown/utimes/truncate（全属性） */
+	.fileattr_get	= ravenfs_fileattr_get,	/* R-MD-09：chattr/lsattr → -EOPNOTSUPP */
+	.fileattr_set	= ravenfs_fileattr_set,
 };
 
 static const struct file_operations ravenfs_dir_operations = {
