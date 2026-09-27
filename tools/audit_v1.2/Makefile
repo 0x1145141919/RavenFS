@@ -6,7 +6,7 @@ LDLIBS    = -lxxhash
 TARGET    = audit_v1.2
 SRCS      = audit_v1.2.cpp
 
-all: $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t
+all: $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t mkstates_a m44_attrcmp
 
 $(TARGET): $(SRCS) ../../include/disk_struct_v1.2.h ../../include/magics.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $(SRCS) $(LDLIBS)
@@ -39,7 +39,15 @@ mkstates_w: mkstates_w.cpp m42_fill.h m41_expect.h ../../include/disk_struct_v1.
 mkstates_t: mkstates_t.cpp m42_fill.h m41_expect.h ../../include/disk_struct_v1.2.h ../../include/magics.h
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ mkstates_t.cpp $(LDLIBS)
 
+# M4.4 setattr 靶子构造器（chmod/chown/utimes/truncate 靶子：REG/DIR/LNK；写副本 + 出 .expect/.wexpect/.plan/.cexpect）
+mkstates_a: mkstates_a.cpp m42_fill.h m41_expect.h ../../include/disk_struct_v1.2.h ../../include/magics.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ mkstates_a.cpp $(LDLIBS)
+
+# M4.4 host 侧属性断言小工具（离线读 inode 字段：mode/uid/gid/times/size/kind）
+m44_attrcmp: m44_attrcmp.cpp ../../include/disk_struct_v1.2.h ../../include/magics.h
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ m44_attrcmp.cpp
+
 clean:
-	rm -f $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t
+	rm -f $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t mkstates_a m44_attrcmp
 
 .PHONY: all clean
