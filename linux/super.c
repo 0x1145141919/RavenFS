@@ -578,10 +578,36 @@ static int ravenfs_write_inode(struct inode *inode, struct writeback_control *wb
 static void ravenfs_evict_inode(struct inode *inode)
 {
 	struct super_block *sb = inode->i_sb;
+	u64 data_root = (u64)PTR_INVALID;
+	u64 data_size = 0;
+	bool data_direct = false, has_data = false;
 
-	/* nlink==0 → 回收：记录清零 + 位图槽位（M3 仅 REG inline，无数据块） */
-	if (!inode->i_nlink)
+	/*
+	 * nlink==0 → 回收，**先 inode 后 free**（§10 不变量 25；handover §6.1）：
+	 *   ① 读盘记录抓外置资产定位（data_root / size / direct_bit；reclaim 会清零）；
+	 *   ② ravenfs_inode_reclaim：记录清零 + inode 位图槽回收（引用先消失）；
+	 *   ③ ravenfs_release_inode_data：释放 data 块 / 区段树（引用消失后才 free）。
+	 * 仅 REG/SOFT_SYM（DIR 资产归 rmdir 自清；inline size ≤160 无外置资产 → 跳过 ③）。
+	 */
+	if (!inode->i_nlink) {
+		struct ravenfs_session *s __free(ravenfs_session) =
+			ravenfs_session_get(sb, inode->i_ino);
+
+		if (!IS_ERR_OR_NULL(s)) {
+			struct raven_Inode_t *r = ravenfs_session_inode(s);
+
+			if (r->size > 160 &&
+			    (S_ISREG(inode->i_mode) || S_ISLNK(inode->i_mode))) {
+				data_root = r->data_root;
+				data_size = r->size;
+				data_direct = RFS_INO1_GET_DIRECT(r->word1) != 0;
+				has_data = true;
+			}
+		}
 		ravenfs_inode_reclaim(sb, inode->i_ino);
+		if (has_data)
+			ravenfs_release_inode_data(sb, data_root, data_size, data_direct);
+	}
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
 }

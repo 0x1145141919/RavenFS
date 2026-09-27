@@ -428,7 +428,8 @@ void ravenfs_inode_mark_dirty(struct super_block *sb, u64 inum)
 
 /*
  * nlink==0 的 inode 回收（evict_inode 调用）：记录清零（防脏行回写复活）+ 位图槽回收。
- * M3 仅 REG inline → 无数据块可回；extent/direct 数据回收待 M4。
+ * **只回收 inode 槽**；该 inode 的 data 块 / 区段树由调用方 evict_inode 随后调
+ * ravenfs_release_inode_data 释放（**先 inode 后 free**，§10 不变量 25 / handover §6.1）。
  */
 void ravenfs_inode_reclaim(struct super_block *sb, u64 inum)
 {

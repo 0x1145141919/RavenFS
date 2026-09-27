@@ -404,6 +404,33 @@ static int rfs_release_tree_rec(struct super_block *sb, u64 root, struct rfs_fre
 	return 0;
 }
 
+/*
+ * evict_inode 数据回收（M4 收口）：释放 nlink==0 的 REG/SOFT_SYM 全部外置数据资产。
+ * 复用 truncate「缩到 inline」出口的下半段释放链：
+ *   · direct（直接区）：释放连续 run [data_root, data_root + ceil(size/4K))；
+ *   · extent（区段树）：释放整棵树（节点：逐个 ravenfs_mdata_drop + free；数据块：收集后 free）。
+ * **先 inode 后 free**（§10 不变量 25 / handover §6.1）：调用方必须已先清零盘 inode 记录
+ * （ravenfs_inode_reclaim）再调用本函数；inline（size ≤ 160）无外置资产，调用方直接跳过。
+ * 逆向（先 free 后清 inode）会造出悬挂映射 —— 严禁。OOM 时宁可泄漏（fsck 可回收）。
+ */
+void ravenfs_release_inode_data(struct super_block *sb, u64 data_root, u64 size, bool direct)
+{
+	struct rfs_freelist *fl;
+
+	if (data_root == (u64)PTR_INVALID)
+		return;
+	if (direct) {
+		ravenfs_block_free(sb, data_root, RFS_NBLK(size));
+		return;
+	}
+	fl = rfs_fl_new();
+	if (!fl)
+		return;		/* OOM：交 fsck 回收，绝不反向破坏「先 inode 后 free」 */
+	rfs_release_tree_rec(sb, data_root, fl, 0);
+	rfs_fl_free(sb, fl);
+	rfs_fl_put(fl);
+}
+
 /* 提交盘 inode 新态（唯一提交点，**内存态**）：size / data_root / direct_bit [/ inline_data]。
  * 落盘 = inode_cache 的 TTL/周期回写 + sync()（**与 iomap_end 同款**，不在此强制 flush）。
  * “先 inode 后 free”纪律：调用方在此更新缓存行后，才可 free 旧根/数据块；

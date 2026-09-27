@@ -220,6 +220,13 @@ ssize_t ravenfs_file_write_iter(struct kiocb *iocb, struct iov_iter *iter);
 long ravenfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
 int ravenfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr);
 
+/* ── M4 收口：evict_inode 数据回收（file.c）──
+ * nlink==0 的 REG/SOFT_SYM 外置数据释放（复用 truncate 出口 1 的下半段释放链）：
+ *   direct → free 连续 run；extent → release 整棵区段树。
+ * 前置纪律 = 先 inode 后 free（§10 不变量 25 / handover §6.1）：调用方须先
+ * ravenfs_inode_reclaim 清零盘记录，再调用本函数；inline（size ≤160）由调用方跳过。 */
+void ravenfs_release_inode_data(struct super_block *sb, u64 data_root, u64 size, bool direct);
+
 /* 区段树写机械（extent_write.c）：查找 / 插入（含叶裂升根）/ 计数 */
 int ravenfs_extent_lookup(struct super_block *sb, u64 root, u64 target,
 			  struct extent_t *out, u64 *next);
