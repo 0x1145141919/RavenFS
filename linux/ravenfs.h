@@ -22,6 +22,7 @@
 #include <linux/rwsem.h>
 #include <linux/refcount.h>
 #include <linux/atomic.h>
+#include <linux/compiler.h>
 #include <linux/cleanup.h>
 
 /* v1.2 盘面结构（-I$(src)/../include） */
@@ -76,6 +77,8 @@ struct ravenfs_sb_info {
 	struct ravenfs_mdata_cache *mcache;	/* mdata_piece_cache_mgr（8K 节点） */
 	struct ravenfs_ttl *ttl;	/* 自写 TTL 淘汰器（cache_ttl.c） */
 	struct ravenfs_bitmap_mgr *bitmap;	/* 双位图分片分配器（bitmap.c；全量常驻内存分片、非缓存行，自有分片级同步） */
+
+	bool	shutdown;	/* RFS_SHUTDOWN（R-LM-09）：自检 / 元数据 I/O 失败 → 全局停机，入口返 -EIO */
 };
 
 struct ravenfs_inode_info {
@@ -380,6 +383,7 @@ long ravenfs_mdata_reap_expired(struct super_block *sb, u64 cutoff_ns);
 void ravenfs_mdata_flush_all(struct super_block *sb);
 int  ravenfs_mdata_wb_dirty(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age);
 int  ravenfs_mdata_writeback_all(struct super_block *sb);
+int  ravenfs_mdata_wb_node(struct super_block *sb, u64 blk);	/* 单节点回写（fsync 用） */
 
 /* ── 架构无关回刷 driver（缓存后端：inode 行 / mdata 节点）──
  * 位图（bitmap.c）= 全量常驻内存分片，**非缓存行**、不接入本 driver（自有分片级同步）。 */
@@ -420,6 +424,20 @@ static inline bool ravenfs_sb_writable(const struct super_block *sb)
 {
 	return !(sb->s_flags & SB_RDONLY);
 }
+
+/* ── R-LM-09：内部停机标志（xfs force-shutdown 惯例）──
+ * 置位后所有入口返 -EIO；恢复 = 彻底 umount + 重新 mount（不做在线 remount-ro）。 */
+static inline bool ravenfs_is_shutdown(const struct super_block *sb)
+{
+	const struct ravenfs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+	return sbi && READ_ONCE(sbi->shutdown);
+}
+void ravenfs_force_shutdown(struct super_block *sb, const char *why);
+
+/* ── R-SY-05：设备 flush 屏障（保证「返回即落盘」）──
+ * 无 bdev / ro 挂载 → no-op 返 0。 */
+int ravenfs_issue_flush(struct super_block *sb);
 
 /* ── 双位图分片分配器（bitmap.c）── */
 struct ravenfs_bitmap_mgr;

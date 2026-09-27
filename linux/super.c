@@ -43,9 +43,135 @@ static const struct file_operations ravenfs_file_operations;
 static const struct fs_context_operations ravenfs_context_ops;
 static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc);
 static int ravenfs_sync_fs(struct super_block *sb, int wait);
+static int ravenfs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
 
 static struct kmem_cache *ravenfs_inode_cachep;
 static struct file_system_type ravenfs_fs_type;
+
+/* ═══════════════════════════════════════════════════════════════════
+ * R-LM-09：内部停机（xfs force-shutdown 惯例） + R-SY-05：flush 屏障
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* 自检 / 元数据 I/O 失败 → 置全局停机；幂等。恢复 = umount + 重挂（不做在线 remount-ro）。 */
+void ravenfs_force_shutdown(struct super_block *sb, const char *why)
+{
+	struct ravenfs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+	if (!sbi)
+		return;
+	if (!sbi->shutdown) {
+		WRITE_ONCE(sbi->shutdown, true);
+		pr_err("ravenfs: FORCED SHUTDOWN (%s) —— 后续操作返 -EIO；请 umount 后重新 mount\n",
+		       why ? why : "?");
+	}
+}
+
+/* 设备 flush 屏障（R-SY-05）：保证此前已提交的写全部落盘（返回即持久）。
+ * 无 bdev / ro 挂载 → no-op。设备不支持 flush 时内核层返回 0。 */
+int ravenfs_issue_flush(struct super_block *sb)
+{
+	if (!sb || !sb->s_bdev || (sb->s_flags & SB_RDONLY))
+		return 0;
+	return blkdev_issue_flush(sb->s_bdev);
+}
+
+/* ── fsync 定向回写：只落「本 inode 树」上的脏节点（非全 mdata 超集）──
+ * 靠 data_root 递推走树；深度上限防成环。节点不在缓存 = 已落盘（no-op）。 */
+#define RFS_FLUSH_DEPTH_MAX 64u
+
+static int ravenfs_flush_extent_tree(struct super_block *sb, u64 root, u32 depth)
+{
+	const struct Bptree_meta_t *m;
+	void *buf;
+	u32 cnt, i;
+	int err = 0;
+
+	if (depth >= RFS_FLUSH_DEPTH_MAX || root == (u64)PTR_INVALID)
+		return 0;
+	buf = kmalloc(RAVENFS_NODE_BYTES, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	if (ravenfs_read_node(sb, root, buf)) {
+		kfree(buf);
+		return 0;
+	}
+	m = buf;
+	if (m->magics[0] != BPTREE_MAGIC1 || m->magics[1] != BPTREE_MAGIC2 ||
+	    m->magics[2] != BPTREE_MAGIC3 || m->magics[3] != BPTREE_MAGIC4) {
+		kfree(buf);
+		return 0;
+	}
+	if (ravenfs_mdata_wb_node(sb, root))
+		err = -EIO;
+	cnt = RFS_PP_COUNT(m->parent_ptr);
+	if (RFS_PP_IS_INNER(m->parent_ptr)) {
+		const struct Bptree_extent_inner_node_t *nd = buf;
+
+		for (i = 0; i < cnt && i < 338 && !err; i++)
+			err = ravenfs_flush_extent_tree(sb,
+				RFS_PTR_ADDR(nd->extents[i].sub_node_ptr), depth + 1);
+	}
+	kfree(buf);
+	return err;
+}
+
+static int ravenfs_flush_ddentry_tree(struct super_block *sb, u64 root, u32 depth)
+{
+	const struct Bptree_meta_t *m;
+	void *buf;
+	u32 cnt, i;
+	int err = 0;
+
+	if (depth >= RFS_FLUSH_DEPTH_MAX || root == (u64)PTR_INVALID)
+		return 0;
+	buf = kmalloc(RAVENFS_NODE_BYTES, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	if (ravenfs_read_node(sb, root, buf)) {
+		kfree(buf);
+		return 0;
+	}
+	m = buf;
+	if (m->magics[0] != DENTRY_MAGIC1 || m->magics[1] != DENTRY_MAGIC2 ||
+	    m->magics[2] != DENTRY_MAGIC3 || m->magics[3] != DENTRY_MAGIC4) {
+		kfree(buf);
+		return 0;
+	}
+	if (ravenfs_mdata_wb_node(sb, root))
+		err = -EIO;
+	cnt = RFS_PP_COUNT(m->parent_ptr);
+	if (RFS_PP_IS_INNER(m->parent_ptr)) {
+		const struct Bptree_ddentry_inner_node_t *nd = buf;
+
+		for (i = 0; i < cnt && i < 127 && !err; i++)
+			err = ravenfs_flush_ddentry_tree(sb,
+				RFS_PTR_ADDR(nd->hints[i].sub_ptr), depth + 1);
+	}
+	kfree(buf);
+	return err;
+}
+
+/* 该 inode 是否需要/是否有 mdata 树：DIR → dentry 树；REG/SYM（非 inline 非 direct）→ extent 树 */
+static int ravenfs_flush_inode_trees(struct super_block *sb, struct inode *inode)
+{
+	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, inode->i_ino);
+	struct raven_Inode_t *r;
+
+	if (IS_ERR_OR_NULL(s))
+		return 0;		/* 行不在缓存 → 无脏元数据 */
+	r = ravenfs_session_inode(s);
+	if (S_ISDIR(inode->i_mode)) {
+		if (r->data_root == (u64)PTR_INVALID)
+			return 0;
+		return ravenfs_flush_ddentry_tree(sb, r->data_root, 0);
+	}
+	if (S_ISREG(inode->i_mode) || S_ISLNK(inode->i_mode)) {
+		if (r->size > 160 && !RFS_INO1_GET_DIRECT(r->word1) &&
+		    r->data_root != (u64)PTR_INVALID)
+			return ravenfs_flush_extent_tree(sb, r->data_root, 0);
+	}
+	return 0;
+}
 
 /* ═══════════════════════════════════════════════════════════════════
  * inode 生命周期（R-LM-01）
@@ -444,25 +570,72 @@ static void ravenfs_evict_inode(struct inode *inode)
 static void ravenfs_put_super(struct super_block *sb)
 {
 	ravenfs_ttl_stop(sb);		/* 先停 TTL 淘汰器（避免与折构竞争） */
-	ravenfs_mdata_cache_destroy(sb);	/* 折构：主动全量刷回/释放（§4.11.1 ②） */
-	ravenfs_cache_destroy(sb);
-	/* 位图全量刷回（M3 持久化）；ro 挂载不写 */
+	/* 干净卸载（R-SY-06/T3）：写序 mdata → inode → 位图，各阶段 + 末尾 flush 屏障 */
+	ravenfs_mdata_cache_destroy(sb);	/* ① 折构：主动全量刷回 mdata 节点（§4.11.1 ②） */
+	ravenfs_issue_flush(sb);
+	ravenfs_cache_destroy(sb);		/* ② inode 记录行全量刷回 */
+	ravenfs_issue_flush(sb);
+	/* ③ 位图全量刷回（M3 持久化）；ro 挂载不写 */
 	if (!(sb->s_flags & SB_RDONLY))
 		ravenfs_bitmap_flush(sb);
+	ravenfs_issue_flush(sb);
 	ravenfs_bitmap_destroy(sb);
 	kfree(sb->s_fs_info);
 	sb->s_fs_info = NULL;
 }
 
-/* 卷级同步（sync(1)/syncfs(2)）：脏元数据行 + 位图 全量刷回；ro 挂载 no-op */
+/*
+ * 卷级同步（sync(1)/syncfs(2)）：脏元数据行 + 位图 全量刷回；ro 挂载 no-op。
+ *
+ * 写序（R-SY-04/05，D-C1；§6.1 修正）：**mdata 树 → inode 行 → 位图**。
+ *   · mdata 先于 inode：inode 行内的 `data_root` 指向该 inode 的树根节点 → 引用者（inode 行）
+ *     必须晚于被引用者（节点）落盘，否则重启见「inode.data_root → 未分配块」。
+ *   · 每阶段后发 `blkdev_issue_flush`：设备可乱序写，无屏障则「按顺序调用」也保不住顺序（§6.1）。
+ *   · 末尾再屏障：保证本函数返回即全卷落盘（syncfs(2) 语义，R-SY-02）。
+ * 注：flush 中途崩溃仍可能留 dangling（位图最后 = 引用先于亮灯）—— §6.1 已裁为设计特性（不修）。
+ */
 static int ravenfs_sync_fs(struct super_block *sb, int wait)
 {
+	int err = 0, e;
+
 	if (!ravenfs_sb_writable(sb))
 		return 0;
-	ravenfs_cache_writeback_all(sb);
-	ravenfs_mdata_writeback_all(sb);
-	ravenfs_bitmap_flush(sb);
-	return 0;
+	if (ravenfs_is_shutdown(sb))
+		return -EIO;
+
+	/* ① mdata 树节点（extent / dentry 树；被 inode 行引用者先落盘） */
+	e = ravenfs_mdata_writeback_all(sb);
+	if (e) {
+		err = e;
+		ravenfs_force_shutdown(sb, "sync_fs: mdata writeback failed");
+	}
+	e = ravenfs_issue_flush(sb);
+	if (e && !err)
+		err = e;
+
+	/* ② inode 记录行（data_root / size / 时间戳翻转） */
+	e = ravenfs_cache_writeback_all(sb);
+	if (e) {
+		if (!err)
+			err = e;
+		ravenfs_force_shutdown(sb, "sync_fs: inode writeback failed");
+	}
+	e = ravenfs_issue_flush(sb);
+	if (e && !err)
+		err = e;
+
+	/* ③ 位图（分配落地） */
+	e = ravenfs_bitmap_flush(sb);
+	if (e) {
+		if (!err)
+			err = e;
+		ravenfs_force_shutdown(sb, "sync_fs: bitmap flush failed");
+	}
+	e = ravenfs_issue_flush(sb);
+	if (e && !err)
+		err = e;
+
+	return err;
 }
 
 static const struct super_operations ravenfs_sops = {
@@ -498,22 +671,59 @@ static const struct file_operations ravenfs_dir_operations = {
 	.llseek		= generic_file_llseek,
 	.read		= generic_read_dir,
 	.iterate_shared	= ravenfs_iterate,
+	.fsync		= ravenfs_fsync,		/* 目录 fsync（durable-create：创建后 fsync 父目录） */
 };
 
 static int ravenfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
 	struct inode *inode = file_inode(file);
-	int err;
+	struct super_block *sb = inode->i_sb;
+	int err = 0, e;
 
+	if (ravenfs_is_shutdown(sb))
+		return -EIO;
+
+	/* ① 脏数据 → 盘：dirty folio 经 iomap `writepages` 落到已分配块（D-M4-6 立刻分配） */
 	err = filemap_write_and_wait_range(inode->i_mapping, start, end);
 	if (err)
 		return err;
-	if (!ravenfs_sb_writable(inode->i_sb))
+	if (!ravenfs_sb_writable(sb))
 		return 0;
-	/* 数据路径未接（M4）；此处落该 inode 行 + 位图（fsync 的元数据义务） */
-	err = ravenfs_inode_flush(inode->i_sb, inode->i_ino);
-	if (!err)
-		ravenfs_bitmap_flush(inode->i_sb);
+
+	/* ② 元数据落盘 + flush 屏障（R-FD-04/R-SY-01/05）。
+	 * 写序（R-SY-04）：本 inode 树节点 → inode 行 → 位图（各阶段后屏障）。
+	 * 树节点 = 定向回写（DIR 的 dentry 树 / REG 的 extent 树，非全 mdata 超集）
+	 * —— 避免把“未 fsync 的父目录树”提前落盘而与其 inode 行（size/data_root）失配。
+	 * datasync 语义同 fsync：inode 行是唯一元数据提交点（data_root/size 与数据可访问性同源）。 */
+	e = ravenfs_flush_inode_trees(sb, inode);
+	if (e) {
+		err = e;
+		ravenfs_force_shutdown(sb, "fsync: inode tree writeback failed");
+	}
+	e = ravenfs_issue_flush(sb);
+	if (e && !err)
+		err = e;
+
+	e = ravenfs_inode_flush(sb, inode->i_ino);
+	if (e) {
+		if (!err)
+			err = e;
+		ravenfs_force_shutdown(sb, "fsync: inode flush failed");
+	}
+	e = ravenfs_issue_flush(sb);
+	if (e && !err)
+		err = e;
+
+	e = ravenfs_bitmap_flush(sb);
+	if (e) {
+		if (!err)
+			err = e;
+		ravenfs_force_shutdown(sb, "fsync: bitmap flush failed");
+	}
+	e = ravenfs_issue_flush(sb);
+	if (e && !err)
+		err = e;
+
 	return err;
 }
 

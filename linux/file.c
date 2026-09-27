@@ -205,6 +205,8 @@ int ravenfs_file_mmap_prepare(struct vm_area_desc *desc)
  */
 ssize_t ravenfs_file_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
+	if (ravenfs_is_shutdown(file_inode(iocb->ki_filp)->i_sb))
+		return -EIO;
 	return generic_file_read_iter(iocb, iter);
 }
 
@@ -217,6 +219,8 @@ ssize_t ravenfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = file_inode(iocb->ki_filp);
 	ssize_t ret;
 
+	if (ravenfs_is_shutdown(inode->i_sb))
+		return -EIO;
 	if (unlikely(IS_IMMUTABLE(inode) || IS_APPEND(inode)))
 		return -EPERM;
 	if (sb_rdonly(inode->i_sb))
@@ -1009,6 +1013,8 @@ long ravenfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 		return -EINVAL;
 	if (offset + len < 0 || (u64)(offset + len) > RAVENFS_MAX_FILESIZE)
 		return -EFBIG;
+	if (ravenfs_is_shutdown(sb))
+		return -EIO;
 	if (sb_rdonly(sb))
 		return -EROFS;
 	if (!S_ISREG(inode->i_mode))
@@ -1052,6 +1058,8 @@ int ravenfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr
 	struct inode *inode = d_inode(dentry);
 	int err;
 
+	if (ravenfs_is_shutdown(inode->i_sb))
+		return -EIO;
 	err = setattr_prepare(idmap, dentry, attr);
 	if (err)
 		return err;

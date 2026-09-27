@@ -70,7 +70,7 @@ static void ravenfs_ttl_work(struct work_struct *w)
 	long freed = 0, wb = 0, bm = 0;
 	unsigned int i;
 
-	if (!sb->s_fs_info || (sb->s_flags & SB_RDONLY)) {
+	if (!sb->s_fs_info || (sb->s_flags & SB_RDONLY) || ravenfs_is_shutdown(sb)) {
 		schedule_delayed_work(&t->work, msecs_to_jiffies(reap_ms ? reap_ms : 4000));
 		return;
 	}
@@ -91,6 +91,8 @@ static void ravenfs_ttl_work(struct work_struct *w)
 		for (i = 0; i < ARRAY_SIZE(ravenfs_wb_backends); i++)
 			if (ravenfs_wb_backends[i]->wb_dirty(sb, wb_cutoff, false))
 				wb = -1;
+		if (wb)
+			ravenfs_force_shutdown(sb, "ttl: periodic writeback failed");
 	}
 
 	/* 趟3：位图全片同步（闸门 `bitmap_sync_seconds`；无脏标记，整轮全同步） */
@@ -99,6 +101,8 @@ static void ravenfs_ttl_work(struct work_struct *w)
 		if (ravenfs_bitmap_flush(sb))
 			bm = -1;
 		t->bm_last = now;
+		if (bm)
+			ravenfs_force_shutdown(sb, "ttl: bitmap flush failed");
 	}
 
 	if (freed)

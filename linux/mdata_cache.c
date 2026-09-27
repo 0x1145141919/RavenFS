@@ -350,6 +350,39 @@ int ravenfs_mdata_writeback_all(struct super_block *sb)
 	return ravenfs_mdata_wb_dirty(sb, 0, true);
 }
 
+/*
+ * 单节点回写（fsync 用）：只把「本 inode 树上的」脏节点落盘。
+ * 锁序同 `ravenfs_mdata_wb_dirty`（持分片写锁）；节点不在缓存则视为已落盘（no-op）。
+ */
+int ravenfs_mdata_wb_node(struct super_block *sb, u64 blk)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	struct ravenfs_mdata_cache *c = sbi ? sbi->mcache : NULL;
+	struct ravenfs_msession *ms;
+	struct ravenfs_mrow *row;
+	int err = 0;
+
+	if (!c || !ravenfs_sb_writable(sb))
+		return 0;
+	ms = ravenfs_mdata_get(sb, blk);
+	if (IS_ERR(ms))
+		return PTR_ERR(ms);
+	row = ms->row;
+	down_write(&ms->shard->lock);
+	if (row->state == ROW_READY && (row->flags & ROWF_DIRTY) &&
+	    !(row->flags & ROWF_WB)) {
+		if (ravenfs_mrow_store(sb, c, row, row->data))
+			err = -EIO;
+		else {
+			row->flags &= ~ROWF_DIRTY;
+			row->wb_stamp = ktime_get_ns();
+		}
+	}
+	up_write(&ms->shard->lock);
+	ravenfs_mdata_put(ms);
+	return err;
+}
+
 /* ── TTL 淘汰（cache_ttl.c 周期调用）：超时且 ref==1 的行 → 原地回写 + 释放 ── */
 long ravenfs_mdata_reap_expired(struct super_block *sb, u64 cutoff_ns)
 {
