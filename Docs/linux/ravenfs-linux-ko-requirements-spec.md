@@ -186,10 +186,12 @@
 
 > 参考：ext2 `ext2_file_operations`（`fs/ext2/file.c:205`）、ext4（`fs/ext4/file.c:974`，含 `fallocate`）、btrfs。
 > **架构前提（R-IO-01）**：走 **Linux 页缓存** + **generic 路径**（后者顺带免掉时间戳义务，见 §2.2）。
+> **2026-09-27 勘误**：文件数据后端改走 **iomap**（见 `Docs/linux/ravenfs-linux-ko-M4-data-spec.md`）：
+> `read_iter` 仍 `generic_file_read_iter`，但 **`write_iter` 改为自写壳 + `iomap_file_buffered_write`**（非 `generic_file_write_iter`，否则运行时对不上 iomap a_ops）；`a_ops` 不含 `write_begin/write_end`。
 
 | ID | 需求 | 依据 | 优先 | 框架优先落点 | 现状 |
 |---|---|---|---|---|---|
-| R-FD-01 | `read_iter`/`write_iter`（缓冲读写；**顺带免费推 mtime/ctime/atime**） | A: ext2；§2.2 | **M** | `generic_file_read_iter`/`generic_file_write_iter`（`mm/filemap.c`） | ⚠️ god 有 pread/pwrite |
+| R-FD-01 | `read_iter`/`write_iter`（缓冲读写；**顺带免费推 mtime/ctime/atime**） | A: ext2；§2.2 | **M** | 读：`generic_file_read_iter`（buffered 读，`mm/filemap.c`）；**写：自写 `write_iter` 壳 + `iomap_file_buffered_write`**（iomap 路线，非 `generic_file_write_iter`；见 `ravenfs-linux-ko-M4-data-spec.md` §1.2/§2.1） | ⚠️ god 有 pread/pwrite |
 | R-FD-02 | `llseek` | A: ext2 | **M** | `generic_file_llseek`（`fs/read_write.c:254`） | ✅ 借用 |
 | R-FD-03 | `mmap`（含**可写**+**可执行**）：动态加载器 mmap 全部 `.so`；**mmap 写自动推 mtime** | A: `mm/filemap.c:4003/4022` | **M** | `generic_file_mmap_prepare`（自带 `filemap_page_mkwrite`）+ `filemap_fault` | ❌ |
 | R-FD-04 | `fsync`/`fdatasync`：真持久 + 回报错误 | A: ext2 `ext2_fsync` | **M** | `filemap_write_and_wait_range` + 元数据落盘 | ❌ |
@@ -198,7 +200,7 @@
 | R-FD-07 | `fallocate`（**普通预分配**，`FALLOC_FL_KEEP_SIZE`）：`journald` 预分配 | A: 纲领 §1-B；ext4/btrfs | **M** | `.fallocate` + god 占位分配 | ❌ **缺口** |
 | R-FD-08 | `punch hole`（`FALLOC_FL_PUNCH_HOLE`）/`ZERO_RANGE` | A: 纲领 §1-B | **M** | god `direct_file_punch_hole` | ⚠️ god 有，无 VFS 钩 |
 | R-FD-09 | 稀疏：未分配读返 0；打洞要有（`SEEK_DATA/HOLE` 可降级） | A: 不变量 22–24 | **M** | 三态 + 洞 | ✅（god 层） |
-| R-FD-10 | `direct_IO`（`O_DIRECT`）：可降级 | A: ext2 无 | C | `-EOPNOTSUPP` | ✅ |
+| R-FD-10 | `direct_IO`（`O_DIRECT`）：可降级 | A: ext2 无 | C | **无 `a_ops->direct_IO` → `open(O_DIRECT)` 直接 `-EINVAL`**（非 `-EOPNOTSUPP`，且**不经过 write**；`fs/open.c:960/968`）；M4 后置 C 真兑现（`…M4-data-spec.md` §7.4） | ✅ |
 
 > **注 R-FD-07**：`fallocate` 与「占位分配是 direct 全覆盖表示的物理义务」（不变量 24）**天然契合**——god 已有，缺 VFS 钩 + `KEEP_SIZE` 交互。**优先级 M、成本低。**
 

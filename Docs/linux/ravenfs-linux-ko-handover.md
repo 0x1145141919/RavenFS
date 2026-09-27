@@ -19,6 +19,7 @@
 |---|---|---|
 | `Docs/linux/ravenfs-linux-ko-requirements-spec.md` | **第一约束需求规格（权威契约）**；含 §4.11.1/§4.11.2（缓存/TTL 基调）、§4.11.3（dcache↔ddentry 一致性纪律） | **以它为准** |
 | `Docs/linux/ravenfs-linux-ko-acceptance-plan.md` | 验收纲领（三层约束、T0–T4 阶梯、§2.0 进度表） | 服从 spec |
+| `Docs/linux/ravenfs-linux-ko-schedule-t0-t1.md` | **T0→T1 阶段排期**（进度无关；顺序/依赖/出口/需求映射）——**排期看它**（本文只留进度） | 服从 spec；M4 细节服从 M4-data-spec |
 | `Docs/disk_layout_v1.1.md` / `Docs/disk_layout_v1.2_inode.md` | 盘面契约（**v1.2 = 语义重定义版**；§5 xattr 抄 ext4；§7 不变量） | 盘面以 **v1.2** 为准 |
 | `Docs/linux/ravenfs-vm-env-notes.md` | 测试 VM 环境实录（认盘 serial、坑） | 环境以它为准 |
 | `Docs/KERNEL_DISCIPLINE.md` / `Docs/DISCIPLINE.md` | 项目纪律（AI 协作 / 思维对齐） | — |

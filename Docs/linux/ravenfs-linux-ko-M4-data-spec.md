@@ -43,6 +43,33 @@
 - **spec §4.4 R-FD-01** 现写「框架落点 = `generic_file_write_iter`」→ **iomap 路线须改为**「自写 `write_iter` 壳 + `iomap_file_buffered_write`」。照旧挂 `generic_file_write_iter` 会**编译过、运行时对不上 iomap a_ops**。
 - **spec §4.4 R-FD-10** 现写「`direct_IO` 可降级，落点 `-EOPNOTSUPP`」→ **口径错**。真实机制：点 **`a_ops->direct_IO` 存废决定 `open(O_DIRECT)` 成败**；无它 → `open` 直接 `-EINVAL`（`fs/open.c:960/968`），**不经过 write**，谈不上 `EOPNOTSUPP`。本 M4 选 **C 真兑现**（§7.4）。
 
+### 1.2 内核真值核对（对 `linux-7.2.3` 源码逐符号核实，2026-09-27）
+
+> 目的：本 spec §2 原按「主线老 iomap」写；**7.2.x 的 iomap 已重构**。以下为对着本机
+> `PS_git/custom-kernel/linux-vfio/src/linux-7.2.3/`（`include/linux/iomap.h`、`fs/iomap/buffered-io.c`、
+> 各家落地 `fs/zonefs/file.c`、`fs/xfs/xfs_aops.c`、`fs/gfs2/aops.c`）核实的**接口真值**，§2/§6.2 已据此改写。
+
+| 符号 | **7.2.3 真值** | 本 spec 旧文（错） |
+|---|---|---|
+| `iomap_read_folio` | `void iomap_read_folio(const struct iomap_ops*, struct iomap_read_folio_ctx*, void *private)` | 老 `(ops, folio, priv)` |
+| `iomap_readahead` | `void iomap_readahead(const struct iomap_ops*, struct iomap_read_folio_ctx*, void*)` | — |
+| 简易读封装 | `iomap_bio_read_folio(folio, ops)` / `iomap_bio_readahead(rac, ops)`（走 `iomap_bio_read_ops`） | 无 |
+| 自定义读 | `struct iomap_read_ops { read_folio_range, submit_read, bio_set }`（经 `ctx.ops`） | 无 |
+| `iomap_writepages` | `int iomap_writepages(struct iomap_writepage_ctx *wpc)` | 老 `(mapping, wbc, ops)` |
+| 回写 ops | `struct iomap_writeback_ops { writeback_range, writeback_submit }`（**不是 `map_blocks`**） | 无 |
+| `iomap_file_buffered_write` | `(iocb, iter, ops, write_ops, private)` **五参** | 三参 |
+| `struct iomap_write_ops` | `{ get_folio, put_folio, iomap_valid, read_folio_range }` | 「可选」未展开 |
+| `migrate_folio` | **`filemap_migrate_folio`**（xfs/zonefs 同；**无 `iomap_migrate_folio`**） | 旧文写 `iomap_migrate_folio` |
+| 其他必挂 a_ops | `.is_partially_uptodate = iomap_is_partially_uptodate`、`.error_remove_folio = generic_error_remove_folio` | 旧文缺 |
+| `dirty_folio`/`invalidate_folio`/`release_folio` | `iomap_dirty_folio` / `iomap_invalidate_folio` / `iomap_release_folio` | ✅ |
+| `IOMAP_INLINE` | 存在（`type=4`；`iomap_read_inline_data`/`iomap_write_begin_inline`/`iomap_write_end_inline`） | ✅ 结论成立 |
+| `IOMAP_DELALLOC` | 存在（`type=1`） | ✅ |
+| 新 flag | `IOMAP_F_SIZE_CHANGED` / `IOMAP_F_STALE` / `IOMAP_F_FOLIO_BATCH` | 旧文无 |
+| `.mmap_prepare` | 存在（`int (*mmap_prepare)(struct vm_area_desc*)`；`generic_file_mmap_prepare(desc)`） | ✅ 已对 |
+
+> **结论**：三态→iomap type（§3）、D-M4-1（`read_folio` 是 mmap 硬前置）、D-M4-4（delalloc）、D-M4-5（O_DIRECT 后置）**全部成立**；
+> 但 **§2 的接线签名**与 **§6.2 的「包装层放大粒度」** 必须按上表改写（下文已改）。
+
 ---
 
 ## 2. 接口清单（ko 侧最终挂点）
@@ -62,31 +89,51 @@
 
 ### 2.2 `address_space_operations`（**iomap 家族**）
 
-| 成员 | 落点 |
+> **7.2.3 核实版**（签名见 §1.2）。最小落地参照 `fs/zonefs/file.c`。
+
+| 成员 | 落点（真实签名） |
 |---|---|
-| `read_folio` | `iomap_read_folio(&ravenfs_iomap_ops, ...)` 包装（**D-M4-1 的前置**） |
-| `readahead` | `iomap_readahead(&ravenfs_iomap_ops, ...)` |
-| `writepages` | `ravenfs_writepages` → `iomap_writepages(&ravenfs_iomap_ops)` |
+| `read_folio` | `ravenfs_read_folio(file, folio)` → `iomap_bio_read_folio(folio, &ravenfs_iomap_ops)`（**D-M4-1 硬前置**）。需自定义读（large-folio 校验 / endio 卸载到 workqueue）时改用 `iomap_read_folio(ops, &ctx, NULL)` + 自写 `iomap_read_ops` |
+| `readahead` | `ravenfs_readahead(rac)` → `iomap_bio_readahead(rac, &ravenfs_iomap_ops)` |
+| `writepages` | `ravenfs_writepages(mapping, wbc)` → 组 `struct iomap_writepage_ctx wpc = {.inode=mapping->host, .wbc=wbc, .ops=&ravenfs_writeback_ops}` → `iomap_writepages(&wpc)` |
 | `dirty_folio` | `iomap_dirty_folio` |
 | `invalidate_folio` | `iomap_invalidate_folio` |
 | `release_folio` | `iomap_release_folio` |
-| `migrate_folio` | `iomap_migrate_folio` |
-| ~~`write_begin`/`write_end`~~ | **不需要**（§1.1 勘误） |
-| `direct_IO` | `iomap_direct_IO`（未来 C，见 §7.4） |
+| `migrate_folio` | **`filemap_migrate_folio`**（**不是** `iomap_migrate_folio`） |
+| `is_partially_uptodate` | `iomap_is_partially_uptodate` |
+| `error_remove_folio` | `generic_error_remove_folio` |
+| ~~`write_begin`/`write_end`~~ | **不需要**（§1.1；iomap 内部 `iomap_write_begin/end`） |
+| `direct_IO` | 未来 C：`ravenfs_direct_IO` → `iomap_dio_rw(iocb, iter, &ravenfs_iomap_ops, &ravenfs_dio_ops, …)`（§7.4） |
 
 ### 2.3 核心自写件：`iomap_ops`
 
 ```c
+/* 逻辑偏移 → 物理映射 / 空洞 / 内联 —— 唯一真正触碰数据语义的自写件 */
 static const struct iomap_ops ravenfs_iomap_ops = {
-    .iomap_begin = ravenfs_iomap_begin,   // ← 唯一真正触碰数据语义的自写件
-    .iomap_end   = ravenfs_iomap_end,
+	.iomap_begin = ravenfs_iomap_begin,   /* (inode,pos,len,flags,iomap,srcmap) */
+	.iomap_end   = ravenfs_iomap_end,
 };
-static const struct iomap_write_ops ravenfs_iomap_write_ops = { /* 可选：iomap_valid 等 */ };
-static const struct iomap_dio_ops   ravenfs_dio_ops        = { /* 未来 C：end_io/submit_io */ };
+
+/* buffered 写可选钩子（M4 先空；需要防 stale 时再填 iomap_valid，见 §12 O-10） */
+static const struct iomap_write_ops ravenfs_write_ops = {
+	/* .get_folio / .put_folio / .iomap_valid / .read_folio_range */
+};
+
+/* ★回写：delalloc 的「真分配」落点 —— iomap_writepages 靠它 */
+static ssize_t ravenfs_writeback_range(struct iomap_writepage_ctx *wpc,
+		struct folio *folio, u64 pos, unsigned len, u64 end_pos);
+static const struct iomap_writeback_ops ravenfs_writeback_ops = {
+	.writeback_range  = ravenfs_writeback_range,
+	.writeback_submit = iomap_ioend_writeback_submit,  /* 默认 ioend 提交即可 */
+};
+
+/* 仅当读需 workqueue/校验/自定义 bio_set 时才需要；否则用 iomap_bio_read_ops */
+/* 未来 C：static const struct iomap_dio_ops ravenfs_dio_ops = {.end_io, .submit_io}; */
 ```
 
 > **纪律**：页缓存、folio、bio、回写、readahead **全由 iomap 核心代劳**；
-> fs 在 `iomap_begin` 只回答「逻辑偏移 → 物理映射/空洞/内联」这一件事。
+> fs 在 `iomap_begin` 只回答「逻辑偏移 → 物理映射/空洞/内联」，在 `writeback_range` 只回答「回写期真分配 + 挂 ioend」。
+> 最小参照：`fs/zonefs/file.c`（读 = `iomap_bio_read_*`；回写 = `zonefs_writeback_range` + `iomap_ioend_writeback_submit`）。
 
 ---
 
@@ -151,13 +198,16 @@ static const struct iomap_dio_ops   ravenfs_dio_ops        = { /* 未来 C：end
 
 > 与 V1（整文件）/ V2（单 run）的区别：**不做全文件预载**，避免 `cat` 大文件读放大；**以 64K 为硬上限**。
 
-### 6.2 实现落点
+### 6.2 实现落点（**7.2.3 核实版：机制 = 大 folio，不是「包装层预取」**）
 
-- **读**：`ravenfs_read_folio` / `ravenfs_readahead` 包装层——缺页时按 **64K 单元** 预取，其余经 `iomap_read_folio`。
-  - 落地：`iomap_read_folio` 前先 `filemap_get_folio`/`filemap_add_folio` 把 64K 单元（≤16 页 / 大 folio）纳入，再触发回填（不破坏 iomap 契约）。
-- **写**：首次写未缓存区同样按 **64K 单元** 预载，避免 read-modify-write 落差（delalloc 下更顺，见 §8）。
+`iomap_read_folio` 缺页时**只处理传入的那一个 folio**（`ctx->cur_folio`），读多少由 **folio 尺寸**决定；fs **无法**在 `read_folio` 里「多读一个单元」。故 64K 单元靠 folio order 实现：
 
-> ⚠️ 该策略**不改 iomap 契约**（iomap 仍按 folio 请求），只是**在 fs 包装层把 miss 的加载粒度放大**。属「框架优先 + 参数化」的合规做法。
+- **落地**：inode 构造期 `mapping_set_folio_min_order(inode->i_mapping, 4)`（order 4 = 16 页 = **64K**）→ 缺页分配的 folio 即 64K，`iomap_read_folio` 随之整单元读入；iomap 内部**按映射边界自动裁剪**（天然不跨 run/洞边界）。
+  - 参照：xfs `fs/xfs/xfs_icache.c:107`（`mapping_set_folio_min_order(..., M_IGEO(mp)->min_folio_order)`）。
+- **⚠ 硬依赖**：`mapping_min_folio_order()` **仅当 `CONFIG_TRANSPARENT_HUGEPAGE=y` 才返回非零**（`include/linux/pagemap.h:469`），否则恒 0 → 退化成 4K。**宿主 config THP=y；guest（7.2.6）未核实 → M4.1 开工前必须在 guest 内查 `TRANSPARENT_HUGEPAGE`**（见 §12 O-5）。
+- **写侧**：`__iomap_get_folio` 亦按 `mapping_large_folio_support()` 取大 folio；首次写未缓存区 = 64K folio 整体回填（避免 RMW 落差）。
+- **inline/洞**：inline 整段直拷；洞段 `folio_zero_range` 零填不 IO（iomap 核心已含，fs 不干预）。
+- **降级（若 guest THP=n）**：退为 4K folio，「批量」改靠 readahead 窗口，**放弃硬 64K 单元** → 触发 §12 O-5 裁决。
 
 ---
 
@@ -206,14 +256,16 @@ mmap      → filemap_fault → a_ops->read_folio ──────────
 
 | 文档 | 动作 |
 |---|---|
-| `ravenfs-linux-ko-requirements-spec.md` §4.4 R-FD-01 | **勘误**：框架落点 `generic_file_write_iter` → 「自写壳 + `iomap_file_buffered_write`」 |
-| 同上 R-FD-10 | **勘误**：`-EOPNOTSUPP` → 「无 `direct_IO` → `open` `EINVAL`」；**C 真兑现后置**（D-M4-5，见 §7.4） |
+| `ravenfs-linux-ko-requirements-spec.md` §4.4 R-FD-01 | **勘误（已改 2026-09-27）**：框架落点 `generic_file_write_iter` → 「自写壳 + `iomap_file_buffered_write`」 |
+| 同上 R-FD-10 | **勘误（已改 2026-09-27）**：`-EOPNOTSUPP` → 「无 `direct_IO` → `open` `EINVAL`」；**C 真兑现后置**（D-M4-5，见 §7.4） |
 | 同上 §4.4 R-FD-03 | 保持；`mmap_prepare` 口径正确（7.2.3） |
 | `ravenfs-linux-ko-handover.md` §10.2 | **勘误**：a_ops 去 `write_begin/write_end`；补「路线 = iomap」 |
 | 同上 §10.3/§10.6 | 保持；M4.1 只读优先不变 |
 | `Docs/pwrite_pipeline.md` | 保持为**盘布局机械真值**；「五段」是设计真相，但**宿主改为 `iomap_begin/end`**（见溶解说明） |
 | `Docs/punch_truncate_pread_spec.md` | 保持；truncate/punch/fallocate 契约不变 |
 | `ravenfs-linux-ko-acceptance-plan.md` §2.0 M4 | 保持；本文件为其细化 |
+| `ravenfs-linux-ko-handover.md` §10.2 | **勘误 v2**：`read_folio`/`writepages` 签名按 7.2.3 改（§1.2）；`migrate_folio=filemap_migrate_folio`；补 `is_partially_uptodate`/`error_remove_folio`/`iomap_writeback_ops` |
+| 本文件 §2.1/§2.2/§2.3/§6.2 | **已改写**为 7.2.3 核实版（§1.2） |
 
 ---
 
@@ -226,7 +278,7 @@ mmap      → filemap_fault → a_ops->read_folio ──────────
 | **O_DIRECT（C）** | **后置**（M4 不做） | §7.4；M4.5 不含 |
 
 > **连带未清项**（delalloc 引出，M4.2 前必须定）：写序不变量 25 的**回写期形态**、`data_root` 提交点搬家后的崩溃窗口、`writepages` 分配失败（ENOSPC）在**回写路径**的暴露面（`write(2)` 已返回成功）。
-> 此连带项若在 M4.2 开工时仍未定义 → 触发第三约束，**上报**。
+> 此连带项若在 M4.2 开工时仍未定义 → 触发第三约束，**上报**。→ **已升级为 §12 的 O-2/O-3/O-4（待裁决）。**
 
 ---
 
@@ -240,6 +292,27 @@ mmap      → filemap_fault → a_ops->read_folio ──────────
 | **M4.4 setattr + 时间戳** | `inode_operations.setattr`；时间戳走 generic | `chmod/chown/utimes/truncate` |
 | **M4.5 收尾** | `fsync` 落数据 / 写序（**delalloc 回写形态**）/ `root_shrink` 延迟 free | `sync` 往返 + 崩溃窗口（§6.1 设计特性） |
 | ~~O_DIRECT（C）~~ | **后置独立里程碑**（D-M4-5，M4 不做） | — |
+
+---
+
+## 12. 待裁决（第三约束上报 · M4 开工前必须闭环）
+
+> 研究后暴露的**非良定义 / 契约冲突**点。按纪律**不自行拍板**，列选项待用户裁决；裁决后回填本表 + 落 §0 定调（编 `D-M4-N`）。
+
+| # | 问题 | 现状冲突 | 选项 | 建议 |
+|---|---|---|---|---|
+| **O-1** | **delalloc 下 direct 态的「物理全覆盖义务」** | 不变量 24 要求 direct 增长时**占位分配**（写时亮灯）；D-M4-4 写时不亮灯 → **写时无法确定能否维持 direct** | (a) 写时预留连续 run（soft-reserve 不亮灯），回写兑付，兑付失败降级 extent（需搬数据）；(b) **delalloc 下非 inline 一律走 extent**，direct 只作**回写期出口坍缩的收敛态**（不再是初始分配态）；(c) 退回同步分配（违背 D-M4-4） | **(b)** — 与出口坍缩天然一致、无搬数据风险；代价 = 盘面不变量 24 需改述（「初始 direct 创建」语义消失） |
+| **O-2** | **不变量 25 的回写期形态** | 原三步（亮灯→落盘→inode 翻转）在 delalloc 下**全压缩到回写**；`write(2)` 返回时零落盘 | (a) 单阶段：回写内「分配→bio→inode 翻转」顺序推进，中途崩 = dangling（**同 M3.5，判为设计特性**）；(b) 分阶段迷你 journal（重） | **(a)** — 与 M3.5 裁决同精神；需把不变量 25 改述为「回写期形态」 |
+| **O-3** | **`data_root` 提交点搬家后的崩溃窗口** | 提交点从 write 期搬到回写期 | write 返回后、回写前崩 = 数据全丢但 inode 未动（安全，等价「没写」）；回写中途 = O-2 | 接受（安全侧） |
+| **O-4** | **回写期 ENOSPC 暴露面** | 真分配在回写 → `write(2)` 已成功返回后才可能 ENOSPC（Arch 安装期致命） | (a) **写时做块数预留**（reserve 计数不亮灯）→ `write(2)` 即返 ENOSPC（ext4 式）；需 sb 级 reserve 新件；(b) 不预留 → ENOSPC 只能 `sync`/`fsync` 暴露 | **(a)** — T3 安装期要能干净失败 |
+| **O-5** | **64K 单元的硬依赖** | `mapping_set_folio_min_order(4)` 受 `CONFIG_TRANSPARENT_HUGEPAGE` 门控 | (a) 依赖 THP（宿主 =y，**guest 未核实**）；(b) guest THP=n 则退 4K + 靠 readahead 窗口；(c) 放弃 64K 用 iomap 默认 | **先核实 guest THP**，再定 (a)/(b) |
+| **O-6** | **extent 树节点的内核侧承载** | M4 spec §10.2 说走现有 `mdata_piece_cache`（8K piece）；研究报告 C 曾提「node latch + bh」 | 保留走 `mdata_piece_cache`（**M2.4 已裁不做 node_latch**，片级 rwsem 已足）；C 的 node latch 建议系误读 | **保留 `mdata_piece_cache`**；在 spec 明确否掉 node_latch |
+| **O-7** | **extent 树分裂/欠载阈值未固化** | 盘面文档**未给**：区段树分裂左右半条数、min occupancy、合并阈值（dentry 有 127→64/63、MINA=63） | 把 god 实参**固化进盘面文档**：阶 337；分裂左 168/右 rest；欠载 `count<168`；合并 `total≤337`；深度上限 64 | **固化进 v1.1 §10 不变量**（否则 ko/journal 无契约依据） |
+| **O-8** | **最大文件尺寸未给** | 三份盘面文档均无显式值；spec R-SP-06 定 `s_maxbytes = 1<<52` | 由 extent 树容量反推（337^depth × 4K，深度上限 64 → 极大）；或直接采用 `1<<52` + `static_assert` | **采用 `1<<52`**（R-SP-06 已有） |
+| **O-9** | **hash 算法自相矛盾** | v1.1 §9 写「XXH64（已定）」；头文件/§6.1 写「待定」 | 统一为 XXH64(seed=0)，或明确 SipHash-2-4 升级路径 | 统一 XXH64（**不属 M4，顺带清**） |
+| **O-10** | **`iomap_write_ops.iomap_valid` 是否实现** | 长写期间 extent 映射可能变（并发/恢复）→ 需 validity_cookie 检测 stale | (a) M4 不做（单挂载 + VFS `inode_lock` 串行化写）；(b) 做（存 data_root 版本号） | **(a)** — M7 并发面再评估 |
+
+> **一句话**：**O-1/O-2/O-4 是 delalloc 的三根硬骨头（必须裁决才能开 M4.2）**；O-5 先查 guest THP；O-6/O-7/O-8 是「契约固化」类（改动小但要落盘）。
 
 ---
 

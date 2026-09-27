@@ -1,0 +1,193 @@
+# RavenFS → Linux KO：**T0→T1 阶段排期**（进度无关 · 可长期存活）
+
+> 2026-09-27 · Raven · 从 `ravenfs-linux-ko-handover.md` **抽出的排期层**。
+> **为什么单独成文**：handover 是「当前进度」快照 —— 腐败速度极快（改代码即过期）；
+> 而 **阶段排期 / 出口判据 / 依赖顺序** 的腐坏速度慢得多 —— 它应当活得比 handover 长。
+> 故本文件**只装排期**，不装进度细节；进度真值看 handover，需求真值看 spec。
+>
+> **设计纪律（防腐）**：正文（§2 起）用**进度无关**口吻写「阶段 = 干什么 + 出口判据 + 依赖 + 需求映射」；
+> **进度状态只在 §1 表格的一个 `状态` 列里**，且**只可改这一列** —— 阶段内容本身不得随进度改写。
+> 若某阶段内容变了（如路线裁决换框架），那是**契约变更**，须在此处显式记 changelog，不许静默改。
+
+---
+
+## 0. 权威关系（冲突时自上而下服从）
+
+| 文档 | 管什么 | 与本文件关系 |
+|---|---|---|
+| `ravenfs-linux-ko-requirements-spec.md` | **第一约束需求规格（权威契约）**，R-* 编号 | **需求以它为准**；本文件只引用 R-*，不定义 R-* |
+| `ravenfs-linux-ko-acceptance-plan.md` | 验收纲领 + **T0–T4 阶梯定义** + 三层约束 | **阶梯以它为准**；本文件从 T0 讲到 T1 |
+| `ravenfs-linux-ko-M4-data-spec.md` | **M4 的第二约束实体化**（走 iomap / 五段管线落点） | **M4 细节以它为准**；本文件只排 M4 的**位置与出口** |
+| `ravenfs-linux-ko-handover.md` | **当前进度 + 代码地图 + 契约速查 + 构建流水线** | **进度以它为准**；本文件不复制其进度细节 |
+| `ravenfs-vm-env-notes.md` | 测试 VM 环境实录 | 环境以它为准 |
+| 本文件 | **T0→T1 的 M 阶段排期**（顺序 / 依赖 / 出口 / 需求映射） | — |
+
+**范围**：**T0（已达成）→ T1（xfstests `-g quick` 缺口表）**，含 T1.5（按缺口表补 M 项至收敛）。
+**范围外**：T2 压力、T3 完整安装、T4 启动、T5/T6（另议）—— 只在 §6 留锚点。
+
+---
+
+## 1. 排期总表（**唯一允许随进度变动的表**）
+
+> 图例：✅ 完成 · 🔶 进行中 · ⬜ 未开始。`状态` 列后的 `(日期)` = 状态最后确认日。
+> **完成了的阶段不要从表里删** —— 保留行 + ✅，它仍是「后续阶段的依赖前提」。
+
+| 阶段 | 内容（一句话） | 出口判据 | 前置依赖 | 需求映射 | 缺口 | 状态 |
+|---|---|---|---|---|---|---|
+| **T0** | 静态：mkfs 产物 → 只读挂载 → audit 全绿 | 不变量 §10 + v1.2 §7 零违例 | — | — | — | ✅ (2026-09-26) |
+| **M3.5** | 一致性/崩溃窗口（写序 + 非干净卸载后 audit） | flush **之外**崩溃不产生损坏（A/B）；flush 中途 dangling = 设计特性（不修） | M3 | R-SY-04/05/07 | G11 | ✅ (2026-09-27) |
+| **M4** | **文件数据**：a_ops + extent 树 + 三态迁移 + truncate/punch/fallocate + **setattr** | `dd/cat/head` 往返一致（跨态 / >4K / 稀疏洞）；`stat.blocks` 吻合；audit 全绿 | M3 | R-FD-01..10、R-MD-01..06、R-SY-04 | G1、G2 | ⬜ **下一步** |
+| **M5 残** | `link` / `symlink`+`get_link` / `mknod` / `tmpfile` | `ln`/`ln -s`/`readlink`/`mknod` 往返；大目录分裂后 `dents_dump` 仍 DUP=0 MISSING=0；audit `chain_bad=0` | M5 | R-NS-05/06/07/09 | G3、G4、G5、G6 | ⬜ |
+| **M6** | **xattr / ACL / capability**：4 回调 + `SB_POSIXACL` + 默认 ACL 继承 + `security.capability`；xattr 块 alloc/free | `setfattr`/`setfacl`/`setcap` 往返；**`rsync -aHAX` 保留 ACL+xattr**；audit xattr 校验通过 | M3、M5 | R-XA-01..04、R-NS-12 | G7、G8、G9 | ⬜ |
+| **M7** | **加固**：停机标志 / 周期回写 / 并发面 / `fsync` 全覆盖 / ENOSPC 干净 | `fsstress` 小规模不炸；`drop_caches` + 并发读写下 audit 仍绿；注入不一致后入口返 `-EIO` | M3–G9 | R-LM-09、R-CO-02/04、R-SY-05 | G10 | ⬜ |
+| **M8** | **预演最狠测试**：`rsync -aHAX` ext4→ravenfs 克隆 + `pacman -Qkk`（T3 前哨） | 克隆零致命错误 + `pacman -Qkk` 元数据全对 | M4 + M5 + M6 | （T3 前置） | G12 | ⬜ |
+| **T1** | **xfstests `./check -g quick`（generic 组）** | **产出失败清单 = 第一约束缺口表**（区分 fail / skip） | M3–M7 | — | G13 | ⬜ |
+| **T1.5** | 按 T1 缺口表逐条补 spec §4 的 **M** 项，重跑至收敛 | 缺口收敛（fail 归零或书面降级） | T1 | — | — | ⬜ |
+| *T2* | *范围外留锚点*：`fsx`/`fsstress`/`fs_mark`，每轮 audit | *无静默损坏（audit 恒绿）* | *T1.5* | — | — | *另议* |
+
+### 1.1 关键工具链前置（不属某单一 M，但挡 T1）
+
+| 前置 | 现状 | 影响的阶段 |
+|---|---|---|
+| **G13：xfstests 工具链进 guest**（guest 无 git/编译链预算） | ⬜ 未解决 | **T1 硬前置**（宿主下载源码 → 投递 → guest 编译；或宿主预编） |
+| **G14：fsck** | ⬜ 空实现（`-n` 只查，由 audit 承担） | 不挡 T1；保留 stub，不修 |
+
+---
+
+## 2. 阶段依赖图（顺序纪律的可视化）
+
+```
+T0 ✅ ──► M3.5 ✅ ──► [M4 文件数据] ──┐
+                              │            ├──► [M8 预演最狠] ──► (T3 前哨)
+   M5 ✅ ──► [M5残 link/sym/mknod/tmpfile] ┘        ▲
+                              │                     │
+                              └──► [M6 xattr/ACL/cap] ──┘
+                                        │
+   M3..G9 ─────────────────────────────► [M7 加固]
+                                        │
+   [G13 xfstests 工具链] ────────────────┴──► [T1 xfstests -g quick] ──► [T1.5 补缺口]
+                                                                              │
+                                                                              └──► (T2 压力，范围外)
+```
+
+**顺序约束（硬）**：
+1. **T1 的缺口表出来前，不许开 T3**（否则在 Arch 里用「莫名其妙的安装失败」重学 xfstests 早能精确告诉你的东西）。—— 验收纲领 §7 纪律。
+2. **M4 先读后写**：M4.1 只读（`read_folio` + `read_iter`/`mmap`）先立住，再进 M4.2 写 —— 见 §3.1。
+3. **阶段内禁止越级**：一个 M 未达出口判据，不进下一个 M。
+4. **M8 晚于 M4+M5+M6**：它要覆盖 ACL/xattr/硬链接/稀疏/大文件/setuid 全景。
+
+---
+
+## 3. 逐阶段详述（进度无关）
+
+### 3.1 M4 · 文件数据（**当前首发阶段**）
+
+> **M4 细则是独立文档 `ravenfs-linux-ko-M4-data-spec.md`（第二约束实体化）—— 以它为准**。
+> ⚠️ **handover §10.3 的 M4 切分已过时**（那份按 buffer_head 路写，含 `write_begin/write_end`）；
+> M4-data-spec 已裁决走 **iomap**，`a_ops` 不带 `write_begin/write_end`。**以 M4-data-spec 为准。**
+
+路线定调（D-M4-1..5）：必须 mmap-able；必须走 `read_iter`/`write_iter`（**iomap 路线**）；buffered cache_miss **整单元 ≤64K 全量加载**；**分配时机 = 写回才分配（delalloc）**；**O_DIRECT 后置**（不在 M4）。
+
+建议切分（每步「编译 + guest 实测」可验收才算完成）：
+
+| 子阶段 | 内容 | 出口判据 |
+|---|---|---|
+| **M4.1 只读** | `a_ops->read_folio/readahead`（64K 单元）+ `read_iter` + `mmap`（`generic_file_mmap_prepare`） | guest `dd/cat/head` 往返一致（三态 / >4K / 稀疏洞）；mmap 读/执行通 |
+| **M4.2 写数据** | `write_iter` + `iomap_begin(WRITE)` + **`writepages` 延迟真分配** + extent 树移植（walk/insert/split/balance/map_unmap）+ 三态迁移 + `i_blocks` 更新 | `dd` 写→读往返一致；`stat.blocks` 吻合；audit 全绿 |
+| **M4.3 truncate/punch/fallocate** | 按 `Docs/punch_truncate_pread_spec.md`（形态×操作矩阵、KEEP_SIZE、≤160 强制回迁 inline、出口坍缩） | spec §8 矩阵全过 |
+| **M4.4 setattr + 时间戳** | `inode_operations.setattr`（`setattr_prepare` + size→truncate + `setattr_copy`）；时间戳走 generic + `write_inode` 落盘 | `chmod/chown/utimes/truncate` 往返一致 |
+| **M4.5 收尾** | `fsync` 落数据；写序（**delalloc 回写形态**）；`extent_root_shrink` 旧根延迟 free | `sync` 往返 + 崩溃窗口符合 §6.1 设计特性 |
+
+**M4 开工前必须处理的既有缺口**（否则必踩）：见 handover §10.4（`extent_root_shrink` 旧根 free 时序 / 写序不变量 25 / `i_blocks` 口径 / readonly 写拒绝接线）。
+
+**M4 必读文档清单**：spec §4.4/§4.5/§4.8 · `pwrite_pipeline.md`（五段写管线）· `punch_truncate_pread_spec.md` · `disk_layout_v1.1.md` §5+§10（不变量 22–25）· `ravenfs-linux-ko-M4-data-spec.md`（iomap 定调）· god 参考 `juvenile_god/extent_*.cpp`。
+
+### 3.2 M5 残 · 命名空间收尾
+
+- **G3 `link`**：dir `inode_operations.link`（盘上 `link_count++`；dcache 交 VFS）。
+- **G4 `symlink` + `get_link`**：短名内联；**T3 前置**（`ld.so`/`/sbin` 依赖 `readlink`）。
+- **G5 `mknod`**：4 型（FIFO/CHR/BLK/SOCK）；CHR/BLK 写 `inline_data[0:4]=rdev`。
+- **G6 `tmpfile`**：`O_TMPFILE`（journald 用）；**依赖 M4 数据路径**。
+
+判据：`ln`/`ln -s`/`readlink`/`mknod` 往返；大目录分裂后 `dents_dump` 仍 DUP=0 MISSING=0；audit `chain_bad=0`。
+
+### 3.3 M6 · xattr / ACL / capability
+
+- **G7 xattr 四回调**：`.getxattr/.setxattr/.listxattr/.removexattr` + `xattr_handler`；xattr 块 alloc/free（bitmap 认领）。
+- **G8 ACL**：`SB_POSIXACL` + `.get_inode_acl/.set_acl` + `posix_acl_create`（默认 ACL 继承）。
+- **G9 capability**：经 xattr 的 `security.capability`。
+
+判据：`setfattr`/`setfacl`/`setcap` 往返；**`rsync -aHAX` 保留 ACL+xattr**；audit xattr 校验通过。
+
+### 3.4 M7 · 加固（「不静默损坏」底线）
+
+- 停机标志：`RFS_SHUTDOWN` 自检失败 → 全局 `-EIO`（xfs force-shutdown 惯例）。
+- **周期回写**：ko 现无周期回写线程 → 无人 sync 时 dirty mdata 行累积（实测 9 万目录 ≈ 735MB）。**这是 M7 的头号硬缺口**。
+- 并发面系统化（bitmap/alloc、回写/evict/sync vs 前台）。
+- `fsync` 全覆盖（数据 + 元数据）。
+- ENOSPC 错误路径干净。
+
+判据：`fsstress` 小规模不炸；`drop_caches` + 并发读写下 audit 仍绿；注入不一致后入口返 `-EIO`。
+
+### 3.5 M8 · 预演最狠测试
+
+`rsync -aHAX --delete` ext4→ravenfs 克隆 + `pacman -Qkk`。**T3 前哨**；覆盖 ACL/xattr/硬链接/稀疏/大文件/setuid 全景（同时也是 G8/G9 的端到端验收器）。
+
+### 3.6 T1 / T1.5
+
+- **T1**：guest 内跑 xfstests `./check -g quick`（generic 组）→ **产出失败清单 = 第一约束缺口表**（区分 fail / skip：O_DIRECT/FITRIM/SEEK_HOLE 等降级项会 skip）。**硬前置 G13（xfstests 工具链进 guest）尚未解决**。
+- **T1.5**：按缺口表逐条补 spec §4 的 **M** 项，重跑 T1 至收敛。
+
+---
+
+## 4. 缺口 → 阶段 映射（G 编号速查）
+
+> G 编号沿用 handover §6（缺口分析）。**缺口内容本身也几乎不腐坏**，故一并搬来。
+
+| G | 缺口 | 症状 | 阶段 | 需求 |
+|---|---|---|---|---|
+| G1 | 文件数据读写 | `read/write/mmap` 全 `-EINVAL`；数据 0 落地 | **M4** | R-FD-01..09、R-MD-01、R-SY-04 |
+| G2 | `setattr` | 无 `.setattr` → `chmod/chown/truncate/utimes` 不落盘 | **M4.4** | R-MD-02/03/05/06 |
+| G3 | 硬链接 `link` | `ln` 失败 | M5 残 | R-NS-05 |
+| G4 | `symlink`+`get_link` | `readlink` `-EINVAL`；T3 前置 | M5 残 | R-NS-06 |
+| G5 | `mknod` | `mknod` 失败（4 型） | M5 残 | R-NS-07 |
+| G6 | `tmpfile` | `O_TMPFILE` 失败（journald 用） | M5 残（依赖 M4） | R-NS-09 |
+| G7 | xattr 四回调 | `setfattr/getfattr` 失败 | M6 | R-XA-01..04 |
+| G8 | ACL | 无 | M6 | R-NS-12、R-XA-* |
+| G9 | capability | 无 | M6 | R-XA-02 |
+| G10 | 加固 | 无停机标志 / 无周期回写 / 并发面未系统化 / fsync 不落数据 | M7 | R-LM-09、R-CO-02/04、R-SY-05 |
+| G11 | 一致性/崩溃窗口 | **已收口（设计特性，不修）** | M3.5 ✅ | R-SY-04/05/07 |
+| G12 | M8 预演最狠测试 | 未做 | M8 | T3 前哨 |
+| G13 | xfstests 工具链 | 未解决（guest 无 git/编译链预算） | **T1 硬前置** | T1 |
+| G14 | fsck | 空实现（`-n` 由 audit 承担） | 不修 | §4 |
+
+**一句话缺口（决定优先级）**：**文件数据（G1）+ setattr（G2）= 「能读写文件」硬缺口；link/symlink/mknod/tmpfile（G3–G6）= 「Arch 安装/运行」硬缺口；xattr/ACL（G7–G9）= 「pacman/rsync -aHAX 保真」硬缺口；加固（G10）= 「不静默损坏」底线。**
+
+---
+
+## 5. 纪律（照旧，勿忘）
+
+- **三层约束**：① 正确性（满足 Arch 用户态规格）② 框架优先（能用内核成熟框架就用）③ **撞上「非良定义问题」第一时间上报用户**（进度可慢、隐患不留）。
+- **小步快跑**：每步「编译 + 实测」可验收才算完成（**只写机构、没接线、跑不了 = 未完成**）；**一步一提交**（commit message 写给接手者）；不憋大招；错了立刻连根铲除；**每步收尾落文档**。
+- **成本审计**：大流量/长耗时先量化（`COST-AUDIT-DISCIPLINE.md`）。
+- **红线**：宿主 `sudo` 不给；不用录存口令提权（guest 测试 VM 凭证除外，用户已授权）。
+- **顺序纪律**：**T1 缺口表出来前不许开 T3**；M4 先读后写；阶段内禁止越级。
+
+---
+
+## 6. 范围外锚点（只留指针，本文不展开）
+
+- **T2 压力**：`fsx`/`fsstress`/`fs_mark`，每轮 audit；判据 = 无静默损坏。
+- **T3 完整安装**：ext4 根内 `insmod` → 构造 ravenfs 根 + 装 UEFI bootloader（判据见验收纲领 §2.1）。
+- **T4 启动**：ESP → ravenfs root 到 multi-user（判据见 §2.2；T3 做好则水到渠成）。
+- **T5/T6**：混沌/崩溃矩阵 · 性能基线 —— **暂缓另议**。
+- **单根断奶验证**：见验收纲领 §3.6。
+
+---
+
+## 附录 A · changelog（阶段内容的契约变更记这里，进度状态不算）
+
+| 日期 | 变更 | 依据 |
+|---|---|---|
+| 2026-09-27 | 本文件从 handover 抽出，覆盖 **T0 → T1** | 用户：handover 腐坏快、排期腐坏慢 |
+| 2026-09-27 | M4 路线 = **iomap**（`a_ops` 无 `write_begin/write_end`）；delalloc；O_DIRECT 后置 | `ravenfs-linux-ko-M4-data-spec.md`（D-M4-1..5）——**覆盖** handover §10.3 旧切分 |
