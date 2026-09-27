@@ -174,9 +174,24 @@ int ravenfs_read_node(struct super_block *sb, u64 blk, void *buf);
 
 /* ── M4.1 只读数据路径（iomap.c / file.c） ── */
 struct iomap_ops;
+struct iomap;
 extern const struct iomap_ops ravenfs_iomap_ops;
 extern const struct address_space_operations ravenfs_aops;
 ssize_t ravenfs_file_read_iter(struct kiocb *iocb, struct iov_iter *iter);
+
+/* M4.2：回写映射复用同一 begin（file.c 的 writeback_range 使用） */
+int ravenfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
+			unsigned int flags, struct iomap *iomap, struct iomap *srcmap);
+
+/* ── M4.2 写数据路径（extent_write.c / iomap.c / file.c） ── */
+ssize_t ravenfs_file_write_iter(struct kiocb *iocb, struct iov_iter *iter);
+
+/* 区段树写机械（extent_write.c）：查找 / 插入（含叶裂升根）/ 计数 */
+int ravenfs_extent_lookup(struct super_block *sb, u64 root, u64 target,
+			  struct extent_t *out, u64 *next);
+int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
+			  const struct extent_t *ext);
+int ravenfs_extent_count(struct super_block *sb, u64 root, u64 *data, u64 *nodes);
 
 /* ── disk_inode_cache_mgr（§4.11.1 + M2.2 行尺寸解耦）── */
 #define RAVENFS_SHARD_SEL_BITS	7	/* 分片选择位宽：≤128 片（>4096 inode 时生效） */

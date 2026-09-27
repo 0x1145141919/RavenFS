@@ -1,23 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * iomap.c —— RavenFS ko：M4.1 只读数据路径（逻辑偏移 → iomap 映射）
+ * iomap.c —— RavenFS ko：文件数据路径（逻辑偏移 → iomap 映射）；M4.1 读 + M4.2 写
  *
  * 依据：Docs/linux/ravenfs-linux-ko-M4-data-spec.md
  *   §1.2（7.2.3 iomap 真值）、§2.3（唯一自写核心 iomap_begin/end）、
- *   §3（三态→iomap type，判据 size 优先 = 不变量 22）、§6（读粒度 = iomap 默认）。
- * 机械真值：Docs/disk_layout_v1.1.md §5（区段树 entry/路由/半开区间）+ §10 不变量 22/35；
+ *   §3（三态→iomap type，判据 size 优先 = 不变量 22）、§6（读粒度 = iomap 默认）、
+ *   §8（写序/崩溃：**立刻分配 D-M4-6**、IOMAP_F_NEW 零填、短写尾不清算 D-M4-10(b)）。
+ * 机械真值：Docs/disk_layout_v1.1.md §5（区段树）+ §10 不变量 22/23/24/25；
  *           Docs/disk_layout_v1.2_inode.md §2（inode 位域）。
  *
  * 纪律（spec §2.3）：
- *   · 页缓存 / folio / bio / readahead **全由 iomap 核心代劳**；
- *     本文件只回答「逻辑偏移 pos → 物理映射 / 空洞 / 内联」。
- *   · M4.1 = **只读**：IOMAP_WRITE / IOMAP_REPORT 一律 -EOPNOTSUPP（写路径 M4.2）。
+ *   · 页缓存 / folio / bio / readahead / 回写 **全由 iomap 核心代劳**；
+ *     本文件只回答「逻辑偏移 pos → 物理映射 / 空洞 / 内联」，并在写向**立刻真分配**。
+ *   · **不返回 IOMAP_DELALLOC**（D-M4-6 立刻分配）；ENOSPC 在 write(2) 即暴露。
  *   · srcmap = iomap（无 COW）。
  *
  * 三态解码（不变量 22，**判据 size 优先**，data_root 取值不参与判定）：
  *   size ≤ 160            → IOMAP_INLINE（内容在 inode.inline_data，offset=0）
  *   size > 160 ∧ direct=1 → IOMAP_MAPPED（连续区 data_root + pos/4096）
  *   size > 160 ∧ direct=0 → extent 树 walk（命中 MAPPED / 未命中 HOLE）
+ *
+ * 写向（IOMAP_WRITE）：
+ *   inline 不越 160 → 照旧 inline；越 160 → **inline→extent 迁移**（D-M4-8）；
+ *   direct 覆盖 → MAPPED（不分配）；direct 增长（不可续）→ **direct→extent 迁移**；
+ *   extent 命中 → MAPPED（不分配）；extent 洞 → **立刻分配 + 插树**，返 MAPPED|IOMAP_F_NEW。
+ *   迁移的盘面物化在本文件完成（iomap.c 是唯一触碰 data_root/direct_bit 的提交点之一）。
  *
  * 【地址换算】盘面 data_root / block_base 均为 **FS_block 号**；iomap->addr 须是
  * **块设备字节偏移**（iomap 直接向 iomap->bdev 提交 bio，iomap_sector = (addr+…)>>9）。
@@ -30,13 +37,12 @@
 #include <linux/slab.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
+#include <linux/timekeeping.h>
 
 #include "ravenfs.h"
 
 /* inline 态字节上限（不变量 22）：size ≤ 160 ⇒ 内容在 inode.inline_data */
 #define RAVENFS_INLINE_BYTES		160U
-/* 区段树深度上限（不变量 35；超限判成环） */
-#define RAVENFS_EXTENT_DEPTH_MAX	64U
 #define RAVENFS_BLK_SHIFT		12			/* 4096 = 1 << 12 */
 /* size → 覆盖块数 ceil(size/4096)（不变量 22） */
 #define RAVENFS_NBLOCKS(b)		(((b) + RAVENFS_BLOCK_SIZE - 1) >> RAVENFS_BLK_SHIFT)
@@ -47,104 +53,357 @@ static inline u64 ravenfs_dev_byte(struct ravenfs_sb_info *sbi, u64 fs_blk)
 	return (u64)ravenfs_dev_blk(sbi, fs_blk) << RAVENFS_BLK_SHIFT;
 }
 
-/*
- * 区段树 walk（上界路由，不变量 9）：
- *   内部：target < key[i] → 子树 i（key = 子树最大**开边界** fblkbase+length）；
- *         无匹配（target ≥ 全部 key）→ 洞。
- *   叶子：相邻 extent 升序；`fblkbase ≤ target < fblkbase+length` 命中。
- *
- * 返回：0 = 命中（*out=extent）；1 = 未命中（洞，*next=下一 extent 起点块号，0=无）；
- *       <0 = 错误。
- */
-static int ravenfs_extent_lookup(struct super_block *sb, u64 root, u64 target,
-				 struct extent_t *out, u64 *next)
+/* 同步落一个 4K 块（迁移物化/零填用；与装载侧同源 sb_bread + sync_dirty_buffer） */
+static int rfs_store_block(struct super_block *sb, u64 fs_blk, const void *buf)
 {
-	u64 blk = root;
-	u32 depth = 0;
-	void *buf;
-	int err = -EIO;
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	struct buffer_head *bh = sb_bread(sb, ravenfs_dev_blk(sbi, fs_blk));
 
-	*next = 0;
-	if (root == (u64)PTR_INVALID)
-		return 1;			/* 无树 → 全洞（size>160 但 direct=0 的空树） */
+	if (!bh)
+		return -EIO;
+	memcpy(bh->b_data, buf, RAVENFS_BLOCK_SIZE);
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+	brelse(bh);
+	return 0;
+}
 
-	buf = kmalloc(RAVENFS_NODE_BYTES, GFP_KERNEL);
+/* 区域树 walk（上界路由）/ i_blocks 计数在 extent_write.c：
+ *   ravenfs_extent_lookup() / ravenfs_extent_insert() / ravenfs_extent_count() */
+
+/* ══════════════════════════════════════════════════════════════════
+ * 写向（IOMAP_WRITE）：立刻分配（D-M4-6）
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* inline→extent 迁移（D-M4-8：越 160 默认升格 extent）
+ *
+ * 分配策略（**只为真正需要的块分配**，缝隙保留为洞——与 god/验收模型一致）：
+ *   · pos 块号 == 0（写从第 0 块起）：单条 extent 覆盖 [0, end_blk)，块 0 物化
+ *     旧 inline + 零填，尾块（若 end 未块对齐）零填，返回映射**非 NEW**。
+ *   · pos 块号 > 0：旧 inline 物化为单块 extent {0,1}（仅当 old_size>0），写域另
+ *     一条 extent {pos_blk, cnt}，返回映射 **NEW**（单次调用，无重入丢标志问题）；
+ *     缝隙 [1, pos_blk) 保留为洞（读 0）。
+ */
+static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *inode,
+					struct raven_Inode_t *r, struct ravenfs_session *ses,
+					loff_t pos, u64 end, struct iomap *iomap)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	u64 old_size = r->size;			/* ≤160 */
+	u64 pos_blk = (u64)pos >> RAVENFS_BLK_SHIFT;
+	u64 end_blk = RAVENFS_NBLOCKS(end);
+	u64 root = (u64)PTR_INVALID, tmp, run = (u64)PTR_INVALID;
+	u8 *buf;
+	int err;
+
+	if (!end_blk)
+		end_blk = 1;
+	buf = kzalloc(RAVENFS_BLOCK_SIZE, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
 
-	for (;;) {
-		const struct Bptree_meta_t *meta;
-		u32 cnt, inner, i;
+	if (pos_blk == 0) {
+		struct extent_t e0;
 
-		if (++depth > RAVENFS_EXTENT_DEPTH_MAX || blk == (u64)PTR_INVALID) {
-			err = -EIO;		/* 深度超限（成环）/ 悬挂指针 */
-			break;
+		run = ravenfs_block_alloc(sb, end_blk, 0);
+		if (run == (u64)PTR_INVALID) {
+			kfree(buf);
+			return -ENOSPC;
 		}
-		err = ravenfs_read_node(sb, blk, buf);
+		/* 块 0 = 旧 inline + 零填 */
+		memset(buf, 0, RAVENFS_BLOCK_SIZE);
+		memcpy(buf, r->inline_data, min_t(u64, old_size, RAVENFS_INLINE_BYTES));
+		err = rfs_store_block(sb, run, buf);
 		if (err)
-			break;
-		meta = buf;
-		if (meta->magics[0] != BPTREE_MAGIC1 || meta->magics[1] != BPTREE_MAGIC2 ||
-		    meta->magics[2] != BPTREE_MAGIC3 || meta->magics[3] != BPTREE_MAGIC4) {
-			err = -EIO;
-			break;
+			goto err_free_run;
+		/* 尾块零填（若 end 未块对齐；中间块写全覆，无需落盘） */
+		if (end_blk > 1 && ((u64)end & (RAVENFS_BLOCK_SIZE - 1))) {
+			memset(buf, 0, RAVENFS_BLOCK_SIZE);
+			err = rfs_store_block(sb, run + end_blk - 1, buf);
+			if (err)
+				goto err_free_run;
 		}
-		cnt = RFS_PP_COUNT(meta->parent_ptr);
-		inner = RFS_PP_IS_INNER(meta->parent_ptr);
-		if (cnt > 338) {
-			err = -EIO;
-			break;
-		}
+		kfree(buf);
+		e0.length = end_blk;
+		e0.fblkbase = 0;
+		e0.block_base.v = RFS_PTR_PACK(0, run);
+		tmp = root;
+		err = ravenfs_extent_insert(sb, inode->i_ino, &tmp, &e0);
+		if (err)
+			return err;		/* 孤儿块（inode 未动，§8） */
+		root = tmp;
+		iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
+		iomap->type = IOMAP_MAPPED;
+		iomap->addr = ravenfs_dev_byte(sbi, run);
+		iomap->length = (end_blk << RAVENFS_BLK_SHIFT) - (u64)pos;
+		iomap->flags = 0;
+	} else {
+		u64 cnt = end_blk - pos_blk;
+		struct extent_t e1;
 
-		if (inner) {
-			const struct Bptree_extent_inner_node_t *nd = buf;
-			u32 sel = cnt;		/* cnt = 无匹配 */
+		if (old_size > 0) {		/* 旧 inline 单块物化（非 NEW） */
+			u64 run0 = ravenfs_block_alloc(sb, 1, 0);
 
-			for (i = 0; i < cnt; i++) {
-				if (target < nd->extents[i].key) {
-					sel = i;
-					break;
-				}
+			if (run0 == (u64)PTR_INVALID) {
+				kfree(buf);
+				return -ENOSPC;
 			}
-			if (sel == cnt) {	/* target ≥ 全部 key → 洞 */
-				err = 1;
-				*next = 0;
-				break;
+			memset(buf, 0, RAVENFS_BLOCK_SIZE);
+			memcpy(buf, r->inline_data, min_t(u64, old_size, RAVENFS_INLINE_BYTES));
+			err = rfs_store_block(sb, run0, buf);
+			if (!err) {
+				struct extent_t e0;
+
+				e0.length = 1;
+				e0.fblkbase = 0;
+				e0.block_base.v = RFS_PTR_PACK(0, run0);
+				tmp = root;
+				err = ravenfs_extent_insert(sb, inode->i_ino, &tmp, &e0);
+				root = tmp;
 			}
-			blk = RFS_PTR_ADDR(nd->extents[sel].sub_node_ptr);
-			continue;
-		}
-
-		/* 叶子：线性扫描（≤337 项，半开区间，升序无重叠） */
-		{
-			const struct Bptree_extent_leaf_node_t *lf = buf;
-
-			err = 1;		/* 默认未命中 */
-			for (i = 0; i < cnt; i++) {
-				const struct extent_t *e = &lf->extents[i];
-				u64 b = e->fblkbase;
-
-				if (target < b) {	/* 越过终点：b = 下一 extent 起点 */
-					*next = b;
-					break;
-				}
-				if (target < b + e->length) {	/* 命中 [b, b+len) */
-					*out = *e;
-					err = 0;
-					break;
-				}
+			if (err) {
+				ravenfs_block_free(sb, run0, 1);
+				kfree(buf);
+				return err;
 			}
-			break;
 		}
+		kfree(buf);
+
+		run = ravenfs_block_alloc(sb, cnt, 0);
+		if (run == (u64)PTR_INVALID)
+			return -ENOSPC;
+		e1.length = cnt;
+		e1.fblkbase = pos_blk;
+		e1.block_base.v = RFS_PTR_PACK(0, run);
+		err = ravenfs_extent_insert(sb, inode->i_ino, &root, &e1);
+		if (err) {
+			ravenfs_block_free(sb, run, cnt);
+			return err;
+		}
+		iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
+		iomap->type = IOMAP_MAPPED;
+		iomap->addr = ravenfs_dev_byte(sbi, run);
+		iomap->length = cnt << RAVENFS_BLK_SHIFT;
+		iomap->flags = IOMAP_F_NEW;
 	}
 
+	/* 提交记录：direct=0；data_root=root；size≥end（强制 extent 解码，不变量 22） */
+	RFS_INO1_SET_DIRECT(*r, 0);
+	r->data_root = root;
+	if (end > r->size)
+		r->size = end;
+	RFS_ROW_MARK_DIRTY(ses->row);
+	return 0;
+
+err_free_run:
 	kfree(buf);
+	ravenfs_block_free(sb, run, end_blk);
 	return err;
 }
 
-static int ravenfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
-			       unsigned int flags, struct iomap *iomap,
-			       struct iomap *srcmap)
+/* direct→extent 迁移（增长不可续）：旧连续区物化一条 + 新增长区一条（零搬移） */
+static int ravenfs_write_migrate_direct(struct super_block *sb, struct inode *inode,
+					struct raven_Inode_t *r, struct ravenfs_session *ses,
+					loff_t pos, u64 end, struct iomap *iomap)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	u64 old_ceil = RAVENFS_NBLOCKS(r->size);
+	u64 old_base = r->data_root;
+	u64 new_ceil = RAVENFS_NBLOCKS(end);
+	u64 grow = (new_ceil > old_ceil) ? (new_ceil - old_ceil) : 1;
+	u64 run, root = (u64)PTR_INVALID, tmp;
+	struct extent_t e0, e1;
+	u8 *zbuf;
+	u64 i, blk, phys, run_end_blk;
+	int err;
+
+	run = ravenfs_block_alloc(sb, grow, 0);
+	if (run == (u64)PTR_INVALID)
+		return -ENOSPC;
+
+	/* 零填新增长块（非 NEW：部分块读需 0） */
+	zbuf = kzalloc(RAVENFS_BLOCK_SIZE, GFP_KERNEL);
+	if (!zbuf) {
+		ravenfs_block_free(sb, run, grow);
+		return -ENOMEM;
+	}
+	for (i = 0; i < grow; i++) {
+		err = rfs_store_block(sb, run + i, zbuf);
+		if (err) {
+			kfree(zbuf);
+			ravenfs_block_free(sb, run, grow);
+			return err;
+		}
+	}
+	kfree(zbuf);
+
+	/* 建树：旧 direct 区（零搬移）+ 新增长区 */
+	e0.length = old_ceil;
+	e0.fblkbase = 0;
+	e0.block_base.v = RFS_PTR_PACK(0, old_base);
+	tmp = root;
+	err = ravenfs_extent_insert(sb, inode->i_ino, &tmp, &e0);
+	if (err)
+		return err;
+	root = tmp;
+
+	e1.length = grow;
+	e1.fblkbase = old_ceil;
+	e1.block_base.v = RFS_PTR_PACK(0, run);
+	err = ravenfs_extent_insert(sb, inode->i_ino, &root, &e1);
+	if (err)
+		return err;
+
+	/* 提交记录：direct=0；data_root=root（size 不变，仍 >160 → extent 解码） */
+	RFS_INO1_SET_DIRECT(*r, 0);
+	r->data_root = root;
+	RFS_ROW_MARK_DIRTY(ses->row);
+
+	blk = (u64)pos >> RAVENFS_BLK_SHIFT;
+	if (blk < old_ceil) {
+		phys = old_base + blk;
+		run_end_blk = old_ceil;
+	} else {
+		phys = run + (blk - old_ceil);
+		run_end_blk = new_ceil;
+	}
+	iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
+	iomap->type = IOMAP_MAPPED;
+	iomap->addr = ravenfs_dev_byte(sbi, phys);
+	iomap->length = (run_end_blk - blk) << RAVENFS_BLK_SHIFT;
+	iomap->flags = 0;
+	return 0;
+}
+
+static int ravenfs_iomap_begin_write(struct inode *inode, loff_t pos, loff_t length,
+				     unsigned int flags, struct iomap *iomap,
+				     struct iomap *srcmap)
+{
+	struct super_block *sb = inode->i_sb;
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
+	struct raven_Inode_t *r;
+	u64 size, end, blk, end_blk;
+	int err;
+
+	if (flags & IOMAP_DIRECT)
+		return -EOPNOTSUPP;		/* O_DIRECT 后置（D-M4-5） */
+
+	ses = ravenfs_session_get(sb, inode->i_ino);
+	if (IS_ERR(ses))
+		return PTR_ERR(ses);
+	r = ravenfs_session_inode(ses);
+
+	memset(iomap, 0, sizeof(*iomap));
+	iomap->bdev = sb->s_bdev;
+	iomap->addr = IOMAP_NULL_ADDR;
+
+	size = r->size;
+	end = (u64)pos + (u64)length;
+
+	/* ── inline 态（size ≤ 160） ── */
+	if (size <= RAVENFS_INLINE_BYTES) {
+		struct ravenfs_inode_info *ri = RAVENFS_I(inode);
+
+		if (end <= RAVENFS_INLINE_BYTES) {
+			/* 仍在内联区：镜像记录 → inode 私有稳定副本（iomap 稍后读取）
+			 * 并清尾（i_size 之后到 160）→ 非尾部写（跳写/缝隙）读回 0。 */
+			memcpy(ri->inline_data, r->inline_data, sizeof(ri->inline_data));
+			if (size < RAVENFS_INLINE_BYTES)
+				memset(ri->inline_data + size, 0, RAVENFS_INLINE_BYTES - size);
+			iomap->offset = 0;
+			iomap->type = IOMAP_INLINE;
+			iomap->addr = 0;
+			iomap->inline_data = ri->inline_data;
+			iomap->length = RAVENFS_INLINE_BYTES;	/* 覆盖 [0,160) 全内联区 */
+			goto out;
+		}
+		err = ravenfs_write_migrate_inline(sb, inode, r, ses, pos, end, iomap);
+		if (err)
+			return err;
+		goto out;
+	}
+
+	/* ── size > 160 ── */
+	blk = (u64)pos >> RAVENFS_BLK_SHIFT;
+	end_blk = RAVENFS_NBLOCKS(end);
+
+	if (RFS_INO1_GET_DIRECT(r->word1)) {
+		u64 old_ceil = RAVENFS_NBLOCKS(size);
+
+		if (end <= (old_ceil << RAVENFS_BLK_SHIFT)) {
+			/* 直指覆盖：不分配 */
+			iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
+			iomap->type = IOMAP_MAPPED;
+			iomap->addr = ravenfs_dev_byte(sbi, r->data_root + blk);
+			iomap->length = (old_ceil - blk) << RAVENFS_BLK_SHIFT;
+			iomap->flags = 0;
+			goto out;
+		}
+		err = ravenfs_write_migrate_direct(sb, inode, r, ses, pos, end, iomap);
+		if (err)
+			return err;
+		goto out;
+	}
+
+	/* ── extent 树 ── */
+	{
+		struct extent_t ext;
+		u64 next;
+
+		err = ravenfs_extent_lookup(sb, r->data_root, blk, &ext, &next);
+		if (err < 0)
+			return err;
+
+		if (err == 0) {			/* 命中：覆盖既有映射 */
+			u64 ext_phys = RFS_PTR_ADDR(ext.block_base) + (blk - ext.fblkbase);
+			u64 run_end = ext.fblkbase + ext.length;
+
+			iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
+			iomap->type = IOMAP_MAPPED;
+			iomap->addr = ravenfs_dev_byte(sbi, ext_phys);
+			iomap->length = (run_end - blk) << RAVENFS_BLK_SHIFT;
+			iomap->flags = 0;
+		} else {			/* 洞 → 立刻分配 + 插树（D-M4-6） */
+			u64 hole_end = next ? min(next, end_blk) : end_blk;
+			u64 cnt, run, newroot;
+			struct extent_t ne;
+
+			if (hole_end <= blk)
+				hole_end = blk + 1;	/* 护栏：长度必 > 0 */
+			cnt = hole_end - blk;
+			run = ravenfs_block_alloc(sb, cnt, 0);
+			if (run == (u64)PTR_INVALID)
+				return -ENOSPC;		/* write(2) 即暴露 */
+			ne.length = cnt;
+			ne.fblkbase = blk;
+			ne.block_base.v = RFS_PTR_PACK(0, run);
+			newroot = r->data_root;
+			err = ravenfs_extent_insert(sb, inode->i_ino, &newroot, &ne);
+			if (err) {
+				ravenfs_block_free(sb, run, cnt);
+				return err;
+			}
+			if (newroot != r->data_root) {
+				r->data_root = newroot;	/* 叶裂升根 → 新根 */
+				RFS_ROW_MARK_DIRTY(ses->row);
+			}
+			iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
+			iomap->type = IOMAP_MAPPED;
+			iomap->addr = ravenfs_dev_byte(sbi, run);
+			iomap->length = cnt << RAVENFS_BLK_SHIFT;
+			iomap->flags = IOMAP_F_NEW;	/* 新分配块 → iomap 核心零填未写部分 */
+		}
+	}
+
+out:
+	*srcmap = *iomap;			/* 无 COW：srcmap = iomap */
+	return 0;
+}
+
+int ravenfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
+			unsigned int flags, struct iomap *iomap,
+			struct iomap *srcmap)
 {
 	struct super_block *sb = inode->i_sb;
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
@@ -153,10 +412,10 @@ static int ravenfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 	u64 size, off, blk, end_blk;
 	int err;
 
-	if (flags & IOMAP_WRITE)
-		return -EOPNOTSUPP;		/* M4.1 只读：写路径 M4.2 */
 	if (flags & IOMAP_REPORT)
-		return -EOPNOTSUPP;		/* M4.1 不做 FIEMAP */
+		return -EOPNOTSUPP;		/* FIEMAP 后置 */
+	if (flags & IOMAP_WRITE)
+		return ravenfs_iomap_begin_write(inode, pos, length, flags, iomap, srcmap);
 
 	memset(iomap, 0, sizeof(*iomap));
 	iomap->bdev = sb->s_bdev;
@@ -186,7 +445,7 @@ static int ravenfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 		/*
 		 * iomap->inline_data 须在 iomap_begin 返回后仍有效（iomap 核心稍后
 		 * 在 iomap_read_inline_data 里读取）→ 不能指向会话缓存行（随会话释放）。
-		 * 镜像一份到 inode 私有区（只读幂等拷贝）。
+		 * 镜像一份到 inode 私有区。
 		 */
 		memcpy(ri->inline_data, r->inline_data, sizeof(ri->inline_data));
 		iomap->offset = 0;
@@ -240,11 +499,54 @@ out:
 	return 0;
 }
 
-static int ravenfs_iomap_end(struct inode *inode, loff_t pos, loff_t length,
-			     ssize_t written, unsigned int flags,
-			     struct iomap *iomap)
+/* i_blocks 诚实化（数据块 + extent 树节点×2；512B 单位） */
+static void ravenfs_write_update_blocks(struct super_block *sb, struct inode *inode,
+					const struct raven_Inode_t *r)
 {
-	/* M4.1 只读：无分配需提交/回滚。写路径的短写尾清算见 M4.2（D-M4-10）。 */
+	u64 blks = 0;
+
+	if (r->size > RAVENFS_INLINE_BYTES) {
+		if (RFS_INO1_GET_DIRECT(r->word1)) {
+			blks = RAVENFS_NBLOCKS(r->size);
+		} else {
+			u64 data = 0, nodes = 0;
+
+			ravenfs_extent_count(sb, r->data_root, &data, &nodes);
+			blks = data + nodes * 2;
+		}
+	}
+	inode->i_blocks = blks * (RAVENFS_BLOCK_SIZE / 512);
+}
+
+static int ravenfs_iomap_end(struct inode *inode, loff_t pos, loff_t length,
+			     ssize_t written, unsigned int flags, struct iomap *iomap)
+{
+	struct super_block *sb = inode->i_sb;
+	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
+	struct raven_Inode_t *r;
+
+	if (!(flags & IOMAP_WRITE))
+		return 0;		/* 只读：无分配需提交/回滚 */
+
+	ses = ravenfs_session_get(sb, inode->i_ino);
+	if (IS_ERR(ses))
+		return 0;		/* 提交失败不致命：内存 inode 已更新 */
+	r = ravenfs_session_inode(ses);
+
+	/* inline 写：把 inode 私有镜像回灌盘记录（iomap_write_end_inline 只写镜像） */
+	if (iomap->type == IOMAP_INLINE) {
+		struct ravenfs_inode_info *ri = RAVENFS_I(inode);
+
+		memcpy(r->inline_data, ri->inline_data, sizeof(r->inline_data));
+	}
+
+	/* 大小提交（实际写入量）；短写尾**不清算**（D-M4-10(b)，evict 再算） */
+	r->size = inode->i_size;
+
+	/* i_blocks 诚实化 */
+	ravenfs_write_update_blocks(sb, inode, r);
+
+	RFS_ROW_MARK_DIRTY(ses->row);
 	return 0;
 }
 

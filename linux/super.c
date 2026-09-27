@@ -497,11 +497,11 @@ static int ravenfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
 static const struct file_operations ravenfs_file_operations = {
 	.llseek		= generic_file_llseek,
 	.read_iter	= ravenfs_file_read_iter,		/* M4.1（自写壳 → generic_file_read_iter） */
+	.write_iter	= ravenfs_file_write_iter,		/* M4.2（自写壳 → iomap_file_buffered_write，立刻分配） */
 	.mmap_prepare	= generic_file_mmap_prepare,		/* M4.1：mmap 读/执行（D-M4-1） */
 	.splice_read	= filemap_splice_read,
 	.splice_write	= iter_file_splice_write,
 	.fsync		= ravenfs_fsync,
-	/* write_iter：M4.2（iomap_file_buffered_write） */
 };
 
 /* ═══════════════════════════════════════════════════════════════════
