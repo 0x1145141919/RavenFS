@@ -192,6 +192,7 @@ T0 ✅ ──► M3.5 ✅ ──► [M4 文件数据] ──┐
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-09-27 | 本文件从 handover 抽出，覆盖 **T0 → T1** | 用户：handover 腐坏快、排期腐坏慢 |
+| 2026-09-28（凌晨） | **🏁 里程碑：M5 起可上实体机灰测** —— M4（文件数据）/ M5（含残 link·symlink·mknod·tmpfile）/ M6（xattr·ACL·capability）**全绿**；**T3 完整安装 §2.1 8/8 PASS**（5.88G 克隆、`pacman -Qkk` 与 ext4 逐字一致、audit BAD=0、loader+initramfs 就绪）；**DKMS 包 `ravenfs-dkms` 起草**（内核更新自动重编 + mkinitcpio 注入 hook）。**T4 就绪未启动** | 用户：里程碑到达 |
 | 2026-09-27 | M4 路线 = **iomap**（`a_ops` 无 `write_begin/write_end`）；delalloc；O_DIRECT 后置 | `ravenfs-linux-ko-M4-data-spec.md`（D-M4-1..5）——**覆盖** handover §10.3 旧切分 |
 | 2026-09-27（晚） | M4 分配时机改 **立刻分配（强同步，非 delalloc）**；读粒度回退 **iomap 默认**（撤 64K 单元）；三态迁移 = inline 默认升格 extent（direct 仅收敛态） | 用户裁决 O-4/O-5/O-1（M4-data-spec §12） |
 | 2026-09-27（晚） | **M4.1 只读 ✅ 实测 PASS**（ko iomap 只读路径；guest 7.2.6；三态/>4K/稀疏洞/2 级树/ELF execve；audit BAD=0） | 提交 `791ad02`（码）+ `97bddbd`（测试资产） |
