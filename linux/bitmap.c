@@ -4,7 +4,7 @@
  *
  * 决议（2026-09-26 深夜，用户裁）：位图 = **全量常驻内存分片**（不做 bh + mark_buffer_dirty
  * 增量那套）；持久化 = 挂载装载、`sync_fs`/`put_super` **全量刷回**。
- * 移植规格：`Docs/linux/m3-port-notes.md` §A（god v1.1 → ko）。
+ * 移植规格：`Docs/linux/ravenfs-linux-ko-handover.md` §3.5（god `bitmap_slices` v1.1 → ko）。
  *
  * 设计：
  *   · 两组：block 组（块位图，1 bit/FS_block）与 inode 组（inode 位图，1 bit/槽）。

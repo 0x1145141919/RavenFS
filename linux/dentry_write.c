@@ -2,7 +2,8 @@
 /*
  * dentry_write.c —— dentry B+树**写入**：多级 walk + 叶插入/分裂 + 根升长 + 内裂 + hint 精确维护
  *
- * 规格：`Docs/linux/m5-dentry-tree-notes.md`（god `dentry_walk_lookup/dentry_split/dentry_insert_delete` 移植）。
+ * 规格：`Docs/linux/ravenfs-linux-ko-handover.md` §4（dentry B+树写入机械；原移植 notes 已折入该节）。
+ *   god 参考：`juvenile_god/dentry_walk_lookup/dentry_split/dentry_insert_delete`（v1.1 语义）。
  * 验收（audit 硬校验）：count ≤ 126；is_root/parent_ptr.ptr 正确；叶条目按 (hash,name) 严格递增；
  *   内 hint `hash_max` **精确等于**子树 max 且严格递增；叶链 = 中序（prev/next，两端哨兵 MASK52）；
  *   根节点 ptr = 目录 inode；全节点显式写 ptrs[]（0 是合法块号，禁当空）。
@@ -596,7 +597,7 @@ int ravenfs_ddentry_insert(struct super_block *sb, u64 dir_ino, const struct rfs
 
 /* ══════════════════════════════════════════════════════════════════
  * 删除路径（M5b）：叶条目删除 + hash_max 上溯 + 欠载平衡/合并/抹匀 + 根收缩
- * 规格：m5-dentry-tree-notes.md §C（god dentry_insert_delete / dentry_balance 移植）
+ * 规格：`Docs/linux/ravenfs-linux-ko-handover.md` §4（god dentry_insert_delete / dentry_balance 移植）
  * ══════════════════════════════════════════════════════════════════ */
 
 #define RFS_DENTRY_MIN	63u

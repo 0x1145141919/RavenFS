@@ -3,7 +3,7 @@
  * name_heap.c —— 长名（>40B）外置部分的 分配/释放/读写（v1.2 盘面 §7）
  *
  * 语义出处：god `juvenile_god/name_heap.cpp`（**逐式移植**，内核适配重写）。
- * 迁移规格：`Docs/linux/m3-port-notes.md` §C.3。
+ * 迁移规格：`Docs/linux/ravenfs-linux-ko-handover.md` §3.6。
  *
  * 结构：每目录 inode 内联 10 个 `name_heap_controller_t`（见 raven_dir_Inode_t）；
  *   档位级懒激活：激活 = **位图面 + 数据面**各一次连续分配（2^1 对齐 ⇒ mdata 8K 片成立）+ 位图面清零。

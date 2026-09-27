@@ -103,18 +103,21 @@
 | M2.5 | 自写 TTL 淘汰器（`cache_ttl.c`，2s，对齐 god）——**压力 shrinker 已移除**，TTL 为唯一冷集淘汰 | ✅ |
 | M2.5b | 行缓冲改**伙伴系统页**（`order=log2(row/4K)`，直映射访问，淘汰归还）；**分片锁重入死锁根治**（锁外分配+I/O） | ✅ 实测 |
 | **T0** | mkfs + 只读挂载 + `audit_v1.2` 全绿 | **✅ 达成** |
-| M3 | 元数据写路径：`write_inode` 落盘 + `mark_inode_dirty` 绑定 / `sync_fs`→`flush_all` / `fsync` / dirty 回写 / **位图持久化（全量内存分片 + 全量刷回）** / 取消强制 RO + **最小写操作**（create/unlink） | **下一步** |
-| M3.5 | 一致性/崩溃窗口验証（写序 + 非干净卸载后 audit） | 待 M3 |
-| M4 | 文件数据：`a_ops` + extent 树对接 + truncate/punch/fallocate + `i_blocks` 更新 | 待 M3 |
-| M5 | 命名空间全量：mkdir/rmdir/link/symlink(`get_link`)/rename/mknod/tmpfile + **dentry 分裂与叶链维护** | 待 M3（T1 缺口主源） |
-| M6 | xattr/ACL：4 回调 + `SB_POSIXACL` + `posix_acl_create` + `security.capability` | 待 M3/M5 |
-| M7 | 加固：停机标志（`RFS_SHUTDOWN`）/ 并发（回写·evict·sync vs 前台）/ fsync 全覆盖 / ENOSPC 干净（~~node_latch~~ 已裁不做） | 待 M3–M6 |
+| M3.1/M3.2 | 双位图分片分配器 / 写回路径（`write_inode` 行同步 + `flush_all` 落盘 + `sync_fs`/`fsync`） | ✅ |
+| M3 | 元数据写路径：取消强制 RO（rw 挂载）+ `create(REG,inline)`/`unlink` + 位图持久化（全量内存分片+全量刷回） | ✅ 实测 |
+| M3.5 | 一致性/崩溃窗口验证（写序 + 非干净卸载后 audit） | 待做 |
+| M4 | 文件数据：`a_ops` + extent 树对接 + truncate/punch/fallocate + `i_blocks` 更新 + **`setattr`** | **下一步** |
+| M5a/M5b | dentry 树写入机构（多级 walk + 叶裂/升根/内裂 + 合并/抹匀/根收缩） | ✅ `716e372`/`678a983` |
+| M5 | mkdir/rmdir + `dir_name_heap_release` + rename(replace/NOREPLACE/EXCHANGE + 跨目录) + 名字堆 5 组精准压测 | ✅ `8d745ae`/`612626a`/`7447eea`/`c50a1e8` |
+| M5残 | link / symlink(`get_link`) / mknod / tmpfile | 待做 |
+| M6 | xattr/ACL：4 回调 + `SB_POSIXACL` + `posix_acl_create` + `security.capability` | 待 M5残 |
+| M7 | 加固：停机标志（`RFS_SHUTDOWN`）/ 周期回写 / 并发（回写·evict·sync vs 前台）/ fsync 全覆盖 / ENOSPC 干净（~~node_latch~~ 已裁不做） | 待 |
 | M8 | 预演最狠测试：`rsync -aHAX` 克隆 + `pacman -Qkk`（T3 前哨） | 待 M4+M5+M6 |
 | T1 | xfstests `-g quick`（generic） → **缺口表**（前置：xfstests 工具链进 guest 尚未解决） | 待 M3–M7 |
 | T1.5 | 按缺口表逐条补 spec §4 的 **M** 项，重跑 T1 至收敛 | 待 T1 |
 | T2 | 压力：`fsx`/`fsstress`/`fs_mark`，**每轮 audit** | 待 T1.5 |
 
-> **子阶段的目标/出口判据/依赖/需求映射**详见交接文档 `ravenfs-linux-ko-handover.md` **§6 里程碑路线图**。
+> **子阶段的目标/出口判据/依赖/需求映射 + 缺口分析**详见交接文档 `ravenfs-linux-ko-handover.md` **§6 缺口分析 / §7 路线图**。
 
 **工具链（host 侧）**：`mkfs/mkfs.ravenfs`（v1.2，root inode=16）· `tools/audit_v1.2/`：`audit_v1.2`（递归只读校验 + 叶链校验）· `mkcontent` / `mkbigdir`（内容/大目录靶子）· `dents_dump`（getdents64 小缓冲续读压测）· `linux/tools/check_super.py`（SB 快速校验）。
 
