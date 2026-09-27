@@ -37,8 +37,8 @@
 | **T0** | 静态：mkfs 产物 → 只读挂载 → audit 全绿 | 不变量 §10 + v1.2 §7 零违例 | — | — | — | ✅ (2026-09-26) |
 | **M3.5** | 一致性/崩溃窗口（写序 + 非干净卸载后 audit） | flush **之外**崩溃不产生损坏（A/B）；flush 中途 dangling = 设计特性（不修） | M3 | R-SY-04/05/07 | G11 | ✅ (2026-09-27) |
 | **M4** | **文件数据**：a_ops + extent 树 + 三态迁移 + truncate/punch/fallocate + **setattr** | `dd/cat/head` 往返一致（跨态 / >4K / 稀疏洞）；`stat.blocks` 吻合；audit 全绿 | M3 | R-FD-01..10、R-MD-01..06、R-SY-04 | G1、G2 | 🔶 **M4.1–M4.4 ✅（2026-09-27）**；M4.5 待做 |
-| **M5 残** | `link` / `symlink`+`get_link` / `mknod` / `tmpfile` | `ln`/`ln -s`/`readlink`/`mknod` 往返；大目录分裂后 `dents_dump` 仍 DUP=0 MISSING=0；audit `chain_bad=0` | M5 | R-NS-05/06/07/09 | G3、G4、G5、G6 | ⬜ |
-| **M6** | **xattr / ACL / capability**：4 回调 + `SB_POSIXACL` + 默认 ACL 继承 + `security.capability`；xattr 块 alloc/free | `setfattr`/`setfacl`/`setcap` 往返；**`rsync -aHAX` 保留 ACL+xattr**；audit xattr 校验通过 | M3、M5 | R-XA-01..04、R-NS-12 | G7、G8、G9 | ⬜ |
+| **M5 残** | `link` / `symlink`+`get_link` / `mknod` / `tmpfile` | `ln`/`ln -s`/`readlink`/`mknod` 往返；大目录分裂后 `dents_dump` 仍 DUP=0 MISSING=0；audit `chain_bad=0` | M5 | R-NS-05/06/07/09 | G3、G4、G5、G6 | ⬜ **必做（非可选）**：`symlink`+`get_link` = `ld.so`/`/sbin` 等 **T3 前置**；`tmpfile`（`O_TMPFILE`）= `journald`；`link` = pacman/rsync 硬链接；`mknod` = 设备节点 |
+| **M6** | **xattr / ACL / capability**：4 回调 + `SB_POSIXACL` + 默认 ACL 继承 + `security.capability`；xattr 块 alloc/free | `setfattr`/`setfacl`/`setcap` 往返；**`rsync -aHAX` 保留 ACL+xattr**；audit xattr 校验通过 | M3、M5 | R-XA-01..04、R-NS-12 | G7、G8、G9 | ⬜ **测试驱动**：范围由 **M8 `rsync -aHAX` 探针**结果决定（保真→缩水/延后；丢 ACL/xattr 或 `setcap` 失效→必须做全） |
 | **M7** | **加固**：停机标志 / 周期回写 / 并发面 / `fsync` 全覆盖 / ENOSPC 干净 | `fsstress` 小规模不炸；`drop_caches` + 并发读写下 audit 仍绿；注入不一致后入口返 `-EIO` | M3–G9 | R-LM-09、R-CO-02/04、R-SY-05 | G10 | ⬜ |
 | **M8** | **预演最狠测试**：`rsync -aHAX` ext4→ravenfs 克隆 + `pacman -Qkk`（T3 前哨） | 克隆零致命错误 + `pacman -Qkk` 元数据全对 | M4 + M5 + M6 | （T3 前置） | G12 | ⬜ |
 | **T1** | **xfstests `./check -g quick`（generic 组）** | **产出失败清单 = 第一约束缺口表**（区分 fail / skip） | M3–M7 | — | G13 | ⬜ |
@@ -108,6 +108,7 @@ T0 ✅ ──► M3.5 ✅ ──► [M4 文件数据] ──┐
 - **G4 `symlink` + `get_link`**：短名内联；**T3 前置**（`ld.so`/`/sbin` 依赖 `readlink`）。
 - **G5 `mknod`**：4 型（FIFO/CHR/BLK/SOCK）；CHR/BLK 写 `inline_data[0:4]=rdev`。
 - **G6 `tmpfile`**：`O_TMPFILE`（journald 用）；**依赖 M4 数据路径**。
+- **定位（2026-09-27，用户定）**：**必做、非可选**——`symlink`/`get_link` 是 **T3（启动）硬前置**（`ld.so` 解析全部 `.so`）；`tmpfile` = `journald`；`link`/`mknod` = 安装/运行所需。**不得当可跳项。**
 
 判据：`ln`/`ln -s`/`readlink`/`mknod` 往返；大目录分裂后 `dents_dump` 仍 DUP=0 MISSING=0；audit `chain_bad=0`。
 
@@ -116,6 +117,7 @@ T0 ✅ ──► M3.5 ✅ ──► [M4 文件数据] ──┐
 - **G7 xattr 四回调**：`.getxattr/.setxattr/.listxattr/.removexattr` + `xattr_handler`；xattr 块 alloc/free（bitmap 认领）。
 - **G8 ACL**：`SB_POSIXACL` + `.get_inode_acl/.set_acl` + `posix_acl_create`（默认 ACL 继承）。
 - **G9 capability**：经 xattr 的 `security.capability`。
+- **定位（2026-09-27，用户定）**：**测试驱动**——必要性由 **M8 的 `rsync -aHAX` 探针**判定；探针**不丢** ACL/xattr 则可缩水/延后，**丢了**（或 `setcap` 失效）则**必须做全**（`pacman` 的 `security.capability`、`setfacl` 都靠它）。
 
 判据：`setfattr`/`setfacl`/`setcap` 往返；**`rsync -aHAX` 保留 ACL+xattr**；audit xattr 校验通过。
 
@@ -196,3 +198,4 @@ T0 ✅ ──► M3.5 ✅ ──► [M4 文件数据] ──┐
 | 2026-09-27（晚） | **M4.2 写 ✅ 第一版实测 PASS**（立刻分配 + extent 插入树/叶裂/升根 + inline/direct→extent 迁移 + i_blocks + writepages；7 写场景/IBLK/HOLE/churn/audit BAD=0） | 提交 `e61c398`（码）+ `d8f86c1`（测试资产） |
 | 2026-09-27（晚） | **M4.3 ✅ 实测 PASS**（O-14 inline 可写 mmap + extent loose/平衡/root_shrink+旧根延迟free + fallocate + truncate/setattr；逐接口 + 350-extent 压力 + audit BAD=0） | 提交 `1735552`（码）+ `440961d`（测试资产） |
 | 2026-09-27（晚） | **M4.4 ✅ 实测 PASS**（setattr 全属性 + 补 `file_update_time`/`fileattr EOPNOTSUPP`/EXCHANGE 时间戳；chmod 4755/2755/1777+chown+touch -d+truncate+remount 保留+chattr 拒；audit BAD=0） | 提交 `01a6a1a`（码） |
+| 2026-09-27（晚） | **M5残 标「必做（非可选）」**（symlink=T3 前置 / tmpfile=journald / link·mknod=安装）；**M6 标「测试驱动」**（范围由 M8 `rsync -aHAX` 探针决定） | 用户：别把 M5残 当可跳、M6 由测试定 |
