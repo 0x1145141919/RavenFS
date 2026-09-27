@@ -80,6 +80,10 @@ struct ravenfs_sb_info {
 
 struct ravenfs_inode_info {
 	struct inode		vfs_inode;	/* 骨架：盘记录归 mgr（§4.11.1）；此处仅备将来私有字段 */
+	/* M4.1：REG/SYM inline 态（size ≤ 160）数据镜像。
+	 * iomap->inline_data 须在 iomap_begin 返回后持续有效，而盘记录位于会随会话
+	 * 释放的缓存行中 → 在此留稳定副本（iomap.c 在 inline 分支拷贝）。 */
+	u8			inline_data[160];
 };
 
 static inline struct ravenfs_inode_info *RAVENFS_I(struct inode *inode)
@@ -167,6 +171,12 @@ int ravenfs_ddentry_delete(struct super_block *sb, u64 dir_ino, const struct rfs
 
 struct inode *ravenfs_iget(struct super_block *sb, u64 inum);
 int ravenfs_read_node(struct super_block *sb, u64 blk, void *buf);
+
+/* ── M4.1 只读数据路径（iomap.c / file.c） ── */
+struct iomap_ops;
+extern const struct iomap_ops ravenfs_iomap_ops;
+extern const struct address_space_operations ravenfs_aops;
+ssize_t ravenfs_file_read_iter(struct kiocb *iocb, struct iov_iter *iter);
 
 /* ── disk_inode_cache_mgr（§4.11.1 + M2.2 行尺寸解耦）── */
 #define RAVENFS_SHARD_SEL_BITS	7	/* 分片选择位宽：≤128 片（>4096 inode 时生效） */

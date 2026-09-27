@@ -242,6 +242,9 @@ static int ravenfs_read_inode(struct inode *inode)
 	case INODE_TYPE_SOFT_SYM:
 		inode->i_op = &ravenfs_file_inode_operations;
 		inode->i_fop = &ravenfs_file_operations;
+		/* M4.1：REG 数据路径走 iomap a_ops（mmap/read_folio 前置，D-M4-1） */
+		if (type == INODE_TYPE_REGULAR)
+			inode->i_data.a_ops = &ravenfs_aops;
 		break;
 	case INODE_TYPE_CHR:
 	case INODE_TYPE_BLK: {
@@ -493,8 +496,12 @@ static int ravenfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
 
 static const struct file_operations ravenfs_file_operations = {
 	.llseek		= generic_file_llseek,
+	.read_iter	= ravenfs_file_read_iter,		/* M4.1（自写壳 → generic_file_read_iter） */
+	.mmap_prepare	= generic_file_mmap_prepare,		/* M4.1：mmap 读/执行（D-M4-1） */
+	.splice_read	= filemap_splice_read,
+	.splice_write	= iter_file_splice_write,
 	.fsync		= ravenfs_fsync,
-	/* read_iter/write_iter/mmap：M4（需 a_ops 落点） */
+	/* write_iter：M4.2（iomap_file_buffered_write） */
 };
 
 /* ═══════════════════════════════════════════════════════════════════
