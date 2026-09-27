@@ -197,12 +197,12 @@
 | R-FD-04 | `fsync`/`fdatasync`：真持久 + 回报错误 | A: ext2 `ext2_fsync` | **M** | `filemap_write_and_wait_range` + 元数据落盘 | ❌ |
 | R-FD-05 | `splice_read`/`splice_write` | A: ext2 表 | **M** | `filemap_splice_read` / `iter_file_splice_write` | ⚠️ 借用 |
 | R-FD-06 | `copy_file_range`：缺省回退读写循环 | A: `fs/read_write.c` | C | 不实现即回退 | ✅ |
-| R-FD-07 | `fallocate`（**普通预分配**，`FALLOC_FL_KEEP_SIZE`）：`journald` 预分配 | A: 纲领 §1-B；ext4/btrfs | **M** | `.fallocate` + god 占位分配 | ❌ **缺口** |
+| R-FD-07 | `fallocate`（**普通预分配**，`flags==0`，**会抬 `size`**） | A: 纲领 §1-B；ext4/btrfs | **M** | `.fallocate` + god 占位分配；**`FALLOC_FL_KEEP_SIZE`（纯预留、不抬 size）→ `-EOPNOTSUPP`**（2026-09-27 裁决，见 `…M4-data-spec.md` D-M4-11；journald 走 `posix_fallocate` 不带此位） | ❌ **缺口** |
 | R-FD-08 | `punch hole`（`FALLOC_FL_PUNCH_HOLE`）/`ZERO_RANGE` | A: 纲领 §1-B | **M** | god `direct_file_punch_hole` | ⚠️ god 有，无 VFS 钩 |
 | R-FD-09 | 稀疏：未分配读返 0；打洞要有（`SEEK_DATA/HOLE` 可降级） | A: 不变量 22–24 | **M** | 三态 + 洞 | ✅（god 层） |
 | R-FD-10 | `direct_IO`（`O_DIRECT`）：可降级 | A: ext2 无 | C | **无 `a_ops->direct_IO` → `open(O_DIRECT)` 直接 `-EINVAL`**（非 `-EOPNOTSUPP`，且**不经过 write**；`fs/open.c:960/968`）；M4 后置 C 真兑现（`…M4-data-spec.md` §7.4） | ✅ |
 
-> **注 R-FD-07**：`fallocate` 与「占位分配是 direct 全覆盖表示的物理义务」（不变量 24）**天然契合**——god 已有，缺 VFS 钩 + `KEEP_SIZE` 交互。**优先级 M、成本低。**
+> **注 R-FD-07**：`fallocate` 与「占位分配是 direct 全覆盖表示的物理义务」（不变量 24）**天然契合**——god 已有，缺 VFS 钩。**只受理 `flags==0`**（抬 `size` 的普通预分配）；`FALLOC_FL_KEEP_SIZE`（纯预留、不抬 size）→ `-EOPNOTSUPP`（第二约束「降级」；`PUNCH_HOLE\|KEEP_SIZE` / `ZERO_RANGE` **例外照收**）。**优先级 M、成本低。**
 
 ### 4.5 MD — 元数据与属性
 
