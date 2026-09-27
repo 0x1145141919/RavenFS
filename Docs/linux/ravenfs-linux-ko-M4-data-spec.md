@@ -297,7 +297,7 @@ mmap      → filemap_fault → a_ops->read_folio ──────────
 | **M4.1 只读** | `a_ops.read_folio/readahead`（**iomap 默认**，D-M4-7）+ `read_iter` + `mmap` | guest `dd/cat/head` 往返一致（三态 / >4K / 稀疏洞）；mmap 读/执行通 —— ✅ **2026-09-27 通过**（提交 `791ad02`；验收 `Docs/linux/ravenfs-linux-ko-M4.1-acceptance.md`） |
 | **M4.2 写数据** | `write_iter` + `iomap_begin(WRITE)` **立刻分配（D-M4-6）** + extent 树移植 + 三态迁移（inline→extent 默认，D-M4-8）+ `i_blocks` | `dd` 写→读往返；`stat.blocks` 吻合；audit 全绿 —— ✅ **2026-09-27 通过**（提交 `e61c398`；验收 `Docs/linux/ravenfs-linux-ko-M4.2-acceptance.md`；已知缺口见 §12 O-13） |
 | **M4.3 truncate/punch/fallocate** | 按 `punch_truncate_pread_spec.md` | spec §8 矩阵 —— ✅ **2026-09-27 通过**（提交 `1735552`；验收 `Docs/linux/ravenfs-linux-ko-M4.3-acceptance.md`；O-14 inline mmap 一并闭环；缺口见 §12 O-15/O-16） |
-| **M4.4 setattr + 时间戳** | `inode_operations.setattr`；时间戳走 generic | `chmod/chown/utimes/truncate` |
+| **M4.4 setattr + 时间戳** | `inode_operations.setattr`；时间戳走 generic | `chmod/chown/utimes/truncate` —— ✅ **2026-09-27 通过**（提交 `01a6a1a`；补 `file_update_time`/`fileattr EOPNOTSUPP`/EXCHANGE 时间戳） |
 | **M4.5 收尾** | `fsync` 落数据 / 写序（**经典形态**，§8）/ `root_shrink` 延迟 free | `sync` 往返 + 崩溃窗口（§8 / handover §6.1 设计特性） |
 | ~~O_DIRECT（C）~~ | **后置独立里程碑**（D-M4-5，M4 不做） | — |
 
