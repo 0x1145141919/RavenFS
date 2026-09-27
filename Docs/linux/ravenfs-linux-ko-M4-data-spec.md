@@ -28,6 +28,7 @@
 | **D-M4-12** | **`mmap` 写必须立刻分配（`page_mkwrite`）** | **已决+已落（2026-09-27，O-13=(a)）** | `vm_ops.page_mkwrite = ravenfs_filemap_page_mkwrite → iomap_page_mkwrite(vmf, &ravenfs_iomap_ops, NULL)`；`iomap_begin` 收 `IOMAP_WRITE\|IOMAP_FAULT` 时**立刻分配**（与 `write()` 同源）。堵住「mmap 洞写静默丢数据」。**M4.2 内补**（**不**推迟到 M4.3；**不**设拒写护栏）。**✅ 已落（提交 `f23b933`；guest mmap 洞写→msync→逐出读回→remount 实测 PASS）** |
 | **D-M4-13** | **碎片化：暂接受为特性** | **已决（2026-09-27，用户）** | 「**能跑是第一要务**」；M4.2 不做合并/删除 → 随机写会碎片化，**暂当 feature**。**后续学习方向**：在 Linux 规则（分配器/位图/写回）下压低碎片（occupy 尾延展 / 批量连续分配 / 融合 / 重建） |
 | **D-M4-14** | **inline 可写 mmap：回灌 `inline_data`（不升格、不静默丢）** | **已决（2026-09-27，O-14=(a)；M4.3 首项）** | 行为规范：mmap 写**不改 size**；`[0,size)` 内字节**持久化到 `inline_data`**；**超出 size 的字节按 Linux 常规刻意静默丢弃**（不报错、**不升格** inline→extent）；**不得**再让 `msync` 返 `EIO` |
+| **D-M4-15** | **`fsync`/`fdatasync` = 定向刷（非卷级）** | **已决（2026-09-27，M4.5 暴露语义分歧）** | `fsync(file)` 只保**该 inode**：脏数据 + 元数据（inode 行 + 该树脏 mdata 节点）+ 相关位图 + **阶段 `blkdev_issue_flush` 屏障**；**不做卷级全盘刷**（卷级 = `sync_fs`/`syncfs`）。**durable-create 归调用方 `fsync(dir)`**（POSIX；R-FD-04/R-SY-01）⇒ **非 ko 缺口** |
 | **D-M4-5** | **O_DIRECT（C 真兑现）后置** | 范围（**已决**，见 §7.4） | god 的 `pwrite_pipeline` 复杂度已致恶心；M4 不碰直写，放最后/独立里程碑 |
 | **路线** | **走 iomap** | 框架选择 | 取代 buffer_head/`generic_perform_write` 路线（E1「缓存/IO 下沉 Linux」的现代落地） |
 
@@ -298,7 +299,7 @@ mmap      → filemap_fault → a_ops->read_folio ──────────
 | **M4.2 写数据** | `write_iter` + `iomap_begin(WRITE)` **立刻分配（D-M4-6）** + extent 树移植 + 三态迁移（inline→extent 默认，D-M4-8）+ `i_blocks` | `dd` 写→读往返；`stat.blocks` 吻合；audit 全绿 —— ✅ **2026-09-27 通过**（提交 `e61c398`；验收 `Docs/linux/ravenfs-linux-ko-M4.2-acceptance.md`；已知缺口见 §12 O-13） |
 | **M4.3 truncate/punch/fallocate** | 按 `punch_truncate_pread_spec.md` | spec §8 矩阵 —— ✅ **2026-09-27 通过**（提交 `1735552`；验收 `Docs/linux/ravenfs-linux-ko-M4.3-acceptance.md`；O-14 inline mmap 一并闭环；缺口见 §12 O-15/O-16） |
 | **M4.4 setattr + 时间戳** | `inode_operations.setattr`；时间戳走 generic | `chmod/chown/utimes/truncate` —— ✅ **2026-09-27 通过**（提交 `01a6a1a`；补 `file_update_time`/`fileattr EOPNOTSUPP`/EXCHANGE 时间戳） |
-| **M4.5 收尾** | `fsync` 落数据 / 写序（**经典形态**，§8）/ `root_shrink` 延迟 free | `sync` 往返 + 崩溃窗口（§8 / handover §6.1 设计特性） |
+| **M4.5 收尾** | `fsync` 落数据 / 写序（**经典形态**，§8）/ `root_shrink` 延迟 free | `sync` 往返 + 崩溃窗口（§8 / handover §6.1 设计特性）—— ✅ **2026-09-27 通过**（提交 `ddc5f6b`；fsync 定向+屏障、`RFS_SHUTDOWN`、CrA/B/C 崩溃矩阵、深层树平衡） |
 | ~~O_DIRECT（C）~~ | **后置独立里程碑**（D-M4-5，M4 不做） | — |
 
 ---

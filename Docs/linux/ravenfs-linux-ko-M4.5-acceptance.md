@@ -56,7 +56,8 @@
 | `syncfs(pipe)` | 内核相关（7.2.x 实测 `0`）—— **仅记录，不断言** | VFS |
 
 > **注**：`fsync/syncfs` 的**真持久**判据在 C2/C3/C6（崩溃后读回），errno 表只验**错误回报面**。
-> **注**：`fsync` 需落到 **`sync_fs`（卷级）+ 单 inode 落盘**；`fsync` 返回即代表「数据 + 元数据 + 位图」落盘（R-SY-03/05）。
+> **注（2026-09-27 裁决订正 D-M4-15）**：`fsync(file)` = **定向**——该 inode 脏数据（`filemap_write_and_wait_range`）+ 其元数据（inode 行 + 该 inode 树上的脏 mdata 节点）+ 相关位图 + **阶段 `blkdev_issue_flush` 屏障**；**不做卷级全盘刷**（卷级是 `sync_fs`/`syncfs` 的职责）。
+> **durable-create（新建文件的目录项）由调用方 `fsync(dir)` 负责**（POSIX 惯例：目录项不在文件自身 `fsync` 的保证内）——**非 ko 缺口**（同 R-FD-04/R-SY-01）。
 >   M4 前实测已知：`fsync` 只落元数据不落数据（handover §6/G10）——**M4.5 须闭环**（否则 C2 前缀必挂）。
 
 ---

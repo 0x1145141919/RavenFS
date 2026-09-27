@@ -36,8 +36,8 @@
 |---|---|---|---|---|---|---|
 | **T0** | 静态：mkfs 产物 → 只读挂载 → audit 全绿 | 不变量 §10 + v1.2 §7 零违例 | — | — | — | ✅ (2026-09-26) |
 | **M3.5** | 一致性/崩溃窗口（写序 + 非干净卸载后 audit） | flush **之外**崩溃不产生损坏（A/B）；flush 中途 dangling = 设计特性（不修） | M3 | R-SY-04/05/07 | G11 | ✅ (2026-09-27) |
-| **M4** | **文件数据**：a_ops + extent 树 + 三态迁移 + truncate/punch/fallocate + **setattr** | `dd/cat/head` 往返一致（跨态 / >4K / 稀疏洞）；`stat.blocks` 吻合；audit 全绿 | M3 | R-FD-01..10、R-MD-01..06、R-SY-04 | G1、G2 | 🔶 **M4.1–M4.4 ✅（2026-09-27）**；M4.5 待做 |
-| **M5 残** | `link` / `symlink`+`get_link` / `mknod` / `tmpfile` | `ln`/`ln -s`/`readlink`/`mknod` 往返；大目录分裂后 `dents_dump` 仍 DUP=0 MISSING=0；audit `chain_bad=0` | M5 | R-NS-05/06/07/09 | G3、G4、G5、G6 | ⬜ **必做（非可选）**：`symlink`+`get_link` = `ld.so`/`/sbin` 等 **T3 前置**；`tmpfile`（`O_TMPFILE`）= `journald`；`link` = pacman/rsync 硬链接；`mknod` = 设备节点 |
+| **M4** | **文件数据**：a_ops + extent 树 + 三态迁移 + truncate/punch/fallocate + **setattr** | `dd/cat/head` 往返一致（跨态 / >4K / 稀疏洞）；`stat.blocks` 吻合；audit 全绿 | M3 | R-FD-01..10、R-MD-01..06、R-SY-04 | G1、G2 | ✅ **M4.1–M4.5 全绿（2026-09-27）** |
+| **M5 残** | `link` / `symlink`+`get_link` / `mknod` / `tmpfile` | `ln`/`ln -s`/`readlink`/`mknod` 往返；大目录分裂后 `dents_dump` 仍 DUP=0 MISSING=0；audit `chain_bad=0` | M5 | R-NS-05/06/07/09 | G3、G4、G5、G6 | 🔶 **代码 ✅ `5791e9a`（host make 绿）；guest 往返待验**（必做、非可选：symlink=T3 前置 / tmpfile=journald / link·mknod=安装） |
 | **M6** | **xattr / ACL / capability**：4 回调 + `SB_POSIXACL` + 默认 ACL 继承 + `security.capability`；xattr 块 alloc/free | `setfattr`/`setfacl`/`setcap` 往返；**`rsync -aHAX` 保留 ACL+xattr**；audit xattr 校验通过 | M3、M5 | R-XA-01..04、R-NS-12 | G7、G8、G9 | ⬜ **测试驱动**：范围由 **M8 `rsync -aHAX` 探针**结果决定（保真→缩水/延后；丢 ACL/xattr 或 `setcap` 失效→必须做全） |
 | **M7** | **加固**：停机标志 / 周期回写 / 并发面 / `fsync` 全覆盖 / ENOSPC 干净 | `fsstress` 小规模不炸；`drop_caches` + 并发读写下 audit 仍绿；注入不一致后入口返 `-EIO` | M3–G9 | R-LM-09、R-CO-02/04、R-SY-05 | G10 | ⬜ |
 | **M8** | **预演最狠测试**：`rsync -aHAX` ext4→ravenfs 克隆 + `pacman -Qkk`（T3 前哨） | 克隆零致命错误 + `pacman -Qkk` 元数据全对 | M4 + M5 + M6 | （T3 前置） | G12 | ⬜ |
@@ -96,7 +96,7 @@ T0 ✅ ──► M3.5 ✅ ──► [M4 文件数据] ──┐
 | **M4.2 写数据** | `write_iter` + `iomap_begin(WRITE)` **立刻分配（D-M4-6）** + extent 树插入（insert/叶裂/升根）+ 三态迁移（inline→extent 默认，D-M4-8）+ `i_blocks` | `dd` 写→读往返；`stat.blocks` 吻合；audit 全绿 —— ✅ **2026-09-27 PASS**（7 写场景/IBLK/HOLE/churn/audit BAD=0；已知缺口：mmap 洞写、无合并删除） |
 | **M4.3 truncate/punch/fallocate** | 按 `Docs/punch_truncate_pread_spec.md`（形态×操作矩阵、KEEP_SIZE、≤160 强制回迁 inline、出口坍缩） | spec §8 矩阵全过 —— ✅ **2026-09-27 PASS**（punch/truncate/fallocate 逐接口 + 平衡压力 350 extent + audit BAD=0；含 O-14 inline mmap） |
 | **M4.4 setattr + 时间戳** | `inode_operations.setattr`（`setattr_prepare` + size→truncate + `setattr_copy`）；时间戳走 generic + `write_inode` 落盘 | `chmod/chown/utimes/truncate` 往返一致 —— ✅ **2026-09-27 PASS**（含 suid/sgid/sticky + remount 保留 + chattr 拒） |
-| **M4.5 收尾** | `fsync` 落数据；写序（**经典形态**）；`extent_root_shrink` 旧根延迟 free | `sync` 往返 + 崩溃窗口符合 §8 设计特性 |
+| **M4.5 收尾** | `fsync` 落数据；写序（**经典形态**）；`extent_root_shrink` 旧根延迟 free | `sync` 往返 + 崩溃窗口符合 §8 设计特性 —— ✅ **2026-09-27 PASS**（fsync 定向+`blkdev_issue_flush` 屏障 + `RFS_SHUTDOWN`；CrA/B/C sysrq-b 后 audit BAD=0；深层树 342→337 合并/root_shrink） |
 
 **M4 开工前必须处理的既有缺口**（否则必踩）：见 handover §10.4（`extent_root_shrink` 旧根 free 时序 / 写序不变量 25 / `i_blocks` 口径 / readonly 写拒绝接线）。
 
@@ -199,3 +199,5 @@ T0 ✅ ──► M3.5 ✅ ──► [M4 文件数据] ──┐
 | 2026-09-27（晚） | **M4.3 ✅ 实测 PASS**（O-14 inline 可写 mmap + extent loose/平衡/root_shrink+旧根延迟free + fallocate + truncate/setattr；逐接口 + 350-extent 压力 + audit BAD=0） | 提交 `1735552`（码）+ `440961d`（测试资产） |
 | 2026-09-27（晚） | **M4.4 ✅ 实测 PASS**（setattr 全属性 + 补 `file_update_time`/`fileattr EOPNOTSUPP`/EXCHANGE 时间戳；chmod 4755/2755/1777+chown+touch -d+truncate+remount 保留+chattr 拒；audit BAD=0） | 提交 `01a6a1a`（码） |
 | 2026-09-27（晚） | **M5残 标「必做（非可选）」**（symlink=T3 前置 / tmpfile=journald / link·mknod=安装）；**M6 标「测试驱动」**（范围由 M8 `rsync -aHAX` 探针决定） | 用户：别把 M5残 当可跳、M6 由测试定 |
+| 2026-09-27（晚） | **M4.5 ✅ 实测 PASS**（fsync 定向 + `blkdev_issue_flush` 屏障 + `RFS_SHUTDOWN`；CrA/B/C 崩溃矩阵 + 深层树平衡；audit BAD=0） | 提交 `ddc5f6b`（码）+ `164ba78`（靶场）；裁判：fsync 定向（非卷级），durable-create 归调用方 `fsync(dir)` → **D-M4-15** |
+| 2026-09-27（晚） | **M5残 代码 ✅**（link/symlink+get_link/mknod/tmpfile，host make 绿）；**guest 往返待验** | 提交 `5791e9a`（码） |
