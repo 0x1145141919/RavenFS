@@ -290,7 +290,7 @@ mmap      → filemap_fault → a_ops->read_folio ──────────
 
 | 步 | 内容 | 判据 |
 |---|---|---|
-| **M4.1 只读** | `a_ops.read_folio/readahead`（**iomap 默认**，D-M4-7）+ `read_iter` + `mmap` | guest `dd/cat/head` 往返一致（三态 / >4K / 稀疏洞）；mmap 读/执行通 |
+| **M4.1 只读** | `a_ops.read_folio/readahead`（**iomap 默认**，D-M4-7）+ `read_iter` + `mmap` | guest `dd/cat/head` 往返一致（三态 / >4K / 稀疏洞）；mmap 读/执行通 —— ✅ **2026-09-27 通过**（提交 `791ad02`；验收 `Docs/linux/ravenfs-linux-ko-M4.1-acceptance.md`） |
 | **M4.2 写数据** | `write_iter` + `iomap_begin(WRITE)` **立刻分配（D-M4-6）** + extent 树移植 + 三态迁移（inline→extent 默认，D-M4-8）+ `i_blocks` | `dd` 写→读往返；`stat.blocks` 吻合；audit 全绿 |
 | **M4.3 truncate/punch/fallocate** | 按 `punch_truncate_pread_spec.md` | spec §8 矩阵 |
 | **M4.4 setattr + 时间戳** | `inode_operations.setattr`；时间戳走 generic | `chmod/chown/utimes/truncate` |

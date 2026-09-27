@@ -36,7 +36,7 @@
 |---|---|---|---|---|---|---|
 | **T0** | 静态：mkfs 产物 → 只读挂载 → audit 全绿 | 不变量 §10 + v1.2 §7 零违例 | — | — | — | ✅ (2026-09-26) |
 | **M3.5** | 一致性/崩溃窗口（写序 + 非干净卸载后 audit） | flush **之外**崩溃不产生损坏（A/B）；flush 中途 dangling = 设计特性（不修） | M3 | R-SY-04/05/07 | G11 | ✅ (2026-09-27) |
-| **M4** | **文件数据**：a_ops + extent 树 + 三态迁移 + truncate/punch/fallocate + **setattr** | `dd/cat/head` 往返一致（跨态 / >4K / 稀疏洞）；`stat.blocks` 吻合；audit 全绿 | M3 | R-FD-01..10、R-MD-01..06、R-SY-04 | G1、G2 | ⬜ **下一步** |
+| **M4** | **文件数据**：a_ops + extent 树 + 三态迁移 + truncate/punch/fallocate + **setattr** | `dd/cat/head` 往返一致（跨态 / >4K / 稀疏洞）；`stat.blocks` 吻合；audit 全绿 | M3 | R-FD-01..10、R-MD-01..06、R-SY-04 | G1、G2 | 🔶 **M4.1 只读 ✅ (2026-09-27)**；M4.2–M4.5 待做 |
 | **M5 残** | `link` / `symlink`+`get_link` / `mknod` / `tmpfile` | `ln`/`ln -s`/`readlink`/`mknod` 往返；大目录分裂后 `dents_dump` 仍 DUP=0 MISSING=0；audit `chain_bad=0` | M5 | R-NS-05/06/07/09 | G3、G4、G5、G6 | ⬜ |
 | **M6** | **xattr / ACL / capability**：4 回调 + `SB_POSIXACL` + 默认 ACL 继承 + `security.capability`；xattr 块 alloc/free | `setfattr`/`setfacl`/`setcap` 往返；**`rsync -aHAX` 保留 ACL+xattr**；audit xattr 校验通过 | M3、M5 | R-XA-01..04、R-NS-12 | G7、G8、G9 | ⬜ |
 | **M7** | **加固**：停机标志 / 周期回写 / 并发面 / `fsync` 全覆盖 / ENOSPC 干净 | `fsstress` 小规模不炸；`drop_caches` + 并发读写下 audit 仍绿；注入不一致后入口返 `-EIO` | M3–G9 | R-LM-09、R-CO-02/04、R-SY-05 | G10 | ⬜ |
@@ -92,7 +92,7 @@ T0 ✅ ──► M3.5 ✅ ──► [M4 文件数据] ──┐
 
 | 子阶段 | 内容 | 出口判据 |
 |---|---|---|
-| **M4.1 只读** | `a_ops->read_folio/readahead`（**iomap 默认**）+ `read_iter` + `mmap`（`generic_file_mmap_prepare`） | guest `dd/cat/head` 往返一致（三态 / >4K / 稀疏洞）；mmap 读/执行通 |
+| **M4.1 只读** | `a_ops->read_folio/readahead`（**iomap 默认**）+ `read_iter` + `mmap`（`generic_file_mmap_prepare`） | guest `dd/cat/head` 往返一致（三态 / >4K / 稀疏洞）；mmap 读/执行通 —— ✅ **2026-09-27 PASS**（三态/>4K/稀疏洞/2 级树/静态 ELF execve rc=42；audit BAD=0） |
 | **M4.2 写数据** | `write_iter` + `iomap_begin(WRITE)` + **`writepages` 延迟真分配** + extent 树移植（walk/insert/split/balance/map_unmap）+ 三态迁移 + `i_blocks` 更新 | `dd` 写→读往返一致；`stat.blocks` 吻合；audit 全绿 |
 | **M4.3 truncate/punch/fallocate** | 按 `Docs/punch_truncate_pread_spec.md`（形态×操作矩阵、KEEP_SIZE、≤160 强制回迁 inline、出口坍缩） | spec §8 矩阵全过 |
 | **M4.4 setattr + 时间戳** | `inode_operations.setattr`（`setattr_prepare` + size→truncate + `setattr_copy`）；时间戳走 generic + `write_inode` 落盘 | `chmod/chown/utimes/truncate` 往返一致 |
@@ -192,3 +192,4 @@ T0 ✅ ──► M3.5 ✅ ──► [M4 文件数据] ──┐
 | 2026-09-27 | 本文件从 handover 抽出，覆盖 **T0 → T1** | 用户：handover 腐坏快、排期腐坏慢 |
 | 2026-09-27 | M4 路线 = **iomap**（`a_ops` 无 `write_begin/write_end`）；delalloc；O_DIRECT 后置 | `ravenfs-linux-ko-M4-data-spec.md`（D-M4-1..5）——**覆盖** handover §10.3 旧切分 |
 | 2026-09-27（晚） | M4 分配时机改 **立刻分配（强同步，非 delalloc）**；读粒度回退 **iomap 默认**（撤 64K 单元）；三态迁移 = inline 默认升格 extent（direct 仅收敛态） | 用户裁决 O-4/O-5/O-1（M4-data-spec §12） |
+| 2026-09-27（晚） | **M4.1 只读 ✅ 实测 PASS**（ko iomap 只读路径；guest 7.2.6；三态/>4K/稀疏洞/2 级树/ELF execve；audit BAD=0） | 提交 `791ad02`（码）+ `97bddbd`（测试资产） |
