@@ -11,6 +11,9 @@
  *   · **绝不挂 write_begin/write_end**（iomap 不需要；spec §1.1/§2.2）。
  *   · read_folio 是 mmap 的硬前置（D-M4-1）——无它 generic_file_mmap_prepare 直接 -ENOEXEC。
  *   · writepages/writeback_range **只查「已分配映射」**（写时已分配，D-M4-6），回写期**不分配**。
+ *   · 可写 mmap 走自写 `ravenfs_file_vm_ops`：`page_mkwrite` → `iomap_page_mkwrite
+ *     (IOMAP_WRITE|IOMAP_FAULT)` → `ravenfs_iomap_begin` **立刻分配**（**D-M4-12**）；
+ *     否则 mmap 洞写会落 HOLE → 回写跳过 → **静默丢数据**（O-13）。
  *   · 无 direct_IO（O_DIRECT 后置 D-M4-5：open(O_DIRECT) 直接 -EINVAL）。
  */
 #include <linux/module.h>
@@ -89,6 +92,46 @@ const struct address_space_operations ravenfs_aops = {
 	.is_partially_uptodate	= iomap_is_partially_uptodate,
 	.error_remove_folio	= generic_error_remove_folio,
 };
+
+/*
+ * 可写 mmap：写 fault 时**立刻分配**（D-M4-12；照抄 zonefs_filemap_page_mkwrite）。
+ * 用 iomap_page_mkwrite（IOMAP_WRITE|IOMAP_FAULT）→ 复用 ravenfs_iomap_begin 写向分支。
+ * 返回 VM_FAULT_LOCKED 的页内容随后由 writepages → writeback_range 落盘（此时映射已存在）。
+ */
+static vm_fault_t ravenfs_filemap_page_mkwrite(struct vm_fault *vmf)
+{
+	struct inode *inode = file_inode(vmf->vma->vm_file);
+	vm_fault_t ret;
+
+	sb_start_pagefault(inode->i_sb);
+	file_update_time(vmf->vma->vm_file);
+
+	/* 与 truncate 串行 */
+	filemap_invalidate_lock_shared(inode->i_mapping);
+	ret = iomap_page_mkwrite(vmf, &ravenfs_iomap_ops, NULL);
+	filemap_invalidate_unlock_shared(inode->i_mapping);
+
+	sb_end_pagefault(inode->i_sb);
+	return ret;
+}
+
+static const struct vm_operations_struct ravenfs_file_vm_ops = {
+	.fault		= filemap_fault,
+	.map_pages	= filemap_map_pages,
+	.page_mkwrite	= ravenfs_filemap_page_mkwrite,
+};
+
+/*
+ * mmap 前置：挂自写 vm_ops（D-M4-12）。取代 generic_file_mmap_prepare
+ * （后者挂 generic_file_vm_ops，其 page_mkwrite = filemap_page_mkwrite **只标脏不分配**）。
+ * read_folio 仍是硬前置（D-M4-1）——由 a_ops 保证。
+ */
+int ravenfs_file_mmap_prepare(struct vm_area_desc *desc)
+{
+	file_accessed(desc->file);
+	desc->vm_ops = &ravenfs_file_vm_ops;
+	return 0;
+}
 
 /*
  * buffered 读入口（spec §2.1：自写壳）。M4.1 直接委派 generic_file_read_iter

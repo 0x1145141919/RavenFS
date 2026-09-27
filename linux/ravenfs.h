@@ -178,6 +178,9 @@ struct iomap;
 extern const struct iomap_ops ravenfs_iomap_ops;
 extern const struct address_space_operations ravenfs_aops;
 ssize_t ravenfs_file_read_iter(struct kiocb *iocb, struct iov_iter *iter);
+/* M4.2：可写 mmap 立刻分配（D-M4-12）——挂自写 vm_ops（page_mkwrite→iomap 写向） */
+struct vm_area_desc;
+int ravenfs_file_mmap_prepare(struct vm_area_desc *desc);
 
 /* M4.2：回写映射复用同一 begin（file.c 的 writeback_range 使用） */
 int ravenfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
