@@ -181,15 +181,16 @@ struct ravenfs_row {
 
 ## 5. 周期回写（TTL 线程扩展）
 
-TTL 线程（`linux/cache_ttl.c`，现为 `delayed_work`）每轮做**两趟**，都在锁外 I/O：
+TTL 线程（`linux/cache_ttl.c`，现为 `delayed_work`）每轮做**三趟**，I/O 全在锁外：
 
 ```
 每 reap_ms（= 4s）：
   趟1 淘汰  ：READY ∧ ref==1 ∧ now-acc_stamp > ttl(2s) → 原地回写(若脏)+释放
   趟2 回写  ：READY(dirty) ∧ now-wb_stamp > wb_age(60s) → copy-out 回写
+  趟3 位图  ：每 bm_sync(30s) 闸门到点 → 全部分片同步一遍（锁内快照→锁外块 I/O） ← 2026-09-27 加
 ```
 
-- **效果**：dirty 集**有界**（最坏 = `wb_age` 窗口内的修改量）→ 崩溃窗口从「自上次 sync 起」收缩到「≤60s」。**修掉缺陷 ②**。
+- **效果**：dirty 集**有界**（最坏 = `wb_age` 窗口内的修改量）→ 崩溃窗口从「自上次 sync 起」收缩到「≤60s」。**修掉缺陷 ②**。位图（趟3）**不做脏标记**：分片按 CPU 切、逐片追脏不划算 → 改为每 **30s** 把**所有分片**与磁盘同步一遍，窗口收到 ≤30s（仅缓解，非解）。
 - **TTL 轮次 1s → 4s**（用户裁决）：淘汰判定粒度变粗（2s TTL 最长 ~6s 才被收）——可接受（TTL 是冷工作集近似）；换来**唤醒次数 ÷4**（省 CPU / xa 抖动）。`ttl` 与 `wb_age` 独立。
 
 ---
@@ -215,10 +216,10 @@ void ravenfs_wb_sweep(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age
 
 - **TTL 线程**：`ravenfs_wb_sweep(sb, now - wb_age, false)`（按龄）。
 - **sync/umount**：`ravenfs_wb_sweep(sb, 0, true)`（全量，忽略龄）。
-- **位图（`bitmap.c`）＝非缓存后端，不接入本 driver**：位图 = 全量常驻内存分片（无行状态机）；其同步由 bitmap 模块**自有的分片级同步**承担——分片级（脏分片）回写 + `sync_fs`/`put_super` 刷回；**不得挂载后仅驻留内存**。
+- **位图（`bitmap.c`）＝非缓存后端，不接入本 driver**：位图 = 全量常驻内存分片（无行状态机、**无脏标记**）；其同步由 bitmap 模块**自有的分片级同步**承担——每 30s 全片同步一遍 + `sync_fs`/`put_super` 刷回；**不得挂载后仅驻留内存**。
   → 与缓存行的"行级 copy-out / 淘汰"是两码事，driver 只覆盖 inode/mdata 两类缓存后端 ⇒ **架构无关回刷**。
 
-> 位图 = 全量常驻内存分片 + 分片级同步（脏分片回写 + `sync_fs`/`put_super` 刷回）；**该机制归 bitmap 模块自身，不并入缓存回刷 driver**。
+> 位图 = 全量常驻内存分片 + 分片级同步（**无脏标记**；TTL 每 30s 全片同步 + `sync_fs`/`put_super` 刷回）；**该机制归 bitmap 模块自身，不并入缓存回刷 driver**。
 
 ---
 
@@ -234,6 +235,7 @@ void ravenfs_wb_sweep(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age
 | **C-6** | TTL 轮次 **4s** | 唤醒 ÷4；TTL 非精确计时 |
 | **C-7** | 回写/淘汰 **架构无关 driver**（**缓存后端**：inode/mdata） | 一套机制；位图非缓存、另有分片同步 |
 | **C-8** | 淘汰状态 `EVICTING`（保留在 xarray，get 重试） | 防同址重载出第二份 |
+| **C-9** | 位图 = **片级全片同步**，**不做脏标记**：**锁内 memcpy 快照 → 锁外 I/O**；组 `wb_lock` 串行写者；TTL 每 **30s** 全片同步 + sync/umount 刷 | 分片按 CPU 切、逐片追脏不划算（用户裁）；片=整块边界使快照/落盘天然对齐；崩溃序无法通解，靠 30s 周期缓解 |
 
 ---
 
@@ -244,7 +246,7 @@ void ravenfs_wb_sweep(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age
 1. **修缺陷①**（dirty 锁纪律：`mark_dirty` / `sync_from_vfs` / `reclaim` 全部改为经 `io_lock`）——**最小且正确性必需，可立刻做**。
 2. 补回状态机 + 双时间戳 + `WB`/`EVICTING`（§2）。
 3. TTL 线程扩展周期回写（§5）+ wb driver（§6）。
-4. 位图**分片级同步**落地（§6；bitmap 模块自有，**非缓存后端**）。
+4. 位图**分片级全片同步**落地（§6；bitmap 模块自有，**非缓存后端**）。✅ 2026-09-27。
 5. **顺带**：`ravenfs_row_write`/`ravenfs_mrow_write` 从"sb_bread+memcpy+bh"改为**原地 bio**（淘汰味标准路径；驻留味用 copy-out）。
 
 **建议 1+2 与 M4.2 同批或先行**；3+4 可归 M7 加固。
@@ -258,6 +260,8 @@ void ravenfs_wb_sweep(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age
 | `ravenfs_ttl_seconds` | 2 | 冷行 TTL（`acc_stamp` 距now） | 2（不变） |
 | `ravenfs_reap_ms` | **4000** | TTL 线程轮次 | ~~1000~~ **改** |
 | `ravenfs_wb_age_seconds` | 60 | 脏行回写 aging（`wb_stamp` 距now） | 新增 |
+| `ravenfs_bitmap_sync_seconds` | 30 | 位图**全片**同步闸门（无脏标记） | 2026-09-27 加 |
+| `ravenfs_bitmap_sync_seconds=0` | — | 关闭位图周期同步（仍靠 sync/umount 刷） | 2026-09-27 加 |
 | `ravenfs_ttl_seconds=0` | — | 关闭 TTL 淘汰（既有语义保留） | 不变 |
 
 ---
@@ -292,7 +296,9 @@ void ravenfs_wb_sweep(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age
 
 「seam」已备：`ravenfs_row_store` / `ravenfs_mrow_store` 是唯一 I/O 函数，换 bio 只动这两处；⚠️ **读写必须同源**（都用 bio 或都用 bh），否则 bdev 页缓存陈旧 → 静默损坏。淘汰味当前也走 bh（多一次 memcpy，非 0 拷贝）。
 
-**未落地**：位图**分片级周期同步**（§6，归 M7；bitmap 模块自身，**非缓存后端**）；独立 `WRITING` 态（用 `ROWF_WB` 标志替代，语义等价）；`wb_dirty` 已加**防活锁上限**（每片 ≤256 轮）。
+**位图分片级同步（2026-09-27 加，已落地）**：`bitmap.c` 组 `wb_lock`（mutex）；`rfs_bm_group_sync()` = **自旋锁内 memcpy 快照整片字 → 锁外逐块 `sb_bread` 全覆盖写**。**无脏标记、无时间戳**（用户裁：分片按 CPU 切，追脏不划算）。触发：① TTL 线程趟3 每 `bitmap_sync_seconds`(30s) 闸门到点 → `ravenfs_bitmap_flush(sb)` **全片**同步；② `sync_fs`/`put_super`/`fsync` 同一函数。`fsync` 由「全位图刷」变为「同函数（本就是全片）」，语义不变、仅拆到片粒度以做到「锁内快照/锁外 I/O」。需含 `linux/mutex.h`。
+
+**仍未落地**：独立 `WRITING` 态（用 `ROWF_WB` 标志替代，语义等价）；`wb_dirty` 已加**防活锁上限**（每片 ≤256 轮）。
 
 **guest 测试步骤**（交接，手测）：
 1. 按 serial `deadbeef` 认盘 → `insmod ravenfs.ko` → 挂载。
@@ -318,7 +324,7 @@ void ravenfs_wb_sweep(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age
 | 落盘 | in-place bio | **`sb_bread` 读-改-写**（与装载同源） |
 | 周期 | TTL 4s 两趟 | ✅ 落地（淘汰 + 超龄回写，`reap_ms=4000`/`wb_age=60s`） |
 | 缺陷① | io_lock 标脏 | ✅ 落地（`RFS_ROW_MARK_DIRTY`，18 处外部裸写收敛） |
-| 位图分片级同步 | bitmap 模块自有（**非缓存后端**） | 未落地（M7） |
+| 位图分片级同步 | bitmap 模块自有（**非缓存后端**） | ✅ 落地（§6/§11）：**无脏标记**；组 wb_lock + 锁内快照/锁外 I/O；TTL 每 30s 全片同步 |
 
 **实测结果**：
 - `rfsdirchurn <mnt> 2`（5 组×2 轮，747109 条长名）：**12/12 PASS**（bfree/ffree 精确回基线）。

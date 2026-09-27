@@ -386,7 +386,8 @@ static inline bool ravenfs_sb_writable(const struct super_block *sb)
 struct ravenfs_bitmap_mgr;
 int  ravenfs_bitmap_create(struct super_block *sb);
 void ravenfs_bitmap_destroy(struct super_block *sb);
-void ravenfs_bitmap_flush(struct super_block *sb);
+/* 全片同步两组位图（锁内快照 → 锁外 I/O）；TTL 周期 / sync_fs/put_super/fsync 共用 */
+int  ravenfs_bitmap_flush(struct super_block *sb);
 u64  ravenfs_block_alloc(struct super_block *sb, u64 count, u32 align_log2);
 void ravenfs_block_free(struct super_block *sb, u64 blk, u64 count);
 bool ravenfs_block_test(struct super_block *sb, u64 blk);

@@ -14,6 +14,11 @@
  *     片下限 = 1 个位图块 = 32768 位（4K 对齐）。每片 `spinlock_t`。
  *   · 锁纪律：**分配**只在片内做位运算（持自旋锁）；**释放**跨片逐段清位。
  *     临界区内不做 I/O / 不分配内存。
+ *   · 片级同步（2026-09-27 加，**无脏标记**）：分片数按 CPU 切，逐片追踪脏位不划算 ⇒ 不做。
+ *     同步 = **锁内 memcpy 快照整片字 → 锁外逐块 I/O**（I/O 绝不入自旋锁）；写者之间由
+ *     组内 `wb_lock`(mutex) 串行（不挡分配/释放）。触发：① TTL 线程每 `bitmap_sync_seconds`
+ *     （30s）把**所有分片**全同步一遍；② `sync_fs`/`put_super`/`fsync` 走同一 `ravenfs_bitmap_flush`。
+ *     崩溃序无法通解，只能靠 ① 把「位图落后内存」的窗口收到 ≤30s 缓解。
  *   · 无保留区：只有 root inode（=16，mkfs 硬编码）被占用；0..15 与 17.. 全部可正常分配。
  *     （2026-09-26 更正：曾误写“inode 组 [0,16) 保留”，该说法不存在，已铲除。）
  *   · 1 = 已用，0 = 空闲。
@@ -24,6 +29,8 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
+#include <linux/timekeeping.h>
 #include <linux/smp.h>
 #include <linux/kernel.h>
 #include <linux/math.h>
@@ -127,6 +134,9 @@ struct ravenfs_bm_group {
 	u32		cpu_slots;
 	u32		*preferred;	/* CPU → 上次命中片 */
 
+	/* 片级同步：写者之间串行（周期回写 vs sync_fs）；不挡分配/释放 */
+	struct mutex	wb_lock;
+
 	/* 装载/刷回映射 */
 	u64		disk_start;	/* 起始 FS_block */
 	u64		disk_blocks;	/* 块数 */
@@ -205,6 +215,7 @@ static int rfs_bm_group_setup(struct ravenfs_bm_group *g, const char *name,
 		s->hint = base;
 		spin_lock_init(&s->lock);
 	}
+	mutex_init(&g->wb_lock);
 	return 0;
 }
 
@@ -325,24 +336,62 @@ static int rfs_bm_group_load(struct super_block *sb, struct ravenfs_bm_group *g)
 	return 0;
 }
 
-/* 全量刷回（对齐持久化：sync_fs / put_super 调用；ro 挂载不得调用） */
-static int rfs_bm_group_flush(struct super_block *sb, struct ravenfs_bm_group *g)
+/*
+ * 片级同步（无脏标记）：把**全部片**与磁盘同步一遍。
+ *   · 原子性：与 alloc/free 对齐的最小临界区 = 片自旋锁内「memcpy 快照整片字」的瞬间
+ *     （拷贝完即可解锁，分配照旧只在同一自旋锁内做位运算，不会读到撕裂快照）。
+ *   · I/O 全在锁外（绝不入自旋锁）；写者之间由组内 `wb_lock`(mutex) 串行（不挡分配/释放）。
+ *   · 快照到 I/O 完成期间的变异不在本次内（下轮再同步）⇒ 只保证“某个一致时间点”落盘，
+ *     崩溃序无法通解，窗口由调用周期（TTL 30s）限制。
+ *   · ro 挂载不得调用。
+ */
+static int rfs_bm_group_sync(struct super_block *sb, struct ravenfs_bm_group *g)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	u64 b;
+	u64 buf_bytes = g->per_bits / 8;
+	void *buf;
+	u32 i;
+	int err = 0;
 
-	for (b = 0; b < g->disk_blocks; b++) {
-		struct buffer_head *bh = sb_bread(sb, ravenfs_dev_blk(sbi, g->disk_start + b));
+	if (!g->n_slices || !buf_bytes)
+		return 0;
+	buf = kvmalloc(buf_bytes, GFP_KERNEL);	/* 片上限缓冲；锁外分配 */
+	if (!buf)
+		return -ENOMEM;
 
-		if (!bh)
-			return -EIO;
-		memcpy(bh->b_data, g->words + b * (RAVENFS_BLOCK_SIZE / sizeof(u64)),
-		       RAVENFS_BLOCK_SIZE);
-		mark_buffer_dirty(bh);
-		sync_dirty_buffer(bh);		/* 确定性：返回即落盘 */
-		brelse(bh);
+	mutex_lock(&g->wb_lock);
+	for (i = 0; i < g->n_slices; i++) {
+		struct ravenfs_bm_slice *s = &g->slices[i];
+		u64 nblk, b;
+
+		/* 片 = 整块边界（per_bits/base_idx 均 32768 对齐）⇒ bits/8 为 4K 整数倍 */
+		if (!s->bits)
+			continue;
+		spin_lock(&s->lock);
+		memcpy(buf, g->words + s->base_idx / 64, s->bits / 8);
+		spin_unlock(&s->lock);
+
+		/* 锁外 I/O：逐块全覆盖写（与装载同源 sb_bread） */
+		nblk = s->bits / RAVENFS_BITS_PER_BLOCK;
+		for (b = 0; b < nblk; b++) {
+			u64 dblk = g->disk_start + s->base_idx / RAVENFS_BITS_PER_BLOCK + b;
+			struct buffer_head *bh = sb_bread(sb, ravenfs_dev_blk(sbi, dblk));
+
+			if (!bh) {
+				err = -EIO;
+				break;
+			}
+			memcpy(bh->b_data, buf + b * RAVENFS_BLOCK_SIZE, RAVENFS_BLOCK_SIZE);
+			mark_buffer_dirty(bh);
+			sync_dirty_buffer(bh);	/* 确定性：返回即落盘 */
+			brelse(bh);
+		}
+		if (err)
+			break;		/* 一个片失败即停，剩余片未同步（下轮/下次重试） */
 	}
-	return 0;
+	mutex_unlock(&g->wb_lock);
+	kvfree(buf);
+	return err;
 }
 
 /* ── mgr 生命周期 ── */
@@ -408,15 +457,21 @@ static void rfs_bm_group_release(struct ravenfs_bm_group *g)
 	kfree(g->preferred);
 }
 
-void ravenfs_bitmap_flush(struct super_block *sb)
+/* 全片同步（两组）：TTL 周期 / sync_fs / put_super / fsync 共用；ro 挂载不得调用 */
+int ravenfs_bitmap_flush(struct super_block *sb)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	int err = 0;
 
 	if (!sbi || !sbi->bitmap)
-		return;
-	if (rfs_bm_group_flush(sb, &sbi->bitmap->blk) ||
-	    rfs_bm_group_flush(sb, &sbi->bitmap->ino))
+		return 0;
+	if (rfs_bm_group_sync(sb, &sbi->bitmap->blk))
+		err = -EIO;
+	if (rfs_bm_group_sync(sb, &sbi->bitmap->ino))
+		err = -EIO;
+	if (err)
 		pr_err("ravenfs: bitmap flush failed\n");
+	return err;
 }
 
 void ravenfs_bitmap_destroy(struct super_block *sb)
