@@ -3,10 +3,17 @@
  * inode_cache.c —— RavenFS ko 的 disk_inode_cache_mgr + inode_session
  *
  * 依据：Docs/linux/ravenfs-linux-ko-requirements-spec.md §4.11.1（基调修订）
+ *      + Docs/linux/ravenfs-ko-cache-statemachine.md（缓存行状态机，2026-09-27）
  *   · 只管**盘 inode 热数据集**（256B 记录）；与 VFS logical inode 解耦。
  *   · 分片 xarray + 片级睡眠 rw_semaphore；分片几何 2^n inode/片（O(1) 位切）。
  *   · 驱逐三路解耦：冷集 → **自写 TTL 淘汰器**（`linux/cache_ttl.c`，主轴）；
  *     折构/卸载 → flush_all() 主动全量刷回。（压力 shrinker 已移除：2026-09-26 深夜）
+ *
+ * 【状态机（2026-09-27 补票）】
+ *   行 = {ref(会话/pin), io_lock(内容+flags), state(READY/EVICTING),
+ *          acc_stamp(访问→TTL), wb_stamp(回写 aging), flags(DIRTY/WB)}。
+ *   铁律：**I/O 一律在锁外**——驻留回写 copy-out 排他后锁外落盘（删 gen）；
+ *         淘汰独占窗口原地写 + 释放。详见 Docs/linux/ravenfs-ko-cache-statemachine.md。
  *
  * 【M2.2 行尺寸解耦（2026-09-26 定）】
  *   · 缓存行大小由 **mount option `row_size=`** 决定，支持 4K/8K/16K/32K/64K 五档；
@@ -25,6 +32,7 @@
 #include <linux/xarray.h>
 #include <linux/rwsem.h>
 #include <linux/refcount.h>
+#include <linux/sched.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/timekeeping.h>
@@ -82,7 +90,7 @@ int ravenfs_cache_create(struct super_block *sb, unsigned int row_size)
 	/* 行缓冲直接走伙伴系统 ⇒ 行字节数必须 ≥ 1 页（4K）。支持表已保证；
 	 * 收窄仅见于 inode_count≤8 的病态盘（非良定义，显式拒绝）。 */
 	if (c->row_size < PAGE_SIZE) {
-		pr_err("ravenfs: row_size %u < PAGE_SIZE，伙伴分配不可用\n", c->row_size);
+		pr_err("ravenfs: row_size %u < PAGE_SIZE，伙伴分配不可用\n", row_size);
 		kfree(c);
 		return -EINVAL;
 	}
@@ -109,9 +117,10 @@ static void ravenfs_row_free(struct ravenfs_cache *c, struct ravenfs_row *row)
 	kfree(row);
 }
 
-/* 脏行落盘：行 → row_blocks 个连续 4K 块（尾部按 array 末尾截断）。ro 挂载不得调用。 */
-static int ravenfs_row_write(struct super_block *sb, struct ravenfs_cache *c,
-			     struct ravenfs_row *row)
+/* 脏行落盘：src → row_blocks 个连续 4K 块（尾部按 array 末尾截断）。ro 挂载不得调用。
+ * sb_bread（读-改-写）+ mark_buffer_dirty + sync_dirty_buffer：与装载侧同源。 */
+static int ravenfs_row_store(struct super_block *sb, struct ravenfs_cache *c,
+			     struct ravenfs_row *row, const void *src)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	u64 blk0 = sbi->inode_array_base + row->line * c->row_blocks;
@@ -126,7 +135,7 @@ static int ravenfs_row_write(struct super_block *sb, struct ravenfs_cache *c,
 
 		if (!bh)
 			return -EIO;
-		memcpy(bh->b_data, (char *)row->data + (u64)i * RAVENFS_BLOCK_SIZE,
+		memcpy(bh->b_data, (const char *)src + (u64)i * RAVENFS_BLOCK_SIZE,
 		       RAVENFS_BLOCK_SIZE);
 		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);		/* 确定性：返回即落盘 */
@@ -140,9 +149,7 @@ static int ravenfs_row_write(struct super_block *sb, struct ravenfs_cache *c,
  * 余下零填充（行缓冲恒为 row_size 字节，行内槽位寻址恒定）。
  *
  * ⚠️ 锁纪律（死锁根治）：**睡眠分配 + 块 I/O 一律在分片锁之外完成**，
- * 再进临界区双检插入。原因：① 不在持锁期间做可能睡眠的重活（块 I/O / 页分配）；
- * ② 免受「分配→direct reclaim→重入本缓存取锁」类自锁死（压力 shrinker 已在同轮移除，
- *    但纪律保留作护栏；见 spec §4.11.2 E）。
+ * 再进临界区双检插入。
  */
 static int ravenfs_row_load(struct super_block *sb, struct ravenfs_cache *c,
 			    struct ravenfs_shard *sh, u32 row_key, u64 line,
@@ -153,6 +160,7 @@ static int ravenfs_row_load(struct super_block *sb, struct ravenfs_cache *c,
 	u64 blk0 = sbi->inode_array_base + line * c->row_blocks;
 	u32 nblk = c->row_blocks, got;
 	int err;
+	u64 now;
 
 	/* 行首必须落在 inode array 内 */
 	if (line * c->row_blocks >= sbi->inode_blocks)
@@ -183,14 +191,23 @@ static int ravenfs_row_load(struct super_block *sb, struct ravenfs_cache *c,
 		brelse(bh);
 	}
 	row->line = line;
-	row->stamp = ktime_get_ns();
+	init_rwsem(&row->io_lock);
+	row->flags = 0;
+	row->state = ROW_READY;
+	now = ktime_get_ns();
+	atomic64_set(&row->acc_stamp, now);
+	row->wb_stamp = now;
 	refcount_set(&row->ref, 1);			/* 缓存基准引用 */
-	row->dirty = false;
 
 	/* —— 临界区：仅 xarray 双检 + 插入 —— */
 	down_write(&sh->lock);
 	old = xa_load(&sh->rows, row_key);
 	if (old) {			/* 双检：他人已装载 → 丢弃自己的，复用他人的 */
+		if (old->state == ROW_EVICTING) {	/* 淘汰在飞：让上层重试 */
+			up_write(&sh->lock);
+			ravenfs_row_free(c, row);
+			return -EAGAIN;
+		}
 		refcount_inc(&old->ref);
 		up_write(&sh->lock);
 		ravenfs_row_free(c, row);
@@ -233,18 +250,26 @@ struct ravenfs_session *ravenfs_session_get(struct super_block *sb, u64 inum)
 	if (!s)
 		return ERR_PTR(-ENOMEM);
 
-	/* 快路径：读锁下查表 + 引用 */
+retry:
+	row = NULL;
+	/* 快路径：读锁下查表 + 引用（淘汰写锁内方置 EVICTING ⇒ 二者互斥） */
 	down_read(&sh->lock);
 	row = xa_load(&sh->rows, row_key);
-	if (row) {
+	if (row && row->state == ROW_EVICTING)
+		row = NULL;			/* 淘汰接管中：置空 → 重试/重载 */
+	else if (row)
 		refcount_inc(&row->ref);
-		row->stamp = ktime_get_ns();	/* 访问刷新（TTL，对齐 god accss_stamp） */
-	}
 	up_read(&sh->lock);
 
-	if (!row) {			/* 慢路径：装载 */
+	if (row) {
+		atomic64_set(&row->acc_stamp, ktime_get_ns());	/* 访问刷新（TTL） */
+	} else {
 		int err = ravenfs_row_load(sb, c, sh, row_key, line, &row);
 
+		if (err == -EAGAIN) {		/* 恰好撞上淘汰：重试 */
+			cond_resched();
+			goto retry;
+		}
 		if (err) {
 			kfree(s);
 			return ERR_PTR(err);
@@ -268,14 +293,21 @@ void ravenfs_session_put(struct ravenfs_session *s)
 	kfree(s);
 }
 
-/* ── 写回（M3）：脏行落盘（sync_fs / umount / fsync 调用；ro 挂载 no-op） ── */
+/* ── 写回（M3+2026-09-27）：脏行落盘；失败恢复脏；I/O 一律在锁外 ── */
 
 static inline bool ravenfs_writable(struct super_block *sb)
 {
 	return !(sb->s_flags & SB_RDONLY);
 }
 
-int ravenfs_cache_writeback_all(struct super_block *sb)
+/* 行脏标记统一走 ravenfs.h 的 RFS_ROW_MARK_DIRTY 宏 */
+
+/*
+ * 脏行落盘（**持分片写锁**：与 drop/淘汰/get 全程串行——复刻旧 writeback_all 安全锁序；
+ * 锁内直接以 row->data 落盘，无需拷贝/pin）。
+ *   ignore_age=false → 只写 wb_stamp < age_cutoff 的行（TTL 周期回写）。
+ */
+int ravenfs_cache_wb_dirty(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_cache *c = sbi ? sbi->icache : NULL;
@@ -293,19 +325,30 @@ int ravenfs_cache_writeback_all(struct super_block *sb)
 		xa_for_each(&sh->rows, key, e) {
 			struct ravenfs_row *row = e;
 
-			if (!row->dirty)
+			if (row->state != ROW_READY)
 				continue;
-			if (ravenfs_row_write(sb, c, row))
+			if (!(row->flags & ROWF_DIRTY) || (row->flags & ROWF_WB))
+				continue;
+			if (!ignore_age && row->wb_stamp >= age_cutoff_ns)
+				continue;
+			if (ravenfs_row_store(sb, c, row, row->data))
 				err = -EIO;
-			else
-				row->dirty = false;
+			else {
+				row->flags &= ~ROWF_DIRTY;
+				row->wb_stamp = ktime_get_ns();
+			}
 		}
 		up_write(&sh->lock);
 	}
 	return err;
 }
 
-/* 单 inode 行落盘（fsync 用） */
+int ravenfs_cache_writeback_all(struct super_block *sb)
+{
+	return ravenfs_cache_wb_dirty(sb, 0, true);
+}
+
+/* 单 inode 行落盘（fsync 用）：持分片写锁（与 drop/淘汰串行） */
 int ravenfs_inode_flush(struct super_block *sb, u64 inum)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
@@ -318,11 +361,16 @@ int ravenfs_inode_flush(struct super_block *sb, u64 inum)
 	s = ravenfs_session_get(sb, inum);
 	if (IS_ERR(s))
 		return PTR_ERR(s);
-	if (s->row->dirty) {
-		err = ravenfs_row_write(sb, c, s->row);
-		if (!err)
-			s->row->dirty = false;
+	down_write(&s->shard->lock);
+	if (s->row->state == ROW_READY && (s->row->flags & ROWF_DIRTY)) {
+		if (ravenfs_row_store(sb, c, s->row, s->row->data))
+			err = -EIO;
+		else {
+			s->row->flags &= ~ROWF_DIRTY;
+			s->row->wb_stamp = ktime_get_ns();
+		}
 	}
+	up_write(&s->shard->lock);
 	return err;
 }
 
@@ -330,6 +378,7 @@ int ravenfs_inode_flush(struct super_block *sb, u64 inum)
  * `write_inode` 的实现：**logical inode → mgr 行同步**（不落盘）。
  * 只推 **VFS 拥有的字段**；**盘专有字段**（data_root / inline_data / heaps / xattr_ptr / type / direct）
  * 一律不动（logical inode 不持有它们，扫写会毁盘）。
+ * 内容改写在 io_lock 写锁内完成（与 copy-out 回写互斥）。
  */
 int ravenfs_inode_sync_from_vfs(struct super_block *sb, struct inode *inode)
 {
@@ -339,6 +388,7 @@ int ravenfs_inode_sync_from_vfs(struct super_block *sb, struct inode *inode)
 
 	if (IS_ERR(s))
 		return PTR_ERR(s);
+	down_write(&s->row->io_lock);
 	r = ravenfs_session_inode(s);
 	r->uid = i_uid_read(inode);
 	r->gid = i_gid_read(inode);
@@ -359,20 +409,21 @@ int ravenfs_inode_sync_from_vfs(struct super_block *sb, struct inode *inode)
 
 		memcpy(r->inline_data, &rdev_le, sizeof(rdev_le));
 	}
-	s->row->dirty = true;
-	s->row->stamp = ktime_get_ns();
+	s->row->flags |= ROWF_DIRTY;
+	s->row->wb_stamp = ktime_get_ns();
+	up_write(&s->row->io_lock);
 	return 0;
 }
 
-/* FS 内部改完盘记录后：标行脏（落盘仍交 flush_all） */
+/* FS 内部改完盘记录后：标行脏（落盘交 flush/周期回写） */
 void ravenfs_inode_mark_dirty(struct super_block *sb, u64 inum)
 {
 	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, inum);
 
 	if (IS_ERR_OR_NULL(s))
 		return;
-	s->row->dirty = true;
-	s->row->stamp = ktime_get_ns();
+	RFS_ROW_MARK_DIRTY(s->row);
+	atomic64_set(&s->row->acc_stamp, ktime_get_ns());
 }
 
 /*
@@ -384,47 +435,66 @@ void ravenfs_inode_reclaim(struct super_block *sb, u64 inum)
 	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, inum);
 
 	if (!IS_ERR_OR_NULL(s)) {
+		down_write(&s->row->io_lock);
 		memset(ravenfs_session_inode(s), 0, RAVENFS_INODE_SIZE);
-		s->row->dirty = true;
-		s->row->stamp = ktime_get_ns();
+		s->row->flags |= ROWF_DIRTY;
+		s->row->wb_stamp = ktime_get_ns();
+		up_write(&s->row->io_lock);
 	}
 	ravenfs_inode_free(sb, inum);	/* 位图槽回收（持久化交 sync/umount flush） */
 }
 
-/* ── TTL 淘汰（cache_ttl.c 周期调用）：只收 refcount==1 ∧ !dirty ∧ stamp<cutoff ── */
-long ravenfs_cache_reap_expired(struct ravenfs_cache *c, u64 cutoff_ns)
+/*
+ * TTL 淘汰（cache_ttl.c 周期调用）：**单临界区，全程持分片写锁**（复刻旧 reap 安全锁序）：
+ * 收 `state==READY ∧ ref==1 ∧ !DIRTY ∧ !WB ∧ 超时` 的行 → 在同一写锁内 erase + free（无 I/O）。
+ */
+long ravenfs_cache_reap_expired(struct super_block *sb, u64 cutoff_ns)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	struct ravenfs_cache *c = sbi ? sbi->icache : NULL;
 	long freed = 0;
 	u32 i;
 
+	if (!c || !ravenfs_writable(sb))
+		return 0;
 	for (i = 0; i < c->n_slices; i++) {
 		struct ravenfs_shard *sh = &c->shards[i];
-		unsigned long victim[64];
-		unsigned int nv = 0, k;
-		unsigned long key;
-		void *e;
 
-		down_write(&sh->lock);
-		xa_for_each(&sh->rows, key, e) {
-			struct ravenfs_row *row = e;
+		for (;;) {
+			unsigned long victim[64];
+			unsigned int nv = 0, k;
+			unsigned long key;
+			void *e;
 
-			if (nv >= ARRAY_SIZE(victim))
-				break;
-			if (row->dirty || refcount_read(&row->ref) != 1)
-				continue;
-			if (row->stamp >= cutoff_ns)
-				continue;
-			victim[nv++] = key;
-		}
-		for (k = 0; k < nv; k++) {
-			struct ravenfs_row *row = xa_erase(&sh->rows, victim[k]);
+			down_write(&sh->lock);
+			xa_for_each(&sh->rows, key, e) {
+				struct ravenfs_row *row = e;
+				bool pick;
 
-			if (row) {
-				ravenfs_row_free(c, row);
-				freed++;
+				if (nv >= ARRAY_SIZE(victim))
+					break;
+				if (row->state != ROW_READY)
+					continue;
+				if (refcount_read(&row->ref) != 1)
+					continue;
+				pick = !(row->flags & ROWF_DIRTY) &&
+				       !(row->flags & ROWF_WB) &&
+				       atomic64_read(&row->acc_stamp) < cutoff_ns;
+				if (pick)
+					victim[nv++] = key;
 			}
+			for (k = 0; k < nv; k++) {
+				struct ravenfs_row *row = xa_erase(&sh->rows, victim[k]);
+
+				if (row) {
+					ravenfs_row_free(c, row);
+					freed++;
+				}
+			}
+			up_write(&sh->lock);
+			if (nv < ARRAY_SIZE(victim))
+				break;
 		}
-		up_write(&sh->lock);
 	}
 	return freed;
 }
@@ -487,3 +557,10 @@ void ravenfs_cache_destroy(struct super_block *sb)
 	kfree(c);
 	sbi->icache = NULL;
 }
+
+/* 架构无关回刷 driver 的 inode 后端 */
+const struct ravenfs_wb_ops ravenfs_wb_inode_ops = {
+	.name     = "inode",
+	.wb_dirty = ravenfs_cache_wb_dirty,
+	.reap     = ravenfs_cache_reap_expired,
+};

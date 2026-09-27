@@ -2,8 +2,10 @@
 /*
  * bitmap.c —— RavenFS ko：**双位图分片分配器**（全量常驻内存，学 god `bitmap_slices`）
  *
- * 决议（2026-09-26 深夜，用户裁）：位图 = **全量常驻内存分片**（不做 bh + mark_buffer_dirty
- * 增量那套）；持久化 = 挂载装载、`sync_fs`/`put_super` **全量刷回**。
+ * 决议（2026-09-26 深夜 + 2026-09-27 复裁，用户裁）：位图 = **全量常驻内存分片**，**不是缓存行**
+ * （不纳入 inode/mdata 的缓存状态机与「架构无关回刷 driver」）；**保留分片设计 + 片级同步机制**；
+ * 持久化 = 挂载装载 + **分片级同步/回写**（脏分片回写 + `sync_fs`/`put_super` 刷回）——
+ * **不得挂载后仅驻留内存不回写**；仍**不做**「bh + mark_buffer_dirty 增量/页缓存推进」那套。
  * 移植规格：`Docs/linux/ravenfs-linux-ko-handover.md` §3.5（god `bitmap_slices` v1.1 → ko）。
  *
  * 设计：

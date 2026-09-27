@@ -126,8 +126,7 @@ static int rfs_heap_activate(struct super_block *sb, struct raven_Inode_t *r, u3
 			return PTR_ERR(ms);
 		}
 		memset(ravenfs_msession_node(ms), 0, RAVENFS_MDATA_NODE_BYTES);
-		ms->row->dirty = true;
-		ms->row->stamp = ktime_get_ns();
+		RFS_ROW_MARK_DIRTY(ms->row);
 	}
 	RFS_NHC_SET(*ctrl, gran, bits, bmp_base, 0, data_base);
 	return 0;
@@ -228,8 +227,7 @@ int ravenfs_name_heap_alloc(struct super_block *sb, u64 dir_ino, u32 name_len,
 				}
 				memcpy(ravenfs_msession_node(ms), buf + p * RAVENFS_MDATA_NODE_BYTES,
 				       RAVENFS_MDATA_NODE_BYTES);
-				ms->row->dirty = true;
-				ms->row->stamp = ktime_get_ns();
+				RFS_ROW_MARK_DIRTY(ms->row);
 			}
 		}
 		kvfree(buf);
@@ -264,21 +262,18 @@ int ravenfs_name_heap_write(struct super_block *sb, u32 name_len, u64 remain_ptr
 			return PTR_ERR(ms);
 		if (in_piece + len <= RAVENFS_MDATA_NODE_BYTES) {
 			memcpy((char *)ravenfs_msession_node(ms) + in_piece, tail, len);
-			ms->row->dirty = true;
-			ms->row->stamp = ktime_get_ns();
+			RFS_ROW_MARK_DIRTY(ms->row);
 		} else {
 			u32 first = (u32)(RAVENFS_MDATA_NODE_BYTES - in_piece);
 			struct ravenfs_msession *ms2 __free(ravenfs_msession);
 
 			memcpy((char *)ravenfs_msession_node(ms) + in_piece, tail, first);
-			ms->row->dirty = true;
-			ms->row->stamp = ktime_get_ns();
+			RFS_ROW_MARK_DIRTY(ms->row);
 			ms2 = ravenfs_mdata_get(sb, piece + 2);
 			if (IS_ERR(ms2))
 				return PTR_ERR(ms2);
 			memcpy(ravenfs_msession_node(ms2), tail + first, len - first);
-			ms2->row->dirty = true;
-			ms2->row->stamp = ktime_get_ns();
+			RFS_ROW_MARK_DIRTY(ms2->row);
 		}
 	}
 	return 0;
@@ -348,8 +343,7 @@ int ravenfs_name_heap_free(struct super_block *sb, u64 dir_ino, u32 name_len,
 						w[local >> 6] &= ~(1ULL << (local & 63));
 					}
 				}
-				ms->row->dirty = true;
-				ms->row->stamp = ktime_get_ns();
+				RFS_ROW_MARK_DIRTY(ms->row);
 			}
 		}
 		return 0;
@@ -411,8 +405,7 @@ int ravenfs_dir_name_heap_release(struct super_block *sb, u64 dir_ino)
 		changed = true;
 	}
 	if (changed) {
-		ds->row->dirty = true;
-		ds->row->stamp = ktime_get_ns();
+		RFS_ROW_MARK_DIRTY(ds->row);
 	}
 	return 0;
 }

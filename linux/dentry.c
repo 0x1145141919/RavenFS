@@ -279,8 +279,7 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	tr->c_ns_stamp = (u32)now.tv_nsec;
 	tr->atime = now.tv_sec;
 	tr->a_ns_stamp = (u32)now.tv_nsec;
-	ts->row->dirty = true;
-	ts->row->stamp = ktime_get_ns();
+	RFS_ROW_MARK_DIRTY(ts->row);
 
 	/* 长名（>40B）：尾段外置到目录名字堆 */
 	if (nlen > DENTRY_INLINE_NAME_MAX) {
@@ -315,8 +314,7 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
 	dr->c_ns_stamp = (u32)now.tv_nsec;
-	ds->row->dirty = true;
-	ds->row->stamp = ktime_get_ns();
+	RFS_ROW_MARK_DIRTY(ds->row);
 	dir->i_size = dr->size;
 	set_nlink(dir, dr->link_count);
 	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
@@ -374,8 +372,7 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
 	dr->c_ns_stamp = (u32)now.tv_nsec;
-	ds->row->dirty = true;
-	ds->row->stamp = ktime_get_ns();
+	RFS_ROW_MARK_DIRTY(ds->row);
 	dir->i_size = dr->size;
 	set_nlink(dir, dr->link_count);
 	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
@@ -473,8 +470,7 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	lf->meta.ptrs[0].v = RFS_PTR_PACK(0, RFS_MASK52);
 	lf->meta.ptrs[1].v = RFS_PTR_PACK(0, dir->i_ino);	/* ".." */
 	lf->meta.ptrs[2].v = RFS_PTR_PACK(0, RFS_MASK52);
-	ms->row->dirty = true;
-	ms->row->stamp = ktime_get_ns();
+	RFS_ROW_MARK_DIRTY(ms->row);
 	ravenfs_mdata_put(ms);
 	ms = NULL;
 
@@ -503,8 +499,7 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	for (s = 0; s < 10; s++)
 		RFS_NHC_SET(*rfs_dir_heap((struct raven_dir_Inode_t *)tr, s), 0, 0,
 			    (u64)NAME_HEAP_INACTIVE, 0, (u64)NAME_HEAP_INACTIVE);
-	ts->row->dirty = true;
-	ts->row->stamp = ktime_get_ns();
+	RFS_ROW_MARK_DIRTY(ts->row);
 
 	if (nlen > DENTRY_INLINE_NAME_MAX) {
 		err = ravenfs_name_heap_alloc(sb, dir->i_ino, nlen, &remain_ptr);
@@ -532,8 +527,7 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
 	dr->c_ns_stamp = (u32)now.tv_nsec;
-	ds->row->dirty = true;
-	ds->row->stamp = ktime_get_ns();
+	RFS_ROW_MARK_DIRTY(ds->row);
 	dir->i_size = dr->size;
 	set_nlink(dir, dr->link_count);
 	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
@@ -628,8 +622,7 @@ int ravenfs_rmdir(struct inode *dir, struct dentry *dentry)
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
 	dr->c_ns_stamp = (u32)now.tv_nsec;
-	ds->row->dirty = true;
-	ds->row->stamp = ktime_get_ns();
+	RFS_ROW_MARK_DIRTY(ds->row);
 	dir->i_size = dr->size;
 	set_nlink(dir, dr->link_count);
 	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
@@ -665,8 +658,7 @@ static int rfs_dir_adjust(struct super_block *sb, struct inode *dir, int delta)
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
 	dr->c_ns_stamp = (u32)now.tv_nsec;
-	ds->row->dirty = true;
-	ds->row->stamp = ktime_get_ns();
+	RFS_ROW_MARK_DIRTY(ds->row);
 	dir->i_size = dr->size;
 	set_nlink(dir, dr->link_count);
 	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
@@ -703,8 +695,7 @@ static int rfs_dir_set_dotdot(struct super_block *sb, u64 dir_ino, u64 parent_in
 		return PTR_ERR(ms);
 	m = ravenfs_msession_node(ms);
 	m->ptrs[1].v = RFS_PTR_PACK(0, parent_ino);
-	ms->row->dirty = true;
-	ms->row->stamp = ktime_get_ns();
+	RFS_ROW_MARK_DIRTY(ms->row);
 	return 0;
 }
 

@@ -474,8 +474,7 @@ static int rfs_new_root_inner(struct super_block *sb, u64 dir_ino, u64 left_blk,
 	}
 
 	ravenfs_session_inode(ds)->data_root = root_blk;
-	ds->row->dirty = true;
-	ds->row->stamp = ktime_get_ns();
+	RFS_ROW_MARK_DIRTY(ds->row);
 	return 0;
 }
 
@@ -938,8 +937,7 @@ static int rfs_root_shrink(struct super_block *sb, u64 dir_ino)
 	NODE_DIRTY(cms);
 
 	ravenfs_session_inode(ds)->data_root = child_blk;
-	ds->row->dirty = true;
-	ds->row->stamp = ktime_get_ns();
+	RFS_ROW_MARK_DIRTY(ds->row);
 
 	ravenfs_mdata_drop(sb, root_blk);
 	ravenfs_block_free(sb, root_blk, 2);

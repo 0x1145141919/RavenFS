@@ -4,7 +4,10 @@
  *
  * 技术路线**完全仿照** disk_inode_cache_mgr（inode_cache.c）：
  *   · 分片 `xarray` + 片级睡眠 `rw_semaphore`；`__free()` session；flush_all。
- *   （压力 shrinker 已移除 2026-09-26 深夜；驱逐 = 自写 TTL + 折构/卸载 flush）
+ *   · 状态机（2026-09-27 补票）与 inode_cache.c 同构：
+ *     {ref, io_lock(内容+flags), state(READY/EVICTING), acc_stamp, wb_stamp, DIRTY/WB}；
+ *     驻留回写 copy-out 排他 → 锁外 I/O（删 gen）；淘汰独占窗口原地写 + 释放。
+ *     详见 Docs/linux/ravenfs-ko-cache-statemachine.md。
  *   · granule（缓存行）**固定 8K** = 1 个 B+tree 节点（= 2 个连续 4K FS_block）——
  *     与 inode 行可配 4K..64K 不同，**mdata 只能是 8K**（8K 是 B+tree 节点的盘面形状）。
  *   · 键 = 节点号 `blk >> 1`（节点首块必为偶块）。
@@ -22,6 +25,7 @@
 #include <linux/xarray.h>
 #include <linux/rwsem.h>
 #include <linux/refcount.h>
+#include <linux/sched.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/timekeeping.h>
@@ -75,9 +79,9 @@ static void ravenfs_mrow_free(struct ravenfs_mdata_cache *c, struct ravenfs_mrow
 	kfree(row);
 }
 
-/* 脏节点落盘：节点 → 2 个连续 4K 块（尾部按 total_blocks 截断）。ro 挂载不得调用。 */
-static int ravenfs_mrow_write(struct super_block *sb, struct ravenfs_mdata_cache *c,
-			      struct ravenfs_mrow *row)
+/* 脏节点落盘：src → 2 个连续 4K 块（尾部按 total_blocks 截断）。ro 挂载不得调用。 */
+static int ravenfs_mrow_store(struct super_block *sb, struct ravenfs_mdata_cache *c,
+			      struct ravenfs_mrow *row, const void *src)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	u64 blk0 = row->node_idx << 1;
@@ -92,7 +96,7 @@ static int ravenfs_mrow_write(struct super_block *sb, struct ravenfs_mdata_cache
 
 		if (!bh)
 			return -EIO;
-		memcpy(bh->b_data, (char *)row->data + (u64)i * RAVENFS_BLOCK_SIZE,
+		memcpy(bh->b_data, (const char *)src + (u64)i * RAVENFS_BLOCK_SIZE,
 		       RAVENFS_BLOCK_SIZE);
 		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);
@@ -101,43 +105,13 @@ static int ravenfs_mrow_write(struct super_block *sb, struct ravenfs_mdata_cache
 	return 0;
 }
 
-int ravenfs_mdata_writeback_all(struct super_block *sb)
-{
-	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_mdata_cache *c = sbi ? sbi->mcache : NULL;
-	int err = 0;
-	u32 i;
-
-	if (!c || !ravenfs_sb_writable(sb))
-		return 0;
-	for (i = 0; i < c->n_slices; i++) {
-		struct ravenfs_mdata_shard *sh = &c->shards[i];
-		unsigned long key;
-		void *e;
-
-		down_write(&sh->lock);
-		xa_for_each(&sh->rows, key, e) {
-			struct ravenfs_mrow *row = e;
-
-			if (!row->dirty)
-				continue;
-			if (ravenfs_mrow_write(sb, c, row))
-				err = -EIO;
-			else
-				row->dirty = false;
-		}
-		up_write(&sh->lock);
-	}
-	return err;
-}
+/* 标 mdata 行脏（见 ravenfs.h 的 RFS_ROW_MARK_DIRTY 宏） */
 
 /*
  * 慢路径：独占装载一个节点。
  *
  * ⚠️ 锁纪律（死锁根治）：**睡眠分配 + 块 I/O 一律在分片锁之外完成**，
- * 再进临界区双检插入。原因：① 不在持锁期间做可能睡眠的重活（块 I/O / 页分配）；
- * ② 免受「分配→direct reclaim→重入本缓存取锁」类自锁死（压力 shrinker 已在同轮移除，
- *    但纪律保留作护栏；见 spec §4.11.2 E）。
+ * 再进临界区双检插入。
  */
 static int ravenfs_mrow_load(struct super_block *sb, struct ravenfs_mdata_cache *c,
 			     struct ravenfs_mdata_shard *sh, unsigned long key,
@@ -148,6 +122,7 @@ static int ravenfs_mrow_load(struct super_block *sb, struct ravenfs_mdata_cache 
 	u64 blk0 = node_idx << 1;			/* 节点首块（偶） */
 	u32 nblk = RAVENFS_MDATA_BLK_PER_NODE, got;
 	int err;
+	u64 now;
 
 	if (blk0 >= c->total_blocks)
 		return -EIO;
@@ -176,14 +151,23 @@ static int ravenfs_mrow_load(struct super_block *sb, struct ravenfs_mdata_cache 
 		brelse(bh);
 	}
 	row->node_idx = node_idx;
-	row->stamp = ktime_get_ns();
+	init_rwsem(&row->io_lock);
+	row->flags = 0;
+	row->state = ROW_READY;
+	now = ktime_get_ns();
+	atomic64_set(&row->acc_stamp, now);
+	row->wb_stamp = now;
 	refcount_set(&row->ref, 1);
-	row->dirty = false;
 
 	/* —— 临界区：仅 xarray 双检 + 插入 —— */
 	down_write(&sh->lock);
 	old = xa_load(&sh->rows, key);
 	if (old) {			/* 双检：他人已装载 → 丢弃自己的，复用他人的 */
+		if (old->state == ROW_EVICTING) {
+			up_write(&sh->lock);
+			ravenfs_mrow_free(c, row);
+			return -EAGAIN;
+		}
 		refcount_inc(&old->ref);
 		up_write(&sh->lock);
 		ravenfs_mrow_free(c, row);
@@ -228,17 +212,25 @@ struct ravenfs_msession *ravenfs_mdata_get(struct super_block *sb, u64 blk)
 	if (!s)
 		return ERR_PTR(-ENOMEM);
 
+retry:
+	row = NULL;
 	down_read(&sh->lock);
 	row = xa_load(&sh->rows, key);
-	if (row) {
+	if (row && row->state == ROW_EVICTING)
+		row = NULL;			/* 淘汰接管中：置空 → 重试/重载 */
+	else if (row)
 		refcount_inc(&row->ref);
-		row->stamp = ktime_get_ns();	/* 访问刷新（TTL） */
-	}
 	up_read(&sh->lock);
 
-	if (!row) {
+	if (row) {
+		atomic64_set(&row->acc_stamp, ktime_get_ns());	/* 访问刷新（TTL） */
+	} else {
 		int err = ravenfs_mrow_load(sb, c, sh, key, node_idx, &row);
 
+		if (err == -EAGAIN) {
+			cond_resched();
+			goto retry;
+		}
 		if (err) {
 			kfree(s);
 			return ERR_PTR(err);
@@ -287,12 +279,17 @@ void ravenfs_mdata_drop(struct super_block *sb, u64 blk)
 	down_write(&sh->lock);
 	row = xa_load(&sh->rows, key);
 	if (row) {
-		if (refcount_read(&row->ref) <= 1) {
+		if (row->state == ROW_EVICTING) {
+			/* 淘汰接管中：由 reap 负责 erase+free，此处**必须让位**
+			 * （否则在 reap 的锁外 store 窗口内 free 该行 → UAF）。 */
+		} else if (refcount_read(&row->ref) <= 1) {
 			row = xa_erase(&sh->rows, key);
 			if (row)
 				ravenfs_mrow_free(c, row);
 		} else {
-			row->dirty = false;	/* 内容作废：禁回写 */
+			down_write(&row->io_lock);	/* shard→row 顺序一致 */
+			row->flags &= ~ROWF_DIRTY;	/* 内容作废：禁回写 */
+			up_write(&row->io_lock);
 		}
 	}
 	up_write(&sh->lock);
@@ -310,16 +307,19 @@ int ravenfs_read_node(struct super_block *sb, u64 blk, void *buf)
 	return 0;
 }
 
-/* ── TTL 淘汰（cache_ttl.c 周期调用） ── */
-long ravenfs_mdata_reap_expired(struct ravenfs_mdata_cache *c, u64 cutoff_ns)
+/* ── 写回（2026-09-27）：脏行落盘；**持分片写锁**（与 drop/淘汰/get 串行，复刻旧安全锁序） ── */
+
+int ravenfs_mdata_wb_dirty(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age)
 {
-	long freed = 0;
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	struct ravenfs_mdata_cache *c = sbi ? sbi->mcache : NULL;
+	int err = 0;
 	u32 i;
 
+	if (!c || !ravenfs_sb_writable(sb))
+		return 0;
 	for (i = 0; i < c->n_slices; i++) {
 		struct ravenfs_mdata_shard *sh = &c->shards[i];
-		unsigned long victim[64];
-		unsigned int nv = 0, k;
 		unsigned long key;
 		void *e;
 
@@ -327,23 +327,77 @@ long ravenfs_mdata_reap_expired(struct ravenfs_mdata_cache *c, u64 cutoff_ns)
 		xa_for_each(&sh->rows, key, e) {
 			struct ravenfs_mrow *row = e;
 
-			if (nv >= ARRAY_SIZE(victim))
-				break;
-			if (row->dirty || refcount_read(&row->ref) != 1)
+			if (row->state != ROW_READY)
 				continue;
-			if (row->stamp >= cutoff_ns)
+			if (!(row->flags & ROWF_DIRTY) || (row->flags & ROWF_WB))
 				continue;
-			victim[nv++] = key;
-		}
-		for (k = 0; k < nv; k++) {
-			struct ravenfs_mrow *row = xa_erase(&sh->rows, victim[k]);
-
-			if (row) {
-				ravenfs_mrow_free(c, row);
-				freed++;
+			if (!ignore_age && row->wb_stamp >= age_cutoff_ns)
+				continue;
+			if (ravenfs_mrow_store(sb, c, row, row->data))
+				err = -EIO;
+			else {
+				row->flags &= ~ROWF_DIRTY;
+				row->wb_stamp = ktime_get_ns();
 			}
 		}
 		up_write(&sh->lock);
+	}
+	return err;
+}
+
+int ravenfs_mdata_writeback_all(struct super_block *sb)
+{
+	return ravenfs_mdata_wb_dirty(sb, 0, true);
+}
+
+/* ── TTL 淘汰（cache_ttl.c 周期调用）：超时且 ref==1 的行 → 原地回写 + 释放 ── */
+long ravenfs_mdata_reap_expired(struct super_block *sb, u64 cutoff_ns)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	struct ravenfs_mdata_cache *c = sbi ? sbi->mcache : NULL;
+	long freed = 0;
+	u32 i;
+
+	if (!c || !ravenfs_sb_writable(sb))
+		return 0;
+	for (i = 0; i < c->n_slices; i++) {
+		struct ravenfs_mdata_shard *sh = &c->shards[i];
+
+		for (;;) {
+			unsigned long victim[64];
+			unsigned int nv = 0, k;
+			unsigned long key;
+			void *e;
+
+			down_write(&sh->lock);
+			xa_for_each(&sh->rows, key, e) {
+				struct ravenfs_mrow *row = e;
+				bool pick;
+
+				if (nv >= ARRAY_SIZE(victim))
+					break;
+				if (row->state != ROW_READY)
+					continue;
+				if (refcount_read(&row->ref) != 1)
+					continue;
+				pick = !(row->flags & ROWF_DIRTY) &&
+				       !(row->flags & ROWF_WB) &&
+				       atomic64_read(&row->acc_stamp) < cutoff_ns;
+				if (pick)
+					victim[nv++] = key;
+			}
+			for (k = 0; k < nv; k++) {
+				struct ravenfs_mrow *row = xa_erase(&sh->rows, victim[k]);
+
+				if (row) {
+					ravenfs_mrow_free(c, row);
+					freed++;
+				}
+			}
+			up_write(&sh->lock);
+			if (nv < ARRAY_SIZE(victim))
+				break;
+		}
 	}
 	return freed;
 }
@@ -404,3 +458,10 @@ void ravenfs_mdata_cache_destroy(struct super_block *sb)
 	kfree(c);
 	sbi->mcache = NULL;
 }
+
+/* 架构无关回刷 driver 的 mdata 后端 */
+const struct ravenfs_wb_ops ravenfs_wb_mdata_ops = {
+	.name     = "mdata",
+	.wb_dirty = ravenfs_mdata_wb_dirty,
+	.reap     = ravenfs_mdata_reap_expired,
+};

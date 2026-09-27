@@ -21,6 +21,7 @@
 #include <linux/xarray.h>
 #include <linux/rwsem.h>
 #include <linux/refcount.h>
+#include <linux/atomic.h>
 #include <linux/cleanup.h>
 
 /* v1.2 盘面结构（-I$(src)/../include） */
@@ -74,7 +75,7 @@ struct ravenfs_sb_info {
 	struct ravenfs_cache *icache;	/* disk_inode_cache_mgr（§4.11.1） */
 	struct ravenfs_mdata_cache *mcache;	/* mdata_piece_cache_mgr（8K 节点） */
 	struct ravenfs_ttl *ttl;	/* 自写 TTL 淘汰器（cache_ttl.c） */
-	struct ravenfs_bitmap_mgr *bitmap;	/* 双位图分片分配器（bitmap.c，全量内存） */
+	struct ravenfs_bitmap_mgr *bitmap;	/* 双位图分片分配器（bitmap.c；全量常驻内存分片、非缓存行，自有分片级同步） */
 };
 
 struct ravenfs_inode_info {
@@ -182,12 +183,41 @@ int ravenfs_read_node(struct super_block *sb, u64 blk, void *buf);
  */
 #define RAVENFS_ORDER_OF(bytes)	ilog2((bytes) >> PAGE_SHIFT)
 
+/* 行生命周期状态（分片 rwsem 护） */
+#define ROW_READY	0UL
+#define ROW_EVICTING	1UL
+/* 行标志（io_lock 护） */
+#define ROWF_DIRTY	(1u << 0)	/* 内容脏，待回写 */
+#define ROWF_WB		(1u << 1)	/* copy-out 快照在飞 */
+
+/* 标行使脏（io_lock 写护）——inode 行 / mdata 行**通用**（struct 字段同名）。
+ * 外部写点统一走此宏（勿再裸写 row->dirty/stamp；调用点需含 linux/{rwsem,timekeeping}.h）。 */
+#define RFS_ROW_MARK_DIRTY(row)					\
+	do {							\
+		down_write(&(row)->io_lock);			\
+		(row)->flags |= ROWF_DIRTY;			\
+		(row)->wb_stamp = ktime_get_ns();		\
+		up_write(&(row)->io_lock);			\
+	} while (0)
+
+/*
+ * 缓存行状态机（详见 Docs/linux/ravenfs-ko-cache-statemachine.md）：
+ *   分片 rwsem —— xarray 成员 + ref pinning + state（get 读锁内 ref++；淘汰写锁内 ref==1 判）
+ *   per-row io_lock —— 内容 + flags（读=session 读共享；写=session 变异 / copy-out 排他）
+ *   acc_stamp(atomic relaxed) —— TTL；wb_stamp(io_lock) —— 回写 aging
+ * 铁律：I/O 一律在锁外（copy-out 后 / 淘汰独占窗口）。
+ */
 struct ravenfs_row {
 	struct page	*page;		/* 伙伴系统页块（order = cache->order，共 row_size 字节） */
 	void		*data;		/* 直映射物理内存 = page_address(page) */
-	refcount_t	ref;		/* 1 = 缓存基准；>1 = 有 session 持有 */
-	bool		dirty;		/* M3：写回语义 */
-	u64		stamp;		/* 最近访问时间（ns；TTL 淘汰用，对齐 god accss_stamp） */
+	refcount_t	ref;		/* 1=缓存基准；>1=session 持有 / 回写 pin */
+
+	struct rw_semaphore io_lock;	/* 内容 + flags 守护 */
+	unsigned int	flags;		/* ROWF_DIRTY | ROWF_WB */
+	unsigned long	state;		/* ROW_READY | ROW_EVICTING */
+
+	atomic64_t	acc_stamp;	/* 最近访问（ns，relaxed）→ TTL 淘汰 */
+	u64		wb_stamp;	/* 最近落盘/最近 dirty（io_lock 护）→ 回写 aging */
 	u64		line;		/* 行号 = inum>>row_bits（诊断用） */
 };
 
@@ -226,7 +256,10 @@ struct ravenfs_session {
 int  ravenfs_cache_create(struct super_block *sb, unsigned int row_size);
 void ravenfs_cache_destroy(struct super_block *sb);
 void ravenfs_cache_flush_all(struct super_block *sb);
-long ravenfs_cache_reap_expired(struct ravenfs_cache *c, u64 cutoff_ns);
+/* TTL 淘汰：对超时（acc_stamp<cutoff）且 ref==1 的行做「脏原地回写 → 释放」 */
+long ravenfs_cache_reap_expired(struct super_block *sb, u64 cutoff_ns);
+/* 驻留回写（copy-out 排他 → 锁外 I/O）：ignore_age=false 时只写 wb_stamp<cutoff 的 */
+int  ravenfs_cache_wb_dirty(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age);
 int  ravenfs_cache_writeback_all(struct super_block *sb);
 int  ravenfs_inode_flush(struct super_block *sb, u64 inum);
 int  ravenfs_inode_sync_from_vfs(struct super_block *sb, struct inode *inode);
@@ -269,8 +302,13 @@ struct ravenfs_mrow {
 	struct page	*page;		/* 伙伴系统页块（order=1，8K） */
 	void		*data;		/* 直映射物理内存 = page_address(page) */
 	refcount_t	ref;
-	bool		dirty;
-	u64		stamp;		/* 最近访问时间（ns；TTL 淘汰用） */
+
+	struct rw_semaphore io_lock;	/* 内容 + flags 守护 */
+	unsigned int	flags;		/* ROWF_DIRTY | ROWF_WB */
+	unsigned long	state;		/* ROW_READY | ROW_EVICTING */
+
+	atomic64_t	acc_stamp;	/* 最近访问（ns，relaxed）→ TTL */
+	u64		wb_stamp;	/* 回写 aging（io_lock 护） */
 	u64		node_idx;
 };
 
@@ -299,9 +337,20 @@ struct ravenfs_msession {
 
 int  ravenfs_mdata_cache_create(struct super_block *sb);
 void ravenfs_mdata_cache_destroy(struct super_block *sb);
-long ravenfs_mdata_reap_expired(struct ravenfs_mdata_cache *c, u64 cutoff_ns);
+long ravenfs_mdata_reap_expired(struct super_block *sb, u64 cutoff_ns);
 void ravenfs_mdata_flush_all(struct super_block *sb);
+int  ravenfs_mdata_wb_dirty(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age);
 int  ravenfs_mdata_writeback_all(struct super_block *sb);
+
+/* ── 架构无关回刷 driver（缓存后端：inode 行 / mdata 节点）──
+ * 位图（bitmap.c）= 全量常驻内存分片，**非缓存行**、不接入本 driver（自有分片级同步）。 */
+struct ravenfs_wb_ops {
+	const char	*name;
+	int		(*wb_dirty)(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age);
+	long		(*reap)(struct super_block *sb, u64 cutoff_ns);
+};
+extern const struct ravenfs_wb_ops ravenfs_wb_inode_ops;
+extern const struct ravenfs_wb_ops ravenfs_wb_mdata_ops;
 
 struct ravenfs_msession *ravenfs_mdata_get(struct super_block *sb, u64 blk);
 void ravenfs_mdata_put(struct ravenfs_msession *s);
@@ -319,9 +368,8 @@ static inline void *ravenfs_msession_node(struct ravenfs_msession *s)
 	return s->row->data;
 }
 
-/* 标记 mdata 行脏（回写交 flush_all；调用点需含 linux/timekeeping.h） */
-#define NODE_DIRTY(ms) \
-	do { (ms)->row->dirty = true; (ms)->row->stamp = ktime_get_ns(); } while (0)
+/* 标记 mdata 行脏（io_lock 写护；调用点需含 linux/timekeeping.h） */
+#define NODE_DIRTY(ms) RFS_ROW_MARK_DIRTY((ms)->row)
 
 /* ── 自写 TTL 淘汰器（cache_ttl.c）── */
 struct ravenfs_ttl;
