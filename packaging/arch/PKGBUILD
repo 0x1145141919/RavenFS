@@ -1,0 +1,30 @@
+# Maintainer: PS <bydwxt@163.com>
+# ravenfs-dkms —— RavenFS（实验性）内核模块。
+#   内核更新：DKMS alpm hook 自动为每个已装内核重编（需对应 *-headers）。
+#   initramfs：自带 /etc/mkinitcpio.conf.d/ravenfs.conf → 自动入镜像。
+pkgname=ravenfs-dkms
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="RavenFS (experimental) kernel module, built via DKMS"
+arch=('x86_64')
+url="https://github.com/openclaw/openclaw"
+license=('GPL-2.0-only')
+depends=('dkms')
+options=('!strip')
+# 个人包：直接从本地源树拷贝（可用 RVN_SRC 覆盖）；不走 tarball/网络。
+_srcroot="${RVN_SRC:-/home/PS/PS_git/OS_pj_uefi/ravenfs}"
+source=('dkms.conf' 'ravenfs.conf')
+sha256sums=('SKIP' 'SKIP')
+
+package() {
+  local dst="$pkgdir/usr/src/ravenfs-${pkgver}"
+  install -d "$dst/linux" "$dst/include"
+  install -m644 "$_srcroot"/linux/*.c  "$dst/linux/"
+  install -m644 "$_srcroot"/linux/*.h  "$dst/linux/"
+  install -m644 "$_srcroot"/linux/Makefile "$dst/linux/"
+  rm -f "$dst/linux/"*.mod.c "$dst/linux/"*.o "$dst/linux/"*.ko "$dst/linux/".*.cmd
+  install -m644 "$_srcroot"/include/*.h "$dst/include/"
+  install -m644 "$srcdir/dkms.conf" "$dst/dkms.conf"
+  sed -i "s/@PKGVER@/${pkgver}/" "$dst/dkms.conf"
+  install -Dm644 "$srcdir/ravenfs.conf" "$pkgdir/etc/mkinitcpio.conf.d/ravenfs.conf"
+}
