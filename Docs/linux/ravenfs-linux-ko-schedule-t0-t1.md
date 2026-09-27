@@ -86,17 +86,17 @@ T0 ✅ ──► M3.5 ✅ ──► [M4 文件数据] ──┐
 > ⚠️ **handover §10.3 的 M4 切分已过时**（那份按 buffer_head 路写，含 `write_begin/write_end`）；
 > M4-data-spec 已裁决走 **iomap**，`a_ops` 不带 `write_begin/write_end`。**以 M4-data-spec 为准。**
 
-路线定调（D-M4-1..5）：必须 mmap-able；必须走 `read_iter`/`write_iter`（**iomap 路线**）；buffered cache_miss **整单元 ≤64K 全量加载**；**分配时机 = 写回才分配（delalloc）**；**O_DIRECT 后置**（不在 M4）。
+路线定调：必须 mmap-able；必须走 `read_iter`/`write_iter`（**iomap 路线**）；**写时立刻分配（强同步，非 delalloc）**；读用 **iomap 默认**（不自研 64K 单元）；三态迁移 = inline 默认升格 extent（direct 仅出口坍缩收敛态）；**O_DIRECT 后置**（不在 M4）。
 
 建议切分（每步「编译 + guest 实测」可验收才算完成）：
 
 | 子阶段 | 内容 | 出口判据 |
 |---|---|---|
-| **M4.1 只读** | `a_ops->read_folio/readahead`（64K 单元）+ `read_iter` + `mmap`（`generic_file_mmap_prepare`） | guest `dd/cat/head` 往返一致（三态 / >4K / 稀疏洞）；mmap 读/执行通 |
+| **M4.1 只读** | `a_ops->read_folio/readahead`（**iomap 默认**）+ `read_iter` + `mmap`（`generic_file_mmap_prepare`） | guest `dd/cat/head` 往返一致（三态 / >4K / 稀疏洞）；mmap 读/执行通 |
 | **M4.2 写数据** | `write_iter` + `iomap_begin(WRITE)` + **`writepages` 延迟真分配** + extent 树移植（walk/insert/split/balance/map_unmap）+ 三态迁移 + `i_blocks` 更新 | `dd` 写→读往返一致；`stat.blocks` 吻合；audit 全绿 |
 | **M4.3 truncate/punch/fallocate** | 按 `Docs/punch_truncate_pread_spec.md`（形态×操作矩阵、KEEP_SIZE、≤160 强制回迁 inline、出口坍缩） | spec §8 矩阵全过 |
 | **M4.4 setattr + 时间戳** | `inode_operations.setattr`（`setattr_prepare` + size→truncate + `setattr_copy`）；时间戳走 generic + `write_inode` 落盘 | `chmod/chown/utimes/truncate` 往返一致 |
-| **M4.5 收尾** | `fsync` 落数据；写序（**delalloc 回写形态**）；`extent_root_shrink` 旧根延迟 free | `sync` 往返 + 崩溃窗口符合 §6.1 设计特性 |
+| **M4.5 收尾** | `fsync` 落数据；写序（**经典形态**）；`extent_root_shrink` 旧根延迟 free | `sync` 往返 + 崩溃窗口符合 §8 设计特性 |
 
 **M4 开工前必须处理的既有缺口**（否则必踩）：见 handover §10.4（`extent_root_shrink` 旧根 free 时序 / 写序不变量 25 / `i_blocks` 口径 / readonly 写拒绝接线）。
 
@@ -191,3 +191,4 @@ T0 ✅ ──► M3.5 ✅ ──► [M4 文件数据] ──┐
 |---|---|---|
 | 2026-09-27 | 本文件从 handover 抽出，覆盖 **T0 → T1** | 用户：handover 腐坏快、排期腐坏慢 |
 | 2026-09-27 | M4 路线 = **iomap**（`a_ops` 无 `write_begin/write_end`）；delalloc；O_DIRECT 后置 | `ravenfs-linux-ko-M4-data-spec.md`（D-M4-1..5）——**覆盖** handover §10.3 旧切分 |
+| 2026-09-27（晚） | M4 分配时机改 **立刻分配（强同步，非 delalloc）**；读粒度回退 **iomap 默认**（撤 64K 单元）；三态迁移 = inline 默认升格 extent（direct 仅收敛态） | 用户裁决 O-4/O-5/O-1（M4-data-spec §12） |
