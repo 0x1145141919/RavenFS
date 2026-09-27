@@ -392,7 +392,7 @@ struct extent_hint_t {
  * VFS 的 struct dentry（dcache）是另一回事，勿混。dentry 树节点/魔数沿用旧名。 */
 struct ddentry_t {
     struct ptr_in_idx inode_ptr;        /* free_to_use = name_len（全名长度） */
-    uint64_t hash;                      /* 名字 64 位 hash（查找主键；算法待定） */
+    uint64_t hash;                      /* 名字 64 位 hash（查找主键；算法 = XXH64(seed=0)，见 disk_layout_v1.1.md §9） */
     uint64_t full_char_remain_ptr;      /* name_len>40: 外置名物理定位；否则 PTR_INVALID */
     char     name[DENTRY_INLINE_NAME_MAX];
 };

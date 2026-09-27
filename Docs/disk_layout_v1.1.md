@@ -237,10 +237,13 @@ extent_hint_t:   key:64 | sub_node_ptr: ptr_in_idx
 - 内部：`key[i] = 子树 i 最大开边界 max(fblkbase+length)`
 - 查找：`target < key[i] → sub_node_ptr[i]`（key 是开边界，`target == key` 时不属于该子树）
 
-### 5.3 分裂 / 删除
+### 5.3 分裂 / 删除 / 平衡（2026-09-27 固化精确值，见 §10-31..36）
 
-- 分裂：叶子满（count > 337）→ 新块装右半，**左半最大开边界提升**为父 separator
+- **阶 = 337**（槽 338，`[337]` 瞬时槽仅内存、禁落盘）；非根 count ∈ [168,337]，根 count ∈ [1,337]
+- 分裂：叶子满（count > 337；纯插先判 ==337）→ **左 168 / 右 count−168**（叶/内同切法）；**左半最大开边界提升**为父 separator
 - 删除：删叶子最大开边界项 → 刷父 `key`（上界路由对称代价，必走路径）
+- **欠载平衡**：非根 **count < 168** → 触发平衡链（自下而上，父指针驱动）；**child+neighbor ≤ 337 → 合并**，否则**抹匀**（左 total/2）；根内 count==1 → root_shrink
+- **深度上限 64**（`blocks[64]/child_idx[64]`，超限判成环）；节点块 = `block_alloc(sb, 2, align_log2=1)` → 2 块连续 + **8K 对齐**
 
 ---
 
@@ -250,7 +253,7 @@ extent_hint_t:   key:64 | sub_node_ptr: ptr_in_idx
 
 ```
 Dentry_t:  inode_ptr: ptr_in_idx   (free_to_use = name_len，≤ RAVENFS_MAX_NAME_LEN=552)
-           hash: 64                (名字 64 位 hash，算法待定)
+           hash: 64                (名字 64 位 hash，算法 = XXH64(seed=0)，见 §9)
            full_char_remain_ptr: 64 (name_len>40: 物理定位 块号[12:63]|偏移[0:11] → name[40..]；否则 PTR_INVALID)
            name[40]
 Dentry_hint_t:  sub_ptr: ptr_in_idx | hash_max: 64
@@ -403,7 +406,7 @@ bitmap 亮灯；数据面容量 = 2^total_bits_count_log2 × 粒度，见下表�
 | 项 | 现状 | 影响 |
 |----|------|------|
 | hash 算法 | **已定：XXH64（seed=0）**，2026-08-20 决策（弃 crc32：32 位熵 + 可线性构造；弃挂载随机 key 方案：hash 落盘需跨挂载稳定） | 抗 DoS 升级：SipHash-2-4 + key 存 SB（mkfs 生成一次），接口签名不变 |
-| min occupancy / 合并阈值 | 待定 | 物理删除后叶子欠载策略（建议挂钩半满 63） |
+| min occupancy / 合并阈值 | **已定（2026-09-27，O-7）**：**dentry** 半满 63（分裂 127→左 63/右 64、欠载 <63）；**extent** 半满 168（分裂 337→左 168/右 169、欠载 <168、合并 ≤337、深度上限 64） | 见 §5.3 / §10-31..36（dentry 见 §10-4） |
 | 堆回收时机 | 待定（目录清空长名后是否释放位图/数据区、数据面是否收缩） | 空间归还策略 |
 
 ---
@@ -453,6 +456,18 @@ bitmap 亮灯；数据面容量 = 2^total_bits_count_log2 × 粒度，见下表�
 23. 三态互斥由 size 保证：外置两态只在 size > 160 出现；size ≤ 160 而 data_root ≠ PTR_INVALID = 不一致（fsck 以 size 为准清理残留并告警）
 24. 迁移：inline → direct/extent（写跨 160，内容拷入首块）；direct 增长需相邻块可续，不可得 → 整文件迁 extent（数据零搬移，旧连续区 = 单条 extent）；写洞 / 打洞（size 不变，整块释放、残块清零）产生块级洞 → extent；truncate 缩至 >160 态不变（direct 释放尾块 / extent 删尾部 extent）；truncate 增大 = 上调 size（inline ≤160 补零推进；inline 跨 160 迁出 / direct 跨块增长与 pwrite 同机械——占位分配是 direct 全覆盖表示的物理义务；extent 纯 size 推进零分配，真稀疏）；truncate 缩至 ≤160 → 强制回迁内联（读回 inline_data + 释放数据块与树 + 复位 data_root）；extent → direct **不做主动/重建式迁移**（不追严格融合），但**尾部元数据写回提交期允许出口缩水**：根叶 && 严格单条 && 覆盖 [0, ceil(size))（fblkbase==0 且 end==ceil(size/4096)）→ 缩 direct（先 inode 后 free 旧根，孤儿语义）——pwrite 增长 / truncate 缩小后收敛单条时触发，判定见 `pwrite_pipeline.md` §8 与 `punch_truncate_pread_spec.md` §6.3
 25. 翻转写序（外置分配 / 迁移 / 回迁统一）：位图亮灯 → 数据块 / 树节点落盘 → inode 字段翻转（data_root / direct_bit / size 同一次写 = 提交点）；崩溃窗口 = 孤儿块，fsck 回收；禁止先翻 inode（会造出悬挂映射）
+
+### 区段树机械参数（31–36，2026-09-27 固化）
+
+> 来源：god 实参（`juvenile_god/extent_*.cpp`）——此前只存在于参考实现代码，现固化进盘面契约（ko 移植硬依据）。
+> （编号 **26–30** 是 `disk_layout_v1.2_inode.md` §7 的 v1.2 增补，不在此处。）
+
+31. 阶 = **337**（槽 338，`[337]` 瞬时槽仅内存、禁落盘）；非根 count ∈ [168,337]，根 count ∈ [1,337]
+32. 分裂：count > 337 → **左 168 / 右 count−168**（叶/内同）；左半最大开边界提升为父 separator
+33. 欠载：非根 **count < 168** → 平衡链（自下而上，父指针驱动）
+34. 平衡：**child+neighbor ≤ 337 → 合并**；否则**抹匀**（左 total/2）；根内 count==1 → root_shrink
+35. 深度上限 **64**（超限判成环）
+36. 节点块：`block_alloc(sb, 2, align_log2=1)` → 2 块连续、**8K 对齐**
 
 ---
 
