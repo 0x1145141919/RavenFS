@@ -38,9 +38,9 @@
 | **M3.5** | 一致性/崩溃窗口（写序 + 非干净卸载后 audit） | flush **之外**崩溃不产生损坏（A/B）；flush 中途 dangling = 设计特性（不修） | M3 | R-SY-04/05/07 | G11 | ✅ (2026-09-27) |
 | **M4** | **文件数据**：a_ops + extent 树 + 三态迁移 + truncate/punch/fallocate + **setattr** | `dd/cat/head` 往返一致（跨态 / >4K / 稀疏洞）；`stat.blocks` 吻合；audit 全绿 | M3 | R-FD-01..10、R-MD-01..06、R-SY-04 | G1、G2 | ✅ **M4.1–M4.5 全绿（2026-09-27）** |
 | **M5 残** | `link` / `symlink`+`get_link` / `mknod` / `tmpfile` | `ln`/`ln -s`/`readlink`/`mknod` 往返；大目录分裂后 `dents_dump` 仍 DUP=0 MISSING=0；audit `chain_bad=0` | M5 | R-NS-05/06/07/09 | G3、G4、G5、G6 | ✅ **完成（2026-09-27）**：code `5791e9a` + symlink 修复 `f1edbc7` + 孤儿块修复 `1f864bf`；guest 往返 PASS（link / symlink fast+slow / mknod 4 型 / `O_TMPFILE` / 大目录 802·502 DUP=MISSING=0）+ audit BAD=0/orphan=0 |
-| **M6** | **xattr / ACL / capability**：4 回调 + `SB_POSIXACL` + 默认 ACL 继承 + `security.capability`；xattr 块 alloc/free | `setfattr`/`setfacl`/`setcap` 往返；**`rsync -aHAX` 保留 ACL+xattr**；audit xattr 校验通过 | M3、M5 | R-XA-01..04、R-NS-12 | G7、G8、G9 | ⬜ **测试驱动**：范围由 **M8 `rsync -aHAX` 探针**结果决定（保真→缩水/延后；丢 ACL/xattr 或 `setcap` 失效→必须做全） |
+| **M6** | **xattr / ACL / capability**：4 回调 + `SB_POSIXACL` + 默认 ACL 继承 + `security.capability`；xattr 块 alloc/free | `setfattr`/`setfacl`/`setcap` 往返；**`rsync -aHAX` 保留 ACL+xattr**；audit xattr 校验通过 | M3、M5 | R-XA-01..04、R-NS-12 | G7、G8、G9 | ⬜ **范围已定（M8 探针 = 必须做全）**：xattr 四回调 + `security.capability` + POSIX ACL(access+default,`SB_POSIXACL`) + `user.*`(含 `user.crtime_usec`) + **xattr>4K 行为** + 命名空间 `user/trusted/security/system` 裁决 |
 | **M7** | **加固**：停机标志 / 周期回写 / 并发面 / `fsync` 全覆盖 / ENOSPC 干净 | `fsstress` 小规模不炸；`drop_caches` + 并发读写下 audit 仍绿；注入不一致后入口返 `-EIO` | M3–G9 | R-LM-09、R-CO-02/04、R-SY-05 | G10 | ⬜ |
-| **M8** | **预演最狠测试**：`rsync -aHAX` ext4→ravenfs 克隆 + `pacman -Qkk`（T3 前哨） | 克隆零致命错误 + `pacman -Qkk` 元数据全对 | M4 + M5 + M6 | （T3 前置） | G12 | ⬜ |
+| **M8** | **预演最狠测试**：`rsync -aHAX` ext4→ravenfs 克隆 + `pacman -Qkk`（T3 前哨） | 克隆零致命错误 + `pacman -Qkk` 元数据全对 | M4 + M5 + M6 | （T3 前置） | G12 | 🔶 **2026-09-27 pilot PASS**：数据/常规元数据近乎无损（`pacman -Qkk` 与 ext4 逐字一致、audit BAD=0、干净卸载）；**唯一系统性缺口 = xattr/ACL/capability**（`rsync -aHAX` rc=23）→ **M6 必须做全**；全量克隆≈2–4min（T3 建议 `-aHAXS`，源先剔 `/root/*.img`） |
 | **T1** | **xfstests `./check -g quick`（generic 组）** | **产出失败清单 = 第一约束缺口表**（区分 fail / skip） | M3–M7 | — | G13 | ⬜ |
 | **T1.5** | 按 T1 缺口表逐条补 spec §4 的 **M** 项，重跑至收敛 | 缺口收敛（fail 归零或书面降级） | T1 | — | — | ⬜ |
 | *T2* | *范围外留锚点*：`fsx`/`fsstress`/`fs_mark`，每轮 audit | *无静默损坏（audit 恒绿）* | *T1.5* | — | — | *另议* |
@@ -202,3 +202,5 @@ T0 ✅ ──► M3.5 ✅ ──► [M4 文件数据] ──┐
 | 2026-09-27（晚） | **M4.5 ✅ 实测 PASS**（fsync 定向 + `blkdev_issue_flush` 屏障 + `RFS_SHUTDOWN`；CrA/B/C 崩溃矩阵 + 深层树平衡；audit BAD=0） | 提交 `ddc5f6b`（码）+ `164ba78`（靶场）；裁判：fsync 定向（非卷级），durable-create 归调用方 `fsync(dir)` → **D-M4-15** |
 | 2026-09-27（晚） | **M5残 代码 ✅**（link/symlink+get_link/mknod/tmpfile，host make 绿）；**guest 往返待验** | 提交 `5791e9a`（码） |
 | 2026-09-27（晚） | **M5残 ✅ 完成**：guest 往返 PASS；途中修 **symlink 两缺陷**（fast usercopy 白名单 / slow i_link+nohighmem）+ **M4 收口孤儿块泄漏**（evict 未接数据回收） | 提交 `f1edbc7`（symlink 修复）+ `1f864bf`（孤儿块修复） |
+| 2026-09-27（晚） | **M8 pilot PASS**：`rsync -aHAX` ext4→ravenfs——内容/权限/属主/ns时间戳/硬链/symlink/设备节点/setuid-sticky/长名/大文件 全保真；**唯一系统性缺口 = xattr/ACL/capability（EOPNOTSUPP，rc=23）→ M6=必须做全**；`pacman -Qkk` 与 ext4 基线一致、audit BAD=0、干净 umount；全量克隆≈2–4min | 用户定 M6 测试驱动 → 探针判「做全」 |
+| 2026-09-27（晚） | **M8 观察（记）**：目录 `st_nlink=entries+2` / `st_size=条目数`（非 POSIX 惯例，§10 不变量 18 有意为之）；inline `i_blocks=0`（O-16 邻域）；默认 `-a` 不保稀疏→T3 用 `-S`；金标准 `/root/*.img` 4.9G junk 建议先剔 | M8 pilot |
