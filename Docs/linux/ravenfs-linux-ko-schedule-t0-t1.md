@@ -37,7 +37,7 @@
 | **T0** | 静态：mkfs 产物 → 只读挂载 → audit 全绿 | 不变量 §10 + v1.2 §7 零违例 | — | — | — | ✅ (2026-09-26) |
 | **M3.5** | 一致性/崩溃窗口（写序 + 非干净卸载后 audit） | flush **之外**崩溃不产生损坏（A/B）；flush 中途 dangling = 设计特性（不修） | M3 | R-SY-04/05/07 | G11 | ✅ (2026-09-27) |
 | **M4** | **文件数据**：a_ops + extent 树 + 三态迁移 + truncate/punch/fallocate + **setattr** | `dd/cat/head` 往返一致（跨态 / >4K / 稀疏洞）；`stat.blocks` 吻合；audit 全绿 | M3 | R-FD-01..10、R-MD-01..06、R-SY-04 | G1、G2 | ✅ **M4.1–M4.5 全绿（2026-09-27）** |
-| **M5 残** | `link` / `symlink`+`get_link` / `mknod` / `tmpfile` | `ln`/`ln -s`/`readlink`/`mknod` 往返；大目录分裂后 `dents_dump` 仍 DUP=0 MISSING=0；audit `chain_bad=0` | M5 | R-NS-05/06/07/09 | G3、G4、G5、G6 | 🔶 **代码 ✅ `5791e9a`（host make 绿）；guest 往返待验**（必做、非可选：symlink=T3 前置 / tmpfile=journald / link·mknod=安装） |
+| **M5 残** | `link` / `symlink`+`get_link` / `mknod` / `tmpfile` | `ln`/`ln -s`/`readlink`/`mknod` 往返；大目录分裂后 `dents_dump` 仍 DUP=0 MISSING=0；audit `chain_bad=0` | M5 | R-NS-05/06/07/09 | G3、G4、G5、G6 | ✅ **完成（2026-09-27）**：code `5791e9a` + symlink 修复 `f1edbc7` + 孤儿块修复 `1f864bf`；guest 往返 PASS（link / symlink fast+slow / mknod 4 型 / `O_TMPFILE` / 大目录 802·502 DUP=MISSING=0）+ audit BAD=0/orphan=0 |
 | **M6** | **xattr / ACL / capability**：4 回调 + `SB_POSIXACL` + 默认 ACL 继承 + `security.capability`；xattr 块 alloc/free | `setfattr`/`setfacl`/`setcap` 往返；**`rsync -aHAX` 保留 ACL+xattr**；audit xattr 校验通过 | M3、M5 | R-XA-01..04、R-NS-12 | G7、G8、G9 | ⬜ **测试驱动**：范围由 **M8 `rsync -aHAX` 探针**结果决定（保真→缩水/延后；丢 ACL/xattr 或 `setcap` 失效→必须做全） |
 | **M7** | **加固**：停机标志 / 周期回写 / 并发面 / `fsync` 全覆盖 / ENOSPC 干净 | `fsstress` 小规模不炸；`drop_caches` + 并发读写下 audit 仍绿；注入不一致后入口返 `-EIO` | M3–G9 | R-LM-09、R-CO-02/04、R-SY-05 | G10 | ⬜ |
 | **M8** | **预演最狠测试**：`rsync -aHAX` ext4→ravenfs 克隆 + `pacman -Qkk`（T3 前哨） | 克隆零致命错误 + `pacman -Qkk` 元数据全对 | M4 + M5 + M6 | （T3 前置） | G12 | ⬜ |
@@ -201,3 +201,4 @@ T0 ✅ ──► M3.5 ✅ ──► [M4 文件数据] ──┐
 | 2026-09-27（晚） | **M5残 标「必做（非可选）」**（symlink=T3 前置 / tmpfile=journald / link·mknod=安装）；**M6 标「测试驱动」**（范围由 M8 `rsync -aHAX` 探针决定） | 用户：别把 M5残 当可跳、M6 由测试定 |
 | 2026-09-27（晚） | **M4.5 ✅ 实测 PASS**（fsync 定向 + `blkdev_issue_flush` 屏障 + `RFS_SHUTDOWN`；CrA/B/C 崩溃矩阵 + 深层树平衡；audit BAD=0） | 提交 `ddc5f6b`（码）+ `164ba78`（靶场）；裁判：fsync 定向（非卷级），durable-create 归调用方 `fsync(dir)` → **D-M4-15** |
 | 2026-09-27（晚） | **M5残 代码 ✅**（link/symlink+get_link/mknod/tmpfile，host make 绿）；**guest 往返待验** | 提交 `5791e9a`（码） |
+| 2026-09-27（晚） | **M5残 ✅ 完成**：guest 往返 PASS；途中修 **symlink 两缺陷**（fast usercopy 白名单 / slow i_link+nohighmem）+ **M4 收口孤儿块泄漏**（evict 未接数据回收） | 提交 `f1edbc7`（symlink 修复）+ `1f864bf`（孤儿块修复） |
