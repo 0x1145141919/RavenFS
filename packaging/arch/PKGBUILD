@@ -13,7 +13,7 @@ depends=('dkms')
 options=('!strip')
 # 个人包：直接从本地源树拷贝（可用 RVN_SRC 覆盖）；不走 tarball/网络。
 _srcroot="${RVN_SRC:-/home/PS/PS_git/OS_pj_uefi/ravenfs}"
-source=('dkms.conf' 'ravenfs.conf')
+source=('dkms.conf' 'mkinitcpio-ravenfs-hook')
 sha256sums=('SKIP' 'SKIP')
 
 package() {
@@ -26,5 +26,5 @@ package() {
   install -m644 "$_srcroot"/include/*.h "$dst/include/"
   install -m644 "$srcdir/dkms.conf" "$dst/dkms.conf"
   sed -i "s/@PKGVER@/${pkgver}/" "$dst/dkms.conf"
-  install -Dm644 "$srcdir/ravenfs.conf" "$pkgdir/etc/mkinitcpio.conf.d/ravenfs.conf"
+  install -Dm755 "$srcdir/mkinitcpio-ravenfs-hook" "$pkgdir/usr/lib/initcpio/install/ravenfs"
 }

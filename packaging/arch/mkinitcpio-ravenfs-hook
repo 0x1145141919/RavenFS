@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# ravenfs-dkms: 把 ravenfs 模块加入 initramfs（守卫版——缺模块则跳过，绝不使 mkinitcpio 失败）。
+build() {
+    local k="${KERNELVERSION:-$(uname -r)}"
+    if modinfo -k "$k" -n ravenfs >/dev/null 2>&1; then
+        add_module ravenfs
+    fi
+}
+help() {
+    cat <<HELPEOF
+ravenfs: 若当前内核已由 DKMS 构建 ravenfs 模块，则将其加入 initramfs；否则跳过。
+在 /etc/mkinitcpio.conf 的 HOOKS 中加入 `ravenfs`（放在 `filesystems` 之前/附近均可）。
+HELPEOF
+}
