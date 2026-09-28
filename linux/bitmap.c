@@ -21,6 +21,11 @@
  *     崩溃序无法通解，只能靠 ① 把「位图落后内存」的窗口收到 ≤30s 缓解。
  *   · 无保留区：只有 root inode（=16，mkfs 硬编码）被占用；0..15 与 17.. 全部可正常分配。
  *     （2026-09-26 更正：曾误写“inode 组 [0,16) 保留”，该说法不存在，已铲除。）
+ *   · **D2/D3 对齐 god（2026-09-28 用户裁）**：补 god 三原语 `alloc_soft` / `soft_occupy` /
+ *     `test_interval` + 软分配 / 锚定认领路由（语义 1:1 对齐 `juvenile_god/bitmap_slices.cpp`；
+ *     仅坐标系差异：god 片内偏移，ko 全局位号）；preferred 初值 `cpu % slice_count` 铺开，
+ *     **搜索式分配（硬/软）一律从 preferred 起扫**（锚定认领锚点片唯一、例外，god 同）。
+ *   · alloc 锁维持**阻塞 spinlock**（不改 try —— 2026-09-28 用户裁：阻塞恰配合后续改制）。
  *   · 1 = 已用，0 = 空闲。
  */
 #include <linux/module.h>
@@ -206,6 +211,11 @@ static int rfs_bm_group_setup(struct ravenfs_bm_group *g, const char *name,
 	if (!g->preferred)
 		return -ENOMEM;
 
+	/* D3（对齐 god ctor）：preferred 按 cpu 片号铺开 —— 首次分配即分摊，
+	 * 不同 CPU 不挤同一片（kzalloc 全 0 会让所有 CPU 首分配串行撞片 0） */
+	for (i = 0; i < cpu_slots; i++)
+		g->preferred[i] = i % n_slices;
+
 	for (i = 0; i < n_slices; i++) {
 		struct ravenfs_bm_slice *s = &g->slices[i];
 		u64 base = (u64)i * g->per_bits;
@@ -280,6 +290,207 @@ static u64 rfs_bm_group_alloc(struct ravenfs_bm_group *g, u64 count, u64 align)
 		}
 	}
 	return RFS_BM_NO_HIT;
+}
+
+/*
+ * ── D2 对齐 god（2026-09-28）：软分配 / 锚定认领 / 区间测试 ──
+ * 语义 1:1 对齐 juvenile_god/bitmap_slices.cpp（alloc_soft / soft_occupy /
+ * test_interval + 路由 block_alloc_soft / block_occupy_soft）；差异仅坐标系
+ * （god 片内偏移，ko 全局位号，同一块内存）与锁策略（ko 阻塞，见文件头）。
+ */
+
+/*
+ * 软分配（god alloc_soft）：只看**单个段**（不走段链，对齐候选被拒不换段），
+ * hint 起段 → 绕回「片内最早段」再试一次；got = min(段长, count)，缺口 *gap。
+ * 返回命中起始全局位号 / RFS_BM_NO_HIT。
+ * count > 本片位数 → NO_HIT（god RC_ERR_STATE：路由层换片 → 全片等价失败）。
+ */
+static u64 rfs_bm_slice_alloc_soft(struct ravenfs_bm_group *g, struct ravenfs_bm_slice *s,
+				   u64 count, u64 align, u64 *gap)
+{
+	u64 lo = s->base_idx, hi = lo + s->bits;
+	u64 cap = max(count, align);
+	u64 from = s->hint < lo ? lo : s->hint;
+	u64 seg_s, seg_e, hit = RFS_BM_NO_HIT;
+	u64 got, j;
+
+	*gap = count;
+	if (!count || count > s->bits || !s->free_count)
+		return RFS_BM_NO_HIT;
+
+	if (next_free_seg(g->words, hi, from, cap, &seg_s, &seg_e)) {
+		u64 cand = (seg_s + align - 1) & ~(align - 1);
+
+		if (cand < seg_e)
+			hit = cand;
+	}
+	if (hit == RFS_BM_NO_HIT &&
+	    next_free_seg(g->words, from, lo, cap, &seg_s, &seg_e)) {
+		u64 cand = (seg_s + align - 1) & ~(align - 1);
+
+		if (cand < seg_e)
+			hit = cand;
+	}
+	if (hit == RFS_BM_NO_HIT)
+		return RFS_BM_NO_HIT;
+
+	got = seg_e - hit;
+	if (got > count)
+		got = count;
+	for (j = 0; j < got; j++)
+		rfs_bm_set(g->words, hit + j);
+	s->free_count -= got;
+	s->hint = hit + got;
+	*gap = count - got;
+	return hit;
+}
+
+/*
+ * 锚定认领（god soft_occupy）：从 base 起贪心认领**连续空闲前缀**，撞第一个
+ * 占用位或到额度即停；**永不越片**（cap 片内夹断，跨界续圈在路由层）。
+ * 口径：*rest 入 = 已由其它途径满足量（路由恒传 0）→ real = len - *rest；
+ *       出 = len - claimed（恒等式与入值无关）。
+ * 返回 0；-ENOSPC = 锚点即占用（*rest 出 = len）；-EINVAL = base 出片（rest 不动）。
+ * hint 只进不退：回卷游标会打烂搜索分配的空间局部性（god 纪律）。
+ */
+static int rfs_bm_slice_occupy(struct ravenfs_bm_group *g, struct ravenfs_bm_slice *s,
+			       u64 base, u64 len, u64 *rest)
+{
+	u64 lo = s->base_idx, hi = lo + s->bits;
+	u64 real, cap, k = 0, j;
+
+	if (*rest > len)
+		return -EINVAL;
+	if (!len || *rest == len)
+		return 0;			/* real == 0：无事可做（rest 不动） */
+	if (base < lo || base >= hi)
+		return -EINVAL;
+	real = len - *rest;
+	cap = min(real, hi - base);
+
+	/* 贪心前缀（字粒度）：与 next_free_seg 段尾延伸同构、方向相反 */
+	while (k < cap) {
+		u64 pos = (base + k) & 63;
+		u64 free_mask = ~g->words[(base + k) >> 6] >> pos;
+		u64 run;
+
+		if (!(free_mask & 1))
+			break;			/* 当前位占用 → 前缀断 */
+		run = (free_mask == ~0ULL) ? (64 - pos) : __builtin_ctzll(~free_mask);
+		k += run;
+		if (k > cap)
+			k = cap;
+	}
+	if (!k) {
+		*rest = len;
+		return -ENOSPC;
+	}
+	for (j = 0; j < k; j++)
+		rfs_bm_set(g->words, base + j);
+	s->free_count -= k;
+	if (base + k > s->hint)
+		s->hint = base + k;		/* 只进不退 */
+	*rest = len - k;
+	return 0;
+}
+
+/* 组内软分配路由（god block_alloc_soft）：preferred 起扫（**分配从 preferred 搞起**）；
+ * **一片为止**（缺口回传，不跨片拼，调用方再决策）；锁忙阻塞等（ko 纪律） */
+static u64 rfs_bm_group_alloc_soft(struct ravenfs_bm_group *g, u64 count, u64 align,
+				   u64 *gap)
+{
+	u32 cpu = (u32)raw_smp_processor_id() % g->cpu_slots;
+	u32 round;
+
+	*gap = count;
+	for (round = 0; round < g->n_slices; round++) {
+		u32 idx = (g->preferred[cpu] + round) % g->n_slices;
+		struct ravenfs_bm_slice *s = &g->slices[idx];
+		u64 hit;
+
+		spin_lock(&s->lock);
+		hit = rfs_bm_slice_alloc_soft(g, s, count, align, gap);
+		spin_unlock(&s->lock);
+		if (hit != RFS_BM_NO_HIT) {
+			g->preferred[cpu] = idx;
+			return hit;
+		}
+	}
+	return RFS_BM_NO_HIT;
+}
+
+/*
+ * 锚定认领路由（god block_occupy_soft）：锚点片唯一 → 阻塞抢锁（不换片，
+ * 纪律同 free）；片内前缀**顶到片尾才续圈**下一片（真实连续），中途撞占用即断。
+ * 返回原址 base（认领 ≥1）/ PTR_INVALID；*rest = 缺口。
+ */
+static u64 rfs_bm_group_occupy_soft(struct ravenfs_bm_group *g, u64 base, u64 count,
+				    u64 *rest)
+{
+	u64 nbits = g->nbits;
+	u64 b = base, remain = count;
+
+	while (remain && b < nbits) {
+		u32 idx = (u32)(b / g->per_bits);
+		struct ravenfs_bm_slice *s;
+		u64 slice_end, left = 0;
+		int rc;
+
+		if (idx >= g->n_slices)
+			break;			/* 越界剩余放弃（防御，同 free） */
+		s = &g->slices[idx];
+		spin_lock(&s->lock);
+		rc = rfs_bm_slice_occupy(g, s, b, remain, &left);
+		spin_unlock(&s->lock);
+		if (rc)
+			break;			/* 锚点即占用：前缀断，不跨 */
+		b += remain - left;		/* claimed */
+		remain = left;
+		if (!remain)
+			break;
+		slice_end = min((u64)(idx + 1) * g->per_bits, nbits);
+		if (b != slice_end)
+			break;			/* 中途撞占用：跨界续圈无意义 */
+		/* b == slice_end == 下一片 base 0 → 续圈 */
+	}
+	*rest = remain;
+	return (count - remain) ? base : (u64)PTR_INVALID;
+}
+
+/* 区间同值测试（god test_interval 的组级版：跨片逐段；单片情形语义等价）：
+ * [base, base+len) 全为 val → 0；异位 → -ENOENT；越界/溢出 → -EINVAL */
+static int rfs_bm_group_test_interval(struct ravenfs_bm_group *g, u64 base, u64 len,
+				      bool val)
+{
+	u64 b = base, end;
+
+	if (len && base + len < base)
+		return -EINVAL;			/* 溢出 */
+	end = base + len;
+	if (end > g->nbits)
+		return -EINVAL;
+	while (b < end) {
+		u32 idx = (u32)(b / g->per_bits);
+		struct ravenfs_bm_slice *s;
+		u64 slice_end, j;
+
+		if (idx >= g->n_slices)
+			return -EINVAL;
+		s = &g->slices[idx];
+		spin_lock(&s->lock);
+		slice_end = min((u64)(idx + 1) * g->per_bits, g->nbits);
+		if (slice_end > end)
+			slice_end = end;
+		for (j = b; j < slice_end; j++) {
+			if (rfs_bm_get(g->words, j) != val) {
+				spin_unlock(&s->lock);
+				return -ENOENT;
+			}
+		}
+		spin_unlock(&s->lock);
+		b = slice_end;
+	}
+	return 0;
 }
 
 /* 释放：跨片逐段清位（重复释放不虚高） */
@@ -500,6 +711,56 @@ u64 ravenfs_block_alloc(struct super_block *sb, u64 count, u32 align_log2)
 	align = 1ULL << min(align_log2, 16u);	/* 防御截断 16 */
 	hit = rfs_bm_group_alloc(&m->blk, count, align);
 	return (hit == RFS_BM_NO_HIT) ? (u64)PTR_INVALID : hit;
+}
+
+/*
+ * 软分配（god block_alloc_soft）：单片取 min(片内可给, count)，**一片为止**；
+ * preferred 起扫。*remain = 缺口；全片无 → PTR_INVALID 且 *remain = count。
+ */
+u64 ravenfs_block_alloc_soft(struct super_block *sb, u64 count, u64 *remain)
+{
+	struct ravenfs_bitmap_mgr *m = ((struct ravenfs_sb_info *)sb->s_fs_info)->bitmap;
+	u64 hit, gap = count;
+
+	if (!m || !count) {
+		if (remain)
+			*remain = count;
+		return (u64)PTR_INVALID;
+	}
+	hit = rfs_bm_group_alloc_soft(&m->blk, count, 1, &gap);
+	if (remain)
+		*remain = gap;
+	return (hit == RFS_BM_NO_HIT) ? (u64)PTR_INVALID : hit;
+}
+
+/*
+ * 锚定认领（god block_occupy_soft）：blkbase 起认领 ≤ count 连续空闲块；
+ * 返回原址（认领 ≥1）/ PTR_INVALID；*rest = 缺口。
+ */
+u64 ravenfs_block_occupy_soft(struct super_block *sb, u64 base, u64 count, u64 *rest)
+{
+	struct ravenfs_bitmap_mgr *m = ((struct ravenfs_sb_info *)sb->s_fs_info)->bitmap;
+	u64 gap = count, ret;
+
+	if (!m || !count) {
+		if (rest)
+			*rest = count;
+		return (u64)PTR_INVALID;
+	}
+	ret = rfs_bm_group_occupy_soft(&m->blk, base, count, &gap);
+	if (rest)
+		*rest = gap;
+	return ret;
+}
+
+/* 区间同值测试（god test_interval 组级版）：0=全同 / -ENOENT=异位 / -EINVAL=越界 */
+int ravenfs_block_test_interval(struct super_block *sb, u64 base, u64 len, bool val)
+{
+	struct ravenfs_bitmap_mgr *m = ((struct ravenfs_sb_info *)sb->s_fs_info)->bitmap;
+
+	if (!m)
+		return -EINVAL;
+	return rfs_bm_group_test_interval(&m->blk, base, len, val);
 }
 
 void ravenfs_block_free(struct super_block *sb, u64 blk, u64 count)

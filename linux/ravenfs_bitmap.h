@@ -20,6 +20,10 @@ bool ravenfs_block_test(struct super_block *sb, u64 blk);
 u64  ravenfs_inode_alloc(struct super_block *sb);
 void ravenfs_inode_free(struct super_block *sb, u64 inum);
 bool ravenfs_inode_test(struct super_block *sb, u64 inum);
+/* D2 对齐 god（2026-09-28）：软分配 / 锚定认领 / 区间同值测试（bitmap_slices 同款语义） */
+u64  ravenfs_block_alloc_soft(struct super_block *sb, u64 count, u64 *remain);
+u64  ravenfs_block_occupy_soft(struct super_block *sb, u64 base, u64 count, u64 *rest);
+int  ravenfs_block_test_interval(struct super_block *sb, u64 base, u64 len, bool val);
 u64  ravenfs_block_free_total(struct super_block *sb);
 u64  ravenfs_inode_free_total(struct super_block *sb);
 
