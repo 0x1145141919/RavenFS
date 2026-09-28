@@ -283,10 +283,13 @@ int ravenfs_read_leaf(struct super_block *sb, u64 blk, void *buf, u32 *cnt)
 
 	if (err)
 		return err;
+	RFS_STAT_INC(sb, dir_leaf_reads);	/* readdir/lookup 读叶子次数 */
 	m = buf;
 	if (m->magics[0] != DENTRY_MAGIC1 || m->magics[1] != DENTRY_MAGIC2 ||
-	    m->magics[2] != DENTRY_MAGIC3 || m->magics[3] != DENTRY_MAGIC4)
+	    m->magics[2] != DENTRY_MAGIC3 || m->magics[3] != DENTRY_MAGIC4) {
+		RFS_STAT_INC(sb, err_other);	/* 兜底：未归类错误返回 */
 		return -EIO;
+	}
 	if (RFS_PP_IS_INNER(m->parent_ptr))
 		return -EIO;
 	*cnt = RFS_PP_COUNT(m->parent_ptr);

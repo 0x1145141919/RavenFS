@@ -183,6 +183,7 @@ const struct address_space_operations ravenfs_aops = {
  */
 int ravenfs_file_mmap_prepare(struct vm_area_desc *desc)
 {
+	RFS_STAT_INC(file_inode(desc->file)->i_sb, op_mmap);
 	file_accessed(desc->file);
 	return generic_file_mmap_prepare(desc);
 }
@@ -193,9 +194,18 @@ int ravenfs_file_mmap_prepare(struct vm_area_desc *desc)
  */
 ssize_t ravenfs_file_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
-	if (ravenfs_is_shutdown(file_inode(iocb->ki_filp)->i_sb))
+	struct super_block *sb = file_inode(iocb->ki_filp)->i_sb;
+	ssize_t ret;
+
+	RFS_STAT_INC(sb, op_read_iter);
+	if (ravenfs_is_shutdown(sb)) {
+		RFS_STAT_INC(sb, err_shutdown_hits);
 		return -EIO;
-	return generic_file_read_iter(iocb, iter);
+	}
+	ret = generic_file_read_iter(iocb, iter);
+	if (ret > 0)
+		RFS_STAT_ADD(sb, op_read_bytes, ret);	/* IO 放大分母 */
+	return ret;
 }
 
 /*
@@ -207,8 +217,11 @@ ssize_t ravenfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = file_inode(iocb->ki_filp);
 	ssize_t ret;
 
-	if (ravenfs_is_shutdown(inode->i_sb))
+	RFS_STAT_INC(inode->i_sb, op_write_iter);
+	if (ravenfs_is_shutdown(inode->i_sb)) {
+		RFS_STAT_INC(inode->i_sb, err_shutdown_hits);
 		return -EIO;
+	}
 	if (unlikely(IS_IMMUTABLE(inode) || IS_APPEND(inode)))
 		return -EPERM;
 	if (sb_rdonly(inode->i_sb))
@@ -232,6 +245,8 @@ ssize_t ravenfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		goto out;
 
 	ret = iomap_file_buffered_write(iocb, from, &ravenfs_iomap_ops, NULL, NULL);
+	if (ret > 0)
+		RFS_STAT_ADD(inode->i_sb, op_write_bytes, ret);	/* IO 放大分母 */
 out:
 	inode_unlock(inode);
 	return ret;
@@ -1022,14 +1037,17 @@ long ravenfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	bool keep;
 	int err;
 
+	RFS_STAT_INC(sb, op_fallocate);
 	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
 		return -EOPNOTSUPP;
 	if (offset < 0 || len <= 0)
 		return -EINVAL;
 	if (offset + len < 0 || (u64)(offset + len) > RAVENFS_MAX_FILESIZE)
 		return -EFBIG;
-	if (ravenfs_is_shutdown(sb))
+	if (ravenfs_is_shutdown(sb)) {
+		RFS_STAT_INC(sb, err_shutdown_hits);
 		return -EIO;
+	}
 	if (sb_rdonly(sb))
 		return -EROFS;
 	if (!S_ISREG(inode->i_mode))
@@ -1073,8 +1091,11 @@ int ravenfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr
 	struct inode *inode = d_inode(dentry);
 	int err;
 
-	if (ravenfs_is_shutdown(inode->i_sb))
+	RFS_STAT_INC(inode->i_sb, op_setattr);
+	if (ravenfs_is_shutdown(inode->i_sb)) {
+		RFS_STAT_INC(inode->i_sb, err_shutdown_hits);
 		return -EIO;
+	}
 	err = setattr_prepare(idmap, dentry, attr);
 	if (err)
 		return err;

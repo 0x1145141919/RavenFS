@@ -87,6 +87,137 @@ struct ravenfs_msession;
 
 /* ─────────────────────────── 内存结构 ─────────────────────────── */
 
+/*
+ * ── superblock 级性能计数器（2026-09-28 部署；设计见
+ *    `Docs/linux/ravenfs-linux-ko-sb-counters-design.md` §3/§6/§7）──
+ * 纯 atomic64 累计量：随 mount 生（kzalloc(sbi) 天然清零 = S3）、随 umount 灭；
+ * 打点只做 atomic64_add，**零分配零 I/O，绝不影响控制流**（P1）。
+ * 98 字段 = §3 A–K 全清单；派生指标（命中率/写放大/换片率…，§4）**不存**，
+ * 由 debugfs stats 文件现算（单一事实来源，P2）。
+ * 口径：入口记 attempts、返回点记 outcomes（P5）；CHUNK 专属 9 个在 FULL 后端恒 0。
+ */
+struct ravenfs_sb_stats {
+	/* A. VFS 操作面 op_（26）—— 负载画像 + 行为指纹 */
+	atomic64_t	op_lookup;
+	atomic64_t	op_create;
+	atomic64_t	op_mkdir;
+	atomic64_t	op_unlink;
+	atomic64_t	op_rmdir;
+	atomic64_t	op_rename;
+	atomic64_t	op_link;
+	atomic64_t	op_symlink;
+	atomic64_t	op_mknod;
+	atomic64_t	op_tmpfile;
+	atomic64_t	op_readdir;
+	atomic64_t	op_read_iter;
+	atomic64_t	op_write_iter;
+	atomic64_t	op_read_bytes;
+	atomic64_t	op_write_bytes;
+	atomic64_t	op_fallocate;
+	atomic64_t	op_fsync;
+	atomic64_t	op_syncfs;
+	atomic64_t	op_getattr;
+	atomic64_t	op_setattr;
+	atomic64_t	op_mmap;
+	atomic64_t	op_listxattr;
+	atomic64_t	op_xattr_get;
+	atomic64_t	op_xattr_set;
+	atomic64_t	op_acl_get;
+	atomic64_t	op_acl_set;
+
+	/* B. inode 行缓存 ic_（9）—— 最核心调试价值 */
+	atomic64_t	ic_hit;
+	atomic64_t	ic_miss;
+	atomic64_t	ic_row_load;
+	atomic64_t	ic_retry;
+	atomic64_t	ic_row_evict;
+	atomic64_t	ic_row_reap;
+	atomic64_t	ic_dirty_mark;
+	atomic64_t	ic_wb_rows;
+	atomic64_t	ic_err;
+
+	/* C. mdata 节点缓存 md_（8） */
+	atomic64_t	md_hit;
+	atomic64_t	md_miss;
+	atomic64_t	md_node_load;
+	atomic64_t	md_retry;
+	atomic64_t	md_drop;
+	atomic64_t	md_reap;
+	atomic64_t	md_node_wb;
+	atomic64_t	md_err;
+
+	/* D. TTL 后台 ttl_（2）—— “机制还活着”的证据 */
+	atomic64_t	ttl_rounds;
+	atomic64_t	ttl_round_errs;
+
+	/* E. 块设备 IO io_（5） */
+	atomic64_t	io_read_ops;
+	atomic64_t	io_read_bytes;
+	atomic64_t	io_write_ops;
+	atomic64_t	io_write_bytes;
+	atomic64_t	io_flush_ops;
+
+	/* F. 位图分配 bm_（18）—— FULL/CHUNK 双后端；后 9 个 CHUNK 专属（FULL 恒 0） */
+	atomic64_t	bm_alloc_calls;
+	atomic64_t	bm_alloc_ok;
+	atomic64_t	bm_alloc_fail;
+	atomic64_t	bm_alloc_blocks;
+	atomic64_t	bm_free_calls;
+	atomic64_t	bm_free_blocks;
+	atomic64_t	bm_soft_ok;
+	atomic64_t	bm_occupy;
+	atomic64_t	bm_sync_slices;
+	atomic64_t	bm_chunk_switch;
+	atomic64_t	bm_chunk_switch_ns;
+	atomic64_t	bm_rec_attach;
+	atomic64_t	bm_rec_drain;
+	atomic64_t	bm_pool_empty;
+	atomic64_t	bm_summary_skip;
+	atomic64_t	bm_scan_ns;
+	atomic64_t	bm_ttl_online;
+	atomic64_t	bm_ttl_drain;
+
+	/* G. extent 树 ext_（7） */
+	atomic64_t	ext_lookup;
+	atomic64_t	ext_insert;
+	atomic64_t	ext_split;
+	atomic64_t	ext_new_root;
+	atomic64_t	ext_balance;
+	atomic64_t	ext_unmap;
+	atomic64_t	ext_node_reads;
+
+	/* H. 目录 dir_（3） */
+	atomic64_t	dir_leaf_reads;
+	atomic64_t	dir_emit;
+	atomic64_t	dir_nlink_adjust;
+
+	/* I. xattr / ACL xa_（10） */
+	atomic64_t	xa_get;
+	atomic64_t	xa_set;
+	atomic64_t	xa_del;
+	atomic64_t	xa_list;
+	atomic64_t	xa_block_load;
+	atomic64_t	xa_block_store;
+	atomic64_t	xa_e2big;
+	atomic64_t	xa_err;
+	atomic64_t	acl_get;
+	atomic64_t	acl_set;
+
+	/* J. 错误与健康 err_（6）—— 少量计数器辅助判断，不搞复杂降级 */
+	atomic64_t	err_shutdown_hits;
+	atomic64_t	err_shutdown_trig;
+	atomic64_t	err_meta_io;
+	atomic64_t	err_sb_read;
+	atomic64_t	err_enospc;
+	atomic64_t	err_other;
+
+	/* K. 生命周期 life_（4） */
+	atomic64_t	life_mount;
+	atomic64_t	life_umount;
+	atomic64_t	life_iget_new;
+	atomic64_t	life_evict;
+};
+
 struct ravenfs_sb_info {
 	u64	total_blocks;
 	u64	inode_count;
@@ -108,7 +239,26 @@ struct ravenfs_sb_info {
 	struct ravenfs_bitmap_mgr *bitmap;	/* 双位图分片分配器（bitmap.c；全量常驻内存分片、非缓存行，自有分片级同步） */
 
 	bool	shutdown;	/* RFS_SHUTDOWN（R-LM-09）：自检 / 元数据 I/O 失败 → 全局停机，入口返 -EIO */
+
+	struct ravenfs_sb_stats stats;	/* §3 性能计数器：随 sbi 一起 kzalloc → mount 即清零（S3） */
+	struct dentry	*dbg_dir;	/* debugfs 挂载点目录（§8） */
+	u64		mounted_at_ns;	/* stats 文件头行用（非计数器，§8.1） */
 };
+
+/*
+ * ── 打点宏（§7.1；唯一入口）──
+ * 必须判 `s_fs_info`：`parse_superblock` 失败 / `put_super` 尾段（kfree 之后）
+ * 都可能出现 `sb` 在手但 sbi 已空的窗口 → 判空是本宏存在的唯一理由。
+ * 只碰 atomic64，**零分配零 I/O，不睡眠，可安全持锁调用**（P1/§7.2）。
+ */
+#define RFS_STAT_INC(sb, field)		RFS_STAT_ADD((sb), field, 1)
+#define RFS_STAT_ADD(sb, field, n)					\
+	do {								\
+		struct super_block *__rfs_sb = (sb);			\
+		struct ravenfs_sb_info *__rfs_s = __rfs_sb ? __rfs_sb->s_fs_info : NULL;	\
+		if (__rfs_s)						\
+			atomic64_add((n), &__rfs_s->stats.field);	\
+	} while (0)
 
 struct ravenfs_inode_info {
 	struct inode		vfs_inode;	/* 骨架：盘记录归 mgr（§4.11.1）；此处仅备将来私有字段 */

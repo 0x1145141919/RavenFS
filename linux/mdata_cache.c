@@ -146,11 +146,14 @@ static int ravenfs_mrow_load(struct super_block *sb, struct ravenfs_mdata_cache 
 
 		if (!bh) {
 			err = -EIO;
+			RFS_STAT_INC(sb, err_meta_io);
 			goto fail_unlocked;
 		}
 		memcpy((char *)row->data + (u64)got * RAVENFS_BLOCK_SIZE,
 		       bh->b_data, RAVENFS_BLOCK_SIZE);
 		brelse(bh);
+		RFS_STAT_INC(sb, io_read_ops);
+		RFS_STAT_ADD(sb, io_read_bytes, RAVENFS_BLOCK_SIZE);
 	}
 	row->node_idx = node_idx;
 	init_rwsem(&row->io_lock);
@@ -174,6 +177,7 @@ static int ravenfs_mrow_load(struct super_block *sb, struct ravenfs_mdata_cache 
 		up_write(&sh->lock);
 		ravenfs_mrow_free(c, row);
 		*out = old;
+		RFS_STAT_INC(sb, md_node_load);	/* 节点盘读次数 */
 		return 0;
 	}
 	err = xa_insert(&sh->rows, key, row, GFP_KERNEL);
@@ -184,6 +188,7 @@ static int ravenfs_mrow_load(struct super_block *sb, struct ravenfs_mdata_cache 
 	refcount_inc(&row->ref);
 	up_write(&sh->lock);
 	*out = row;
+	RFS_STAT_INC(sb, md_node_load);	/* 节点盘读次数 */
 	return 0;
 fail_unlocked:
 	ravenfs_mrow_free(c, row);
@@ -204,8 +209,10 @@ struct ravenfs_msession *ravenfs_mdata_get(struct super_block *sb, u64 blk)
 	if (!c)
 		return ERR_PTR(-EIO);
 	node_idx = blk >> 1;
-	if ((node_idx << 1) >= c->total_blocks)
+	if ((node_idx << 1) >= c->total_blocks) {
+		RFS_STAT_INC(sb, md_err);
 		return ERR_PTR(-EIO);
+	}
 	sh_idx = (u32)(node_idx >> c->shard_bits);
 	key = (unsigned long)node_idx & c->node_mask;
 	sh = &c->shards[sh_idx];
@@ -226,17 +233,22 @@ retry:
 
 	if (row) {
 		atomic64_set(&row->acc_stamp, ktime_get_ns());	/* 访问刷新（TTL） */
+		RFS_STAT_INC(sb, md_hit);	/* 快路径命中 */
 	} else {
 		int err = ravenfs_mrow_load(sb, c, sh, key, node_idx, &row);
 
 		if (err == -EAGAIN) {
+			RFS_STAT_INC(sb, md_retry);
 			cond_resched();
 			goto retry;
 		}
 		if (err) {
+			RFS_STAT_INC(sb, md_miss);
+			RFS_STAT_INC(sb, md_err);
 			kfree(s);
 			return ERR_PTR(err);
 		}
+		RFS_STAT_INC(sb, md_miss);	/* 走 mrow_load = miss */
 	}
 	s->sbi = sbi;
 	s->shard = sh;
@@ -274,6 +286,7 @@ void ravenfs_mdata_drop(struct super_block *sb, u64 blk)
 	node_idx = blk >> 1;
 	if ((node_idx << 1) >= c->total_blocks)
 		return;
+	RFS_STAT_INC(sb, md_drop);	/* 显式丢弃次数 */
 	sh_idx = (u32)(node_idx >> c->shard_bits);
 	key = (unsigned long)node_idx & c->node_mask;
 	sh = &c->shards[sh_idx];
@@ -340,6 +353,7 @@ int ravenfs_mdata_wb_dirty(struct super_block *sb, u64 age_cutoff_ns, bool ignor
 			else {
 				row->flags &= ~ROWF_DIRTY;
 				row->wb_stamp = ktime_get_ns();
+				RFS_STAT_INC(sb, md_node_wb);	/* 元数据节点写回量 */
 			}
 		}
 		up_write(&sh->lock);
@@ -378,6 +392,7 @@ int ravenfs_mdata_wb_node(struct super_block *sb, u64 blk)
 		else {
 			row->flags &= ~ROWF_DIRTY;
 			row->wb_stamp = ktime_get_ns();
+			RFS_STAT_INC(sb, md_node_wb);	/* 元数据节点写回量 */
 		}
 	}
 	up_write(&ms->shard->lock);
@@ -434,6 +449,7 @@ long ravenfs_mdata_reap_expired(struct super_block *sb, u64 cutoff_ns)
 				break;
 		}
 	}
+	RFS_STAT_ADD(sb, md_reap, freed);	/* TTL 淘汰节点数 */
 	return freed;
 }
 

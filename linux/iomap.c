@@ -69,6 +69,8 @@ static int rfs_store_block(struct super_block *sb, u64 fs_blk, const void *buf)
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
 	brelse(bh);
+	RFS_STAT_INC(sb, io_write_ops);
+	RFS_STAT_ADD(sb, io_write_bytes, RAVENFS_BLOCK_SIZE);
 	return 0;
 }
 
@@ -376,8 +378,10 @@ static int ravenfs_iomap_begin_write(struct inode *inode, loff_t pos, loff_t len
 				hole_end = blk + 1;	/* 护栏：长度必 > 0 */
 			cnt = hole_end - blk;
 			run = ravenfs_block_alloc(sb, cnt, 0);
-			if (run == (u64)PTR_INVALID)
+			if (run == (u64)PTR_INVALID) {
+				RFS_STAT_INC(sb, err_enospc);
 				return -ENOSPC;		/* write(2) 即暴露 */
+			}
 			ne.length = cnt;
 			ne.fblkbase = blk;
 			ne.block_base.v = RFS_PTR_PACK(0, run);

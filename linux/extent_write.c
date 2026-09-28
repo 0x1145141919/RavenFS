@@ -117,6 +117,7 @@ int ravenfs_extent_lookup(struct super_block *sb, u64 root, u64 target,
 	void *buf;
 	int err = -EIO;
 
+	RFS_STAT_INC(sb, ext_lookup);	/* extent 查找次数 */
 	*next = 0;
 	if (root == (u64)PTR_INVALID)
 		return 1;			/* 空树 → 全洞 */
@@ -137,6 +138,7 @@ int ravenfs_extent_lookup(struct super_block *sb, u64 root, u64 target,
 		err = ravenfs_read_node(sb, blk, buf);
 		if (err)
 			break;
+		RFS_STAT_INC(sb, ext_node_reads);	/* 走树步数 */
 		meta = buf;
 		err = rfs_ext_meta_ok(meta, &cnt, &inner, &rootf, &pptr);
 		if (err)
@@ -272,6 +274,7 @@ static int rfs_ext_walk(struct super_block *sb, u64 root, u64 target, struct rfs
 		err = ravenfs_read_node(sb, blk, buf);
 		if (err)
 			break;
+		RFS_STAT_INC(sb, ext_node_reads);	/* 走树步数 */
 		err = rfs_ext_meta_ok(buf, &cnt, &inner, &rootf, &pptr);
 		if (err)
 			break;
@@ -372,6 +375,7 @@ static int rfs_ext_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_n
 	bool was_root;
 	int err;
 
+	RFS_STAT_INC(sb, ext_split);	/* 分裂频率 → 树是否在抖 */
 	if (IS_ERR(vms))
 		return PTR_ERR(vms);
 	vl = ravenfs_msession_node(vms);
@@ -448,6 +452,7 @@ static int rfs_ext_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_
 	const u32 right = RFS_EXT_MAX_SLOTS - RFS_EXT_SPLIT;
 	int err;
 
+	RFS_STAT_INC(sb, ext_split);
 	if (IS_ERR(vms))
 		return PTR_ERR(vms);
 	vi = ravenfs_msession_node(vms);
@@ -529,6 +534,7 @@ static int rfs_ext_new_root_inner(struct super_block *sb, u64 ino, u64 left_blk,
 	u64 root_blk, kids[2];
 	int k, err = 0;
 
+	RFS_STAT_INC(sb, ext_new_root);	/* 树长高的次数 */
 	root_blk = ravenfs_block_alloc(sb, 2, 1);
 	if (root_blk == (u64)PTR_INVALID)
 		return -ENOSPC;
@@ -642,6 +648,7 @@ int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
 	u32 idx, cnt2;
 	int err = 0;
 
+	RFS_STAT_INC(sb, ext_insert);	/* 映射插入次数 */
 	if (ext->length == 0)
 		return 0;
 
@@ -752,6 +759,7 @@ int ravenfs_extent_new_root_leaf(struct super_block *sb, u64 ino, u64 *root_out)
 	u64 blk;
 	int err;
 
+	RFS_STAT_INC(sb, ext_new_root);
 	if (*root_out != (u64)PTR_INVALID)
 		return 0;			/* 已有树 */
 	blk = ravenfs_block_alloc(sb, 2, 1);
@@ -879,6 +887,7 @@ static int rfs_ext_node_balance(struct super_block *sb, u64 parent_blk, u32 idx,
 	bool is_inner;
 	int ret = 0;
 
+	RFS_STAT_INC(sb, ext_balance);	/* 平衡动作次数 */
 	*need = false;
 	pms = ravenfs_mdata_get(sb, parent_blk);
 	if (IS_ERR(pms))
@@ -1167,6 +1176,7 @@ static int rfs_ext_balance_from(struct super_block *sb, u64 ino, u64 child_blk,
 	u64 cur = child_blk;
 	u32 hop;
 
+	RFS_STAT_INC(sb, ext_balance);
 	for (hop = 0; hop < RFS_EXT_DEPTH_MAX; hop++) {
 		struct ravenfs_msession *ms, *ps;
 		struct Bptree_meta_t *m;
@@ -1261,6 +1271,7 @@ int ravenfs_extent_unmap_loose(struct super_block *sb, u64 ino, u64 *root_io,
 	u64 pptr, off, rec_len, rec_fb, rec_addr, cut;
 	int err, kind;
 
+	RFS_STAT_INC(sb, ext_unmap);	/* unmap 强度 */
 	if (old_root)
 		*old_root = (u64)PTR_INVALID;
 	if (ext->length == 0)

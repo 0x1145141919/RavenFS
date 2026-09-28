@@ -95,6 +95,8 @@ static void ravenfs_ttl_work(struct work_struct *w)
 				wb = -1;
 		if (wb)
 			ravenfs_force_shutdown(sb, "ttl: periodic writeback failed");
+		if (wb)
+			RFS_STAT_INC(sb, ttl_round_errs);	/* 后台刷盘失败累积 */
 	}
 
 	/* 趟3：位图全片同步（闸门 `bitmap_sync_seconds`；无脏标记，整轮全同步） */
@@ -105,6 +107,8 @@ static void ravenfs_ttl_work(struct work_struct *w)
 		t->bm_last = now;
 		if (bm)
 			ravenfs_force_shutdown(sb, "ttl: bitmap flush failed");
+		if (bm)
+			RFS_STAT_INC(sb, ttl_round_errs);
 	}
 
 	if (freed)
@@ -118,6 +122,7 @@ static void ravenfs_ttl_work(struct work_struct *w)
 				    freed, t->reaped_total, wb, t->wb_total, bm, t->bm_total,
 				    ttl_seconds, wb_age_seconds, bitmap_sync_seconds, t->rounds);
 
+	RFS_STAT_INC(sb, ttl_rounds);	/* 后台还活着吗（数不涨 = work 卡死） */
 	schedule_delayed_work(&t->work, msecs_to_jiffies(reap_ms ? reap_ms : 4000));
 }
 

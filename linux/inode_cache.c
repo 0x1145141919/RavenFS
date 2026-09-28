@@ -187,11 +187,14 @@ static int ravenfs_row_load(struct super_block *sb, struct ravenfs_cache *c,
 
 		if (!bh) {
 			err = -EIO;
+			RFS_STAT_INC(sb, err_meta_io);
 			goto fail_unlocked;
 		}
 		memcpy((char *)row->data + (u64)got * RAVENFS_BLOCK_SIZE,
 		       bh->b_data, RAVENFS_BLOCK_SIZE);
 		brelse(bh);
+		RFS_STAT_INC(sb, io_read_ops);
+		RFS_STAT_ADD(sb, io_read_bytes, RAVENFS_BLOCK_SIZE);
 	}
 	row->line = line;
 	init_rwsem(&row->io_lock);
@@ -215,6 +218,7 @@ static int ravenfs_row_load(struct super_block *sb, struct ravenfs_cache *c,
 		up_write(&sh->lock);
 		ravenfs_row_free(c, row);
 		*out = old;
+		RFS_STAT_INC(sb, ic_row_load);	/* 从盘装载行（成功返回） */
 		return 0;
 	}
 	err = xa_insert(&sh->rows, row_key, row, GFP_KERNEL);
@@ -225,6 +229,7 @@ static int ravenfs_row_load(struct super_block *sb, struct ravenfs_cache *c,
 	refcount_inc(&row->ref);			/* 给本次 session */
 	up_write(&sh->lock);
 	*out = row;
+	RFS_STAT_INC(sb, ic_row_load);	/* 从盘装载行（成功返回） */
 	return 0;
 fail_unlocked:
 	ravenfs_row_free(c, row);
@@ -241,8 +246,10 @@ struct ravenfs_session *ravenfs_session_get(struct super_block *sb, u64 inum)
 	u32 sh_idx, row_key;
 	u64 line;
 
-	if (!c || inum >= sbi->inode_count)
+	if (!c || inum >= sbi->inode_count) {
+		RFS_STAT_INC(sb, ic_err);
 		return ERR_PTR(-EIO);
+	}
 
 	sh_idx = (u32)(inum >> c->shard_bits);
 	line = inum >> c->row_bits;
@@ -266,17 +273,22 @@ retry:
 
 	if (row) {
 		atomic64_set(&row->acc_stamp, ktime_get_ns());	/* 访问刷新（TTL） */
+		RFS_STAT_INC(sb, ic_hit);	/* 快路径命中（§7.3：与 miss 互斥完备） */
 	} else {
 		int err = ravenfs_row_load(sb, c, sh, row_key, line, &row);
 
 		if (err == -EAGAIN) {		/* 恰好撞上淘汰：重试 */
+			RFS_STAT_INC(sb, ic_retry);	/* 淘汰竞争烈度 */
 			cond_resched();
 			goto retry;
 		}
 		if (err) {
+			RFS_STAT_INC(sb, ic_miss);
+			RFS_STAT_INC(sb, ic_err);
 			kfree(s);
 			return ERR_PTR(err);
 		}
+		RFS_STAT_INC(sb, ic_miss);	/* 走 row_load = miss（最终归宿记一次） */
 	}
 
 	s->sbi = sbi;
@@ -339,6 +351,7 @@ int ravenfs_cache_wb_dirty(struct super_block *sb, u64 age_cutoff_ns, bool ignor
 			else {
 				row->flags &= ~ROWF_DIRTY;
 				row->wb_stamp = ktime_get_ns();
+				RFS_STAT_INC(sb, ic_wb_rows);	/* inode 行写回量 */
 			}
 		}
 		up_write(&sh->lock);
@@ -426,6 +439,7 @@ void ravenfs_inode_mark_dirty(struct super_block *sb, u64 inum)
 	if (IS_ERR_OR_NULL(s))
 		return;
 	RFS_ROW_MARK_DIRTY(s->row);
+	RFS_STAT_INC(sb, ic_dirty_mark);	/* 脏行产生速率 */
 	atomic64_set(&s->row->acc_stamp, ktime_get_ns());
 }
 
@@ -438,6 +452,7 @@ void ravenfs_inode_reclaim(struct super_block *sb, u64 inum)
 {
 	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, inum);
 
+	RFS_STAT_INC(sb, ic_row_evict);	/* 主动逐出（§3.B 打点口径） */
 	if (!IS_ERR_OR_NULL(s)) {
 		down_write(&s->row->io_lock);
 		memset(ravenfs_session_inode(s), 0, RAVENFS_INODE_SIZE);
@@ -500,6 +515,7 @@ long ravenfs_cache_reap_expired(struct super_block *sb, u64 cutoff_ns)
 				break;
 		}
 	}
+	RFS_STAT_ADD(sb, ic_row_reap, freed);	/* TTL 过期淘汰行数 */
 	return freed;
 }
 

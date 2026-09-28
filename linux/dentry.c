@@ -91,6 +91,7 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	u32 nlen = dentry->d_name.len;
 	int err;
 
+	RFS_STAT_INC(sb, op_create);
 	if (nlen == 0 || nlen > RAVENFS_MAX_NAME_LEN)
 		return -ENAMETOOLONG;
 	if (!S_ISDIR(dir->i_mode))
@@ -115,8 +116,10 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	hash = xxh64(dentry->d_name.name, nlen, 0);
 
 	inum = ravenfs_inode_alloc(sb);
-	if (inum == (u64)PTR_INVALID)
+	if (inum == (u64)PTR_INVALID) {
+		RFS_STAT_INC(sb, err_enospc);
 		return -ENOSPC;
+	}
 	ts = ravenfs_session_get(sb, inum);
 	if (IS_ERR(ts)) {
 		ravenfs_inode_free(sb, inum);
@@ -206,6 +209,7 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 	u32 nlen = dentry->d_name.len;
 	int err;
 
+	RFS_STAT_INC(sb, op_unlink);
 	if (nlen == 0 || nlen > RAVENFS_MAX_NAME_LEN)
 		return -ENAMETOOLONG;
 	ds = ravenfs_session_get(sb, dir->i_ino);
@@ -285,6 +289,7 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	u32 nlen = dentry->d_name.len, s;
 	int err;
 
+	RFS_STAT_INC(sb, op_mkdir);
 	if (nlen == 0 || nlen > RAVENFS_MAX_NAME_LEN)
 		return ERR_PTR(-ENAMETOOLONG);
 	if (!S_ISDIR(dir->i_mode))
@@ -308,10 +313,13 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	hash = xxh64(dentry->d_name.name, nlen, 0);
 
 	inum = ravenfs_inode_alloc(sb);
-	if (inum == (u64)PTR_INVALID)
+	if (inum == (u64)PTR_INVALID) {
+		RFS_STAT_INC(sb, err_enospc);
 		return ERR_PTR(-ENOSPC);
+	}
 	new_root = ravenfs_block_alloc(sb, 2, 1);
 	if (new_root == (u64)PTR_INVALID) {
+		RFS_STAT_INC(sb, err_enospc);
 		ravenfs_inode_free(sb, inum);
 		return ERR_PTR(-ENOSPC);
 	}
@@ -423,6 +431,7 @@ int ravenfs_rmdir(struct inode *dir, struct dentry *dentry)
 	u32 nlen = dentry->d_name.len;
 	int err;
 
+	RFS_STAT_INC(sb, op_rmdir);
 	if (nlen == 0 || nlen > RAVENFS_MAX_NAME_LEN)
 		return -ENAMETOOLONG;
 	if (!target || !S_ISDIR(target->i_mode))
@@ -506,6 +515,7 @@ static int rfs_dir_adjust(struct super_block *sb, struct inode *dir, int delta)
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
 	dr = ravenfs_session_inode(ds);
+	RFS_STAT_INC(sb, dir_nlink_adjust);	/* nlink 维护频次 */
 	dr->size = (u64)((s64)dr->size + delta);
 	dr->link_count = (u32)dr->size + 2;
 	now = current_time(dir);
@@ -546,6 +556,7 @@ int ravenfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry
 	bool old_is_dir, new_is_dir = false;
 	int err;
 
+	RFS_STAT_INC(sb, op_rename);
 	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
 		return -EINVAL;
 	if ((flags & RENAME_NOREPLACE) && (flags & RENAME_EXCHANGE))
@@ -824,8 +835,11 @@ int ravenfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *de
 	struct timespec64 now;
 	int err;
 
-	if (ravenfs_is_shutdown(sb))
+	RFS_STAT_INC(sb, op_link);
+	if (ravenfs_is_shutdown(sb)) {
+		RFS_STAT_INC(sb, err_shutdown_hits);
 		return -EIO;
+	}
 	if (sb_rdonly(sb))
 		return -EROFS;
 	if (!inode)
@@ -884,6 +898,8 @@ static int rfs_pwrite_dev(struct super_block *sb, u64 dev_byte, const void *src,
 		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);
 		brelse(bh);
+		RFS_STAT_INC(sb, io_write_ops);
+		RFS_STAT_ADD(sb, io_write_bytes, RAVENFS_BLOCK_SIZE);
 		done += n;
 	}
 	return 0;
@@ -929,8 +945,11 @@ int ravenfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	u64 inum;
 	int err;
 
-	if (ravenfs_is_shutdown(sb))
+	RFS_STAT_INC(sb, op_symlink);
+	if (ravenfs_is_shutdown(sb)) {
+		RFS_STAT_INC(sb, err_shutdown_hits);
 		return -EIO;
+	}
 	if (sb_rdonly(sb))
 		return -EROFS;
 	if (!S_ISDIR(dir->i_mode))
@@ -1005,8 +1024,11 @@ int ravenfs_mknod(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	u64 inum;
 	int err;
 
-	if (ravenfs_is_shutdown(sb))
+	RFS_STAT_INC(sb, op_mknod);
+	if (ravenfs_is_shutdown(sb)) {
+		RFS_STAT_INC(sb, err_shutdown_hits);
 		return -EIO;
+	}
 	if (sb_rdonly(sb))
 		return -EROFS;
 	if (!S_ISDIR(dir->i_mode))
@@ -1045,8 +1067,11 @@ int ravenfs_tmpfile(struct mnt_idmap *idmap, struct inode *dir, struct file *fil
 	u64 inum;
 	int err;
 
-	if (ravenfs_is_shutdown(sb))
+	RFS_STAT_INC(sb, op_tmpfile);
+	if (ravenfs_is_shutdown(sb)) {
+		RFS_STAT_INC(sb, err_shutdown_hits);
 		return -EIO;
+	}
 	if (sb_rdonly(sb))
 		return -EROFS;
 	if (!S_ISDIR(dir->i_mode))
@@ -1078,6 +1103,7 @@ struct dentry *ravenfs_lookup(struct inode *dir, struct dentry *dentry,
 	u64 ino;
 	int err;
 
+	RFS_STAT_INC(dir->i_sb, op_lookup);
 	if (dentry->d_name.len > RAVENFS_MAX_NAME_LEN)
 		return ERR_PTR(-ENAMETOOLONG);
 	if (!S_ISDIR(dir->i_mode))
@@ -1122,6 +1148,7 @@ static int ravenfs_emit_leaf(struct super_block *sb, const void *buf, u64 blk, u
 
 	if (!nm)
 		return -ENOMEM;
+	RFS_STAT_INC(sb, dir_emit);	/* 实际吐出条目批次数（每叶一次） */
 	for (i = from; i < cnt; i++) {
 		const struct ddentry_t *e = &lf->entries[i];
 		unsigned int en;
@@ -1152,6 +1179,7 @@ int ravenfs_iterate(struct file *file, struct dir_context *ctx)
 	bool stopped = false;
 	int err = 0;
 
+	RFS_STAT_INC(sb, op_readdir);
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
 	buf = kmalloc(RAVENFS_NODE_BYTES, GFP_KERNEL);

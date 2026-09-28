@@ -64,6 +64,9 @@ static int rfs_xb_load(struct super_block *sb, u64 blk, void **out)
 	}
 	memcpy(buf, bh->b_data, RFS_XATTR_BLOCK_SIZE);
 	brelse(bh);
+	RFS_STAT_INC(sb, xa_block_load);
+	RFS_STAT_INC(sb, io_read_ops);
+	RFS_STAT_ADD(sb, io_read_bytes, RAVENFS_BLOCK_SIZE);
 	*out = buf;
 	return 0;
 }
@@ -80,6 +83,9 @@ static int rfs_xb_store(struct super_block *sb, u64 blk, const void *buf)
 	mark_buffer_dirty(bh);
 	sync_dirty_buffer(bh);
 	brelse(bh);
+	RFS_STAT_INC(sb, xa_block_store);
+	RFS_STAT_INC(sb, io_write_ops);
+	RFS_STAT_ADD(sb, io_write_bytes, RAVENFS_BLOCK_SIZE);
 	return 0;
 }
 
@@ -287,8 +293,10 @@ static int rfs_xattr_set_core(struct super_block *sb, u64 inum, int name_index,
 	if (name_len > RFS_XATTR_NAME_MAX)
 		return -ERANGE;
 	/* 定调：值 > 1 FS_block → 干净拒绝（不发明分片） */
-	if (value_len > RFS_XATTR_BLOCK_SIZE || value_len > RFS_XATTR_SIZE_MAX)
+	if (value_len > RFS_XATTR_BLOCK_SIZE || value_len > RFS_XATTR_SIZE_MAX) {
+		RFS_STAT_INC(sb, xa_e2big);	/* 单块上限被撞的频率 */
 		return -E2BIG;
+	}
 
 	err = rfs_xattr_ptr(sb, inum, &ptr);
 	if (err)
@@ -349,6 +357,7 @@ static int rfs_xattr_set_core(struct super_block *sb, u64 inum, int name_index,
 		free_spc += RFS_XATTR_LEN(here->e_name_len);
 	}
 	if (free_spc < RFS_XATTR_LEN(name_len) + RFS_XATTR_ALIGN(value_len)) {
+		RFS_STAT_INC(sb, xa_e2big);
 		err = -E2BIG;			/* 放不进一块（定调：E2BIG，非 ENOSPC） */
 		goto out;
 	}
@@ -458,14 +467,21 @@ int ravenfs_xattr_get(struct inode *inode, int name_index, const char *name,
 		      void *buffer, size_t size)
 {
 	struct ravenfs_inode_info *ri = RAVENFS_I(inode);
+	struct super_block *sb = inode->i_sb;
 	int err;
 
-	if (ravenfs_is_shutdown(inode->i_sb))
+	RFS_STAT_INC(sb, op_xattr_get);
+	RFS_STAT_INC(sb, xa_get);
+	if (ravenfs_is_shutdown(sb)) {
+		RFS_STAT_INC(sb, err_shutdown_hits);
 		return -EIO;
+	}
 	down_read(&ri->xattr_sem);
-	err = rfs_xattr_get_core(inode->i_sb, inode->i_ino, name_index, name,
+	err = rfs_xattr_get_core(sb, inode->i_ino, name_index, name,
 				 buffer, size);
 	up_read(&ri->xattr_sem);
+	if (err < 0)
+		RFS_STAT_INC(sb, xa_err);
 	return err;
 }
 
@@ -476,14 +492,23 @@ int ravenfs_xattr_set(struct inode *inode, int name_index, const char *name,
 	struct super_block *sb = inode->i_sb;
 	int err;
 
-	if (ravenfs_is_shutdown(sb))
+	RFS_STAT_INC(sb, op_xattr_set);
+	if (value == NULL)
+		RFS_STAT_INC(sb, xa_del);	/* del = set 空值路径 */
+	else
+		RFS_STAT_INC(sb, xa_set);
+	if (ravenfs_is_shutdown(sb)) {
+		RFS_STAT_INC(sb, err_shutdown_hits);
 		return -EIO;
+	}
 	if (sb_rdonly(sb))
 		return -EROFS;
 	down_write(&ri->xattr_sem);
 	err = rfs_xattr_set_core(sb, inode->i_ino, name_index, name, value,
 				 size, flags);
 	up_write(&ri->xattr_sem);
+	if (err)
+		RFS_STAT_INC(sb, xa_err);
 	if (!err) {
 		inode_set_ctime_current(inode);
 		mark_inode_dirty(inode);
@@ -597,8 +622,12 @@ ssize_t ravenfs_listxattr(struct dentry *dentry, char *buffer, size_t buffer_siz
 	char *p = buffer;
 	int err;
 
-	if (ravenfs_is_shutdown(sb))
+	RFS_STAT_INC(sb, op_listxattr);
+	RFS_STAT_INC(sb, xa_list);
+	if (ravenfs_is_shutdown(sb)) {
+		RFS_STAT_INC(sb, err_shutdown_hits);
 		return -EIO;
+	}
 
 	down_read(&ri->xattr_sem);
 	err = rfs_xattr_ptr(sb, inode->i_ino, &ptr);
@@ -663,6 +692,8 @@ struct posix_acl *ravenfs_get_inode_acl(struct inode *inode, int type, bool rcu)
 	struct posix_acl *acl;
 	int ret;
 
+	RFS_STAT_INC(inode->i_sb, op_acl_get);
+	RFS_STAT_INC(inode->i_sb, acl_get);
 	if (rcu)
 		return ERR_PTR(-ECHILD);
 	switch (type) {
@@ -701,6 +732,7 @@ static int rfs_set_acl_internal(struct inode *inode, struct posix_acl *acl, int 
 	size_t size = 0;
 	int err;
 
+	RFS_STAT_INC(inode->i_sb, acl_set);	/* 真 ACL 写（含 init_acl 内部） */
 	switch (type) {
 	case ACL_TYPE_ACCESS:
 		index = RFS_XATTR_INDEX_POSIX_ACL_ACCESS;
@@ -732,6 +764,7 @@ int ravenfs_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 	umode_t mode = inode->i_mode;
 	int update_mode = 0, err;
 
+	RFS_STAT_INC(inode->i_sb, op_acl_set);
 	if (type == ACL_TYPE_ACCESS && acl) {
 		err = posix_acl_update_mode(idmap, inode, &mode, &acl);
 		if (err)

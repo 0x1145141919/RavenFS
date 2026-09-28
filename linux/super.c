@@ -32,6 +32,9 @@
 #include <linux/crc32.h>
 #include <linux/string.h>
 #include <linux/fileattr.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+#include <linux/timekeeping.h>
 
 #include "ravenfs.h"
 #include "ravenfs_dir.h"
@@ -54,6 +57,67 @@ static int ravenfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
 static struct kmem_cache *ravenfs_inode_cachep;
 static struct file_system_type ravenfs_fs_type;
 
+/*
+ * ── §8 性能计数器出口：debugfs（`/sys/kernel/debug/ravenfs/<s_id>/stats`）──
+ * 一个 seq_file kv 文件**全吐**（不拆多文件）：一次 cat = 一次完整观测；root-only、
+ * 非 ABI（字段增删改名无兼容义务）。i_private = sb（同 UAF 纪律：删除必须先于
+ * kfree(sbi)，见 put_super）。
+ */
+static struct dentry *ravenfs_dbg_root;
+
+static const char *const ravenfs_stat_names[] = {
+	/* A op_ */  "op_lookup", "op_create", "op_mkdir", "op_unlink", "op_rmdir",
+	"op_rename", "op_link", "op_symlink", "op_mknod", "op_tmpfile",
+	"op_readdir", "op_read_iter", "op_write_iter", "op_read_bytes",
+	"op_write_bytes", "op_fallocate", "op_fsync", "op_syncfs", "op_getattr",
+	"op_setattr", "op_mmap", "op_listxattr", "op_xattr_get", "op_xattr_set",
+	"op_acl_get", "op_acl_set",
+	/* B ic_ */  "ic_hit", "ic_miss", "ic_row_load", "ic_retry", "ic_row_evict",
+	"ic_row_reap", "ic_dirty_mark", "ic_wb_rows", "ic_err",
+	/* C md_ */  "md_hit", "md_miss", "md_node_load", "md_retry", "md_drop",
+	"md_reap", "md_node_wb", "md_err",
+	/* D ttl_ */ "ttl_rounds", "ttl_round_errs",
+	/* E io_ */  "io_read_ops", "io_read_bytes", "io_write_ops", "io_write_bytes",
+	"io_flush_ops",
+	/* F bm_ */  "bm_alloc_calls", "bm_alloc_ok", "bm_alloc_fail", "bm_alloc_blocks",
+	"bm_free_calls", "bm_free_blocks", "bm_soft_ok", "bm_occupy",
+	"bm_sync_slices", "bm_chunk_switch", "bm_chunk_switch_ns", "bm_rec_attach",
+	"bm_rec_drain", "bm_pool_empty", "bm_summary_skip", "bm_scan_ns",
+	"bm_ttl_online", "bm_ttl_drain",
+	/* G ext_ */ "ext_lookup", "ext_insert", "ext_split", "ext_new_root",
+	"ext_balance", "ext_unmap", "ext_node_reads",
+	/* H dir_ */ "dir_leaf_reads", "dir_emit", "dir_nlink_adjust",
+	/* I xa_ */  "xa_get", "xa_set", "xa_del", "xa_list", "xa_block_load",
+	"xa_block_store", "xa_e2big", "xa_err", "acl_get", "acl_set",
+	/* J err_ */ "err_shutdown_hits", "err_shutdown_trig", "err_meta_io",
+	"err_sb_read", "err_enospc", "err_other",
+	/* K life_ */"life_mount", "life_umount", "life_iget_new", "life_evict",
+};
+
+static int ravenfs_stats_show(struct seq_file *m, void *v)
+{
+	struct super_block *sb = m->private;
+	struct ravenfs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+	const atomic64_t *st;
+	unsigned int i;
+
+	/* 结构体成员全为 atomic64_t 且无填充 → 当连续数组读（下面断言守着） */
+	BUILD_BUG_ON(sizeof(struct ravenfs_sb_stats) !=
+		     ARRAY_SIZE(ravenfs_stat_names) * sizeof(atomic64_t));
+	if (!sbi)
+		return 0;
+	st = (const atomic64_t *)&sbi->stats;
+	seq_printf(m, "# ravenfs stats  sb=%s  mounted_at=%llu\n",
+		   sb->s_id, (unsigned long long)sbi->mounted_at_ns);
+	for (i = 0; i < ARRAY_SIZE(ravenfs_stat_names); i++)
+		seq_printf(m, "%s\t%llu\n", ravenfs_stat_names[i],
+			   (unsigned long long)atomic64_read(&st[i]));
+	/* §5：shutdown 布尔（gauge；零成本，独立状态段，勿与 counter 混读） */
+	seq_printf(m, "# state\nshutdown\t%d\n", ravenfs_is_shutdown(sb) ? 1 : 0);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(ravenfs_stats);
+
 /* ═══════════════════════════════════════════════════════════════════
  * R-LM-09：内部停机（xfs force-shutdown 惯例） + R-SY-05：flush 屏障
  * ═══════════════════════════════════════════════════════════════════ */
@@ -65,6 +129,7 @@ void ravenfs_force_shutdown(struct super_block *sb, const char *why)
 
 	if (!sbi)
 		return;
+	RFS_STAT_INC(sb, err_shutdown_trig);	/* §7.3：每次调用都记（不只首次） */
 	if (!sbi->shutdown) {
 		WRITE_ONCE(sbi->shutdown, true);
 		pr_err("ravenfs: FORCED SHUTDOWN (%s) —— 后续操作返 -EIO；请 umount 后重新 mount\n",
@@ -78,6 +143,7 @@ int ravenfs_issue_flush(struct super_block *sb)
 {
 	if (!sb || !sb->s_bdev || (sb->s_flags & SB_RDONLY))
 		return 0;
+	RFS_STAT_INC(sb, io_flush_ops);	/* R-SY-05 屏障次数 */
 	return blkdev_issue_flush(sb->s_bdev);
 }
 
@@ -427,6 +493,7 @@ struct inode *ravenfs_iget(struct super_block *sb, u64 inum)
 	if (!(inode_state_read_once(inode) & I_NEW))
 		return inode;
 
+	RFS_STAT_INC(sb, life_iget_new);	/* inode churn：新建 VFS inode */
 	err = ravenfs_read_inode(inode);
 	if (err) {
 		iget_failed(inode);
@@ -452,6 +519,7 @@ static int ravenfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 {
 	struct inode *inode = d_inode(path->dentry);
 
+	RFS_STAT_INC(inode->i_sb, op_getattr);
 	/* R-MD-01：内存 inode 直填（rdev 已由 i_rdev 提供；dir nlink 即盘上 size+2） */
 	generic_fillattr(idmap, request_mask, inode, stat);
 	return 0;
@@ -590,6 +658,8 @@ static void ravenfs_evict_inode(struct inode *inode)
 	u64 data_size = 0;
 	bool data_direct = false, has_data = false;
 
+	RFS_STAT_INC(sb, life_evict);
+
 	/*
 	 * nlink==0 → 回收，**先 inode 后 free**（§10 不变量 25；handover §6.1）：
 	 *   ① 读盘记录抓外置资产定位（data_root / size / direct_bit；reclaim 会清零）；
@@ -627,6 +697,9 @@ static void ravenfs_evict_inode(struct inode *inode)
 
 static void ravenfs_put_super(struct super_block *sb)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+
+	RFS_STAT_INC(sb, life_umount);
 	ravenfs_ttl_stop(sb);		/* 先停 TTL 淘汰器（避免与折构竞争） */
 	/* 干净卸载（R-SY-06/T3）：写序 mdata → inode → 位图，各阶段 + 末尾 flush 屏障 */
 	ravenfs_mdata_cache_destroy(sb);	/* ① 折构：主动全量刷回 mdata 节点（§4.11.1 ②） */
@@ -638,6 +711,9 @@ static void ravenfs_put_super(struct super_block *sb)
 		ravenfs_bitmap_flush(sb);
 	ravenfs_issue_flush(sb);
 	ravenfs_bitmap_destroy(sb);
+	/* §8.2 UAF 红线：stats 文件 i_private 持 sb/sbi 指针 → debugfs 目录必须
+	 * **早于** kfree(sbi) 摘除；debugfs_remove 会等进行中的 read 结束。 */
+	debugfs_remove_recursive(sbi ? sbi->dbg_dir : NULL);
 	kfree(sb->s_fs_info);
 	sb->s_fs_info = NULL;
 }
@@ -656,10 +732,13 @@ static int ravenfs_sync_fs(struct super_block *sb, int wait)
 {
 	int err = 0, e;
 
+	RFS_STAT_INC(sb, op_syncfs);
 	if (!ravenfs_sb_writable(sb))
 		return 0;
-	if (ravenfs_is_shutdown(sb))
+	if (ravenfs_is_shutdown(sb)) {
+		RFS_STAT_INC(sb, err_shutdown_hits);
 		return -EIO;
+	}
 
 	/* ① mdata 树节点（extent / dentry 树；被 inode 行引用者先落盘） */
 	e = ravenfs_mdata_writeback_all(sb);
@@ -769,8 +848,11 @@ static int ravenfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
 	struct super_block *sb = inode->i_sb;
 	int err = 0, e;
 
-	if (ravenfs_is_shutdown(sb))
+	RFS_STAT_INC(sb, op_fsync);
+	if (ravenfs_is_shutdown(sb)) {
+		RFS_STAT_INC(sb, err_shutdown_hits);
 		return -EIO;
+	}
 
 	/* ① 脏数据 → 盘：dirty folio 经 iomap `writepages` 落到已分配块（D-M4-6 立刻分配） */
 	err = filemap_write_and_wait_range(inode->i_mapping, start, end);
@@ -947,6 +1029,7 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	bh = sb_bread(sb, 0);
 	if (!bh) {
 		pr_err("ravenfs: cannot read superblock\n");
+		RFS_STAT_INC(sb, err_sb_read);	/* 盘/设备健康 */
 		return -EIO;
 	}
 	err = ravenfs_parse_superblock(sb, bh->b_data, row_size);
@@ -970,6 +1053,15 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_root = d_make_root(root);
 	if (!sb->s_root)
 		return -ENOMEM;
+
+	/* §8.2：debugfs 出口 `<s_id>/stats`；kernel.debugfs=off 时 create 返回 ERR_PTR
+	 * → 忽略（IS_ERR_OR_NULL 守卫，不挡挂载）。 */
+	sbi->mounted_at_ns = ktime_get_ns();
+	RFS_STAT_INC(sb, life_mount);
+	sbi->dbg_dir = debugfs_create_dir(sb->s_id,
+			IS_ERR_OR_NULL(ravenfs_dbg_root) ? NULL : ravenfs_dbg_root);
+	if (!IS_ERR_OR_NULL(sbi->dbg_dir))
+		debugfs_create_file("stats", 0444, sbi->dbg_dir, sb, &ravenfs_stats_fops);
 
 	pr_info("ravenfs: mounted blocks=%llu inodes=%llu root_ino=%llu\n",
 		sbi->total_blocks, sbi->inode_count, sbi->root_ino);
@@ -1044,12 +1136,16 @@ static int __init ravenfs_init(void)
 		ravenfs_inode_cachep = NULL;
 		return err;
 	}
+	/* §8.2：debugfs 根目录（`/sys/kernel/debug/ravenfs`）；失败忽略 */
+	ravenfs_dbg_root = debugfs_create_dir("ravenfs", NULL);
 	pr_info("ravenfs: module loaded\n");
 	return 0;
 }
 
 static void __exit ravenfs_exit(void)
 {
+	debugfs_remove_recursive(ravenfs_dbg_root);
+	ravenfs_dbg_root = NULL;
 	unregister_filesystem(&ravenfs_fs_type);
 	rcu_barrier();
 	kmem_cache_destroy(ravenfs_inode_cachep);

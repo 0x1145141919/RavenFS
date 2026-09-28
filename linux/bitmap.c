@@ -399,6 +399,7 @@ static u64 rfs_bm_slice_alloc(struct ravenfs_bm_group *g, struct ravenfs_bm_slic
 				rfs_bm_set(g->words, hit + j);
 			s->free_count -= count;
 			s->hint = hit + count;
+			RFS_STAT_ADD(g->sb, bm_alloc_blocks, count);	/* 分配块总量 */
 		}
 	}
 	spin_unlock(&s->lock);
@@ -410,20 +411,31 @@ static u64 rfs_bm_group_alloc(struct ravenfs_bm_group *g, u64 count, u64 align)
 {
 	u32 cpu = (u32)raw_smp_processor_id() % g->cpu_slots;
 	u32 round;
+	u64 hit;
+
+	RFS_STAT_INC(g->sb, bm_alloc_calls);	/* 组级入口（两模式同一计数，§3.F） */
 
 	/* §12 分叉：CHUNK 走懒加载路由（FULL 旧码原样 = 红线） */
-	if (g->backing_mode == RFS_BM_BACKING_CHUNK)
-		return rfs_bm_group_chunk_alloc(g, count, align);
+	if (g->backing_mode == RFS_BM_BACKING_CHUNK) {
+		hit = rfs_bm_group_chunk_alloc(g, count, align);
+		if (hit != RFS_BM_NO_HIT)
+			RFS_STAT_INC(g->sb, bm_alloc_ok);
+		else
+			RFS_STAT_INC(g->sb, bm_alloc_fail);
+		return hit;
+	}
 
 	for (round = 0; round < g->n_slices; round++) {
 		u32 idx = (g->preferred[cpu] + round) % g->n_slices;
-		u64 hit = rfs_bm_slice_alloc(g, &g->slices[idx], count, align);
 
+		hit = rfs_bm_slice_alloc(g, &g->slices[idx], count, align);
 		if (hit != RFS_BM_NO_HIT) {
 			g->preferred[cpu] = idx;
+			RFS_STAT_INC(g->sb, bm_alloc_ok);
 			return hit;
 		}
 	}
+	RFS_STAT_INC(g->sb, bm_alloc_fail);	/* 全片扫毕 = ENOSPC/碎片 */
 	return RFS_BM_NO_HIT;
 }
 
@@ -477,6 +489,7 @@ static u64 rfs_bm_slice_alloc_soft(struct ravenfs_bm_group *g, struct ravenfs_bm
 	s->free_count -= got;
 	s->hint = hit + got;
 	*gap = count - got;
+	RFS_STAT_INC(g->sb, bm_soft_ok);	/* 软分配成功（D2/D3 实测面） */
 	return hit;
 }
 
@@ -526,6 +539,7 @@ static int rfs_bm_slice_occupy(struct ravenfs_bm_group *g, struct ravenfs_bm_sli
 	if (base + k > s->hint)
 		s->hint = base + k;		/* 只进不退 */
 	*rest = len - k;
+	RFS_STAT_INC(g->sb, bm_occupy);	/* 锚定认领（认领 >=1 位） */
 	return 0;
 }
 
@@ -645,6 +659,8 @@ static void rfs_bm_group_free(struct ravenfs_bm_group *g, u64 base, u64 count)
 {
 	u64 i = base;
 
+	RFS_STAT_INC(g->sb, bm_free_calls);	/* 组级入口（两模式同一计数） */
+
 	/* §12 分叉：CHUNK 走懒加载路由（在线直改/离线挂 record/池空兜底） */
 	if (g->backing_mode == RFS_BM_BACKING_CHUNK) {
 		rfs_bm_group_chunk_free(g, base, count);
@@ -670,6 +686,7 @@ static void rfs_bm_group_free(struct ravenfs_bm_group *g, u64 base, u64 count)
 			if (rfs_bm_get(g->words, i + j)) {
 				rfs_bm_clear(g->words, i + j);
 				s->free_count++;
+				RFS_STAT_INC(g->sb, bm_free_blocks);	/* 仅 1→0 实清计 */
 			}
 		}
 		spin_unlock(&s->lock);
@@ -823,11 +840,15 @@ static int rfs_bm_chunk_read(struct ravenfs_bm_group *g, u64 rel, void *buf, u64
 		struct buffer_head *bh = sb_bread(g->sb,
 			ravenfs_dev_blk(sbi, g->disk_start + rel + b));
 
-		if (!bh)
+		if (!bh) {
+			RFS_STAT_INC(g->sb, err_meta_io);
 			return -EIO;
+		}
 		memcpy((u8 *)buf + b * RAVENFS_BLOCK_SIZE, bh->b_data,
 		       RAVENFS_BLOCK_SIZE);
 		brelse(bh);
+		RFS_STAT_INC(g->sb, io_read_ops);
+		RFS_STAT_ADD(g->sb, io_read_bytes, RAVENFS_BLOCK_SIZE);
 	}
 	return 0;
 }
@@ -842,13 +863,17 @@ static int rfs_bm_chunk_write(struct ravenfs_bm_group *g, u64 rel, const void *b
 		struct buffer_head *bh = sb_bread(g->sb,
 			ravenfs_dev_blk(sbi, g->disk_start + rel + b));
 
-		if (!bh)
+		if (!bh) {
+			RFS_STAT_INC(g->sb, err_meta_io);
 			return -EIO;
+		}
 		memcpy(bh->b_data, (const u8 *)buf + b * RAVENFS_BLOCK_SIZE,
 		       RAVENFS_BLOCK_SIZE);
 		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);	/* 确定性：返回即落盘（对齐 FULL 同步口径） */
 		brelse(bh);
+		RFS_STAT_INC(g->sb, io_write_ops);
+		RFS_STAT_ADD(g->sb, io_write_bytes, RAVENFS_BLOCK_SIZE);
 	}
 	return 0;
 }
@@ -895,6 +920,7 @@ static u64 rfs_bm_drain_window(struct ravenfs_bm_slice *s, u32 ctl, u64 *target_
 		if (ns >= wlo && ne <= whi) {	/* 整段覆盖 → 摘节点 */
 			*pp = n->next;
 			rfs_bm_pool_release(bk->pool, n);
+			RFS_STAT_INC(bk->grp->sb, bm_rec_drain);	/* drain 消费量 */
 			continue;		/* pp 已指向后继，不推进 */
 		}
 		if (ns >= wlo) {		/* 尾伸窗外 → 收缩留尾 */
@@ -921,6 +947,7 @@ static u64 rfs_bm_drain_window(struct ravenfs_bm_slice *s, u32 ctl, u64 *target_
 		}
 	}
 	bk->ctls[ctl].has_recs = kept ? 1 : 0;
+	RFS_STAT_ADD(bk->grp->sb, bm_free_blocks, cleared);	/* drain 实清（1→0） */
 	return cleared;
 }
 
@@ -937,6 +964,7 @@ static void rfs_bm_clear_bits_locked(struct ravenfs_bm_slice *s, u64 from, u64 t
 			cleared++;
 		}
 	s->free_count += cleared;
+	RFS_STAT_ADD(s->backing->grp->sb, bm_free_blocks, cleared);	/* 仅 1→0 实清计 */
 	s->backing->ctls[from >> (15 + s->backing->chunk_order)].dirty = 1;
 }
 
@@ -949,11 +977,13 @@ static int rfs_bm_chunk_ensure_online(struct ravenfs_bm_slice *s, u32 ctl)
 {
 	struct rfs_bm_backing *bk = s->backing;
 	u64 tlo, thi;
+	u64 t0;
 	u32 old;
 	bool need_write = false;
 
 	if (!bk || ctl >= bk->chunks_per_slice)
 		return -EINVAL;
+	t0 = ktime_get_ns();	/* bm_chunk_switch_ns：换片全程计时（§3.F） */
 	mutex_lock(&bk->chg_mu);
 	rfs_bm_ctl_window(s, ctl, &tlo, &thi);
 
@@ -1020,6 +1050,8 @@ static int rfs_bm_chunk_ensure_online(struct ravenfs_bm_slice *s, u32 ctl)
 		bk->online_chunk = ctl;
 		bk->gen++;
 		bk->slice_base = (u8 *)bk->buffer - tlo / 8;	/* §4 重指 */
+		RFS_STAT_INC(bk->grp->sb, bm_chunk_switch);	/* 换片频率 */
+		RFS_STAT_ADD(bk->grp->sb, bm_chunk_switch_ns, ktime_get_ns() - t0);
 	}
 	spin_unlock(&s->lock);
 	mutex_unlock(&bk->chg_mu);
@@ -1043,6 +1075,7 @@ static int rfs_bm_chunk_lock_window(struct ravenfs_bm_slice *s, u32 ctl)
 		if (bk->ctls[ctl].summary == RFS_BM_SUM_ALL_USED &&
 		    !bk->ctls[ctl].has_recs) {
 			spin_unlock(&s->lock);
+			RFS_STAT_INC(bk->grp->sb, bm_summary_skip);	/* 摘要免载入跳过 */
 			return RFS_BM_WIN_SKIP;		/* 摘要免载入跳过（§7/§10.5） */
 		}
 		spin_unlock(&s->lock);
@@ -1070,6 +1103,7 @@ static bool rfs_bm_win_alloc_hard(struct ravenfs_bm_slice *s, u64 from, u64 to,
 	s->free_count -= count;
 	s->hint = hit + count;			/* 片内偏移（CHUNK 约定） */
 	*out = s->base_idx + hit;		/* 全局位号（对外零换算） */
+	RFS_STAT_ADD(s->backing->grp->sb, bm_alloc_blocks, count);	/* 分配块总量 */
 	return true;
 }
 
@@ -1099,6 +1133,7 @@ static bool rfs_bm_win_alloc_soft(struct ravenfs_bm_slice *s, u64 from, u64 to,
 	s->hint = hit + got;
 	*out = s->base_idx + hit;
 	*left = count - got;
+	RFS_STAT_INC(s->backing->grp->sb, bm_soft_ok);	/* 软分配成功 */
 	return true;
 }
 
@@ -1154,6 +1189,7 @@ static int rfs_bm_win_soft_occupy(struct ravenfs_bm_slice *s, u64 wlo, u64 whi,
 	if (off + k > s->hint)
 		s->hint = off + k;		/* 只进不退 */
 	*rest = len - k;
+	RFS_STAT_INC(s->backing->grp->sb, bm_occupy);	/* 锚定认领 */
 	return 0;
 }
 
@@ -1408,6 +1444,7 @@ static void rfs_bm_chunk_slice_free(struct ravenfs_bm_slice *s, u64 base, u64 le
 				node->len = n;
 				node->next = bk->rec_head;
 				bk->rec_head = node;
+				RFS_STAT_INC(bk->grp->sb, bm_rec_attach);	/* 离线还账挂账 */
 				/* 摘要降级（§6）：覆盖到的 ctl 一律 MIXED，
 				 * 否则盘态 ALL_USED（其实有待还空闲）被免载入
 				 * 跳过 → 错误 ENOSPC（§10.5） */
@@ -1423,6 +1460,7 @@ static void rfs_bm_chunk_slice_free(struct ravenfs_bm_slice *s, u64 base, u64 le
 				continue;
 			}
 		}
+		RFS_STAT_INC(bk->grp->sb, bm_pool_empty);	/* 池空兜底（撞池深上限） */
 		/* 池空兜底（§6/§10.9）：解锁 → 慢路径强制上线 → 重锁 → 直清；
 		 * 此时盘态仍显示已分配（free 未记账），alloc 抢不走它 ⇒ 不越序。 */
 		spin_unlock(&s->lock);
@@ -1486,10 +1524,14 @@ static bool rfs_bm_chunk_slice_test(struct ravenfs_bm_slice *s, u64 base)
 		u8 sum = bk->ctls[c].summary;		/* 摘要裁决（免载入） */
 
 		spin_unlock(&s->lock);
-		if (sum == RFS_BM_SUM_ALL_USED)
+		if (sum == RFS_BM_SUM_ALL_USED) {
+			RFS_STAT_INC(bk->grp->sb, bm_summary_skip);	/* 摘要裁决免载入 */
 			return true;
-		if (sum == RFS_BM_SUM_ALL_FREE)
+		}
+		if (sum == RFS_BM_SUM_ALL_FREE) {
+			RFS_STAT_INC(bk->grp->sb, bm_summary_skip);	/* 摘要裁决免载入 */
 			return false;
+		}
 		if (rfs_bm_chunk_ensure_online(s, c))
 			return true;			/* MIXED 上线查；I/O 失败 → 保守按已用 */
 		spin_lock(&s->lock);
@@ -1512,6 +1554,7 @@ static int rfs_bm_chunk_mount_scan(struct ravenfs_bm_slice *s, u32 ctl)
 	struct rfs_bm_backing *bk = s->backing;
 	struct ravenfs_bm_group *g;
 	u64 wlo, whi, nbits, nblocks, w, ones, zeros, gwlo, gwhi;
+	u64 t0;
 	const u64 *words;
 	int rc = 0;
 
@@ -1523,10 +1566,12 @@ static int rfs_bm_chunk_mount_scan(struct ravenfs_bm_slice *s, u32 ctl)
 	nblocks = nbits / RAVENFS_BITS_PER_BLOCK;	/* §3：恒整页，无 sub-page 尾块 */
 	if (!nblocks)
 		return -EINVAL;
+	t0 = ktime_get_ns();	/* bm_scan_ns：mount 顺序扫描逐窗计时 */
 
 	mutex_lock(&bk->chg_mu);
 	if (rfs_bm_chunk_read(g, bk->ctls[ctl].disk_block_rel, bk->buffer, nblocks)) {
 		mutex_unlock(&bk->chg_mu);
+		RFS_STAT_ADD(g->sb, bm_scan_ns, ktime_get_ns() - t0);
 		return -EIO;
 	}
 	words = (const u64 *)bk->buffer;
@@ -1558,6 +1603,7 @@ static int rfs_bm_chunk_mount_scan(struct ravenfs_bm_slice *s, u32 ctl)
 			rc = -EINVAL;
 	}
 	mutex_unlock(&bk->chg_mu);
+	RFS_STAT_ADD(g->sb, bm_scan_ns, ktime_get_ns() - t0);
 	return rc;
 }
 
@@ -1593,6 +1639,8 @@ static void rfs_bm_chunk_sync_one(struct ravenfs_bm_slice *s, u32 ctl)
 		spin_lock(&s->lock);
 		rfs_bm_recompute_summary(s, ctl, bk->buffer);
 		spin_unlock(&s->lock);
+		RFS_STAT_INC(g->sb, bm_ttl_online);	/* TTL 态1：在线脏窗同步量 */
+		RFS_STAT_INC(g->sb, bm_sync_slices);
 		return;
 	}
 	offline_recs = (bk->online_chunk != ctl) && bk->ctls[ctl].has_recs;
@@ -1620,6 +1668,8 @@ static void rfs_bm_chunk_sync_one(struct ravenfs_bm_slice *s, u32 ctl)
 	spin_lock(&s->lock);
 	rfs_bm_recompute_summary(s, ctl, bk->snapshot);
 	spin_unlock(&s->lock);
+	RFS_STAT_INC(g->sb, bm_ttl_drain);	/* TTL 态2：离线还账窗同步量 */
+	RFS_STAT_INC(g->sb, bm_sync_slices);
 }
 
 /* §9 单片 TTL：遍历本片 chunk 数组（不拿全片锁），逐 chunk 三态分派 */
@@ -1896,6 +1946,8 @@ static int rfs_bm_group_load(struct super_block *sb, struct ravenfs_bm_group *g)
 		memcpy(g->words + b * (RAVENFS_BLOCK_SIZE / sizeof(u64)), bh->b_data,
 		       RAVENFS_BLOCK_SIZE);
 		brelse(bh);
+		RFS_STAT_INC(g->sb, io_read_ops);
+		RFS_STAT_ADD(g->sb, io_read_bytes, RAVENFS_BLOCK_SIZE);
 	}
 	rfs_bm_group_scan_free(g);
 	return 0;
@@ -1954,9 +2006,12 @@ static int rfs_bm_group_sync(struct super_block *sb, struct ravenfs_bm_group *g)
 			mark_buffer_dirty(bh);
 			sync_dirty_buffer(bh);	/* 确定性：返回即落盘 */
 			brelse(bh);
+			RFS_STAT_INC(sb, io_write_ops);
+			RFS_STAT_ADD(sb, io_write_bytes, RAVENFS_BLOCK_SIZE);
 		}
 		if (err)
 			break;		/* 一个片失败即停，剩余片未同步（下轮/下次重试） */
+		RFS_STAT_INC(sb, bm_sync_slices);	/* FULL：逐片全量写回片数 */
 	}
 	mutex_unlock(&g->wb_lock);
 	kvfree(buf);
