@@ -4,16 +4,18 @@
  *
  * 依据：Docs/linux/ravenfs-linux-ko-M4-data-spec.md
  *   §2.1（file_operations 挂点）、§2.2（iomap 家族 a_ops）、§2.3（writepages/writeback_ops）、
- *   §5（mmap 前置 = read_folio）、§6（读粒度 = iomap 默认 D-M4-7）、§8（回写只查已分配映射）。
+ *   §5（mmap 前置 = read_folio）、§6（读粒度 = iomap 默认 D-M4-7）、§8（回写 / 写序 / 崩溃分析）。
  * 惯例参照：fs/zonefs/file.c（最小 iomap 接线）、fs/xfs/xfs_aops.c（a_ops 家族 + writeback_range）。
  *
  * 纪律：
  *   · **绝不挂 write_begin/write_end**（iomap 不需要；spec §1.1/§2.2）。
  *   · read_folio 是 mmap 的硬前置（D-M4-1）——无它 generic_file_mmap_prepare 直接 -ENOEXEC。
- *   · writepages/writeback_range **只查「已分配映射」**（写时已分配，D-M4-6），回写期**不分配**。
- *   · 可写 mmap 走自写 `ravenfs_file_vm_ops`：`page_mkwrite` → `iomap_page_mkwrite
- *     (IOMAP_WRITE|IOMAP_FAULT)` → `ravenfs_iomap_begin` **立刻分配**（**D-M4-12**）；
- *     否则 mmap 洞写会落 HOLE → 回写跳过 → **静默丢数据**（O-13）。
+ *   · `write(2)`/`fallocate` **写时立刻分配**（D-M4-6 不变：位图纯内存零 I/O，ENOSPC 即暴露）。
+ *   · mmap 写 fault **不分配**：改用 generic_file_vm_ops（filemap_page_mkwrite 只标脏），
+ *     分配移到**回写落点** —— writeback_range 查到 HOLE 即调 iomap_begin(IOMAP_WRITE)
+ *     真分配（**2026-09-28 用户裁，修订 D-M4-12**；O-13 保护不丢：洞在 bio 提交前被分配）。
+ *     接受的代价：回写期 ENOSPC → iomap 清脏位 + mapping_error（fsync 报错）丢数据；
+ *     /mnt/huge_data 空间大，风险声明接受（裁决记录在 spec D-M4-12 行）。
  *   · 无 direct_IO（O_DIRECT 后置 D-M4-5：open(O_DIRECT) 直接 -EINVAL）。
  */
 #include <linux/module.h>
@@ -51,8 +53,11 @@ static void ravenfs_readahead(struct readahead_control *rac)
 }
 
 /*
- * 回写映射：只查「已分配映射」（wpc->iomap 复用；跨越边界才重查）。
- * 写时已分配（D-M4-6）→ 回写期**不分配**；洞返回 HOLE，iomap 核心跳过（不写）。
+ * 回写映射：wpc->iomap 复用（跨越边界才重查）。
+ * **2026-09-28 用户裁（修订 D-M4-12）：mmap 路径 = 回写落点分配** ——
+ * 查到 HOLE 即调写向分支真分配（IOMAP_WRITE）。O-13「洞写静默丢数据」的
+ * 保护由 mkwrite 挪到这里：分配发生在 bio 提交之前，不再跳过。
+ * 副作用：回写期 ENOSPC → iomap 清脏位 + mapping_error（spec D-M4-12 修订注记）。
  */
 static ssize_t ravenfs_writeback_range(struct iomap_writepage_ctx *wpc,
 				       struct folio *folio, u64 pos,
@@ -63,7 +68,7 @@ static ssize_t ravenfs_writeback_range(struct iomap_writepage_ctx *wpc,
 
 	if (pos < wpc->iomap.offset ||
 	    pos >= wpc->iomap.offset + wpc->iomap.length) {
-		int err = ravenfs_iomap_begin(inode, pos, len, 0,
+		int err = ravenfs_iomap_begin(inode, pos, len, IOMAP_WRITE,
 					      &wpc->iomap, &srcmap);
 
 		if (err)
@@ -167,43 +172,19 @@ const struct address_space_operations ravenfs_aops = {
 };
 
 /*
- * 可写 mmap：写 fault 时**立刻分配**（D-M4-12；照抄 zonefs_filemap_page_mkwrite）。
- * 用 iomap_page_mkwrite（IOMAP_WRITE|IOMAP_FAULT）→ 复用 ravenfs_iomap_begin 写向分支。
- * 返回 VM_FAULT_LOCKED 的页内容随后由 writepages → writeback_range 落盘（此时映射已存在）。
- */
-static vm_fault_t ravenfs_filemap_page_mkwrite(struct vm_fault *vmf)
-{
-	struct inode *inode = file_inode(vmf->vma->vm_file);
-	vm_fault_t ret;
-
-	sb_start_pagefault(inode->i_sb);
-	file_update_time(vmf->vma->vm_file);
-
-	/* 与 truncate 串行 */
-	filemap_invalidate_lock_shared(inode->i_mapping);
-	ret = iomap_page_mkwrite(vmf, &ravenfs_iomap_ops, NULL);
-	filemap_invalidate_unlock_shared(inode->i_mapping);
-
-	sb_end_pagefault(inode->i_sb);
-	return ret;
-}
-
-static const struct vm_operations_struct ravenfs_file_vm_ops = {
-	.fault		= filemap_fault,
-	.map_pages	= filemap_map_pages,
-	.page_mkwrite	= ravenfs_filemap_page_mkwrite,
-};
-
-/*
- * mmap 前置：挂自写 vm_ops（D-M4-12）。取代 generic_file_mmap_prepare
- * （后者挂 generic_file_vm_ops，其 page_mkwrite = filemap_page_mkwrite **只标脏不分配**）。
+ * mmap 前置：**改挂 generic_file_vm_ops**（2026-09-28 用户裁，修订/退役 D-M4-12；
+ * f23b933 的自写 mkwrite 路径删除）。其 page_mkwrite = filemap_page_mkwrite
+ * **只标脏不分配**；块分配推迟到回写落点（ravenfs_writeback_range 调
+ * iomap_begin(IOMAP_WRITE)）。
+ * 动机：/mnt/huge_data 空间大 → 晚 ENOSPC（回写期）风险声明接受；
+ * O-13 保护不丢 —— 洞写在 bio 提交前被分配，不会走「HOLE 跳过」。
+ * write(2)/fallocate 仍写时立刻分配（D-M4-6 不变）。
  * read_folio 仍是硬前置（D-M4-1）——由 a_ops 保证。
  */
 int ravenfs_file_mmap_prepare(struct vm_area_desc *desc)
 {
 	file_accessed(desc->file);
-	desc->vm_ops = &ravenfs_file_vm_ops;
-	return 0;
+	return generic_file_mmap_prepare(desc);
 }
 
 /*

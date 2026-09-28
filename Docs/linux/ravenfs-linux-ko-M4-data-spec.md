@@ -19,13 +19,13 @@
 | **D-M4-2** | **必须走 `read_iter`/`write_iter` 路线** | **硬约束** | 不再手搓 `direct_file_pwrite` 式同步总装；缓冲读写全部经 VFS 迭代器 |
 | ~~**D-M4-3**~~ | ~~buffered cache_miss 全量加载（64K 单元）~~ | **撤销（2026-09-27 晚，O-5）** | 见 **D-M4-7** |
 | ~~**D-M4-4**~~ | ~~分配时机 = 写回才分配（delalloc）~~ | **撤销（2026-09-27 晚，O-4）** | 见 **D-M4-6** |
-| **D-M4-6** | **分配时机 = 立刻分配（强同步）** | **已决（2026-09-27，O-4）** | `iomap_begin(WRITE)` **立刻真分配**并返 **`IOMAP_MAPPED`**（**非** `IOMAP_DELALLOC`）；依据 = 位图分配器**纯内存多分片**（分配零 I/O、极廉价，无推迟动机）→ **ENOSPC 在 `write(2)` 即暴露**。必须记录 `f_off→blkidx`（逻辑→物理映射）——extent 树 / direct 表示即为此而设 |
+| **D-M4-6** | **分配时机 = 立刻分配（强同步）** | **已决（2026-09-27，O-4）** | `iomap_begin(WRITE)` **立刻真分配**并返 **`IOMAP_MAPPED`**（**非** `IOMAP_DELALLOC`）；依据 = 位图分配器**纯内存多分片**（分配零 I/O、极廉价，无推迟动机）→ **ENOSPC 在 `write(2)` 即暴露**。必须记录 `f_off→blkidx`（逻辑→物理映射）——extent 树 / direct 表示即为此而设。**⚡ 限定（2026-09-28）**：本条适用 `write(2)`/`fallocate`；**mmap 写 fault 不再分配**（见 D-M4-12 修订），改回写落点分配 |
 | **D-M4-7** | **读粒度 = iomap 默认** | **已决（2026-09-27，O-5）** | 不做自研「64K 单元 / 大 folio」；用 iomap 默认（`read_folio` + readahead）。**后续有时间/token 再研究** |
 | **D-M4-8** | **三态迁移基调 = inline 默认升格 extent** | **已决（2026-09-27，O-1）** | inline 写越 160 → **默认升格为 extent**；**direct 仅作出口坍缩的收敛态**（末尾发现单 extent 覆盖 `[0,size)` 再缩 direct），**不作初始分配态** |
 | **D-M4-9** | **不做 `iomap_write_ops.iomap_valid`** | **已决（2026-09-27，O-10）** | 因 O-4 立刻分配 → 映射**自创建起稳定**，无 stale 窗口；单挂载 + VFS `inode_lock` 串行化已足 |
 | **D-M4-10** | **短写尾巴：保留 + `evict_inode` 清算** | **已决（2026-09-27，O-11=(b)）** | `iomap_end` 对「已分配但未写完」区间 **不 free**（短期浪费可接受）；改在 **VFS `evict_inode`（inode 驱逐）时「秋后算账」** trim 超出 `size` 的意外尾块。⇒ 常驻文件的尾巴挂到 **unlink / umount** 才清算（可接受，见 §8）。因 **KEEP_SIZE 已拒（D-M4-11）**，「> `size` 分配」只剩短写尾一类，**无 fallocate 误伤** |
 | **D-M4-11** | **`fallocate` 拒绝 `FALLOC_FL_KEEP_SIZE`（纯预留）** | **已决（2026-09-27，O-12）** | `.fallocate` **只受理 `flags==0` 的普通预分配**（会抬 `size`）；**`FALLOC_FL_KEEP_SIZE`（纯预留、不抬 size）→ `-EOPNOTSUPP`**（第二约束「降级」路径）⇒ 盘上**永无「已分配但 > `size`」的 fallocate 预留** → **O-12 消解**。**例外**：`FALLOC_FL_PUNCH_HOLE\|FALLOC_FL_KEEP_SIZE`（打洞，R-FD-08，**该位是 ABI 强制**）与 `FALLOC_FL_ZERO_RANGE` **照常受理** |
-| **D-M4-12** | **`mmap` 写必须立刻分配（`page_mkwrite`）** | **已决+已落（2026-09-27，O-13=(a)）** | `vm_ops.page_mkwrite = ravenfs_filemap_page_mkwrite → iomap_page_mkwrite(vmf, &ravenfs_iomap_ops, NULL)`；`iomap_begin` 收 `IOMAP_WRITE\|IOMAP_FAULT` 时**立刻分配**（与 `write()` 同源）。堵住「mmap 洞写静默丢数据」。**M4.2 内补**（**不**推迟到 M4.3；**不**设拒写护栏）。**✅ 已落（提交 `f23b933`；guest mmap 洞写→msync→逐出读回→remount 实测 PASS）** |
+| **D-M4-12** | **`mmap` 写必须立刻分配（`page_mkwrite`）** | **已决+已落（2026-09-27，O-13=(a)）→ ⚡ 修订（2026-09-28，用户裁）** | `vm_ops.page_mkwrite = ravenfs_filemap_page_mkwrite → iomap_page_mkwrite(vmf, &ravenfs_iomap_ops, NULL)`；`iomap_begin` 收 `IOMAP_WRITE\|IOMAP_FAULT` 时**立刻分配**（与 `write()` 同源）。堵住「mmap 洞写静默丢数据」。**M4.2 内补**（**不**推迟到 M4.3；**不**设拒写护栏）。**✅ 已落（提交 `f23b933`；guest mmap 洞写→msync→逐出读回→remount 实测 PASS）**。**⚡ 修订（2026-09-28 用户裁）**：改用 `generic_file_mmap_prepare`（`generic_file_vm_ops`，page_mkwrite 只标脏），**分配移到回写落点**（`ravenfs_writeback_range` → `iomap_begin(IOMAP_WRITE)`）；f23b933 自写 mkwrite 退役。**O-13 保护保留**（洞在 bio 提交前分配，不走 HOLE 跳过）。**接受**：回写期 ENOSPC → iomap 清脏位 + mapping_error 丢脏数据（动机：/mnt/huge_data 空间大，晚 ENOSPC 风险声明接受）。**⚠ 待回归**：guest mmap 洞写→msync→逐出读回→remount（原 O-13 用例重跑） |
 | **D-M4-13** | **碎片化：暂接受为特性** | **已决（2026-09-27，用户）** | 「**能跑是第一要务**」；M4.2 不做合并/删除 → 随机写会碎片化，**暂当 feature**。**后续学习方向**：在 Linux 规则（分配器/位图/写回）下压低碎片（occupy 尾延展 / 批量连续分配 / 融合 / 重建） |
 | **D-M4-14** | **inline 可写 mmap：回灌 `inline_data`（不升格、不静默丢）** | **已决（2026-09-27，O-14=(a)；M4.3 首项）** | 行为规范：mmap 写**不改 size**；`[0,size)` 内字节**持久化到 `inline_data`**；**超出 size 的字节按 Linux 常规刻意静默丢弃**（不报错、**不升格** inline→extent）；**不得**再让 `msync` 返 `EIO` |
 | **D-M4-15** | **`fsync`/`fdatasync` = 定向刷（非卷级）** | **已决（2026-09-27，M4.5 暴露语义分歧）** | `fsync(file)` 只保**该 inode**：脏数据 + 元数据（inode 行 + 该树脏 mdata 节点）+ 相关位图 + **阶段 `blkdev_issue_flush` 屏障**；**不做卷级全盘刷**（卷级 = `sync_fs`/`syncfs`）。**durable-create 归调用方 `fsync(dir)`**（POSIX；R-FD-04/R-SY-01）⇒ **非 ko 缺口** |
@@ -131,7 +131,7 @@ static const struct iomap_write_ops ravenfs_write_ops = {
 	/* .get_folio / .put_folio / .iomap_valid / .read_folio_range */
 };
 
-/* ★回写：只查「已分配映射」（写时已分配）+ 挂 ioend —— **不在回写期分配**（D-M4-6） */
+/* ★回写：查映射 + **HOLE 则写向分配**（2026-09-28 修订：mmap 落点分配，取代 D-M4-12）+ 挂 ioend */
 static ssize_t ravenfs_writeback_range(struct iomap_writepage_ctx *wpc,
 		struct folio *folio, u64 pos, unsigned len, u64 end_pos);
 static const struct iomap_writeback_ops ravenfs_writeback_ops = {
@@ -144,7 +144,7 @@ static const struct iomap_writeback_ops ravenfs_writeback_ops = {
 ```
 
 > **纪律**：页缓存、folio、bio、回写、readahead **全由 iomap 核心代劳**；
-> fs 在 `iomap_begin` 回答「逻辑偏移 → 物理映射/空洞/内联」（**写向 = 立刻分配**），在 `writeback_range` 只负责「查已分配映射 + 挂 ioend」（**不再分配**，见 D-M4-6）。
+> fs 在 `iomap_begin` 回答「逻辑偏移 → 物理映射/空洞/内联」（**写向 = 立刻分配**），在 `writeback_range` 查映射 + 挂 ioend（**HOLE 时经 IOMAP_WRITE 分配** —— 2026-09-28 修订，mmap 落点分配，见 D-M4-12）。
 > 最小参照：`fs/zonefs/file.c`（读 = `iomap_bio_read_*`；回写 = `zonefs_writeback_range` + `iomap_ioend_writeback_submit`）。
 
 ---
@@ -234,7 +234,11 @@ mmap      → filemap_fault → a_ops->read_folio ──────────
 
 ## 8. 一致性 / 崩溃 / 写序（**D-M4-4 撤销后重述**）
 
-**分配时机 = 立刻（D-M4-6）** —— 写时 `iomap_begin(WRITE)` 直接真分配并返 `IOMAP_MAPPED`；**不再有 delalloc 预留**。于是：
+**分配时机 = 立刻（D-M4-6，限 `write(2)`/`fallocate`）** —— 写时 `iomap_begin(WRITE)` 直接真分配并返 `IOMAP_MAPPED`；**不再有 delalloc 预留**。
+>
+> **⚡ 2026-09-28 修订（D-M4-12）**：mmap 路径改回写期分配 → 本节前提对 mmap 的修正：回写**前**崩溃 = 数据只在页缓存，无痕（比立刻分配更干净）；回写**中/后**窗口 = 同 write(2)（位图/extent 行均为缓存态，sync_fs 写序 mdata→inode→bitmap 不变，**无新增悬空块窗口**）。
+
+于是：
 
 | 项 | 要求 | 状态 |
 |---|---|---|
@@ -311,7 +315,7 @@ mmap      → filemap_fault → a_ops->read_folio ──────────
 | # | 问题 | 现状冲突 | 选项 | **裁决（2026-09-27 用户）** |
 |---|---|---|---|---|
 | **O-1** | **delalloc 下 direct 态的「物理全覆盖义务」** | 不变量 24 要求 direct 增长时**占位分配**（写时亮灯）；D-M4-4 写时不亮灯 → **写时无法确定能否维持 direct** | (a) 写时预留连续 run（soft-reserve 不亮灯），回写兑付，兑付失败降级 extent（需搬数据）；(b) **delalloc 下非 inline 一律走 extent**，direct 只作**回写期出口坍缩的收敛态**（不再是初始分配态）；(c) 退回同步分配（违背 D-M4-4） | **(b)** 确实可以inline默认升格->extent,最后尾巴处发现确实可以shrink到一个extent再direct → **D-M4-8** |
-| **O-2** | **不变量 25 的回写期形态** | 原三步（亮灯→落盘→inode 翻转）在 delalloc 下**全压缩到回写**；`write(2)` 返回时零落盘 | (a) 单阶段：回写内「分配→bio→inode 翻转」顺序推进，中途崩 = dangling（**同 M3.5，判为设计特性**）；(b) 分阶段迷你 journal（重） | **消解**（O-4 立刻分配后不再有「全压缩到回写」）→ 见 §8 |
+| **O-2** | **不变量 25 的回写期形态** | 原三步（亮灯→落盘→inode 翻转）在 delalloc 下**全压缩到回写**；`write(2)` 返回时零落盘 | (a) 单阶段：回写内「分配→bio→inode 翻转」顺序推进，中途崩 = dangling（**同 M3.5，判为设计特性**）；(b) 分阶段迷你 journal（重） | **消解**（O-4 立刻分配后不再有「全压缩到回写」）→ 见 §8。**⚡ 部分复活（2026-09-28）**：mmap 路径「分配→bio→翻转」重回回写内（D-M4-12 修订）；无新增悬空窗口（见 §8 修订注） |
 | **O-3** | **`data_root` 提交点搬家后的崩溃窗口** | 提交点从 write 期搬到回写期 | write 返回后、回写前崩 = 数据全丢但 inode 未动（安全，等价「没写」）；回写中途 = O-2 | **消解**（提交点不再搬到回写期） |
 | **O-4** | **回写期 ENOSPC 暴露面** | 真分配在回写 → `write(2)` 已成功返回后才可能 ENOSPC（Arch 安装期致命） | (a) **写时做块数预留**（reserve 计数不亮灯）→ `write(2)` 即返 ENOSPC（ext4 式）；需 sb 级 reserve 新件；(b) 不预留 → ENOSPC 只能 `sync`/`fsync` 暴露 | 另一条路，强同步，数据块一个需求立马上分配，我的位图分配器纯内存多分片不怕，但是要记录f_off->blkidx,就是设计来解决这个的|
 | **O-5** | **64K 单元的硬依赖** | `mapping_set_folio_min_order(4)` 受 `CONFIG_TRANSPARENT_HUGEPAGE` 门控 | (a) 依赖 THP（宿主 =y，**guest 未核实**）；(b) guest THP=n 则退 4K + 靠 readahead 窗口；(c) 放弃 64K 用 iomap 默认 | 统一回退到 （C）使用iomap的先进框架，后续有时间有token再研究 |
