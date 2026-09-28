@@ -3,7 +3,7 @@
 #   内核更新：DKMS alpm hook 自动为每个已装内核重编（需对应 *-headers）。
 #   initramfs：自带 /etc/mkinitcpio.conf.d/ravenfs.conf → 自动入镜像。
 pkgname=ravenfs-dkms
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="RavenFS (experimental) kernel module, built via DKMS"
 arch=('x86_64')
