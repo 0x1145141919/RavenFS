@@ -40,6 +40,10 @@
 #include <linux/timekeeping.h>
 
 #include "ravenfs.h"
+#include "ravenfs_iomap.h"
+#include "ravenfs_extent.h"
+#include "ravenfs_cache.h"
+#include "ravenfs_bitmap.h"
 
 /* inline 态字节上限（不变量 22）：size ≤ 160 ⇒ 内容在 inode.inline_data */
 #define RAVENFS_INLINE_BYTES		160U

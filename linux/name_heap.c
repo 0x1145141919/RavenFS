@@ -25,6 +25,10 @@
 #include <linux/timekeeping.h>
 
 #include "ravenfs.h"
+#include "ravenfs_cache.h"
+#include "ravenfs_mdata_cache.h"
+#include "ravenfs_bitmap.h"
+#include "ravenfs_name_heap.h"
 
 /* 10 槽静态几何（与 raven_dir_Inode_t 字段序一一对应；disk_layout_v1.2 §7.4 容量表） */
 static const u8 rfs_heap_gran_log2[10] = { 3, 3, 3, 6, 6, 7, 7, 8, 8, 9 };	/* 8B/64B/128B/256B/512B */

@@ -30,6 +30,8 @@
 #include <linux/kernel.h>
 
 #include "ravenfs.h"
+#include "ravenfs_cache.h"
+#include "ravenfs_bitmap.h"
 
 static unsigned int ttl_seconds = 2;
 module_param(ttl_seconds, uint, 0644);

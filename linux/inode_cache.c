@@ -38,6 +38,9 @@
 #include <linux/timekeeping.h>
 
 #include "ravenfs.h"
+#include "ravenfs_file.h"
+#include "ravenfs_cache.h"
+#include "ravenfs_bitmap.h"
 
 /* ── 分片/行几何（与 §4.11.1 + M2.2 逐式一致） ── */
 static void ravenfs_geo_init(struct ravenfs_cache *c, u64 inode_count, u32 row_size)

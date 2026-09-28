@@ -6,7 +6,7 @@
  *       Docs/disk_layout_v1.1.md §5（区段树 entry/路由/分裂/平衡）+ §10 不变量 8/9/10/31–36
  *       （阶 337 / 左 168 / 欠载 <168 / 合并 ≤337 / 深度 64 / 节点 8K 对齐）；
  *       研究报告 m4-research/C-god-extent.md（god 机械伪规格，理念参考非照搬）。
- * 范式：linux/dentry_write.c（同一「树写机械」骨架：walk → 叶插 → 叶裂 → 升根 → 刷父 key）。
+ * 范式：linux/dentry_tree.c + dentry_node.c（同一「树写机械」骨架：walk → 叶插 → 叶裂 → 升根 → 刷父 key）。
  *
  * 【M4.2 第一版范围（诚实边界）】
  *   · 只做 **插入**：多级 walk（严格上界路由）+ 叶插入 + 叶裂（左 168）+ 内裂 + 升根 + 父 key 上溯。
@@ -26,6 +26,9 @@
 #include <linux/timekeeping.h>
 
 #include "ravenfs.h"
+#include "ravenfs_extent.h"
+#include "ravenfs_mdata_cache.h"
+#include "ravenfs_bitmap.h"
 
 #define RFS_EXT_ORDER		337u	/* 阶 */
 #define RFS_EXT_MAX_SLOTS	338u	/* 槽 [0,337]；[337] 瞬时 */
@@ -736,7 +739,7 @@ int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
  * 依据：Docs/punch_truncate_pread_spec.md §5/§6/§7（**P10✓ 旧根延迟 free**）；
  *       Docs/disk_layout_v1.1.md §5.3 + §10 不变量 31–36（阶 337 / 左 168 / 欠载 <168 /
  *       合并 ≤337 / 深度 64）；m4-research/C-god-extent.md §2.7/§2.8（god 机械伪规格）。
- * 范式：linux/dentry_write.c（node_balance / root_shrink / 上溯；同机械，阈值换 337/168）。
+ * 范式：linux/dentry_node.c（node_balance / root_shrink / 上溯；同机械，阈值换 337/168）。
  * 纪律（P10）：`extent_root_shrink` 根更迭时**旧根不 free**，随 `old_root` 上抛；
  *       调用方在 inode.data_root 提交**之后**统一 free（严禁先 free 后翻 inode = 悬挂）。
  * ══════════════════════════════════════════════════════════════════ */

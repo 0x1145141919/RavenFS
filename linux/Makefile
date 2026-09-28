@@ -6,7 +6,7 @@
 #   guest 内构建由 vm/share/install-ravenfs-module.sh 走 `make -C $KDIR M=<src>/linux modules`
 #
 obj-m += ravenfs.o
-ravenfs-y := super.o dentry.o dentry_write.o inode_cache.o mdata_cache.o cache_ttl.o bitmap.o name_heap.o iomap.o file.o extent_write.o xattr.o
+ravenfs-y := super.o dentry.o dentry_tree.o dentry_node.o inode_cache.o mdata_cache.o cache_ttl.o bitmap.o name_heap.o iomap.o file.o extent_write.o xattr.o
 
 # v1.2 盘面头在 ../include（C/C++ 双兼容，内部按 __KERNEL__ 选 linux/types.h）
 ccflags-y := -I$(src)/../include
@@ -19,6 +19,8 @@ PWD  := $(shell pwd)
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	# 编译完顺手刷新 IDE compile db（失败不挡构建）
+	-@python3 $(PWD)/../tools/ide/gen_compile_commands.py
 
 modules_install:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules_install

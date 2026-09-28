@@ -34,6 +34,12 @@
 #include <linux/fileattr.h>
 
 #include "ravenfs.h"
+#include "ravenfs_dir.h"
+#include "ravenfs_file.h"
+#include "ravenfs_cache.h"
+#include "ravenfs_mdata_cache.h"
+#include "ravenfs_bitmap.h"
+#include "ravenfs_xattr.h"
 
 /* ── 前向声明（ops 表在 read_inode 里被引用） ── */
 static const struct inode_operations ravenfs_dir_inode_operations;

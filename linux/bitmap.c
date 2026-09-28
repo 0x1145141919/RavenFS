@@ -38,6 +38,7 @@
 #include <linux/string.h>
 
 #include "ravenfs.h"
+#include "ravenfs_bitmap.h"
 
 /* 片下限：1 个位图块 = 4096B × 8 = 32768 位（保证片基址 4K 对齐） */
 #define RFS_BM_SLICE_MIN_BITS	32768ULL

@@ -31,6 +31,8 @@
 #include <linux/timekeeping.h>
 
 #include "ravenfs.h"
+#include "ravenfs_cache.h"
+#include "ravenfs_mdata_cache.h"
 
 static void ravenfs_mgeo_init(struct ravenfs_mdata_cache *c, u64 total_blocks)
 {

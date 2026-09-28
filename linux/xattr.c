@@ -37,6 +37,9 @@
 #include <linux/user_namespace.h>
 
 #include "ravenfs.h"
+#include "ravenfs_cache.h"
+#include "ravenfs_bitmap.h"
+#include "ravenfs_xattr.h"
 
 #define RFS_XATTR_NAME_MAX	255
 #define RFS_XATTR_SIZE_MAX	65536
