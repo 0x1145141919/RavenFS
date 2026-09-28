@@ -2,7 +2,13 @@
 
 /* v1.2：mkfs 适配 v1.2 盘面（type:6 / mode_xattr:12|52 / xattr_ptr 哨兵 / version 3）
  * 注：用户态上帝类（juvenile_god）**刻意暂不迁移**，仍用 disk_struct_v1.1.hpp；
- *     mkfs 先行适配 v1.2（见 disk_layout_v1.2_inode.md §8）。 */
+ *     mkfs 先行适配 v1.2（见 disk_layout_v1.2_inode.md §8）。
+ *
+ * 双版本写出口（2026-09-28）：**默认写 v1.2；`--v1.1` 写 v1.1 盘**（god/测试团队
+ * 专用 —— god 仍以 disk_struct_v1.1.hpp 挂盘，version≠2 即 RC_ERR_VERSION，
+ * v1.2 盘挂不进 god）。两版盘上字节布局全等（SB/inode/dentry 关键偏移实测一致，
+ * 见 089be87 “字节 offset 不变，语义重定义”），仅语义取值分叉四处：
+ *   version 2|3 · root inode 0|16 · type 编码 DIR=1|4 · permission_bits 裸值|mode_xattr 打包 */
 #include "../include/disk_struct_v1.2.h"
 #include "../include/magics.h"
 
@@ -28,6 +34,7 @@ struct MkfsParams {
     uint8_t     uuid[16];
     bool        force;
     bool        verbose;
+    bool        v11;              // true → 写 v1.1 盘面（--v1.1；god/测试团队用；默认 v1.2）
 
     uint64_t    lba_size;        // NVMe→Identify, file→4096
     uint64_t    multiplier;      // 4096 / lba_size

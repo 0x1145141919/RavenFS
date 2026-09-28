@@ -21,6 +21,8 @@ static void print_usage(const char *prog) {
         "  --backups=N        Backup Superblock count (default: 3)\n"
         "  --label=NAME       Volume label (max 48 bytes)\n"
         "  --uuid=UUID        Explicit UUID (auto-generated if omitted)\n"
+        "  --v1.1             Write v1.1 disk format (version=2, root inode 0)\n"
+        "                     for juvenile god / tests (default: v1.2)\n"
         "  -f, --force        Overwrite existing filesystem\n"
         "  -v, --verbose      Print detailed layout info\n"
         "  -h, --help         Show this help\n"
@@ -49,6 +51,7 @@ int main(int argc, char *argv[]) {
         {"backups",     required_argument, 0, 'b'},
         {"label",       required_argument, 0, 'l'},
         {"uuid",        required_argument, 0, 'u'},
+        {"v1.1",        no_argument,       0, '1'},
         {"force",       no_argument,       0, 'f'},
         {"verbose",     no_argument,       0, 'v'},
         {"help",        no_argument,       0, 'h'},
@@ -99,6 +102,9 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "invalid UUID format\n");
                 return 1;
             }
+            break;
+        case '1':
+            params.v11 = true;      /* --v1.1：写 v1.1 盘（god/测试团队） */
             break;
         case 'f':
             params.force = true;
@@ -253,9 +259,10 @@ int main(int argc, char *argv[]) {
     if (ret == 0) {
         char uuid_str[37];
         uuid_unparse(params.uuid, uuid_str);
-        printf("mkfs.ravenfs: done  device=%s  blocks=%lu  "
+        printf("mkfs.ravenfs: done  device=%s  format=%s  blocks=%lu  "
                "ratio=%lu  inodes=%lu  backups=%u  uuid=%s\n",
                params.device,
+               params.v11 ? "v1.1" : "v1.2",
                (unsigned long)geo.total_blocks,
                (unsigned long)params.inode_ratio,
                (unsigned long)params.inode_count,

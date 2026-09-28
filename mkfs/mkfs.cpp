@@ -277,11 +277,11 @@ static void build_superblock(RavenSuperblock *sb, const MkfsParams &p,
                               const uint64_t *backup_blocks) {
     memset(sb, 0, sizeof(*sb));
     sb->magic          = SUPERBLOCK_MAGIC;
-    sb->version        = RAVENFS_VERSION;   /* v1.2 = 3 */
+    sb->version        = p.v11 ? 2u : RAVENFS_VERSION;   /* v1.1=2 / v1.2=3（god 只认 2） */
     sb->world_base_lba = p.world_base_lba;
     sb->total_blocks   = geo.total_blocks;
     sb->inode_array_count = p.inode_count;
-    sb->root_inode     = RAVENFS_ROOT_INODE;
+    sb->root_inode     = p.v11 ? 0 : RAVENFS_ROOT_INODE; /* v1.1 root=0 / v1.2 root=16 */
     memcpy(sb->uuid, p.uuid, 16);
     memcpy(sb->volume_name, p.label, sizeof(sb->volume_name));
     sb->backup_prev  = PTR_INVALID;
@@ -322,14 +322,23 @@ static void build_root_dentry_node(Bptree_ddentry_leaf_node_t *node, uint64_t ro
     /* entries[127] 全零（memset） */
 }
 
-static void build_root_inode(raven_Inode_t *inode, uint64_t root_dentry_block) {
+static void build_root_inode(raven_Inode_t *inode, uint64_t root_dentry_block,
+                             uint64_t stamp_sec, bool v11) {
     memset(inode, 0, sizeof(*inode));
-    /* v1.2 第一字：type:6 | direct:1 | i_flags:57（DIR 的 direct 位恒 0） */
-    inode->word1                   = RFS_INO1_PACK(INODE_TYPE_DIR, 0, 0);
+    /* 时间戳：与 SB born_time 同源（2026-09-28 修 —— 原先三字段留 0，挂载后根目录显示 1970） */
+    inode->mtime = inode->ctime = inode->atime = stamp_sec;
+    inode->m_ns_stamp = inode->c_ns_stamp = inode->a_ns_stamp = 0;
+    /* 第一字语义分叉（盘上同位，编码不同）：
+     *   v1.1：type:2 | direct:1 | other:61，DIR 编码 = 1（REGULAR=0 / SOFT_SYM=2）
+     *   v1.2：type:6 | direct:1 | i_flags:57，DIR = S_IFMT>>12 = 4（直接写 1 会被
+     *        v1.1 的 2 位 type 读成 REGULAR → 根变文件，故必须分叉） */
+    inode->word1                   = v11 ? 1 : RFS_INO1_PACK(INODE_TYPE_DIR, 0, 0);
     inode->uid                     = 0;
     inode->gid                     = 0;
-    /* v1.2 mode_xattr：mode:12 | xattr_ptr:52（无 xattr = 52 位全 1 哨兵） */
-    inode->mode_xattr              = RFS_MODE_XATTR_PACK(0755, RFS_XATTR_NONE);
+    /* mode 位语义分叉：v1.1 permission_bits 裸值（高 52 位 = 0）；
+     * v1.2 mode_xattr = mode:12 | xattr_ptr:52（无 xattr = 52 位全 1 哨兵） */
+    inode->mode_xattr              = v11 ? 0755
+                                         : RFS_MODE_XATTR_PACK(0755, RFS_XATTR_NONE);
     inode->size                    = 0;
     inode->data_root               = root_dentry_block;
     inode->link_count              = 2;
@@ -478,11 +487,15 @@ int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
     uint64_t ibm_off = block_to_offset(geo.inode_array_bitmap_base, params);
     uint64_t dn_off  = block_to_offset(root_dentry_block, params);
 
+    /* 根 inode 索引：v1.1 = 0（god 按 0 挂根，位图片 0 hint 也从 1 起）；
+     * v1.2 = 16（st_ino=0 视为已删除的语义裁定，见 mkfs.hpp RAVENFS_ROOT_INODE） */
+    const uint64_t root_ino = params.v11 ? 0 : RAVENFS_ROOT_INODE;
+
     Bptree_ddentry_leaf_node_t dentry_node;
-    build_root_dentry_node(&dentry_node, RAVENFS_ROOT_INODE);
+    build_root_dentry_node(&dentry_node, root_ino);
 
     raven_Inode_t root_inode;
-    build_root_inode(&root_inode, root_dentry_block);
+    build_root_inode(&root_inode, root_dentry_block, sb.born_time, params.v11);
 
     {
         BitmapBuf      bitmap(fd, geo, bm_off);
@@ -496,9 +509,9 @@ int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
         bitmap.mark_backup(backup_blocks, bc);
         bitmap.mark_tail();
 
-        inodes.set(RAVENFS_ROOT_INODE, &root_inode);
+        inodes.set(root_ino, &root_inode);
 
-        ibitmap.mark(RAVENFS_ROOT_INODE);
+        ibitmap.mark(root_ino);
         ibitmap.mark_tail();
 
         // Root dentry + Backup SBs（显式写）
