@@ -57,5 +57,8 @@ linux/.*.cmd
 linux/.module-common.o
 linux/ravenfs.o
 
+# IDE compile db（tools/ide/gen_compile_commands.py 生成）
+linux/compile_commands.json
+
 # 独立虚拟机环境（脚本 + 磁盘镜像，不随仓库走）
 linux/vm/
