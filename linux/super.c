@@ -377,6 +377,7 @@ static int ravenfs_read_inode(struct inode *inode)
 		inode->i_fop = &ravenfs_file_operations;
 		/* M4.1：REG 数据路径走 iomap a_ops（mmap/read_folio 前置，D-M4-1） */
 		inode->i_data.a_ops = &ravenfs_aops;
+		mapping_set_folio_order_range(inode->i_mapping, 0, 4);   /* ← 加这行：4K..64K */    
 		break;
 	case INODE_TYPE_SOFT_SYM:
 		/* R-NS-06：fast（≤160 内联 → simple_get_link）/ slow（page_get_link）双态分派。
