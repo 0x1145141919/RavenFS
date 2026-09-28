@@ -8,7 +8,13 @@
 
 #include "ravenfs.h"
 
-/* ── 双位图分片分配器（bitmap.c）── */
+/* ── 双位图分片分配器（bitmap.c）──
+ *
+ * backing 后端（2026-09-28 CHUNK 化移植，规格 Docs/runtime_tech/03_chunk_backed_slices.md）：
+ *   · **默认 FULL** = 全量常驻内存分片（本注前全部现行为逐位不变 = 红线）；
+ *   · **CHUNK**（懒加载）= 每片一个固定 chunk 缓冲 + 控制器数组 + 返还记录，
+ *     经**模块参数**显式开启：`bitmap_backing=1`（0=FULL 默认）、`bitmap_chunk_order=4`
+ *     （chunk = 4K<<order 字节，有效 0..8）。顶层 API 签名/语义不变。 */
 struct ravenfs_bitmap_mgr;
 int  ravenfs_bitmap_create(struct super_block *sb);
 void ravenfs_bitmap_destroy(struct super_block *sb);
