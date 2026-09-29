@@ -59,12 +59,12 @@ result_code_t RavenFS_juvenile::extent_Bptree_walk(uint64_t root_blk_idx, bptree
         Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
         if (!is_extent_node(meta)) return RC_ERR_STATE;
         /* 根校验：第 0 层必须是根，后续层必须非根（树损坏即报） */
-        if ((depth == 0) != (bool)meta->parent_ptr.is_root_node)
+        if ((depth == 0) != (bool)RFS_PP_IS_ROOT(meta->parent_ptr))
             return RC_ERR_STATE;
 
         trace->blocks[depth] = cur_blk;
 
-        if (!meta->parent_ptr.is_inner_node) {
+        if (!RFS_PP_IS_INNER(meta->parent_ptr)) {
             /* 叶子：GLB 查找 + 覆盖检测收尾 */
             auto *leaf = (Bptree_extent_leaf_node_t *)sess.data;
             leaf_node_result_t res = extent_leaf_node_lookup(leaf, logical_block_idx);
@@ -76,16 +76,16 @@ result_code_t RavenFS_juvenile::extent_Bptree_walk(uint64_t root_blk_idx, bptree
 
         /* 内部节点：严格上界路由（找第一个 key > target） */
         auto *node = (Bptree_extent_inner_node_t *)sess.data;
-        if (node->meta.parent_ptr.entry_count == 0) return RC_ERR_STATE;
+        if (RFS_PP_COUNT(node->meta.parent_ptr) == 0) return RC_ERR_STATE;
         uint16_t hint_idx = extent_inner_node_lookup(node, logical_block_idx);
         if (hint_idx == EXTENT_LEAF_GLB_NONE) {
             /* 右击穿：target ≥ 全部子树开边界。目标明确——新区间是
              * 全局最大，归宿 = 最右叶子末尾。特化：不再二分，每层
              * 直取最后一个 hint 下钻到最右叶子。 */
-            hint_idx = (uint16_t)(node->meta.parent_ptr.entry_count - 1);
+            hint_idx = (uint16_t)(RFS_PP_COUNT(node->meta.parent_ptr) - 1);
         }
         trace->child_idx[depth] = hint_idx;   /* uint16_t 直赋；337 阶不可截断 */
-        cur_blk = node->extents[hint_idx].sub_node_ptr.ptr;
+        cur_blk = RFS_PTR_ADDR(node->extents[hint_idx].sub_node_ptr);
     }
     return RC_ERR_STATE;   /* 深度超限：树成环 / 指针损坏 */
 }
@@ -117,7 +117,7 @@ RavenFS_juvenile::leaf_node_result_t RavenFS_juvenile::extent_leaf_node_lookup(B
     res.greates_lower_bound_idx = EXTENT_LEAF_GLB_NONE;
     res.is_idx_hitted = false;
 
-    const uint16_t count = (uint16_t)leaf->meta.parent_ptr.entry_count; /* ≤337 */
+    const uint16_t count = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr); /* ≤337 */
     uint16_t lo = 0, hi = count;
     uint16_t glb = EXTENT_LEAF_GLB_NONE;   /* 哨兵：无下界（最左插入） */
     while (lo < hi) {
@@ -153,7 +153,7 @@ RavenFS_juvenile::leaf_node_result_t RavenFS_juvenile::extent_leaf_node_lookup(B
  * ═══════════════════════════════════════════════════════════════════ */
 uint16_t RavenFS_juvenile::extent_inner_node_lookup(Bptree_extent_inner_node_t *node, uint64_t target)
 {
-    const uint16_t count = (uint16_t)node->meta.parent_ptr.entry_count;
+    const uint16_t count = (uint16_t)RFS_PP_COUNT(node->meta.parent_ptr);
     uint16_t lo = 0, hi = count;
     while (lo < hi) {
         uint16_t mid = lo + (hi - lo) / 2;

@@ -114,12 +114,12 @@ static void gen_name(char *buf, const grp_t &g, uint64_t idx) {
 static uint64_t count_bits_full(RavenFS_juvenile &fs, const name_heap_controller_t &c) {
     /* self_reliat 写回缓存：位图面修改未落盘前直读盘会假阳性 → 先同步点 */
     if (fs.mdata_piece_mgr) fs.mdata_piece_mgr->flush_all();
-    if (c.bitmap_base_block_ptr == NAME_HEAP_INACTIVE) return 0;
-    const uint64_t bmp_blks = 1ULL << ((uint64_t)c.total_bits_count_log2 - 15);
+    if (RFS_NHC_BITMAP(c) == NAME_HEAP_INACTIVE) return 0;
+    const uint64_t bmp_blks = 1ULL << ((uint64_t)RFS_NHC_BITS(c) - 15);
     uint64_t n = 0;
     for (uint64_t p = 0; p < bmp_blks / 2; p++) {
         alignas(uint8_t) uint8_t bmp[8192];
-        if (fs.read_buff(c.bitmap_base_block_ptr + p * 2, 2, bmp) != RC_OK) return UINT64_MAX;
+        if (fs.read_buff(RFS_NHC_BITMAP(c) + p * 2, 2, bmp) != RC_OK) return UINT64_MAX;
         for (int i = 0; i < 8192; i++) n += (uint64_t)__builtin_popcount(bmp[i]);
     }
     return n;
@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
                 if (fs.root_dir_lookup(nm, &inum) != RC_OK) { bad++; continue; }
                 InodeSession s(fs.inode_cache_mgr, inum);
                 if (!s) { bad++; continue; }
-                if (s.inode->type != mix_type(g, i)) bad++;
+                if (RFS_INO1_GET_TYPE(s.inode->word1) != mix_type(g, i)) bad++;
             }
             if (bad) {
                 p1_ok = false;
@@ -248,30 +248,30 @@ int main(int argc, char **argv) {
     printf("\n--- Phase 3: 位图满校验 ---\n");
     {
         raven_Inode_t ino;
-        fs.inode_read(0, &ino);
+        fs.inode_read(fs.root_inum, &ino);
         raven_dir_Inode_t *dino = (raven_dir_Inode_t *)&ino;
         name_heap_controller_t *c512 = &dino->heaps_512B_8k;
-        CHECK(c512->bitmap_base_block_ptr != NAME_HEAP_INACTIVE, "512B_8k 已激活");
+        CHECK(RFS_NHC_BITMAP(*c512) != NAME_HEAP_INACTIVE, "512B_8k 已激活");
         uint64_t bits = count_bits_full(fs, *c512);
         CHECK(bits == 65536, "512B_8k 位图置位 %llu == 65536（全满）", (unsigned long long)bits);
 
         name_heap_controller_t *c8 = &dino->heaps_8B_8k;
-        CHECK(c8->bitmap_base_block_ptr != NAME_HEAP_INACTIVE, "8B_8k 已激活");
+        CHECK(RFS_NHC_BITMAP(*c8) != NAME_HEAP_INACTIVE, "8B_8k 已激活");
         uint64_t bits8 = count_bits_full(fs, *c8);
         if (FULL) {
             CHECK(bits8 == 65536, "8B_8k 位图置位 %llu == 65536（全满）", (unsigned long long)bits8);
             name_heap_controller_t *c8b = &dino->heaps_8B_16k;
-            CHECK(c8b->bitmap_base_block_ptr != NAME_HEAP_INACTIVE, "8B_16k 已激活（8B_8k 满后升级）");
+            CHECK(RFS_NHC_BITMAP(*c8b) != NAME_HEAP_INACTIVE, "8B_16k 已激活（8B_8k 满后升级）");
             uint64_t b16 = count_bits_full(fs, *c8b);
             CHECK(b16 == 131072, "8B_16k 位图置位 %llu == 131072（全满）", (unsigned long long)b16);
             name_heap_controller_t *c8c = &dino->heaps_8B_32k;
-            CHECK(c8c->bitmap_base_block_ptr != NAME_HEAP_INACTIVE, "8B_32k 已激活（8B_16k 满后升级）");
+            CHECK(RFS_NHC_BITMAP(*c8c) != NAME_HEAP_INACTIVE, "8B_32k 已激活（8B_16k 满后升级）");
             uint64_t b32 = count_bits_full(fs, *c8c);
             CHECK(b32 == 262144, "8B_32k 位图置位 %llu == 262144（全满）", (unsigned long long)b32);
         } else {
             CHECK(bits8 == 65536, "8B_8k 位图置位 %llu == 65536（缩水版全满）", (unsigned long long)bits8);
             name_heap_controller_t *c8b = &dino->heaps_8B_16k;
-            CHECK(c8b->bitmap_base_block_ptr != NAME_HEAP_INACTIVE, "8B_16k 已激活（8B_8k 满后升级）");
+            CHECK(RFS_NHC_BITMAP(*c8b) != NAME_HEAP_INACTIVE, "8B_16k 已激活（8B_8k 满后升级）");
         }
     }
 
@@ -313,13 +313,13 @@ int main(int argc, char **argv) {
         result_code_t lr = fs.root_dir_lookup(nm, &inum);
         CHECK(lr == RC_ERR_NOT_FOUND, "删光后 lookup 任意名字 → %s", rc_name(lr));
 
-        CHECK(fs.dir_name_heap_release(0) == RC_OK, "dir_name_heap_release(0) → RC_OK");
+        CHECK(fs.dir_name_heap_release(fs.root_inum) == RC_OK, "dir_name_heap_release(0) → RC_OK");
         raven_Inode_t ino;
-        fs.inode_read(0, &ino);
+        fs.inode_read(fs.root_inum, &ino);
         raven_dir_Inode_t *dino = (raven_dir_Inode_t *)&ino;
         bool all_inactive = true;
         for (int s = 0; s < 10; s++) {
-            if (((name_heap_controller_t *)&dino->heaps_8B_8k)[s].bitmap_base_block_ptr
+            if (RFS_NHC_BITMAP(((name_heap_controller_t *)&dino->heaps_8B_8k)[s])
                     != NAME_HEAP_INACTIVE) { all_inactive = false; break; }
         }
         CHECK(all_inactive, "10 个堆全部重置未激活（空间全归还）");

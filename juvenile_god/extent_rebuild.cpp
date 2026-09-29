@@ -80,15 +80,15 @@ result_code_t RavenFS_juvenile::extent_rebuild_tree(uint64_t &root_blk, uint64_t
             Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
             if (!is_extent_node(meta)) return RC_ERR_STATE;
             old_blocks.push_back(blk);
-            if (meta->parent_ptr.is_inner_node) {
+            if (RFS_PP_IS_INNER(meta->parent_ptr)) {
                 Bptree_extent_inner_node_t *inner = (Bptree_extent_inner_node_t *)sess.data;
-                const uint16_t cnt = (uint16_t)inner->meta.parent_ptr.entry_count;
+                const uint16_t cnt = (uint16_t)RFS_PP_COUNT(inner->meta.parent_ptr);
                 if (cnt == 0) return RC_ERR_STATE;
                 for (uint16_t i = cnt; i-- > 0;)   /* 倒序：先入栈最右 → 最左先出 */
-                    stack.push_back(inner->extents[i].sub_node_ptr.ptr);
+                    stack.push_back(RFS_PTR_ADDR(inner->extents[i].sub_node_ptr));
             } else {
                 Bptree_extent_leaf_node_t *leaf = (Bptree_extent_leaf_node_t *)sess.data;
-                const uint16_t cnt = (uint16_t)leaf->meta.parent_ptr.entry_count;
+                const uint16_t cnt = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr);
                 const size_t old = recs.size();
                 recs.resize(old + cnt);
                 memcpy(&recs[old], leaf->extents, (size_t)cnt * sizeof(extent_t));
@@ -103,7 +103,7 @@ result_code_t RavenFS_juvenile::extent_rebuild_tree(uint64_t &root_blk, uint64_t
             extent_t &p = recs[w - 1];
             const extent_t &c = recs[i];
             if (p.fblkbase + p.length == c.fblkbase &&
-                p.block_base.ptr + p.length == c.block_base.ptr) {
+                RFS_PTR_ADDR(p.block_base) + p.length == RFS_PTR_ADDR(c.block_base)) {
                 p.length += c.length;
                 continue;
             }
@@ -151,9 +151,9 @@ result_code_t RavenFS_juvenile::extent_rebuild_tree(uint64_t &root_blk, uint64_t
             if (!sess) { for (uint64_t x : all_new) block_free(x, 2); return RC_ERR_IO; }
             Bptree_extent_leaf_node_t *leaf = (Bptree_extent_leaf_node_t *)sess.data;
             extent_node_meta_init(sess.data, (uint16_t)cnt_g, false, leaf_is_root, parent);
-            leaf->meta.ptrs[0].ptr = PTR_INVALID;
-            leaf->meta.ptrs[1].ptr = (g == 0) ? PTR_INVALID : blks[0][g - 1];
-            leaf->meta.ptrs[2].ptr = (g == m[0] - 1) ? PTR_INVALID : blks[0][g + 1];
+            RFS_PTR_SET_ADDR(leaf->meta.ptrs[0], PTR_INVALID);
+            RFS_PTR_SET_ADDR(leaf->meta.ptrs[1], (g == 0) ? PTR_INVALID : blks[0][g - 1]);
+            RFS_PTR_SET_ADDR(leaf->meta.ptrs[2], (g == m[0] - 1) ? PTR_INVALID : blks[0][g + 1]);
             memcpy(leaf->extents, &recs[off], (size_t)cnt_g * sizeof(extent_t));
             lmax[g] = recs[off + cnt_g - 1].fblkbase + recs[off + cnt_g - 1].length;
             off += cnt_g;
@@ -176,12 +176,12 @@ result_code_t RavenFS_juvenile::extent_rebuild_tree(uint64_t &root_blk, uint64_t
             if (!sess) { for (uint64_t x : all_new) block_free(x, 2); return RC_ERR_IO; }
             Bptree_extent_inner_node_t *inner = (Bptree_extent_inner_node_t *)sess.data;
             extent_node_meta_init(sess.data, (uint16_t)cnt_p, true, is_root_p, parent);
-            inner->meta.ptrs[0].ptr = PTR_INVALID;
-            inner->meta.ptrs[1].ptr = PTR_INVALID;
-            inner->meta.ptrs[2].ptr = PTR_INVALID;
+            RFS_PTR_SET_ADDR(inner->meta.ptrs[0], PTR_INVALID);
+            RFS_PTR_SET_ADDR(inner->meta.ptrs[1], PTR_INVALID);
+            RFS_PTR_SET_ADDR(inner->meta.ptrs[2], PTR_INVALID);
             for (uint64_t t = 0; t < cnt_p; t++) {
                 inner->extents[t].key = lmax[coff + t];
-                inner->extents[t].sub_node_ptr.ptr = blks[k - 1][coff + t];
+                RFS_PTR_SET_ADDR(inner->extents[t].sub_node_ptr, blks[k - 1][coff + t]);
             }
             kmax[p] = inner->extents[cnt_p - 1].key;
             coff += cnt_p;

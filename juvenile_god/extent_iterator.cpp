@@ -60,9 +60,9 @@ RavenFS_juvenile::extent_iterator::extent_iterator(RavenFS_juvenile *fs_owner,
         return _it_fail_ret_; }                                                  \
     auto *leaf_##sess_var = (Bptree_extent_leaf_node_t *)sess_var.data;          \
     if (!is_extent_node(&leaf_##sess_var->meta) ||                                \
-        leaf_##sess_var->meta.parent_ptr.is_inner_node) {                        \
+        RFS_PP_IS_INNER(leaf_##sess_var->meta.parent_ptr)) {                        \
         iterator_erro_flag = true; return _it_fail_ret_; }                       \
-    uint16_t count_##sess_var = (uint16_t)leaf_##sess_var->meta.parent_ptr.entry_count;
+    uint16_t count_##sess_var = (uint16_t)RFS_PP_COUNT(leaf_##sess_var->meta.parent_ptr);
 
 /* ═══════════════════════════════════════════════════════════════════
  * next_gap — 当前 extent 之后的紧邻空洞
@@ -86,13 +86,13 @@ RavenFS_juvenile::gap_desicritor_t RavenFS_juvenile::extent_iterator::next_gap()
         g.gap_len = leaf_sess->extents[idx + 1].fblkbase - cur_end;  /* ≥0：排序+无重叠不变量 */
         return g;
     }
-    if (leaf_sess->meta.parent_ptr.is_root_node) {          /* 单叶子树 = 树最右 */
+    if (RFS_PP_IS_ROOT(leaf_sess->meta.parent_ptr)) {          /* 单叶子树 = 树最右 */
         g.interval_base_logical_block = cur_end;
         g.type = tail_infinite;
         return g;
     }
     const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
-    uint64_t nb = leaf_sess->meta.ptrs[2].ptr;              /* 后继指针（sess 存活期取） */
+    uint64_t nb = RFS_PTR_ADDR(leaf_sess->meta.ptrs[2]);              /* 后继指针（sess 存活期取） */
     while (nb != PTR_INVALID_52) {                          /* 跨界：跳过空叶子找首个非空 */
         EXTENT_IT_SESS_OPEN(ns, nb);
         if (count_ns > 0) {
@@ -100,7 +100,7 @@ RavenFS_juvenile::gap_desicritor_t RavenFS_juvenile::extent_iterator::next_gap()
             g.gap_len = leaf_ns->extents[0].fblkbase - cur_end;
             return g;
         }
-        nb = leaf_ns->meta.ptrs[2].ptr;
+        nb = RFS_PTR_ADDR(leaf_ns->meta.ptrs[2]);
     }
     g.interval_base_logical_block = cur_end;                /* 链表扫尽仍无 → 实际最右 */
     g.type = tail_infinite;
@@ -130,12 +130,12 @@ RavenFS_juvenile::gap_desicritor_t RavenFS_juvenile::extent_iterator::prev_gap()
         g.gap_len = cur_fblk - g.interval_base_logical_block;
         return g;
     }
-    if (leaf_sess->meta.parent_ptr.is_root_node) {          /* 单叶子树 = 树最左 */
+    if (RFS_PP_IS_ROOT(leaf_sess->meta.parent_ptr)) {          /* 单叶子树 = 树最左 */
         g.type = prev_noexist;
         return g;
     }
     const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
-    uint64_t pb = leaf_sess->meta.ptrs[1].ptr;              /* 前驱指针（sess 存活期取） */
+    uint64_t pb = RFS_PTR_ADDR(leaf_sess->meta.ptrs[1]);              /* 前驱指针（sess 存活期取） */
     while (pb != PTR_INVALID_52) {                          /* 跨界：跳过空叶子找末项 */
         EXTENT_IT_SESS_OPEN(ps, pb);
         if (count_ps > 0) {
@@ -144,7 +144,7 @@ RavenFS_juvenile::gap_desicritor_t RavenFS_juvenile::extent_iterator::prev_gap()
             g.gap_len = cur_fblk - g.interval_base_logical_block;
             return g;
         }
-        pb = leaf_ps->meta.ptrs[1].ptr;
+        pb = RFS_PTR_ADDR(leaf_ps->meta.ptrs[1]);
     }
     g.type = prev_noexist;                                  /* 扫尽仍无前驱 extent */
     return g;
@@ -164,10 +164,10 @@ RavenFS_juvenile::extent_iterator &RavenFS_juvenile::extent_iterator::operator++
     mdata_piece_session sess(fs->mdata_piece_mgr, leaf_node_blkbase);
     if (sess.index_error() || !sess) { iterator_erro_flag = true; return *this; }
     auto *leaf = (Bptree_extent_leaf_node_t *)sess.data;
-    if (!is_extent_node(&leaf->meta) || leaf->meta.parent_ptr.is_inner_node) {
+    if (!is_extent_node(&leaf->meta) || RFS_PP_IS_INNER(leaf->meta.parent_ptr)) {
         iterator_erro_flag = true; return *this;
     }
-    const uint16_t count = (uint16_t)leaf->meta.parent_ptr.entry_count;
+    const uint16_t count = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr);
 
     if (idx == EXTENT_LEAF_GLB_NONE) {                  /* 虚拟前位：目标 = 本叶子首项 */
         if (count > 0) { idx = 0; iterator_erro_flag = false; return *this; }
@@ -177,25 +177,25 @@ RavenFS_juvenile::extent_iterator &RavenFS_juvenile::extent_iterator::operator++
         if (idx + 1 < count) { idx++; iterator_erro_flag = false; return *this; }
     }
 
-    if (leaf->meta.parent_ptr.is_root_node) {           /* 单叶子树无后继 */
+    if (RFS_PP_IS_ROOT(leaf->meta.parent_ptr)) {           /* 单叶子树无后继 */
         iterator_erro_flag = true; return *this;
     }
-    uint64_t nb = leaf->meta.ptrs[2].ptr;               /* 跨界：沿后继链找非空叶子 */
+    uint64_t nb = RFS_PTR_ADDR(leaf->meta.ptrs[2]);               /* 跨界：沿后继链找非空叶子 */
     while (nb != PTR_INVALID_52) {
         mdata_piece_session ns(fs->mdata_piece_mgr, nb);
         if (ns.index_error() || !ns) { iterator_erro_flag = true; return *this; }
         auto *nl = (Bptree_extent_leaf_node_t *)ns.data;
-        if (!is_extent_node(&nl->meta) || nl->meta.parent_ptr.is_inner_node) {
+        if (!is_extent_node(&nl->meta) || RFS_PP_IS_INNER(nl->meta.parent_ptr)) {
             iterator_erro_flag = true; return *this;
         }
-        const uint16_t ncnt = (uint16_t)nl->meta.parent_ptr.entry_count;
+        const uint16_t ncnt = (uint16_t)RFS_PP_COUNT(nl->meta.parent_ptr);
         if (ncnt > 0) {
             leaf_node_blkbase = nb;
             idx = 0;
             iterator_erro_flag = false;
             return *this;
         }
-        nb = nl->meta.ptrs[2].ptr;
+        nb = RFS_PTR_ADDR(nl->meta.ptrs[2]);
     }
     iterator_erro_flag = true;                          /* 树最右末尾再 ++：越界，位置不变 */
     return *this;
@@ -216,33 +216,33 @@ RavenFS_juvenile::extent_iterator &RavenFS_juvenile::extent_iterator::operator--
     mdata_piece_session sess(fs->mdata_piece_mgr, leaf_node_blkbase);
     if (sess.index_error() || !sess) { iterator_erro_flag = true; return *this; }
     auto *leaf = (Bptree_extent_leaf_node_t *)sess.data;
-    if (!is_extent_node(&leaf->meta) || leaf->meta.parent_ptr.is_inner_node) {
+    if (!is_extent_node(&leaf->meta) || RFS_PP_IS_INNER(leaf->meta.parent_ptr)) {
         iterator_erro_flag = true; return *this;
     }
-    const uint16_t count = (uint16_t)leaf->meta.parent_ptr.entry_count;
+    const uint16_t count = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr);
     if (idx >= count) { iterator_erro_flag = true; return *this; }   /* 槽位越界 */
 
     if (idx > 0) { idx--; iterator_erro_flag = false; return *this; }
 
-    if (leaf->meta.parent_ptr.is_root_node) {           /* 单叶子树无前驱 */
+    if (RFS_PP_IS_ROOT(leaf->meta.parent_ptr)) {           /* 单叶子树无前驱 */
         iterator_erro_flag = true; return *this;
     }
-    uint64_t pb = leaf->meta.ptrs[1].ptr;               /* 跨界：沿前驱链找非空叶子 */
+    uint64_t pb = RFS_PTR_ADDR(leaf->meta.ptrs[1]);               /* 跨界：沿前驱链找非空叶子 */
     while (pb != PTR_INVALID_52) {
         mdata_piece_session ps(fs->mdata_piece_mgr, pb);
         if (ps.index_error() || !ps) { iterator_erro_flag = true; return *this; }
         auto *pl = (Bptree_extent_leaf_node_t *)ps.data;
-        if (!is_extent_node(&pl->meta) || pl->meta.parent_ptr.is_inner_node) {
+        if (!is_extent_node(&pl->meta) || RFS_PP_IS_INNER(pl->meta.parent_ptr)) {
             iterator_erro_flag = true; return *this;
         }
-        const uint16_t ncnt = (uint16_t)pl->meta.parent_ptr.entry_count;
+        const uint16_t ncnt = (uint16_t)RFS_PP_COUNT(pl->meta.parent_ptr);
         if (ncnt > 0) {
             leaf_node_blkbase = pb;
             idx = (uint16_t)(ncnt - 1);
             iterator_erro_flag = false;
             return *this;
         }
-        pb = pl->meta.ptrs[1].ptr;
+        pb = RFS_PTR_ADDR(pl->meta.ptrs[1]);
     }
     iterator_erro_flag = true;                          /* 树最左开头再 --：越界，位置不变 */
     return *this;
@@ -273,10 +273,10 @@ bool RavenFS_juvenile::extent_iterator::current_extent(extent_t &out)
     mdata_piece_session sess(fs->mdata_piece_mgr, leaf_node_blkbase);
     if (sess.index_error() || !sess) { iterator_erro_flag = true; return false; }
     auto *leaf = (Bptree_extent_leaf_node_t *)sess.data;
-    if (!is_extent_node(&leaf->meta) || leaf->meta.parent_ptr.is_inner_node) {
+    if (!is_extent_node(&leaf->meta) || RFS_PP_IS_INNER(leaf->meta.parent_ptr)) {
         iterator_erro_flag = true; return false;
     }
-    const uint16_t count = (uint16_t)leaf->meta.parent_ptr.entry_count;
+    const uint16_t count = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr);
     if (idx >= count) { iterator_erro_flag = true; return false; }
 
     out = leaf->extents[idx];

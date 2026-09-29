@@ -116,9 +116,9 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
         if (sess.index_error()) return RC_ERR_STATE;
         if (!sess) return RC_ERR_IO;
         Bptree_extent_leaf_node_t *leaf = (Bptree_extent_leaf_node_t *)sess.data;
-        if (!is_extent_node(&leaf->meta) || leaf->meta.parent_ptr.is_inner_node)
+        if (!is_extent_node(&leaf->meta) || RFS_PP_IS_INNER(leaf->meta.parent_ptr))
             return RC_ERR_STATE;
-        uint16_t count = (uint16_t)leaf->meta.parent_ptr.entry_count;
+        uint16_t count = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr);
 
         if (hit) return RC_ERR_OVERLAP;   /* 起点被 GLB 覆盖（区间重叠） */
 
@@ -135,12 +135,12 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
         if (glb != EXTENT_LEAF_GLB_NONE) {
             const extent_t g = leaf->extents[glb];
             L = (g.fblkbase + g.length == ext.fblkbase &&
-                 g.block_base.ptr + g.length == ext.block_base.ptr);
+                 RFS_PTR_ADDR(g.block_base) + g.length == RFS_PTR_ADDR(ext.block_base));
         }
         if (pos < count) {
             const extent_t r = leaf->extents[pos];
             R = (ext.fblkbase + ext.length == r.fblkbase &&
-                 ext.block_base.ptr + ext.length == r.block_base.ptr);
+                 RFS_PTR_ADDR(ext.block_base) + ext.length == RFS_PTR_ADDR(r.block_base));
         }
         merge = L ? (R ? merge_t::both : merge_t::left)
                   : (R ? merge_t::right : merge_t::none);
@@ -157,7 +157,7 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
             const uint64_t cut = ext.length;
             extent_t nr = leaf->extents[pos];
             nr.fblkbase -= cut;
-            nr.block_base.ptr -= cut;
+            RFS_PTR_SET_ADDR(nr.block_base, RFS_PTR_ADDR(nr.block_base) - cut);
             nr.length += cut;
             leaf->extents[pos] = nr;
             sess.dirty();
@@ -177,8 +177,8 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
             }
             memset(&leaf->extents[count - 1], 0, sizeof(extent_t));
             count--;
-            leaf->meta.parent_ptr.entry_count = count;
-            is_root_leaf = leaf->meta.parent_ptr.is_root_node;
+            RFS_PP_SET_COUNT(leaf->meta.parent_ptr, count);
+            is_root_leaf = RFS_PP_IS_ROOT(leaf->meta.parent_ptr);
             underflow = (!is_root_leaf && count < 168);
             sess.dirty();
         } else {
@@ -205,7 +205,7 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
             }
             leaf->extents[pos] = ext;
             count++;
-            leaf->meta.parent_ptr.entry_count = count;
+            RFS_PP_SET_COUNT(leaf->meta.parent_ptr, count);
             need_split = count > 337;
             sess.dirty();
         }
@@ -294,10 +294,10 @@ result_code_t RavenFS_juvenile::extent_split_cascade(
             if (ps.index_error()) return RC_ERR_STATE;
             if (!ps) return RC_ERR_IO;
             Bptree_extent_inner_node_t *pn = (Bptree_extent_inner_node_t *)ps.data;
-            if (!is_extent_node(&pn->meta) || !pn->meta.parent_ptr.is_inner_node)
+            if (!is_extent_node(&pn->meta) || !RFS_PP_IS_INNER(pn->meta.parent_ptr))
                 return RC_ERR_STATE;
-            const bool parent_is_root = pn->meta.parent_ptr.is_root_node;
-            const uint64_t grand_blk = pn->meta.parent_ptr.ptr;
+            const bool parent_is_root = RFS_PP_IS_ROOT(pn->meta.parent_ptr);
+            const uint64_t grand_blk = RFS_PP_PTR(pn->meta.parent_ptr);
             split_result_t isr = extent_inner_split(cur_parent, reserve_pool[pool_used++]);
             if (isr.rc != RC_OK) return isr.rc;
             if (parent_is_root) {
@@ -312,13 +312,13 @@ result_code_t RavenFS_juvenile::extent_split_cascade(
             if (gs.index_error()) return RC_ERR_STATE;
             if (!gs) return RC_ERR_IO;
             Bptree_extent_inner_node_t *grand = (Bptree_extent_inner_node_t *)gs.data;
-            if (!is_extent_node(&grand->meta) || !grand->meta.parent_ptr.is_inner_node)
+            if (!is_extent_node(&grand->meta) || !RFS_PP_IS_INNER(grand->meta.parent_ptr))
                 return RC_ERR_STATE;
-            const uint16_t gcnt = (uint16_t)grand->meta.parent_ptr.entry_count;
+            const uint16_t gcnt = (uint16_t)RFS_PP_COUNT(grand->meta.parent_ptr);
             uint16_t grand_idx = 0;
             bool found = false;
             for (; grand_idx < gcnt; grand_idx++) {
-                if (grand->extents[grand_idx].sub_node_ptr.ptr == cur_parent) {
+                if (RFS_PTR_ADDR(grand->extents[grand_idx].sub_node_ptr) == cur_parent) {
                     found = true; break;
                 }
             }
@@ -404,9 +404,9 @@ result_code_t RavenFS_juvenile::extent_unmap_range_loose(uint64_t &root_blk,
         if (sess.index_error()) return RC_ERR_STATE;
         if (!sess) return RC_ERR_IO;
         Bptree_extent_leaf_node_t *leaf = (Bptree_extent_leaf_node_t *)sess.data;
-        if (!is_extent_node(&leaf->meta) || leaf->meta.parent_ptr.is_inner_node)
+        if (!is_extent_node(&leaf->meta) || RFS_PP_IS_INNER(leaf->meta.parent_ptr))
             return RC_ERR_STATE;
-        const uint16_t count = (uint16_t)leaf->meta.parent_ptr.entry_count;
+        const uint16_t count = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr);
         if (glb == EXTENT_LEAF_GLB_NONE || glb >= count) return RC_ERR_STATE;
 
         const extent_t rec = leaf->extents[glb];   /* packed 成员禁引用绑定 → 拷贝 */
@@ -414,7 +414,7 @@ result_code_t RavenFS_juvenile::extent_unmap_range_loose(uint64_t &root_blk,
         /* ── 子集校验（相对偏移防 64 位溢出；is_leaf_hit 已保证 off < rec.length） ── */
         const uint64_t off = ext.fblkbase - rec.fblkbase;
         if (ext.length > rec.length - off) return RC_ERR_STATE;   /* 终点越出记录 */
-        if (rec.block_base.ptr + off != ext.block_base.ptr)
+        if (RFS_PTR_ADDR(rec.block_base) + off != RFS_PTR_ADDR(ext.block_base))
             return RC_ERR_STATE;   /* phys 偏移自洽失败：账本与树脱节/错删 */
 
         /* ── 三分支判定 ── */
@@ -441,9 +441,9 @@ result_code_t RavenFS_juvenile::extent_unmap_range_loose(uint64_t &root_blk,
             }
             memset(&leaf->extents[cnt - 1], 0, sizeof(extent_t));
             cnt--;
-            leaf->meta.parent_ptr.entry_count = cnt;
+            RFS_PP_SET_COUNT(leaf->meta.parent_ptr, cnt);
             sess.dirty();
-            is_root_leaf = leaf->meta.parent_ptr.is_root_node;
+            is_root_leaf = RFS_PP_IS_ROOT(leaf->meta.parent_ptr);
             underflow = (!is_root_leaf && cnt < 168);
         } else if (kind == kind_t::head || kind == kind_t::tail) {
             /* 缩水：count/槽位不动 → 无欠载无分裂可能 → 零分配零失败面（仅 IO） */
@@ -452,7 +452,7 @@ result_code_t RavenFS_juvenile::extent_unmap_range_loose(uint64_t &root_blk,
                 const uint64_t cut = ext.length;
                 nr.fblkbase += cut;
                 nr.length -= cut;
-                nr.block_base.ptr += cut;   /* phys 随逻辑线性平移（连续映射保持） */
+                RFS_PTR_SET_ADDR(nr.block_base, RFS_PTR_ADDR(nr.block_base) + cut);   /* phys 随逻辑线性平移（连续映射保持） */
             } else {
                 nr.length = off;            /* 剩头 off 块；phys 起点未动 */
             }
@@ -478,7 +478,7 @@ result_code_t RavenFS_juvenile::extent_unmap_range_loose(uint64_t &root_blk,
             extent_t right = rec;
             right.fblkbase += off + ext.length;
             right.length = rem_tail;
-            right.block_base.ptr += off + ext.length;
+            RFS_PTR_SET_ADDR(right.block_base, RFS_PTR_ADDR(right.block_base) + off + ext.length);
             leaf->extents[glb] = left;
             const uint16_t pos = (uint16_t)(glb + 1);
             if (pos < count) {
@@ -487,7 +487,7 @@ result_code_t RavenFS_juvenile::extent_unmap_range_loose(uint64_t &root_blk,
             }
             leaf->extents[pos] = right;
             const uint16_t ncount = (uint16_t)(count + 1);
-            leaf->meta.parent_ptr.entry_count = ncount;
+            RFS_PP_SET_COUNT(leaf->meta.parent_ptr, ncount);
             need_split = ncount > 337;
             sess.dirty();
         }

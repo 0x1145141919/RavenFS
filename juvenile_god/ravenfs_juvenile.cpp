@@ -337,7 +337,7 @@ RavenFS_juvenile::RavenFS_juvenile(const linux_userspace_mount_t &mnt, uint64_t 
     root_inum = sb.root_inode;
     raven_Inode_t root_inode;
     inode_read(root_inum, &root_inode);
-    if (root_inode.type != INODE_TYPE_DIR || root_inode.data_root == PTR_INVALID) {
+    if (RFS_INO1_GET_TYPE(root_inode.word1) != INODE_TYPE_DIR || root_inode.data_root == PTR_INVALID) {
         fail(RC_ERR_STATE);
         return;
     }
@@ -598,7 +598,11 @@ bool RavenFS_juvenile::bitmaps_load() {
         if (!(block_bits[i / 8] & (1u << (i % 8)))) goto fail;
     for (uint64_t i = inode_bm_base; i < bitmap_start; i++)
         if (!(block_bits[i / 8] & (1u << (i % 8)))) goto fail;
-    if (!(inode_bits[0] & 1u)) goto fail;   /* root inode 亮灯 */
+    {   /* root inode 亮灯（v1.2: root=sb.root_inode=16；v1.1: 0） */
+        const uint64_t ri = sb.root_inode;
+        if (ri >= inode_bm_blocks * 4096 * 8) goto fail;
+        if (!(inode_bits[ri / 8] & (1u << (ri % 8)))) goto fail;
+    }
 
 
     return true;

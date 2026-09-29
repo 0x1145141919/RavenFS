@@ -1,5 +1,5 @@
 #pragma once
-#include "disk_struct_v1.1.hpp"   /* result_code_t + RC_* 全局共享结果码 */
+#include "disk_struct_v1.2.h"   /* result_code_t + RC_* 全局共享结果码 */
 #include "cache_mgr_mode.hpp"     /* cache_work_mode_t：三后端枚举（no_cache / self_reliat / offload） */
 #include "inode_cache_radix.hpp"  /* ctrl_word 位域常量 + cache_ctrl_state_t + bitfield 分片轮子（通用共享） */
 

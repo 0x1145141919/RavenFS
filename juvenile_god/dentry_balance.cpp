@@ -42,48 +42,48 @@ result_code_t RavenFS_juvenile::dentry_node_balance(
     // 获取节点末项 hash（叶子 entry 或内部 hint）
     auto get_node_max_hash = [](const void *node_buf, bool is_inner) -> uint64_t {
         const Bptree_meta_t *meta = (const Bptree_meta_t *)node_buf;
-        uint16_t cnt = (uint16_t)meta->parent_ptr.entry_count;
+        uint16_t cnt = (uint16_t)RFS_PP_COUNT(meta->parent_ptr);
         if (cnt == 0) return 0;
         if (is_inner) {
-            const Bptree_dentry_inner_node_t *inner = (const Bptree_dentry_inner_node_t *)node_buf;
+            const Bptree_ddentry_inner_node_t *inner = (const Bptree_ddentry_inner_node_t *)node_buf;
             return inner->hints[cnt - 1].hash_max;
         } else {
-            const Bptree_dentry_leaf_node_t *leaf = (const Bptree_dentry_leaf_node_t *)node_buf;
+            const Bptree_ddentry_leaf_node_t *leaf = (const Bptree_ddentry_leaf_node_t *)node_buf;
             return leaf->entries[cnt - 1].hash;
         }
     };
 
     // 更新父节点中指定 hint 的 hash_max
-    auto update_parent_hint = [](Bptree_dentry_inner_node_t *parent, uint16_t hint_idx, uint64_t new_hash) {
+    auto update_parent_hint = [](Bptree_ddentry_inner_node_t *parent, uint16_t hint_idx, uint64_t new_hash) {
         parent->hints[hint_idx].hash_max = new_hash;
     };
 
     // 从父节点删除指定 hint（memmove 左移）
-    auto remove_parent_hint = [](Bptree_dentry_inner_node_t *parent, uint16_t del_idx) {
-        uint16_t cnt = (uint16_t)parent->meta.parent_ptr.entry_count;
+    auto remove_parent_hint = [](Bptree_ddentry_inner_node_t *parent, uint16_t del_idx) {
+        uint16_t cnt = (uint16_t)RFS_PP_COUNT(parent->meta.parent_ptr);
         if (del_idx < cnt - 1) {
             memmove(&parent->hints[del_idx], &parent->hints[del_idx + 1],
-                    (cnt - del_idx - 1) * sizeof(Dentry_hint_t));
+                    (cnt - del_idx - 1) * sizeof(ddentry_hint_t));
         }
-        parent->meta.parent_ptr.entry_count = cnt - 1;
+        RFS_PP_SET_COUNT(parent->meta.parent_ptr, cnt - 1);
     };
 
     // ⚠ 孩子 parent_ptr 收敛：合并/抹匀后节点归属可能变化，
     // 将 node 的 cnt 个 hint 指向的孩子 parent_ptr 统一改为 node_blk。
     // （叶子无孩子，仅内部节点调用；只读-改-写 parent_ptr 变化的，IO 最小化）
-    auto reparent_children = [&](Bptree_dentry_inner_node_t *node,
+    auto reparent_children = [&](Bptree_ddentry_inner_node_t *node,
                                  uint64_t node_blk, uint16_t cnt) -> result_code_t {
         for (uint16_t i = 0; i < cnt; i++) {
-            uint64_t cblk = node->hints[i].sub_ptr.ptr;
+            uint64_t cblk = RFS_PTR_ADDR(node->hints[i].sub_ptr);
             if (cblk == PTR_INVALID_52) return RC_ERR_STATE;
             mdata_piece_session c_sess(mdata_piece_mgr, cblk);
             if (c_sess.index_error()) return RC_ERR_STATE;
             if (!c_sess) return RC_ERR_IO;
             Bptree_meta_t *cm = (Bptree_meta_t *)c_sess.data;
             if (!is_dentry_node(cm)) return RC_ERR_STATE;
-            if (cm->parent_ptr.is_root_node) return RC_ERR_STATE;
-            if (cm->parent_ptr.ptr != node_blk) {
-                cm->parent_ptr.ptr = node_blk;
+            if (RFS_PP_IS_ROOT(cm->parent_ptr)) return RC_ERR_STATE;
+            if (RFS_PP_PTR(cm->parent_ptr) != node_blk) {
+                RFS_PP_SET_PTR(cm->parent_ptr, node_blk);
                 c_sess.dirty();
             }
         }
@@ -94,22 +94,22 @@ result_code_t RavenFS_juvenile::dentry_node_balance(
     mdata_piece_session parent_sess(mdata_piece_mgr, parent_node_blkbase);
     if (parent_sess.index_error()) return RC_ERR_STATE;
     if (!parent_sess) return RC_ERR_IO;
-    Bptree_dentry_inner_node_t *parent = (Bptree_dentry_inner_node_t *)parent_sess.data;
+    Bptree_ddentry_inner_node_t *parent = (Bptree_ddentry_inner_node_t *)parent_sess.data;
     if (!is_dentry_node(&parent->meta)) return RC_ERR_STATE;
-    if (!parent->meta.parent_ptr.is_inner_node) return RC_ERR_STATE;
+    if (!RFS_PP_IS_INNER(parent->meta.parent_ptr)) return RC_ERR_STATE;
 
-    uint16_t parent_count = (uint16_t)parent->meta.parent_ptr.entry_count;
+    uint16_t parent_count = (uint16_t)RFS_PP_COUNT(parent->meta.parent_ptr);
     if (idx >= parent_count) return RC_ERR_STATE;
 
     // ---------- 2. 读目标子节点 ----------
-    uint64_t child_blk = parent->hints[idx].sub_ptr.ptr;
+    uint64_t child_blk = RFS_PTR_ADDR(parent->hints[idx].sub_ptr);
     mdata_piece_session child_sess(mdata_piece_mgr, child_blk);
     if (child_sess.index_error()) return RC_ERR_STATE;
     if (!child_sess) return RC_ERR_IO;
     Bptree_meta_t *child_meta = (Bptree_meta_t *)child_sess.data;
     if (!is_dentry_node(child_meta)) return RC_ERR_STATE;
-    uint16_t child_count = (uint16_t)child_meta->parent_ptr.entry_count;
-    bool is_inner = child_meta->parent_ptr.is_inner_node;
+    uint16_t child_count = (uint16_t)RFS_PP_COUNT(child_meta->parent_ptr);
+    bool is_inner = RFS_PP_IS_INNER(child_meta->parent_ptr);
 
     // 若子节点已健康（>=63），无需平衡
     if (child_count >= 63) return RC_OK;
@@ -127,14 +127,14 @@ result_code_t RavenFS_juvenile::dentry_node_balance(
         // 非头部（含尾部）：向左看
         neighbor_idx = idx - 1;
     }
-    uint64_t neighbor_blk = parent->hints[neighbor_idx].sub_ptr.ptr;
+    uint64_t neighbor_blk = RFS_PTR_ADDR(parent->hints[neighbor_idx].sub_ptr);
     mdata_piece_session neighbor_sess(mdata_piece_mgr, neighbor_blk);
     if (neighbor_sess.index_error()) return RC_ERR_STATE;
     if (!neighbor_sess) return RC_ERR_IO;
     Bptree_meta_t *neighbor_meta = (Bptree_meta_t *)neighbor_sess.data;
     if (!is_dentry_node(neighbor_meta)) return RC_ERR_STATE;
-    if (neighbor_meta->parent_ptr.is_inner_node != is_inner) return RC_ERR_STATE;
-    uint16_t neighbor_count = (uint16_t)neighbor_meta->parent_ptr.entry_count;
+    if (RFS_PP_IS_INNER(neighbor_meta->parent_ptr) != is_inner) return RC_ERR_STATE;
+    uint16_t neighbor_count = (uint16_t)RFS_PP_COUNT(neighbor_meta->parent_ptr);
 
     uint16_t total = child_count + neighbor_count;
 
@@ -143,21 +143,21 @@ result_code_t RavenFS_juvenile::dentry_node_balance(
         if (is_inner) {
             // ---- 内部节点合并 ----
             // 目标与邻居均为内部节点，无兄弟链表
-            Bptree_dentry_inner_node_t *child = (Bptree_dentry_inner_node_t *)child_sess.data;
-            Bptree_dentry_inner_node_t *neighbor = (Bptree_dentry_inner_node_t *)neighbor_sess.data;
+            Bptree_ddentry_inner_node_t *child = (Bptree_ddentry_inner_node_t *)child_sess.data;
+            Bptree_ddentry_inner_node_t *neighbor = (Bptree_ddentry_inner_node_t *)neighbor_sess.data;
             
             if (idx == 0) {
                 // 目标左，邻居右：将邻居所有 hints 追加到目标末尾
                 memcpy(&child->hints[child_count], neighbor->hints,
-                       neighbor_count * sizeof(Dentry_hint_t));
-                child->meta.parent_ptr.entry_count = total;
+                       neighbor_count * sizeof(ddentry_hint_t));
+                RFS_PP_SET_COUNT(child->meta.parent_ptr, total);
             } else {
                 // 目标右，邻居左：将邻居 hints 插入目标开头，目标原 hints 后移
                 memmove(&child->hints[neighbor_count], &child->hints[0],
-                        child_count * sizeof(Dentry_hint_t));
+                        child_count * sizeof(ddentry_hint_t));
                 memcpy(&child->hints[0], neighbor->hints,
-                       neighbor_count * sizeof(Dentry_hint_t));
-                child->meta.parent_ptr.entry_count = total;
+                       neighbor_count * sizeof(ddentry_hint_t));
+                RFS_PP_SET_COUNT(child->meta.parent_ptr, total);
             }
             // ⚠ 合并后全部孩子归属 child：parent_ptr 收敛到 child_blk
             { result_code_t r = reparent_children(child, child_blk, total); if (r != RC_OK) return r; }
@@ -165,43 +165,43 @@ result_code_t RavenFS_juvenile::dentry_node_balance(
             child_sess.dirty();
         } else {
             // ---- 叶子节点合并 ----
-            Bptree_dentry_leaf_node_t *child = (Bptree_dentry_leaf_node_t *)child_sess.data;
-            Bptree_dentry_leaf_node_t *neighbor = (Bptree_dentry_leaf_node_t *)neighbor_sess.data;
+            Bptree_ddentry_leaf_node_t *child = (Bptree_ddentry_leaf_node_t *)child_sess.data;
+            Bptree_ddentry_leaf_node_t *neighbor = (Bptree_ddentry_leaf_node_t *)neighbor_sess.data;
             
             if (idx == 0) {
                 // 目标左，邻居右：追加邻居 entries
                 memcpy(&child->entries[child_count], neighbor->entries,
-                       neighbor_count * sizeof(Dentry_t));
-                child->meta.parent_ptr.entry_count = total;
+                       neighbor_count * sizeof(ddentry_t));
+                RFS_PP_SET_COUNT(child->meta.parent_ptr, total);
                 // 更新兄弟链表：目标的下一个 = 邻居的下一个
-                child->meta.ptrs[2].ptr = neighbor->meta.ptrs[2].ptr;
+                RFS_PTR_SET_ADDR(child->meta.ptrs[2], RFS_PTR_ADDR(neighbor->meta.ptrs[2]));
                 // 若邻居有后继，更新后继的前驱指向目标
-                uint64_t next_blk = neighbor->meta.ptrs[2].ptr;
+                uint64_t next_blk = RFS_PTR_ADDR(neighbor->meta.ptrs[2]);
                 if (next_blk != PTR_INVALID_52) {
                     mdata_piece_session next_sess(mdata_piece_mgr, next_blk);
                     if (next_sess.index_error()) return RC_ERR_STATE;
                     if (!next_sess) return RC_ERR_IO;
-                    Bptree_dentry_leaf_node_t *next_node = (Bptree_dentry_leaf_node_t *)next_sess.data;
-                    next_node->meta.ptrs[1].ptr = child_blk;
+                    Bptree_ddentry_leaf_node_t *next_node = (Bptree_ddentry_leaf_node_t *)next_sess.data;
+                    RFS_PTR_SET_ADDR(next_node->meta.ptrs[1], child_blk);
                     next_sess.dirty();
                 }
             } else {
                 // 目标右，邻居左：将邻居 entries 插入目标开头
                 memmove(&child->entries[neighbor_count], &child->entries[0],
-                        child_count * sizeof(Dentry_t));
+                        child_count * sizeof(ddentry_t));
                 memcpy(&child->entries[0], neighbor->entries,
-                       neighbor_count * sizeof(Dentry_t));
-                child->meta.parent_ptr.entry_count = total;
+                       neighbor_count * sizeof(ddentry_t));
+                RFS_PP_SET_COUNT(child->meta.parent_ptr, total);
                 // 更新兄弟链表：目标的前驱 = 邻居的前驱
-                child->meta.ptrs[1].ptr = neighbor->meta.ptrs[1].ptr;
+                RFS_PTR_SET_ADDR(child->meta.ptrs[1], RFS_PTR_ADDR(neighbor->meta.ptrs[1]));
                 // 若邻居有前驱，更新前驱的后继指向目标
-                uint64_t prev_blk = neighbor->meta.ptrs[1].ptr;
+                uint64_t prev_blk = RFS_PTR_ADDR(neighbor->meta.ptrs[1]);
                 if (prev_blk != PTR_INVALID_52) {
                     mdata_piece_session prev_sess(mdata_piece_mgr, prev_blk);
                     if (prev_sess.index_error()) return RC_ERR_STATE;
                     if (!prev_sess) return RC_ERR_IO;
-                    Bptree_dentry_leaf_node_t *prev_node = (Bptree_dentry_leaf_node_t *)prev_sess.data;
-                    prev_node->meta.ptrs[2].ptr = child_blk;
+                    Bptree_ddentry_leaf_node_t *prev_node = (Bptree_ddentry_leaf_node_t *)prev_sess.data;
+                    RFS_PTR_SET_ADDR(prev_node->meta.ptrs[2], child_blk);
                     prev_sess.dirty();
                 }
             }
@@ -232,8 +232,8 @@ result_code_t RavenFS_juvenile::dentry_node_balance(
         parent->hints[kept_idx_after].hash_max = new_max;
 
         // 判断父节点是否欠载（非根且 entry_count < 63）
-        uint16_t new_parent_count = (uint16_t)parent->meta.parent_ptr.entry_count;
-        bool parent_is_root = parent->meta.parent_ptr.is_root_node;
+        uint16_t new_parent_count = (uint16_t)RFS_PP_COUNT(parent->meta.parent_ptr);
+        bool parent_is_root = RFS_PP_IS_ROOT(parent->meta.parent_ptr);
         if (!parent_is_root && new_parent_count < 63)
             is_parent_need_balance = true;
         else
@@ -250,28 +250,28 @@ result_code_t RavenFS_juvenile::dentry_node_balance(
         uint16_t right_count = total - left_count;
 
         if (is_inner) {
-            Bptree_dentry_inner_node_t *child = (Bptree_dentry_inner_node_t *)child_sess.data;
-            Bptree_dentry_inner_node_t *neighbor = (Bptree_dentry_inner_node_t *)neighbor_sess.data;
+            Bptree_ddentry_inner_node_t *child = (Bptree_ddentry_inner_node_t *)child_sess.data;
+            Bptree_ddentry_inner_node_t *neighbor = (Bptree_ddentry_inner_node_t *)neighbor_sess.data;
             // 将两个节点的 hints 合并到一个临时数组
-            Dentry_hint_t merged[254]; // 最多 254
+            ddentry_hint_t merged[254]; // 最多 254
             if (idx == 0) {
                 // 目标左，邻居右：目标在前，邻居在后
-                memcpy(merged, child->hints, child_count * sizeof(Dentry_hint_t));
-                memcpy(merged + child_count, neighbor->hints, neighbor_count * sizeof(Dentry_hint_t));
+                memcpy(merged, child->hints, child_count * sizeof(ddentry_hint_t));
+                memcpy(merged + child_count, neighbor->hints, neighbor_count * sizeof(ddentry_hint_t));
                 // 分配：前 left_count 给目标，后 right_count 给邻居
-                memcpy(child->hints, merged, left_count * sizeof(Dentry_hint_t));
-                memcpy(neighbor->hints, merged + left_count, right_count * sizeof(Dentry_hint_t));
-                child->meta.parent_ptr.entry_count = left_count;
-                neighbor->meta.parent_ptr.entry_count = right_count;
+                memcpy(child->hints, merged, left_count * sizeof(ddentry_hint_t));
+                memcpy(neighbor->hints, merged + left_count, right_count * sizeof(ddentry_hint_t));
+                RFS_PP_SET_COUNT(child->meta.parent_ptr, left_count);
+                RFS_PP_SET_COUNT(neighbor->meta.parent_ptr, right_count);
             } else {
                 // 目标右，邻居左：邻居在前，目标在后
-                memcpy(merged, neighbor->hints, neighbor_count * sizeof(Dentry_hint_t));
-                memcpy(merged + neighbor_count, child->hints, child_count * sizeof(Dentry_hint_t));
+                memcpy(merged, neighbor->hints, neighbor_count * sizeof(ddentry_hint_t));
+                memcpy(merged + neighbor_count, child->hints, child_count * sizeof(ddentry_hint_t));
                 // 分配：前 left_count 给邻居，后 right_count 给目标
-                memcpy(neighbor->hints, merged, left_count * sizeof(Dentry_hint_t));
-                memcpy(child->hints, merged + left_count, right_count * sizeof(Dentry_hint_t));
-                neighbor->meta.parent_ptr.entry_count = left_count;
-                child->meta.parent_ptr.entry_count = right_count;
+                memcpy(neighbor->hints, merged, left_count * sizeof(ddentry_hint_t));
+                memcpy(child->hints, merged + left_count, right_count * sizeof(ddentry_hint_t));
+                RFS_PP_SET_COUNT(neighbor->meta.parent_ptr, left_count);
+                RFS_PP_SET_COUNT(child->meta.parent_ptr, right_count);
             }
             // ⚠ 抹匀后孩子可能换父：parent_ptr 收敛（idx==0: child左邻右；否则 neighbor左child右）
             if (idx == 0) {
@@ -286,25 +286,25 @@ result_code_t RavenFS_juvenile::dentry_node_balance(
             neighbor_sess.dirty();
         } else {
             // ---- 叶子节点抹匀 ----
-            Bptree_dentry_leaf_node_t *child = (Bptree_dentry_leaf_node_t *)child_sess.data;
-            Bptree_dentry_leaf_node_t *neighbor = (Bptree_dentry_leaf_node_t *)neighbor_sess.data;
-            Dentry_t merged[254]; // 最多 254
+            Bptree_ddentry_leaf_node_t *child = (Bptree_ddentry_leaf_node_t *)child_sess.data;
+            Bptree_ddentry_leaf_node_t *neighbor = (Bptree_ddentry_leaf_node_t *)neighbor_sess.data;
+            ddentry_t merged[254]; // 最多 254
             if (idx == 0) {
                 // 目标左，邻居右
-                memcpy(merged, child->entries, child_count * sizeof(Dentry_t));
-                memcpy(merged + child_count, neighbor->entries, neighbor_count * sizeof(Dentry_t));
-                memcpy(child->entries, merged, left_count * sizeof(Dentry_t));
-                memcpy(neighbor->entries, merged + left_count, right_count * sizeof(Dentry_t));
-                child->meta.parent_ptr.entry_count = left_count;
-                neighbor->meta.parent_ptr.entry_count = right_count;
+                memcpy(merged, child->entries, child_count * sizeof(ddentry_t));
+                memcpy(merged + child_count, neighbor->entries, neighbor_count * sizeof(ddentry_t));
+                memcpy(child->entries, merged, left_count * sizeof(ddentry_t));
+                memcpy(neighbor->entries, merged + left_count, right_count * sizeof(ddentry_t));
+                RFS_PP_SET_COUNT(child->meta.parent_ptr, left_count);
+                RFS_PP_SET_COUNT(neighbor->meta.parent_ptr, right_count);
             } else {
                 // 目标右，邻居左
-                memcpy(merged, neighbor->entries, neighbor_count * sizeof(Dentry_t));
-                memcpy(merged + neighbor_count, child->entries, child_count * sizeof(Dentry_t));
-                memcpy(neighbor->entries, merged, left_count * sizeof(Dentry_t));
-                memcpy(child->entries, merged + left_count, right_count * sizeof(Dentry_t));
-                neighbor->meta.parent_ptr.entry_count = left_count;
-                child->meta.parent_ptr.entry_count = right_count;
+                memcpy(merged, neighbor->entries, neighbor_count * sizeof(ddentry_t));
+                memcpy(merged + neighbor_count, child->entries, child_count * sizeof(ddentry_t));
+                memcpy(neighbor->entries, merged, left_count * sizeof(ddentry_t));
+                memcpy(child->entries, merged + left_count, right_count * sizeof(ddentry_t));
+                RFS_PP_SET_COUNT(neighbor->meta.parent_ptr, left_count);
+                RFS_PP_SET_COUNT(child->meta.parent_ptr, right_count);
             }
             // 写回两个节点（析构时；兄弟链表保持不变）
             child_sess.dirty();
@@ -349,16 +349,16 @@ result_code_t RavenFS_juvenile::dentry_root_shrink(uint64_t root_blk, uint64_t r
     mdata_piece_session root_sess(mdata_piece_mgr, root_blk);
     if (root_sess.index_error()) return RC_ERR_STATE;
     if (!root_sess) return RC_ERR_IO;
-    Bptree_dentry_inner_node_t *root = (Bptree_dentry_inner_node_t *)root_sess.data;
+    Bptree_ddentry_inner_node_t *root = (Bptree_ddentry_inner_node_t *)root_sess.data;
     if (!is_dentry_node(&root->meta)) return RC_ERR_STATE;
-    if (!root->meta.parent_ptr.is_root_node) return RC_ERR_STATE;
+    if (!RFS_PP_IS_ROOT(root->meta.parent_ptr)) return RC_ERR_STATE;
 
     /* 非内部节点（根叶子）或孩子不止一个：无需收缩 */
-    if (!root->meta.parent_ptr.is_inner_node) return RC_OK;
-    uint16_t cnt = (uint16_t)root->meta.parent_ptr.entry_count;
+    if (!RFS_PP_IS_INNER(root->meta.parent_ptr)) return RC_OK;
+    uint16_t cnt = (uint16_t)RFS_PP_COUNT(root->meta.parent_ptr);
     if (cnt != 1) return RC_OK;
 
-    uint64_t child_blk = root->hints[0].sub_ptr.ptr;
+    uint64_t child_blk = RFS_PTR_ADDR(root->hints[0].sub_ptr);
 
     /* ── 读唯一孩子，提升为新根 ── */
     mdata_piece_session child_sess(mdata_piece_mgr, child_blk);
@@ -366,21 +366,21 @@ result_code_t RavenFS_juvenile::dentry_root_shrink(uint64_t root_blk, uint64_t r
     if (!child_sess) return RC_ERR_IO;
     Bptree_meta_t *child_meta = (Bptree_meta_t *)child_sess.data;
     if (!is_dentry_node(child_meta)) return RC_ERR_STATE;
-    if (child_meta->parent_ptr.is_root_node) return RC_ERR_STATE;   /* 孩子已是根？结构损坏 */
+    if (RFS_PP_IS_ROOT(child_meta->parent_ptr)) return RC_ERR_STATE;   /* 孩子已是根？结构损坏 */
 
-    child_meta->parent_ptr.is_root_node  = 1;
-    child_meta->parent_ptr.ptr           = root_inode_idx;   /* "." 指向目录自身 inode */
+    RFS_PP_SET_IS_ROOT(child_meta->parent_ptr, 1);
+    RFS_PP_SET_PTR(child_meta->parent_ptr, root_inode_idx);   /* "." 指向目录自身 inode */
 
     /* 叶子：".." 孤儿自指（与 dir_insert_dentry 空目录建根对齐）；
      * 根不做同级链表 → ptrs[2] 失效。内部节点 ptrs[1] 亦为 ".."。 */
-    if (!child_meta->parent_ptr.is_inner_node) {
-        auto *child_leaf = (Bptree_dentry_leaf_node_t *)child_sess.data;
-        child_leaf->meta.ptrs[0].ptr        = PTR_INVALID;
-        child_leaf->meta.ptrs[1].ptr        = root_inode_idx;   /* ".." */
-        child_leaf->meta.ptrs[2].ptr        = PTR_INVALID;
+    if (!RFS_PP_IS_INNER(child_meta->parent_ptr)) {
+        auto *child_leaf = (Bptree_ddentry_leaf_node_t *)child_sess.data;
+        RFS_PTR_SET_ADDR(child_leaf->meta.ptrs[0], PTR_INVALID);
+        RFS_PTR_SET_ADDR(child_leaf->meta.ptrs[1], root_inode_idx);   /* ".." */
+        RFS_PTR_SET_ADDR(child_leaf->meta.ptrs[2], PTR_INVALID);
     } else {
-        auto *child_inner = (Bptree_dentry_inner_node_t *)child_sess.data;
-        child_inner->meta.ptrs[1].ptr       = root_inode_idx;   /* ".." */
+        auto *child_inner = (Bptree_ddentry_inner_node_t *)child_sess.data;
+        RFS_PTR_SET_ADDR(child_inner->meta.ptrs[1], root_inode_idx);   /* ".." */
     }
 
     child_sess.dirty();

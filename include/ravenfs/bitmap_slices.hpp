@@ -1,5 +1,5 @@
 #pragma once
-#include "../disk_struct_v1.1.hpp"   /* result_code_t / RC_* / PTR_INVALID */
+#include "../disk_struct_v1.2.h"   /* result_code_t / RC_* / PTR_INVALID */
 #include "../util/lock.h"            /* rw_try_spinlock_t（2026-09-03 收编：原嵌 God 类，随位图模块顶出） */
 #include <cstdint>
 #include <cstddef>

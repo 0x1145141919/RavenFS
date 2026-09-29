@@ -1,5 +1,5 @@
 #pragma once
-#include "../disk_struct_v1.1.hpp"
+#include "../disk_struct_v1.2.h"
 #include "cache_mgr_mode.hpp"
 #include "../magics.h"
 #include <list>
@@ -48,9 +48,8 @@ class bitmap_slices_mgr_t;      /* 双位图分片分配器（bitmap_slices.hpp�
  *    bitmap 自描述四连验）。
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* 磁盘格式版本：v1=1，v1.1=2（disk_layout_v1.1.md §1：v1.1 起 bump）
- * 与 mkfs/mkfs.hpp 同值；挂载校验用 */
-constexpr uint32_t RAVENFS_VERSION = 2;
+/* 磁盘格式版本：由 disk_struct_v1.2.h 的 RAVENFS_VERSION 宏提供（v1.2 = 3）。
+ * v1.1 起版本常量统一下沉到磁盘结构头，避免与宏重定义冲突。 */
 
 /* ── readdir 输出项 ──
  * 名字 ≤ RAVENFS_MAX_NAME_LEN（552B），character 含结尾 '\0'。 */
@@ -438,7 +437,7 @@ private:
     /* 激活堆槽：位图面+数据面一次分配（各自连续、2^1 对齐）+ 位图清零 + 控制器落盘 */
     result_code_t name_heap_activate(raven_dir_Inode_t *dino, uint16_t slot, uint64_t dir_inode_idx);
     /* dentry 完整名字比较（树内条目 vs 目标名；>40B 内部读堆外置部分） */
-    int dentry_name_cmp(const Dentry_t &e, const char *name, uint16_t name_len);
+    int dentry_name_cmp(const ddentry_t &e, const char *name, uint16_t name_len);
     result_code_t dentry_Bptree_walk(uint64_t root_blk_idx,bptree_path_t*trace,name_cmlpx_t*name);
     result_code_t extent_Bptree_walk(uint64_t root_blk_idx,bptree_path_t*trace,uint64_t logical_block_idx);
     struct leaf_node_result_t{
@@ -534,8 +533,8 @@ private:
         uint64_t high_node_blkidx;
         uint64_t low_node_maxhash;
     };
-    leaf_node_result_t dentry_leaf_node_lookup(Bptree_dentry_leaf_node_t*leaf,name_cmlpx_t*name);/* is_idx_hitted=精准命中 */
-    uint16_t dentry_inner_node_lookup(Bptree_dentry_inner_node_t*node,uint64_t hash);
+    leaf_node_result_t dentry_leaf_node_lookup(Bptree_ddentry_leaf_node_t*leaf,name_cmlpx_t*name);/* is_idx_hitted=精准命中 */
+    uint16_t dentry_inner_node_lookup(Bptree_ddentry_inner_node_t*node,uint64_t hash);
     /* 区段树叶子 GLB 查找：GLB = 最后一个 fblkbase ≤ target 的 extent；
      * is_idx_hitted = GLB **覆盖** target（target-fblkbase < length，半开区间），
      * 与 dentry 精准命中语义不同——区间键无相等，只有被覆盖/落空洞。

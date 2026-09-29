@@ -11,7 +11,7 @@ RavenFS_juvenile::regular_file_type_t RavenFS_juvenile::ftype(raven_Inode_t *ino
     if(inode->size<=160){
         return regular_file_type_t::inline_file;
     }else{
-        if(inode->is_data_root_direct_bit){
+        if(RFS_INO1_GET_DIRECT(inode->word1)){
             return regular_file_type_t::direct;
         }else{
             return regular_file_type_t::extent;
@@ -55,7 +55,7 @@ result_code_t RavenFS_juvenile::dfprealloc_and_plan(raven_Inode_t *inode, uint64
 
     affect_extents.clear();
     if (!inode) return RC_ERR_STATE;
-    if (inode->type != INODE_TYPE_REGULAR && inode->type != INODE_TYPE_SOFT_SYM)
+    if (RFS_INO1_GET_TYPE(inode->word1) != INODE_TYPE_REGULAR && RFS_INO1_GET_TYPE(inode->word1) != INODE_TYPE_SOFT_SYM)
         return RC_ERR_STATE;                       /* 非 REG/SOFT_SYM：不在受理范围 */
     if (len == 0) return RC_OK;                    /* 零长写无操作（POSIX：不扩文件） */
     if (offset > ~0ULL - len) return RC_ERR_STATE; /* offset+len 溢出：调用方参数错误 */
@@ -67,7 +67,7 @@ result_code_t RavenFS_juvenile::dfprealloc_and_plan(raven_Inode_t *inode, uint64
     /* 回滚账本：逆序 free（唯一失败出口前调用；位图 free 幂等） */
     auto rollback = [&]() {
         for (auto it = affect_extents.rbegin(); it != affect_extents.rend(); ++it)
-            block_free(it->block_base.ptr, it->length);
+            block_free(RFS_PTR_ADDR(it->block_base), it->length);
         affect_extents.clear();
     };
 
@@ -86,8 +86,8 @@ result_code_t RavenFS_juvenile::dfprealloc_and_plan(raven_Inode_t *inode, uint64
                 extent_t e;
                 e.fblkbase = cur;
                 e.length = claimed;
-                e.block_base.ptr = got;
-                e.block_base.free_to_use = 0;
+                RFS_PTR_SET_ADDR(e.block_base, got);
+                RFS_PTR_SET_FREE(e.block_base, 0);
                 affect_extents.push_back(e);
                 cur += claimed;
                 rest = r;
@@ -101,8 +101,8 @@ result_code_t RavenFS_juvenile::dfprealloc_and_plan(raven_Inode_t *inode, uint64
             extent_t e;
             e.fblkbase = cur;
             e.length = claimed;
-            e.block_base.ptr = got;
-            e.block_base.free_to_use = 0;
+            RFS_PTR_SET_ADDR(e.block_base, got);
+            RFS_PTR_SET_FREE(e.block_base, 0);
             affect_extents.push_back(e);
             cur += claimed;
             rest = r;
@@ -123,8 +123,8 @@ result_code_t RavenFS_juvenile::dfprealloc_and_plan(raven_Inode_t *inode, uint64
             extent_t e;
             e.fblkbase = 0;
             e.length = newceil;
-            e.block_base.ptr = blk;
-            e.block_base.free_to_use = 0;
+            RFS_PTR_SET_ADDR(e.block_base, blk);
+            RFS_PTR_SET_FREE(e.block_base, 0);
             affect_extents.push_back(e);
             return RC_OK;
         }
@@ -197,7 +197,7 @@ result_code_t RavenFS_juvenile::dfprealloc_and_plan(raven_Inode_t *inode, uint64
         /* GLB 覆盖 d_start：[d_start, R.end) 跳过；R 成为左上下文 */
         if (!it.current_extent(R)) return RC_ERR_STATE;   /* hit 必可读，防御 */
         prev_end = R.fblkbase + R.length;
-        prev_pend = R.block_base.ptr + R.length;
+        prev_pend = RFS_PTR_ADDR(R.block_base) + R.length;
         have_prev = true;
         cur = prev_end;
         if (cur >= d_end) return RC_OK;  /* 写域全被覆盖：零新段 */
@@ -207,7 +207,7 @@ result_code_t RavenFS_juvenile::dfprealloc_and_plan(raven_Inode_t *inode, uint64
          * 锚只在中段起点恰 == GLB 终点（d_start==prev_end）时成立，循环统一判定 */
         if (!it.current_extent(R)) return RC_ERR_STATE;
         prev_end = R.fblkbase + R.length;
-        prev_pend = R.block_base.ptr + R.length;
+        prev_pend = RFS_PTR_ADDR(R.block_base) + R.length;
         have_prev = true;
         ++it;
     } else {
@@ -227,9 +227,9 @@ result_code_t RavenFS_juvenile::dfprealloc_and_plan(raven_Inode_t *inode, uint64
         mdata_piece_session s(mdata_piece_mgr, it.leaf_blk());
         if (s.index_error() || !s) return false;
         auto *lf = (Bptree_extent_leaf_node_t *)s.data;
-        if (!is_extent_node(&lf->meta) || lf->meta.parent_ptr.is_inner_node) return false;
-        if (lf->meta.parent_ptr.is_root_node) return true;   /* 单叶树 */
-        return lf->meta.ptrs[2].ptr == PTR_INVALID_52;
+        if (!is_extent_node(&lf->meta) || RFS_PP_IS_INNER(lf->meta.parent_ptr)) return false;
+        if (RFS_PP_IS_ROOT(lf->meta.parent_ptr)) return true;   /* 单叶树 */
+        return RFS_PTR_ADDR(lf->meta.ptrs[2]) == PTR_INVALID_52;
     };
 
     for (;;) {
@@ -253,7 +253,7 @@ result_code_t RavenFS_juvenile::dfprealloc_and_plan(raven_Inode_t *inode, uint64
             cur = R.fblkbase + R.length;
             if (cur >= d_end) break;
             prev_end = cur;
-            prev_pend = R.block_base.ptr + R.length;
+            prev_pend = RFS_PTR_ADDR(R.block_base) + R.length;
             have_prev = true;
             ++it;
         } else {
@@ -275,7 +275,7 @@ result_code_t RavenFS_juvenile::dfprealloc_and_plan(raven_Inode_t *inode, uint64
         auto prev = affect_extents.begin();
         for (auto it = std::next(prev); it != affect_extents.end();) {
             if (prev->fblkbase + prev->length == it->fblkbase &&
-                prev->block_base.ptr + prev->length == it->block_base.ptr) {
+                RFS_PTR_ADDR(prev->block_base) + prev->length == RFS_PTR_ADDR(it->block_base)) {
                 prev->length += it->length;
                 it = affect_extents.erase(it);
             } else {
@@ -307,9 +307,9 @@ result_code_t RavenFS_juvenile::extent_new_root_leaf(uint64_t owner_inode_idx, u
         }
         extent_node_meta_init(s.data, 0, false, true, owner_inode_idx);
         Bptree_meta_t *meta = (Bptree_meta_t *)s.data;
-        meta->ptrs[0].ptr = PTR_INVALID_52;
-        meta->ptrs[1].ptr = PTR_INVALID_52;
-        meta->ptrs[2].ptr = PTR_INVALID_52;
+        RFS_PTR_SET_ADDR(meta->ptrs[0], PTR_INVALID_52);
+        RFS_PTR_SET_ADDR(meta->ptrs[1], PTR_INVALID_52);
+        RFS_PTR_SET_ADDR(meta->ptrs[2], PTR_INVALID_52);
         s.dirty();
     }
     root_blk = blk;
@@ -358,7 +358,7 @@ result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset,
         InodeSession s(inode_cache_mgr, inode_idx);
         if (!s.inode) return RC_ERR_IO;
         raven_Inode_t *ino = s.inode;
-        if (ino->type != INODE_TYPE_REGULAR && ino->type != INODE_TYPE_SOFT_SYM)
+        if (RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_REGULAR && RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_SOFT_SYM)
             return RC_ERR_STATE;
         pre_size = ino->size;
         pre_data_root = ino->data_root;
@@ -400,7 +400,7 @@ result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset,
         } else if (segs.size() == 1) {
             const extent_t &e = segs[0];
             keep_direct = (e.fblkbase == oldceil &&
-                           e.block_base.ptr == pre_data_root + oldceil);   /* 1 段尾贴 */
+                           RFS_PTR_ADDR(e.block_base) == pre_data_root + oldceil);   /* 1 段尾贴 */
         }
     } else {   /* inline 迁出 */
         keep_direct = (segs.size() == 1 && segs[0].fblkbase == 0);
@@ -421,15 +421,15 @@ result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset,
             if (sess.index_error() || !sess) return;
             Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
             if (!is_extent_node(meta)) return;
-            if (!meta->parent_ptr.is_inner_node) {
-                if (!meta->parent_ptr.is_root_node) parents.push_back(meta->parent_ptr.ptr);
+            if (!RFS_PP_IS_INNER(meta->parent_ptr)) {
+                if (!RFS_PP_IS_ROOT(meta->parent_ptr)) parents.push_back(RFS_PP_PTR(meta->parent_ptr));
                 leaves.push_back(cur);
-                cur = meta->ptrs[2].ptr;
+                cur = RFS_PTR_ADDR(meta->ptrs[2]);
                 continue;
             }
             auto *inner = (Bptree_extent_inner_node_t *)sess.data;
-            if (inner->meta.parent_ptr.entry_count == 0) return;
-            cur = inner->extents[0].sub_node_ptr.ptr;
+            if (RFS_PP_COUNT(inner->meta.parent_ptr) == 0) return;
+            cur = RFS_PTR_ADDR(inner->extents[0].sub_node_ptr);
         }
         for (uint64_t b : leaves) block_free(b, 2);
         std::sort(parents.begin(), parents.end());
@@ -442,9 +442,9 @@ result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset,
                 mdata_piece_session sess(mdata_piece_mgr, b);
                 if (sess.index_error() || !sess) return;
                 Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
-                if (!is_extent_node(meta) || !meta->parent_ptr.is_inner_node) return;
-                if (meta->parent_ptr.is_root_node) saw_root = true;
-                else next.push_back(meta->parent_ptr.ptr);
+                if (!is_extent_node(meta) || !RFS_PP_IS_INNER(meta->parent_ptr)) return;
+                if (RFS_PP_IS_ROOT(meta->parent_ptr)) saw_root = true;
+                else next.push_back(RFS_PP_PTR(meta->parent_ptr));
             }
             for (uint64_t b : layer) block_free(b, 2);
             if (saw_root) break;
@@ -464,7 +464,7 @@ result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset,
                 free_orphan_extent_tree(root_blk);
             }
         }
-        for (const extent_t &e : segs) block_free(e.block_base.ptr, e.length);
+        for (const extent_t &e : segs) block_free(RFS_PTR_ADDR(e.block_base), e.length);
     };
 
     /* ── phase2：逐段 map（仅树路径；保 direct 全程无树）── */
@@ -472,19 +472,19 @@ result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset,
         /* 物化：非树态跃迁 → 建空根叶（direct 旧区随后 map 一条，零搬移） */
         result_code_t rc = extent_new_root_leaf(inode_idx, root_blk);
         if (rc) {
-            for (const extent_t &e : segs) block_free(e.block_base.ptr, e.length);
+            for (const extent_t &e : segs) block_free(RFS_PTR_ADDR(e.block_base), e.length);
             return rc;   /* 树未建成：仅 phase1 账本 */
         }
         if (pre_shape == direct) {
             extent_t oldrec;
             oldrec.fblkbase = 0;
             oldrec.length = oldceil;
-            oldrec.block_base.ptr = pre_data_root;
-            oldrec.block_base.free_to_use = 0;
+            RFS_PTR_SET_ADDR(oldrec.block_base, pre_data_root);
+            RFS_PTR_SET_FREE(oldrec.block_base, 0);
             rc = extent_map_range(root_blk, inode_idx, oldrec);   /* 空根叶纯插，无失败面 */
             if (rc) {
                 block_free(root_blk, 2);
-                for (const extent_t &e : segs) block_free(e.block_base.ptr, e.length);
+                for (const extent_t &e : segs) block_free(RFS_PTR_ADDR(e.block_base), e.length);
                 return rc;
             }
         }
@@ -515,12 +515,12 @@ result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset,
             return RC_ERR_STATE;
         }
         Bptree_meta_t *meta = (Bptree_meta_t *)s.data;
-        if (!meta->parent_ptr.is_inner_node &&
-            (uint16_t)meta->parent_ptr.entry_count == 1) {
+        if (!RFS_PP_IS_INNER(meta->parent_ptr) &&
+            (uint16_t)RFS_PP_COUNT(meta->parent_ptr) == 1) {
             const extent_t e0 = ((Bptree_extent_leaf_node_t *)s.data)->extents[0];
             if (e0.fblkbase == 0 && e0.fblkbase + e0.length == size_ceil) {
                 collapse = true;
-                collapse_base = e0.block_base.ptr;
+                collapse_base = RFS_PTR_ADDR(e0.block_base);
             }
         }
     }
@@ -542,7 +542,7 @@ result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset,
             while (seg_i < segs.size() && b >= segs[seg_i].fblkbase + segs[seg_i].length)
                 seg_i++;
             if (seg_i < segs.size() && b >= segs[seg_i].fblkbase)
-                return segs[seg_i].block_base.ptr + (b - segs[seg_i].fblkbase);
+                return RFS_PTR_ADDR(segs[seg_i].block_base) + (b - segs[seg_i].fblkbase);
             return PTR_INVALID_52;   /* 未命中 = 旧块 */
         };
         /* 旧块物理：树路径 → 树 walk；保 direct → 直指公式（仅 direct 旧态存在旧块） */
@@ -556,9 +556,9 @@ result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset,
                 if (s.index_error() || !s) return RC_ERR_IO;
                 auto *leaf = (Bptree_extent_leaf_node_t *)s.data;
                 const uint16_t glb = tr.child_idx[tr.depth - 1];
-                if (glb >= (uint16_t)leaf->meta.parent_ptr.entry_count) return RC_ERR_STATE;
+                if (glb >= (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr)) return RC_ERR_STATE;
                 const extent_t &e = leaf->extents[glb];
-                out = e.block_base.ptr + (b - e.fblkbase);
+                out = RFS_PTR_ADDR(e.block_base) + (b - e.fblkbase);
                 return RC_OK;
             }
             if (b >= oldceil) return RC_ERR_STATE;   /* 保 direct：新块必在 seg 内（防御） */
@@ -605,7 +605,7 @@ result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset,
          * direct 语义全覆盖，未写区必须读 0（§7；extent 路径洞无 phys 天然读 0）。 */
         if (keep_direct && mig) {
             std::vector<uint8_t> zeros(FS_BLOCK, 0);
-            const uint64_t seg_base = segs[0].block_base.ptr;
+            const uint64_t seg_base = RFS_PTR_ADDR(segs[0].block_base);
             const uint64_t seg_len = segs[0].length;
             for (uint64_t b = 1; b < d_start && b < seg_len; b++)
                 write_block(seg_base + b, zeros.data());
@@ -640,7 +640,7 @@ result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset,
     /* ── phase4：inode 一次写 = 提交点（坍缩：先提交 direct 态再 free 旧根）── */
     {
         const uint64_t direct_base = keep_direct
-            ? (pre_shape == inline_file ? segs[0].block_base.ptr : pre_data_root)
+            ? (pre_shape == inline_file ? RFS_PTR_ADDR(segs[0].block_base) : pre_data_root)
             : (collapse ? collapse_base : 0);
         InodeSession s(inode_cache_mgr, inode_idx);
         if (!s.inode) {
@@ -650,10 +650,10 @@ result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset,
         }
         s.inode->size = newsize;
         if (keep_direct || collapse) {
-            s.inode->is_data_root_direct_bit = 1;
+            RFS_INO1_SET_DIRECT(*s.inode, 1);
             s.inode->data_root = direct_base;
         } else {
-            s.inode->is_data_root_direct_bit = 0;
+            RFS_INO1_SET_DIRECT(*s.inode, 0);
             s.inode->data_root = root_blk;
         }
         s.dirty();
@@ -705,7 +705,7 @@ result_code_t RavenFS_juvenile::regular_file_reclaim(uint64_t inode_idx, bool de
         InodeSession ino_sess(inode_cache_mgr, inode_idx);
         if (!ino_sess) return RC_ERR_IO;
         raven_Inode_t *ino = ino_sess.inode;
-        if (ino->type != INODE_TYPE_REGULAR && ino->type != INODE_TYPE_SOFT_SYM)
+        if (RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_REGULAR && RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_SOFT_SYM)
             return RC_ERR_STATE;   /* 非 REG/SOFT_SYM：不归本回收器管 */
         shape = ftype(ino);
         data_root = ino->data_root;
@@ -760,11 +760,11 @@ result_code_t RavenFS_juvenile::regular_file_reclaim(uint64_t inode_idx, bool de
             if (!sess) return RC_ERR_IO;
             Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
             if (!is_extent_node(meta)) return RC_ERR_STATE;
-            if (!meta->parent_ptr.is_inner_node) { found_leaf = true; break; }
+            if (!RFS_PP_IS_INNER(meta->parent_ptr)) { found_leaf = true; break; }
             Bptree_extent_inner_node_t *inner = (Bptree_extent_inner_node_t *)sess.data;
-            const uint16_t cnt = (uint16_t)inner->meta.parent_ptr.entry_count;
+            const uint16_t cnt = (uint16_t)RFS_PP_COUNT(inner->meta.parent_ptr);
             if (cnt == 0) return RC_ERR_STATE;
-            cur = inner->extents[0].sub_node_ptr.ptr;
+            cur = RFS_PTR_ADDR(inner->extents[0].sub_node_ptr);
         }
         if (!found_leaf) return RC_ERR_STATE;   /* 深度超限：树成环 */
 
@@ -775,23 +775,23 @@ result_code_t RavenFS_juvenile::regular_file_reclaim(uint64_t inode_idx, bool de
             if (sess.index_error()) return RC_ERR_STATE;
             if (!sess) return RC_ERR_IO;
             Bptree_extent_leaf_node_t *leaf = (Bptree_extent_leaf_node_t *)sess.data;
-            if (!is_extent_node(&leaf->meta) || leaf->meta.parent_ptr.is_inner_node)
+            if (!is_extent_node(&leaf->meta) || RFS_PP_IS_INNER(leaf->meta.parent_ptr))
                 return RC_ERR_STATE;
-            const uint16_t cnt = (uint16_t)leaf->meta.parent_ptr.entry_count;
+            const uint16_t cnt = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr);
             for (uint16_t i = 0; i < cnt; i++) {
                 const extent_t e = leaf->extents[i];
-                if (e.block_base.ptr == PTR_INVALID_52 || e.length == 0)
+                if (RFS_PTR_ADDR(e.block_base) == PTR_INVALID_52 || e.length == 0)
                     return RC_ERR_STATE;   /* 记录 phys 无效：结构异常，拒绝乱 free */
                 if (destroy_data) {
-                    result_code_t r = zero_range(e.block_base.ptr, e.length);
+                    result_code_t r = zero_range(RFS_PTR_ADDR(e.block_base), e.length);
                     if (r != RC_OK) return r;
                 }
-                block_free(e.block_base.ptr, e.length);
+                block_free(RFS_PTR_ADDR(e.block_base), e.length);
             }
-            if (!leaf->meta.parent_ptr.is_root_node)
-                parents.push_back(leaf->meta.parent_ptr.ptr);
+            if (!RFS_PP_IS_ROOT(leaf->meta.parent_ptr))
+                parents.push_back(RFS_PP_PTR(leaf->meta.parent_ptr));
             leaves.push_back(iter);
-            iter = leaf->meta.ptrs[2].ptr;
+            iter = RFS_PTR_ADDR(leaf->meta.ptrs[2]);
         }
 
         /* 叶块整体释放（数据已清，叶链遍历完） */
@@ -809,10 +809,10 @@ result_code_t RavenFS_juvenile::regular_file_reclaim(uint64_t inode_idx, bool de
                 if (sess.index_error()) return RC_ERR_STATE;
                 if (!sess) return RC_ERR_IO;
                 Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
-                if (!is_extent_node(meta) || !meta->parent_ptr.is_inner_node)
+                if (!is_extent_node(meta) || !RFS_PP_IS_INNER(meta->parent_ptr))
                     return RC_ERR_STATE;
-                if (meta->parent_ptr.is_root_node) saw_root = true;
-                else next.push_back(meta->parent_ptr.ptr);
+                if (RFS_PP_IS_ROOT(meta->parent_ptr)) saw_root = true;
+                else next.push_back(RFS_PP_PTR(meta->parent_ptr));
             }
             for (uint64_t b : layer) block_free(b, 2);
             if (saw_root) break;
@@ -869,8 +869,8 @@ result_code_t RavenFS_juvenile::direct_file_pread(uint64_t inode_idx, uint64_t o
         InodeSession s(inode_cache_mgr, inode_idx);
         if (!s.inode) return RC_ERR_IO;
         raven_Inode_t *ino = s.inode;
-        if (ino->type == INODE_TYPE_DIR) return RC_ERR_IS_DIR;
-        if (ino->type != INODE_TYPE_REGULAR) return RC_ERR_STATE;  /* SOFT_SYM 拒 */
+        if (RFS_INO1_GET_TYPE(ino->word1) == INODE_TYPE_DIR) return RC_ERR_IS_DIR;
+        if (RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_REGULAR) return RC_ERR_STATE;  /* SOFT_SYM 拒 */
         fsize = ino->size;
         if (offset >= fsize) return RC_OK;               /* R2：越界读 = 0 字节 */
         if (fsize <= INLINE_MAX) {                       /* inline：会话内直拷 */
@@ -880,7 +880,7 @@ result_code_t RavenFS_juvenile::direct_file_pread(uint64_t inode_idx, uint64_t o
             return RC_OK;
         }
         base = ino->data_root;
-        is_direct = ino->is_data_root_direct_bit;
+        is_direct = RFS_INO1_GET_DIRECT(ino->word1);
         root = ino->data_root;
     }   /* 会话析构（非 inline 走 IO 段），字段已快照 */
 
@@ -944,9 +944,9 @@ result_code_t RavenFS_juvenile::direct_file_pread(uint64_t inode_idx, uint64_t o
         mdata_piece_session s(mdata_piece_mgr, it.leaf_blk());
         if (s.index_error() || !s) return false;
         auto *lf = (Bptree_extent_leaf_node_t *)s.data;
-        if (!is_extent_node(&lf->meta) || lf->meta.parent_ptr.is_inner_node) return false;
-        if (lf->meta.parent_ptr.is_root_node) return true;   /* 单叶树 */
-        return lf->meta.ptrs[2].ptr == PTR_INVALID_52;
+        if (!is_extent_node(&lf->meta) || RFS_PP_IS_INNER(lf->meta.parent_ptr)) return false;
+        if (RFS_PP_IS_ROOT(lf->meta.parent_ptr)) return true;   /* 单叶树 */
+        return RFS_PTR_ADDR(lf->meta.ptrs[2]) == PTR_INVALID_52;
     };
 
     for (;;) {
@@ -975,7 +975,7 @@ result_code_t RavenFS_juvenile::direct_file_pread(uint64_t inode_idx, uint64_t o
                 const uint64_t lo = offset > blk_off ? offset - blk_off : 0;
                 const uint64_t hi = clamp_end - blk_off < FS_BLOCK ? clamp_end - blk_off : FS_BLOCK;
                 if (lo >= hi) continue;
-                read_block(R.block_base.ptr + (b - R.fblkbase), tmp.data());
+                read_block(RFS_PTR_ADDR(R.block_base) + (b - R.fblkbase), tmp.data());
                 memcpy(dst + (blk_off + lo - offset), tmp.data() + lo, hi - lo);
             }
             cur_b = last_b;
@@ -1013,15 +1013,15 @@ void RavenFS_juvenile::extent_orphan_release(uint64_t tree_root)
         if (sess.index_error() || !sess) return;
         Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
         if (!is_extent_node(meta)) return;
-        if (!meta->parent_ptr.is_inner_node) {
-            if (!meta->parent_ptr.is_root_node) parents.push_back(meta->parent_ptr.ptr);
+        if (!RFS_PP_IS_INNER(meta->parent_ptr)) {
+            if (!RFS_PP_IS_ROOT(meta->parent_ptr)) parents.push_back(RFS_PP_PTR(meta->parent_ptr));
             leaves.push_back(cur);
-            cur = meta->ptrs[2].ptr;
+            cur = RFS_PTR_ADDR(meta->ptrs[2]);
             continue;
         }
         auto *inner = (Bptree_extent_inner_node_t *)sess.data;
-        if (inner->meta.parent_ptr.entry_count == 0) return;
-        cur = inner->extents[0].sub_node_ptr.ptr;
+        if (RFS_PP_COUNT(inner->meta.parent_ptr) == 0) return;
+        cur = RFS_PTR_ADDR(inner->extents[0].sub_node_ptr);
     }
     for (uint64_t b : leaves) block_free(b, 2);
     std::sort(parents.begin(), parents.end());
@@ -1034,9 +1034,9 @@ void RavenFS_juvenile::extent_orphan_release(uint64_t tree_root)
             mdata_piece_session sess(mdata_piece_mgr, b);
             if (sess.index_error() || !sess) return;
             Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
-            if (!is_extent_node(meta) || !meta->parent_ptr.is_inner_node) return;
-            if (meta->parent_ptr.is_root_node) saw_root = true;
-            else next.push_back(meta->parent_ptr.ptr);
+            if (!is_extent_node(meta) || !RFS_PP_IS_INNER(meta->parent_ptr)) return;
+            if (RFS_PP_IS_ROOT(meta->parent_ptr)) saw_root = true;
+            else next.push_back(RFS_PP_PTR(meta->parent_ptr));
         }
         for (uint64_t b : layer) block_free(b, 2);
         if (saw_root) break;
@@ -1096,11 +1096,11 @@ result_code_t RavenFS_juvenile::file_data_release(regular_file_type_t shape, uin
         if (!sess) return RC_ERR_IO;
         Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
         if (!is_extent_node(meta)) return RC_ERR_STATE;
-        if (!meta->parent_ptr.is_inner_node) { found_leaf = true; break; }
+        if (!RFS_PP_IS_INNER(meta->parent_ptr)) { found_leaf = true; break; }
         Bptree_extent_inner_node_t *inner = (Bptree_extent_inner_node_t *)sess.data;
-        const uint16_t cnt = (uint16_t)inner->meta.parent_ptr.entry_count;
+        const uint16_t cnt = (uint16_t)RFS_PP_COUNT(inner->meta.parent_ptr);
         if (cnt == 0) return RC_ERR_STATE;
-        cur = inner->extents[0].sub_node_ptr.ptr;
+        cur = RFS_PTR_ADDR(inner->extents[0].sub_node_ptr);
     }
     if (!found_leaf) return RC_ERR_STATE;
     uint64_t iter = cur;
@@ -1109,22 +1109,22 @@ result_code_t RavenFS_juvenile::file_data_release(regular_file_type_t shape, uin
         if (sess.index_error()) return RC_ERR_STATE;
         if (!sess) return RC_ERR_IO;
         Bptree_extent_leaf_node_t *leaf = (Bptree_extent_leaf_node_t *)sess.data;
-        if (!is_extent_node(&leaf->meta) || leaf->meta.parent_ptr.is_inner_node)
+        if (!is_extent_node(&leaf->meta) || RFS_PP_IS_INNER(leaf->meta.parent_ptr))
             return RC_ERR_STATE;
-        const uint16_t cnt = (uint16_t)leaf->meta.parent_ptr.entry_count;
+        const uint16_t cnt = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr);
         for (uint16_t i = 0; i < cnt; i++) {
             const extent_t e = leaf->extents[i];
-            if (e.block_base.ptr == PTR_INVALID_52 || e.length == 0) return RC_ERR_STATE;
+            if (RFS_PTR_ADDR(e.block_base) == PTR_INVALID_52 || e.length == 0) return RC_ERR_STATE;
             if (destroy_data) {
-                result_code_t r = zero_range(e.block_base.ptr, e.length);
+                result_code_t r = zero_range(RFS_PTR_ADDR(e.block_base), e.length);
                 if (r != RC_OK) return r;
             }
-            block_free(e.block_base.ptr, e.length);
+            block_free(RFS_PTR_ADDR(e.block_base), e.length);
         }
-        if (!leaf->meta.parent_ptr.is_root_node)
-            parents.push_back(leaf->meta.parent_ptr.ptr);
+        if (!RFS_PP_IS_ROOT(leaf->meta.parent_ptr))
+            parents.push_back(RFS_PP_PTR(leaf->meta.parent_ptr));
         leaves.push_back(iter);
-        iter = leaf->meta.ptrs[2].ptr;
+        iter = RFS_PTR_ADDR(leaf->meta.ptrs[2]);
     }
     for (uint64_t b : leaves) block_free(b, 2);
     std::sort(parents.begin(), parents.end());
@@ -1138,9 +1138,9 @@ result_code_t RavenFS_juvenile::file_data_release(regular_file_type_t shape, uin
             if (sess.index_error()) return RC_ERR_STATE;
             if (!sess) return RC_ERR_IO;
             Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
-            if (!is_extent_node(meta) || !meta->parent_ptr.is_inner_node) return RC_ERR_STATE;
-            if (meta->parent_ptr.is_root_node) saw_root = true;
-            else next.push_back(meta->parent_ptr.ptr);
+            if (!is_extent_node(meta) || !RFS_PP_IS_INNER(meta->parent_ptr)) return RC_ERR_STATE;
+            if (RFS_PP_IS_ROOT(meta->parent_ptr)) saw_root = true;
+            else next.push_back(RFS_PP_PTR(meta->parent_ptr));
         }
         for (uint64_t b : layer) block_free(b, 2);
         if (saw_root) break;
@@ -1182,15 +1182,15 @@ result_code_t RavenFS_juvenile::direct_file_punch_hole(uint64_t inode_idx, uint6
         InodeSession s(inode_cache_mgr, inode_idx);
         if (!s.inode) return RC_ERR_IO;
         raven_Inode_t *ino = s.inode;
-        if (ino->type == INODE_TYPE_DIR) return RC_ERR_IS_DIR;
-        if (ino->type != INODE_TYPE_REGULAR) return RC_ERR_STATE;
+        if (RFS_INO1_GET_TYPE(ino->word1) == INODE_TYPE_DIR) return RC_ERR_IS_DIR;
+        if (RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_REGULAR) return RC_ERR_STATE;
         size = ino->size;
         if (len == 0) return RC_OK;                  /* P2：零长 → no-op */
         if (offset > ~0ULL - len) return RC_ERR_STATE;  /* 溢出防御在前（§4 同款 pread） */
         if (offset >= size) return RC_OK;            /* P3：洞越 EOF → no-op */
         shape = ftype(ino);
         droot = ino->data_root;
-        is_direct = ino->is_data_root_direct_bit;
+        is_direct = RFS_INO1_GET_DIRECT(ino->word1);
 
         if (shape == inline_file) {
             /* inline：洞域 ⊆ [0,size)，就地清零（无块级概念） */
@@ -1218,9 +1218,9 @@ result_code_t RavenFS_juvenile::direct_file_punch_hole(uint64_t inode_idx, uint6
         if (s.index_error() || !s) return false;
         auto *leaf = (Bptree_extent_leaf_node_t *)s.data;
         const uint16_t glb = tr.child_idx[tr.depth - 1];
-        if (glb >= (uint16_t)leaf->meta.parent_ptr.entry_count) return false;
+        if (glb >= (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr)) return false;
         const extent_t &e = leaf->extents[glb];
-        phys = e.block_base.ptr + (b - e.fblkbase);
+        phys = RFS_PTR_ADDR(e.block_base) + (b - e.fblkbase);
         return true;
     };
     auto block_phys_of = [&](uint64_t b, uint64_t &phys) -> bool {
@@ -1265,14 +1265,14 @@ result_code_t RavenFS_juvenile::direct_file_punch_hole(uint64_t inode_idx, uint6
         if (db_start > 0) {
             extent_t seg;
             seg.fblkbase = 0; seg.length = db_start;
-            seg.block_base.ptr = droot; seg.block_base.free_to_use = 0;
+            RFS_PTR_SET_ADDR(seg.block_base, droot); RFS_PTR_SET_FREE(seg.block_base, 0);
             rc = extent_map_range(new_root, inode_idx, seg);
             if (rc) { extent_orphan_release(new_root); return rc; }
         }
         if (db_end < oldceil) {
             extent_t seg;
             seg.fblkbase = db_end; seg.length = oldceil - db_end;
-            seg.block_base.ptr = droot + db_end; seg.block_base.free_to_use = 0;
+            RFS_PTR_SET_ADDR(seg.block_base, droot + db_end); RFS_PTR_SET_FREE(seg.block_base, 0);
             rc = extent_map_range(new_root, inode_idx, seg);
             if (rc) { extent_orphan_release(new_root); return rc; }
         }
@@ -1283,7 +1283,7 @@ result_code_t RavenFS_juvenile::direct_file_punch_hole(uint64_t inode_idx, uint6
         {
             InodeSession s(inode_cache_mgr, inode_idx);
             if (!s.inode) { extent_orphan_release(new_root); return RC_ERR_IO; }
-            s.inode->is_data_root_direct_bit = 0;
+            RFS_INO1_SET_DIRECT(*s.inode, 0);
             s.inode->data_root = new_root;
             s.dirty();
         }
@@ -1325,7 +1325,7 @@ result_code_t RavenFS_juvenile::direct_file_punch_hole(uint64_t inode_idx, uint6
                     const uint64_t t = (e.fblkbase + e.length < db_end) ? (e.fblkbase + e.length) : db_end;
                     if (s < t) {
                         lo_ext = s; len_ext = t - s;
-                        phys_ext = e.block_base.ptr + (s - e.fblkbase);
+                        phys_ext = RFS_PTR_ADDR(e.block_base) + (s - e.fblkbase);
                         found = true; break;
                     }
                 }
@@ -1334,14 +1334,14 @@ result_code_t RavenFS_juvenile::direct_file_punch_hole(uint64_t inode_idx, uint6
             if (!found) break;
             extent_t lext;
             lext.fblkbase = lo_ext; lext.length = len_ext;
-            lext.block_base.ptr = phys_ext; lext.block_base.free_to_use = 0;
+            RFS_PTR_SET_ADDR(lext.block_base, phys_ext); RFS_PTR_SET_FREE(lext.block_base, 0);
             rc = extent_unmap_range_loose(root_blk, inode_idx, lext);
             if (rc) {
                 /* 部分 punch：已生效不回滚（§5.4）——root 若变先提交，报错 */
                 if (root_blk != droot) commit_root(root_blk);
                 return rc;
             }
-            const uint64_t fptr = lext.block_base.ptr;
+            const uint64_t fptr = RFS_PTR_ADDR(lext.block_base);
             freed.push_back({fptr, lext.length});
         }
         if (root_blk != droot) commit_root(root_blk);
@@ -1384,12 +1384,12 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
         InodeSession s(inode_cache_mgr, inode_idx);
         if (!s.inode) return RC_ERR_IO;
         raven_Inode_t *ino = s.inode;
-        if (ino->type == INODE_TYPE_DIR) return RC_ERR_IS_DIR;
-        if (ino->type != INODE_TYPE_REGULAR) return RC_ERR_STATE;
+        if (RFS_INO1_GET_TYPE(ino->word1) == INODE_TYPE_DIR) return RC_ERR_IS_DIR;
+        if (RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_REGULAR) return RC_ERR_STATE;
         size = ino->size;
         shape = ftype(ino);
         droot = ino->data_root;
-        is_direct = ino->is_data_root_direct_bit;
+        is_direct = RFS_INO1_GET_DIRECT(ino->word1);
 
         if (len_new == size) return RC_OK;              /* T7 no-op */
 
@@ -1439,7 +1439,7 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
             InodeSession s(inode_cache_mgr, inode_idx);
             if (!s.inode) return RC_ERR_IO;
             s.inode->size = len_new;
-            s.inode->is_data_root_direct_bit = 0;
+            RFS_INO1_SET_DIRECT(*s.inode, 0);
             s.inode->data_root = PTR_INVALID;
             memcpy(s.inode->inline_data, buf, len_new);
             s.dirty();
@@ -1487,9 +1487,9 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
             if (s.index_error() || !s) return false;
             auto *leaf = (Bptree_extent_leaf_node_t *)s.data;
             const uint16_t glb = tr.child_idx[tr.depth - 1];
-            if (glb >= (uint16_t)leaf->meta.parent_ptr.entry_count) return false;
+            if (glb >= (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr)) return false;
             const extent_t &e = leaf->extents[glb];
-            phys = e.block_base.ptr + (b - e.fblkbase);
+            phys = RFS_PTR_ADDR(e.block_base) + (b - e.fblkbase);
             return true;
         };
         for (int guard = 0; guard < 100000; guard++) {
@@ -1520,7 +1520,7 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
                     const uint64_t t = (e.fblkbase + e.length < oldceil) ? (e.fblkbase + e.length) : oldceil;
                     if (s < t) {
                         lo_ext = s; len_ext = t - s;
-                        phys_ext = e.block_base.ptr + (s - e.fblkbase);
+                        phys_ext = RFS_PTR_ADDR(e.block_base) + (s - e.fblkbase);
                         found = true; break;
                     }
                 }
@@ -1529,7 +1529,7 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
             if (!found) break;
             extent_t lext;
             lext.fblkbase = lo_ext; lext.length = len_ext;
-            lext.block_base.ptr = phys_ext; lext.block_base.free_to_use = 0;
+            RFS_PTR_SET_ADDR(lext.block_base, phys_ext); RFS_PTR_SET_FREE(lext.block_base, 0);
             rc = extent_unmap_range_loose(root_blk, inode_idx, lext);
             if (rc) {
                 /* 部分 shrink：已 loose 生效不回滚（合法形态）——root 若变先提交，防悬挂 */
@@ -1539,7 +1539,7 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
                 }
                 return rc;
             }
-            const uint64_t fptr = lext.block_base.ptr;
+            const uint64_t fptr = RFS_PTR_ADDR(lext.block_base);
             freed.push_back({fptr, lext.length});
         }
 
@@ -1563,12 +1563,12 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
             if (s.index_error() || !s) return RC_ERR_STATE;
             Bptree_meta_t *meta = (Bptree_meta_t *)s.data;
             if (!is_extent_node(meta)) return RC_ERR_STATE;
-            if (!meta->parent_ptr.is_inner_node &&
-                (uint16_t)meta->parent_ptr.entry_count == 1) {
+            if (!RFS_PP_IS_INNER(meta->parent_ptr) &&
+                (uint16_t)RFS_PP_COUNT(meta->parent_ptr) == 1) {
                 const extent_t e0 = ((Bptree_extent_leaf_node_t *)s.data)->extents[0];
                 if (e0.fblkbase == 0 && e0.fblkbase + e0.length == newceil) {
                     collapse = true;
-                    collapse_base = e0.block_base.ptr;
+                    collapse_base = RFS_PTR_ADDR(e0.block_base);
                 }
             }
         }
@@ -1579,10 +1579,10 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
             if (!s.inode) return RC_ERR_IO;
             s.inode->size = len_new;
             if (collapse) {
-                s.inode->is_data_root_direct_bit = 1;
+                RFS_INO1_SET_DIRECT(*s.inode, 1);
                 s.inode->data_root = collapse_base;
             } else {
-                s.inode->is_data_root_direct_bit = 0;
+                RFS_INO1_SET_DIRECT(*s.inode, 0);
                 s.inode->data_root = root_blk;
             }
             s.dirty();

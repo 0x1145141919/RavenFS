@@ -24,13 +24,13 @@
 
 uint64_t node_max_hash(const void *node_buf) {
     const Bptree_meta_t *meta = (const Bptree_meta_t *)node_buf;
-    uint16_t cnt = (uint16_t)meta->parent_ptr.entry_count;
+    uint16_t cnt = (uint16_t)RFS_PP_COUNT(meta->parent_ptr);
     if (cnt == 0) return 0;
-    if (meta->parent_ptr.is_inner_node) {
-        const Bptree_dentry_inner_node_t *inner = (const Bptree_dentry_inner_node_t *)node_buf;
+    if (RFS_PP_IS_INNER(meta->parent_ptr)) {
+        const Bptree_ddentry_inner_node_t *inner = (const Bptree_ddentry_inner_node_t *)node_buf;
         return inner->hints[cnt - 1].hash_max;
     } else {
-        const Bptree_dentry_leaf_node_t *leaf = (const Bptree_dentry_leaf_node_t *)node_buf;
+        const Bptree_ddentry_leaf_node_t *leaf = (const Bptree_ddentry_leaf_node_t *)node_buf;
         return leaf->entries[cnt - 1].hash;
     }
 }
@@ -58,14 +58,14 @@ result_code_t RavenFS_juvenile::dentry_Bptree_walk(uint64_t root_blk_idx, bptree
         Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
         if (!is_dentry_node(meta)) return RC_ERR_STATE;
         /* 根校验：第 0 层必须是根，后续层必须非根（树损坏即报） */
-        if ((depth == 0) != (bool)meta->parent_ptr.is_root_node)
+        if ((depth == 0) != (bool)RFS_PP_IS_ROOT(meta->parent_ptr))
             return RC_ERR_STATE;
 
         trace->blocks[depth] = cur_blk;
 
-        if (!meta->parent_ptr.is_inner_node) {
+        if (!RFS_PP_IS_INNER(meta->parent_ptr)) {
             /* 叶子：复合序查找收尾 */
-            auto *leaf = (Bptree_dentry_leaf_node_t *)sess.data;
+            auto *leaf = (Bptree_ddentry_leaf_node_t *)sess.data;
             leaf_node_result_t res = dentry_leaf_node_lookup(leaf, name);
             trace->depth = depth + 1;
             trace->is_leaf_hit = res.is_idx_hitted;
@@ -74,17 +74,17 @@ result_code_t RavenFS_juvenile::dentry_Bptree_walk(uint64_t root_blk_idx, bptree
         }
 
         /* 内部节点：上界路由（找第一个 hash_max ≥ target） */
-        auto *node = (Bptree_dentry_inner_node_t *)sess.data;
-        if (node->meta.parent_ptr.entry_count == 0) return RC_ERR_STATE;
+        auto *node = (Bptree_ddentry_inner_node_t *)sess.data;
+        if (RFS_PP_COUNT(node->meta.parent_ptr) == 0) return RC_ERR_STATE;
         uint16_t hint_idx = dentry_inner_node_lookup(node, name->hash);
         if (hint_idx == 0xFFFF) {
             /* 击穿：target > 全部子树 hash_max。目标明确——新条目是
              * 全局最大，归宿 = 最右叶子末尾。特化：不再二分，每层
              * 直取最后一个 hint 下钻到最右叶子。 */
-            hint_idx = (uint16_t)(node->meta.parent_ptr.entry_count - 1);
+            hint_idx = (uint16_t)(RFS_PP_COUNT(node->meta.parent_ptr) - 1);
         }
         trace->child_idx[depth] = (uint8_t)hint_idx;
-        cur_blk = node->hints[hint_idx].sub_ptr.ptr;
+        cur_blk = RFS_PTR_ADDR(node->hints[hint_idx].sub_ptr);
     }
     return RC_ERR_STATE;   /* 深度超限：树成环 / 指针损坏 */
 }
@@ -123,9 +123,9 @@ result_code_t RavenFS_juvenile::dentry_Bptree_walk(uint64_t root_blk_idx, bptree
  * 树内条目 e 的完整名字 = e.name[0..min(40,e_len)) +（e_len>40 时）堆外置尾部。
  * 与目标名 memcmp 公共前缀，长度裁决；e_len 取 inode_ptr.free_to_use。
  * 读堆失败保守返回 1（目标 < 条目，不会误判命中）。 */
-int RavenFS_juvenile::dentry_name_cmp(const Dentry_t &e, const char *name, uint16_t name_len)
+int RavenFS_juvenile::dentry_name_cmp(const ddentry_t &e, const char *name, uint16_t name_len)
 {
-    const uint16_t e_len = (uint16_t)e.inode_ptr.free_to_use;
+    const uint16_t e_len = (uint16_t)RFS_PTR_FREE(e.inode_ptr);
     char e_buf[RAVENFS_MAX_NAME_LEN];
     const uint16_t e_inline = (e_len < DENTRY_INLINE_NAME_MAX) ? e_len : DENTRY_INLINE_NAME_MAX;
     memcpy(e_buf, e.name, e_inline);
@@ -139,20 +139,20 @@ int RavenFS_juvenile::dentry_name_cmp(const Dentry_t &e, const char *name, uint1
     return (e_len < name_len) ? -1 : (e_len > name_len) ? 1 : 0;
 }
 
-RavenFS_juvenile::leaf_node_result_t RavenFS_juvenile::dentry_leaf_node_lookup(Bptree_dentry_leaf_node_t *leaf, name_cmlpx_t *name)
+RavenFS_juvenile::leaf_node_result_t RavenFS_juvenile::dentry_leaf_node_lookup(Bptree_ddentry_leaf_node_t *leaf, name_cmlpx_t *name)
 {
     leaf_node_result_t res;
     res.greates_lower_bound_idx = 0;
     res.is_idx_hitted = false;
 
-    const uint16_t count = (uint16_t)leaf->meta.parent_ptr.entry_count; /* ≤126 */
+    const uint16_t count = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr); /* ≤126 */
     const uint64_t target_hash = name->hash;
 
     uint16_t lo = 0, hi = count;
     uint16_t glb = DENTRY_LEAF_GLB_NONE;   /* 哨兵：无下界（最左插入） */
     while (lo < hi) {
         uint16_t mid = lo + (hi - lo) / 2;
-        const Dentry_t &e = leaf->entries[mid];
+        const ddentry_t &e = leaf->entries[mid];
         bool e_le_target;
         if (e.hash < target_hash)
             e_le_target = true;
@@ -171,7 +171,7 @@ RavenFS_juvenile::leaf_node_result_t RavenFS_juvenile::dentry_leaf_node_lookup(B
 
     res.greates_lower_bound_idx = glb;
     if (glb != DENTRY_LEAF_GLB_NONE) {
-        const Dentry_t &e = leaf->entries[glb];
+        const ddentry_t &e = leaf->entries[glb];
         if (e.hash == target_hash && dentry_name_cmp(e, name->name, name->name_len) == 0)
             res.is_idx_hitted = true;
     }
@@ -181,9 +181,9 @@ RavenFS_juvenile::leaf_node_result_t RavenFS_juvenile::dentry_leaf_node_lookup(B
  * 找第一个 hash_max ≥ target 的 hint（最小上界，等价于 lower_bound）。
  * 全部 hash_max < target（击穿）→ 0xFFFF（与叶子 GLB 哨兵同值）。
  * 空节点（entry_count=0）→ 0xFFFF。 */
-uint16_t RavenFS_juvenile::dentry_inner_node_lookup(Bptree_dentry_inner_node_t *node, uint64_t hash)
+uint16_t RavenFS_juvenile::dentry_inner_node_lookup(Bptree_ddentry_inner_node_t *node, uint64_t hash)
 {
-    const uint16_t count = (uint16_t)node->meta.parent_ptr.entry_count;
+    const uint16_t count = (uint16_t)RFS_PP_COUNT(node->meta.parent_ptr);
     uint16_t lo = 0, hi = count;
     while (lo < hi) {
         uint16_t mid = lo + (hi - lo) / 2;

@@ -170,6 +170,20 @@ RFS_STATIC_ASSERT(sizeof(struct parent_ptr_t) == 8, "parent_ptr_t must be 8B");
                 (((uint64_t)(root)  & RFS_PP_ROOT_MASK)  << RFS_PP_ROOT_SHIFT)  | \
                 (((uint64_t)(ptr)   & RFS_PP_PTR_MASK)   << RFS_PP_PTR_SHIFT)))
 
+/* 逐字段写（掩码法；god 迁移用，与 RFS_PTR_SET_XXX / RFS_INO1_SET_XXX 同风格） */
+#define RFS_PP_SET_COUNT(x, count) \
+    do { (x).v = (((x).v) & ~(RFS_PP_COUNT_MASK << RFS_PP_COUNT_SHIFT)) | \
+                 ((((uint64_t)(count)) & RFS_PP_COUNT_MASK) << RFS_PP_COUNT_SHIFT); } while (0)
+#define RFS_PP_SET_IS_INNER(x, inner) \
+    do { (x).v = (((x).v) & ~(RFS_PP_INNER_MASK << RFS_PP_INNER_SHIFT)) | \
+                 ((((uint64_t)(inner)) & RFS_PP_INNER_MASK) << RFS_PP_INNER_SHIFT); } while (0)
+#define RFS_PP_SET_IS_ROOT(x, root) \
+    do { (x).v = (((x).v) & ~(RFS_PP_ROOT_MASK << RFS_PP_ROOT_SHIFT)) | \
+                 ((((uint64_t)(root)) & RFS_PP_ROOT_MASK) << RFS_PP_ROOT_SHIFT); } while (0)
+#define RFS_PP_SET_PTR(x, ptr) \
+    do { (x).v = (((x).v) & ~(RFS_PP_PTR_MASK << RFS_PP_PTR_SHIFT)) | \
+                 ((((uint64_t)(ptr)) & RFS_PP_PTR_MASK) << RFS_PP_PTR_SHIFT); } while (0)
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * name_heap_controller_t —— 名字堆控制器（每目录 10 个）
  *   word0: bytes_per_bit_log2:6 | total_bits_count_log2:6 | bitmap_base_block_ptr:52
@@ -203,6 +217,20 @@ RFS_STATIC_ASSERT(sizeof(struct name_heap_controller_t) == 16, "name_heap_contro
                 (((uint64_t)(bitmap) & RFS_NHC_BITMAP_MASK) << RFS_NHC_BITMAP_SHIFT)); \
     (x).word1 = ((((uint64_t)(resv)   & RFS_NHC_RESV_MASK)   << RFS_NHC_RESV_SHIFT)   | \
                 (((uint64_t)(data)   & RFS_NHC_DATA_MASK)   << RFS_NHC_DATA_SHIFT)); } while (0)
+
+/* 逐字段写（掩码法；保留未触及字段；god 迁移用） */
+#define RFS_NHC_SET_GRAN(x, gran) \
+    do { (x).word0 = (((x).word0) & ~(RFS_NHC_GRAN_MASK << RFS_NHC_GRAN_SHIFT)) | \
+                     ((((uint64_t)(gran)) & RFS_NHC_GRAN_MASK) << RFS_NHC_GRAN_SHIFT); } while (0)
+#define RFS_NHC_SET_BITS(x, bits) \
+    do { (x).word0 = (((x).word0) & ~(RFS_NHC_BITS_MASK << RFS_NHC_BITS_SHIFT)) | \
+                     ((((uint64_t)(bits)) & RFS_NHC_BITS_MASK) << RFS_NHC_BITS_SHIFT); } while (0)
+#define RFS_NHC_SET_BITMAP(x, bmp) \
+    do { (x).word0 = (((x).word0) & ~(RFS_NHC_BITMAP_MASK << RFS_NHC_BITMAP_SHIFT)) | \
+                     ((((uint64_t)(bmp)) & RFS_NHC_BITMAP_MASK) << RFS_NHC_BITMAP_SHIFT); } while (0)
+#define RFS_NHC_SET_DATA(x, data) \
+    do { (x).word1 = (((x).word1) & ~(RFS_NHC_DATA_MASK << RFS_NHC_DATA_SHIFT)) | \
+                     ((((uint64_t)(data)) & RFS_NHC_DATA_MASK) << RFS_NHC_DATA_SHIFT); } while (0)
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * inode 第一字（word1）—— type:6 | is_data_root_direct_bit:1 | i_flags:57

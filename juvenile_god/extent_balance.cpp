@@ -35,9 +35,9 @@ result_code_t RavenFS_juvenile::extent_node_balance(
 
     auto node_max_key = [](const void *buf) -> uint64_t {
         const Bptree_meta_t *m = (const Bptree_meta_t *)buf;
-        uint16_t cnt = (uint16_t)m->parent_ptr.entry_count;
+        uint16_t cnt = (uint16_t)RFS_PP_COUNT(m->parent_ptr);
         if (cnt == 0) return 0;
-        if (m->parent_ptr.is_inner_node) {
+        if (RFS_PP_IS_INNER(m->parent_ptr)) {
             const Bptree_extent_inner_node_t *n = (const Bptree_extent_inner_node_t *)buf;
             return n->extents[cnt - 1].key;
         }
@@ -45,26 +45,26 @@ result_code_t RavenFS_juvenile::extent_node_balance(
         return l->extents[cnt - 1].fblkbase + l->extents[cnt - 1].length;
     };
     auto remove_parent_hint = [](Bptree_extent_inner_node_t *parent, uint16_t del) {
-        uint16_t cnt = (uint16_t)parent->meta.parent_ptr.entry_count;
+        uint16_t cnt = (uint16_t)RFS_PP_COUNT(parent->meta.parent_ptr);
         if (del < cnt - 1) {
             memmove(&parent->extents[del], &parent->extents[del + 1],
                     (size_t)(cnt - del - 1) * sizeof(extent_hint_t));
         }
-        parent->meta.parent_ptr.entry_count = cnt - 1;
+        RFS_PP_SET_COUNT(parent->meta.parent_ptr, cnt - 1);
     };
     auto reparent_children = [&](Bptree_extent_inner_node_t *node,
                                  uint64_t node_blk, uint16_t cnt) -> result_code_t {
         for (uint16_t i = 0; i < cnt; i++) {
-            uint64_t cblk = node->extents[i].sub_node_ptr.ptr;
+            uint64_t cblk = RFS_PTR_ADDR(node->extents[i].sub_node_ptr);
             if (cblk == PTR_INVALID_52) return RC_ERR_STATE;
             mdata_piece_session c_sess(mdata_piece_mgr, cblk);
             if (c_sess.index_error()) return RC_ERR_STATE;
             if (!c_sess) return RC_ERR_IO;
             Bptree_meta_t *cm = (Bptree_meta_t *)c_sess.data;
             if (!is_extent_node(cm)) return RC_ERR_STATE;
-            if (cm->parent_ptr.is_root_node) return RC_ERR_STATE;
-            if (cm->parent_ptr.ptr != node_blk) {
-                cm->parent_ptr.ptr = node_blk;
+            if (RFS_PP_IS_ROOT(cm->parent_ptr)) return RC_ERR_STATE;
+            if (RFS_PP_PTR(cm->parent_ptr) != node_blk) {
+                RFS_PP_SET_PTR(cm->parent_ptr, node_blk);
                 c_sess.dirty();
             }
         }
@@ -76,20 +76,20 @@ result_code_t RavenFS_juvenile::extent_node_balance(
     if (parent_sess.index_error()) return RC_ERR_STATE;
     if (!parent_sess) return RC_ERR_IO;
     Bptree_extent_inner_node_t *parent = (Bptree_extent_inner_node_t *)parent_sess.data;
-    if (!is_extent_node(&parent->meta) || !parent->meta.parent_ptr.is_inner_node)
+    if (!is_extent_node(&parent->meta) || !RFS_PP_IS_INNER(parent->meta.parent_ptr))
         return RC_ERR_STATE;
-    uint16_t parent_count = (uint16_t)parent->meta.parent_ptr.entry_count;
+    uint16_t parent_count = (uint16_t)RFS_PP_COUNT(parent->meta.parent_ptr);
     if (idx >= parent_count) return RC_ERR_STATE;
 
     /* ── 2. 目标子节点 ── */
-    uint64_t child_blk = parent->extents[idx].sub_node_ptr.ptr;
+    uint64_t child_blk = RFS_PTR_ADDR(parent->extents[idx].sub_node_ptr);
     mdata_piece_session child_sess(mdata_piece_mgr, child_blk);
     if (child_sess.index_error()) return RC_ERR_STATE;
     if (!child_sess) return RC_ERR_IO;
     Bptree_meta_t *child_meta = (Bptree_meta_t *)child_sess.data;
     if (!is_extent_node(child_meta)) return RC_ERR_STATE;
-    uint16_t child_count = (uint16_t)child_meta->parent_ptr.entry_count;
-    bool is_inner = child_meta->parent_ptr.is_inner_node;
+    uint16_t child_count = (uint16_t)RFS_PP_COUNT(child_meta->parent_ptr);
+    bool is_inner = RFS_PP_IS_INNER(child_meta->parent_ptr);
     if (child_count >= 168) return RC_OK;   /* 已健康 */
 
     /* ── 3. 邻居方向：头部向右，其余向左 ── */
@@ -100,14 +100,14 @@ result_code_t RavenFS_juvenile::extent_node_balance(
     } else {
         neighbor_idx = (uint16_t)(idx - 1);
     }
-    uint64_t neighbor_blk = parent->extents[neighbor_idx].sub_node_ptr.ptr;
+    uint64_t neighbor_blk = RFS_PTR_ADDR(parent->extents[neighbor_idx].sub_node_ptr);
     mdata_piece_session neighbor_sess(mdata_piece_mgr, neighbor_blk);
     if (neighbor_sess.index_error()) return RC_ERR_STATE;
     if (!neighbor_sess) return RC_ERR_IO;
     Bptree_meta_t *neighbor_meta = (Bptree_meta_t *)neighbor_sess.data;
     if (!is_extent_node(neighbor_meta)) return RC_ERR_STATE;
-    if (neighbor_meta->parent_ptr.is_inner_node != is_inner) return RC_ERR_STATE;
-    uint16_t neighbor_count = (uint16_t)neighbor_meta->parent_ptr.entry_count;
+    if (RFS_PP_IS_INNER(neighbor_meta->parent_ptr) != is_inner) return RC_ERR_STATE;
+    uint16_t neighbor_count = (uint16_t)RFS_PP_COUNT(neighbor_meta->parent_ptr);
     uint16_t total = (uint16_t)(child_count + neighbor_count);
 
     /* ── 4. total ≤ 337：合并（保留 child，free neighbor） ── */
@@ -126,7 +126,7 @@ result_code_t RavenFS_juvenile::extent_node_balance(
                 memcpy(&child->extents[0], neighbor->extents,
                        neighbor_count * sizeof(extent_hint_t));
             }
-            child->meta.parent_ptr.entry_count = total;
+            RFS_PP_SET_COUNT(child->meta.parent_ptr, total);
             result_code_t rr = reparent_children(child, child_blk, total);
             if (rr != RC_OK) return rr;
             child_sess.dirty();
@@ -137,14 +137,14 @@ result_code_t RavenFS_juvenile::extent_node_balance(
                 /* child 左、neighbor 右：追加 + 链后继接管 */
                 memcpy(&child->extents[child_count], neighbor->extents,
                        neighbor_count * sizeof(extent_t));
-                child->meta.ptrs[2].ptr = neighbor->meta.ptrs[2].ptr;
-                uint64_t next_blk = neighbor->meta.ptrs[2].ptr;
+                RFS_PTR_SET_ADDR(child->meta.ptrs[2], RFS_PTR_ADDR(neighbor->meta.ptrs[2]));
+                uint64_t next_blk = RFS_PTR_ADDR(neighbor->meta.ptrs[2]);
                 if (next_blk != PTR_INVALID_52) {
                     mdata_piece_session next_sess(mdata_piece_mgr, next_blk);
                     if (next_sess.index_error()) return RC_ERR_STATE;
                     if (!next_sess) return RC_ERR_IO;
                     Bptree_extent_leaf_node_t *next_node = (Bptree_extent_leaf_node_t *)next_sess.data;
-                    next_node->meta.ptrs[1].ptr = child_blk;
+                    RFS_PTR_SET_ADDR(next_node->meta.ptrs[1], child_blk);
                     next_sess.dirty();
                 }
             } else {
@@ -153,18 +153,18 @@ result_code_t RavenFS_juvenile::extent_node_balance(
                         child_count * sizeof(extent_t));
                 memcpy(&child->extents[0], neighbor->extents,
                        neighbor_count * sizeof(extent_t));
-                child->meta.ptrs[1].ptr = neighbor->meta.ptrs[1].ptr;
-                uint64_t prev_blk = neighbor->meta.ptrs[1].ptr;
+                RFS_PTR_SET_ADDR(child->meta.ptrs[1], RFS_PTR_ADDR(neighbor->meta.ptrs[1]));
+                uint64_t prev_blk = RFS_PTR_ADDR(neighbor->meta.ptrs[1]);
                 if (prev_blk != PTR_INVALID_52) {
                     mdata_piece_session prev_sess(mdata_piece_mgr, prev_blk);
                     if (prev_sess.index_error()) return RC_ERR_STATE;
                     if (!prev_sess) return RC_ERR_IO;
                     Bptree_extent_leaf_node_t *prev_node = (Bptree_extent_leaf_node_t *)prev_sess.data;
-                    prev_node->meta.ptrs[2].ptr = child_blk;
+                    RFS_PTR_SET_ADDR(prev_node->meta.ptrs[2], child_blk);
                     prev_sess.dirty();
                 }
             }
-            child->meta.parent_ptr.entry_count = total;
+            RFS_PP_SET_COUNT(child->meta.parent_ptr, total);
             child_sess.dirty();
         }
 
@@ -179,8 +179,8 @@ result_code_t RavenFS_juvenile::extent_node_balance(
         if (del_idx < kept_before) kept_after--;
         parent->extents[kept_after].key = new_max;
 
-        uint16_t npc = (uint16_t)parent->meta.parent_ptr.entry_count;
-        bool parent_is_root = parent->meta.parent_ptr.is_root_node;
+        uint16_t npc = (uint16_t)RFS_PP_COUNT(parent->meta.parent_ptr);
+        bool parent_is_root = RFS_PP_IS_ROOT(parent->meta.parent_ptr);
         if (!parent_is_root && npc < 168) need_balance = true;
         parent_sess.dirty();
         return RC_OK;
@@ -198,8 +198,8 @@ result_code_t RavenFS_juvenile::extent_node_balance(
             memcpy(merged + child_count, neighbor->extents, neighbor_count * sizeof(extent_hint_t));
             memcpy(child->extents, merged, left_count * sizeof(extent_hint_t));
             memcpy(neighbor->extents, merged + left_count, right_count * sizeof(extent_hint_t));
-            child->meta.parent_ptr.entry_count = left_count;
-            neighbor->meta.parent_ptr.entry_count = right_count;
+            RFS_PP_SET_COUNT(child->meta.parent_ptr, left_count);
+            RFS_PP_SET_COUNT(neighbor->meta.parent_ptr, right_count);
             result_code_t rr = reparent_children(child, child_blk, left_count);
             if (rr != RC_OK) return rr;
             rr = reparent_children(neighbor, neighbor_blk, right_count);
@@ -209,8 +209,8 @@ result_code_t RavenFS_juvenile::extent_node_balance(
             memcpy(merged + neighbor_count, child->extents, child_count * sizeof(extent_hint_t));
             memcpy(neighbor->extents, merged, left_count * sizeof(extent_hint_t));
             memcpy(child->extents, merged + left_count, right_count * sizeof(extent_hint_t));
-            neighbor->meta.parent_ptr.entry_count = left_count;
-            child->meta.parent_ptr.entry_count = right_count;
+            RFS_PP_SET_COUNT(neighbor->meta.parent_ptr, left_count);
+            RFS_PP_SET_COUNT(child->meta.parent_ptr, right_count);
             result_code_t rr = reparent_children(neighbor, neighbor_blk, left_count);
             if (rr != RC_OK) return rr;
             rr = reparent_children(child, child_blk, right_count);
@@ -227,15 +227,15 @@ result_code_t RavenFS_juvenile::extent_node_balance(
             memcpy(merged + child_count, neighbor->extents, neighbor_count * sizeof(extent_t));
             memcpy(child->extents, merged, left_count * sizeof(extent_t));
             memcpy(neighbor->extents, merged + left_count, right_count * sizeof(extent_t));
-            child->meta.parent_ptr.entry_count = left_count;
-            neighbor->meta.parent_ptr.entry_count = right_count;
+            RFS_PP_SET_COUNT(child->meta.parent_ptr, left_count);
+            RFS_PP_SET_COUNT(neighbor->meta.parent_ptr, right_count);
         } else {
             memcpy(merged, neighbor->extents, neighbor_count * sizeof(extent_t));
             memcpy(merged + neighbor_count, child->extents, child_count * sizeof(extent_t));
             memcpy(neighbor->extents, merged, left_count * sizeof(extent_t));
             memcpy(child->extents, merged + left_count, right_count * sizeof(extent_t));
-            neighbor->meta.parent_ptr.entry_count = left_count;
-            child->meta.parent_ptr.entry_count = right_count;
+            RFS_PP_SET_COUNT(neighbor->meta.parent_ptr, left_count);
+            RFS_PP_SET_COUNT(child->meta.parent_ptr, right_count);
         }
         /* 兄弟链表不变（两节点都存活，链序不变） */
         child_sess.dirty();
@@ -266,29 +266,29 @@ result_code_t RavenFS_juvenile::extent_root_shrink(uint64_t &root_blk, uint64_t 
     if (!root_sess) return RC_ERR_IO;
     Bptree_extent_inner_node_t *root = (Bptree_extent_inner_node_t *)root_sess.data;
     if (!is_extent_node(&root->meta)) return RC_ERR_STATE;
-    if (!root->meta.parent_ptr.is_root_node) return RC_ERR_STATE;
-    if (!root->meta.parent_ptr.is_inner_node) return RC_OK;
-    uint16_t cnt = (uint16_t)root->meta.parent_ptr.entry_count;
+    if (!RFS_PP_IS_ROOT(root->meta.parent_ptr)) return RC_ERR_STATE;
+    if (!RFS_PP_IS_INNER(root->meta.parent_ptr)) return RC_OK;
+    uint16_t cnt = (uint16_t)RFS_PP_COUNT(root->meta.parent_ptr);
     if (cnt != 1) return RC_OK;
 
-    uint64_t child_blk = root->extents[0].sub_node_ptr.ptr;
+    uint64_t child_blk = RFS_PTR_ADDR(root->extents[0].sub_node_ptr);
     mdata_piece_session child_sess(mdata_piece_mgr, child_blk);
     if (child_sess.index_error()) return RC_ERR_STATE;
     if (!child_sess) return RC_ERR_IO;
     Bptree_meta_t *cm = (Bptree_meta_t *)child_sess.data;
     if (!is_extent_node(cm)) return RC_ERR_STATE;
-    if (cm->parent_ptr.is_root_node) return RC_ERR_STATE;   /* 孩子已是根：结构损坏 */
+    if (RFS_PP_IS_ROOT(cm->parent_ptr)) return RC_ERR_STATE;   /* 孩子已是根：结构损坏 */
 
-    cm->parent_ptr.is_root_node = 1;
-    cm->parent_ptr.ptr = owner_inode_idx;   /* "." 审计锚 */
-    if (!cm->parent_ptr.is_inner_node) {
+    RFS_PP_SET_IS_ROOT(cm->parent_ptr, 1);
+    RFS_PP_SET_PTR(cm->parent_ptr, owner_inode_idx);   /* "." 审计锚 */
+    if (!RFS_PP_IS_INNER(cm->parent_ptr)) {
         Bptree_extent_leaf_node_t *cl = (Bptree_extent_leaf_node_t *)child_sess.data;
-        cl->meta.ptrs[0].ptr = PTR_INVALID;   /* 清前驱（根无链表） */
-        cl->meta.ptrs[1].ptr = PTR_INVALID;   /* 文件树根无 ".." */
-        cl->meta.ptrs[2].ptr = PTR_INVALID;   /* 清后继 */
+        RFS_PTR_SET_ADDR(cl->meta.ptrs[0], PTR_INVALID);   /* 清前驱（根无链表） */
+        RFS_PTR_SET_ADDR(cl->meta.ptrs[1], PTR_INVALID);   /* 文件树根无 ".." */
+        RFS_PTR_SET_ADDR(cl->meta.ptrs[2], PTR_INVALID);   /* 清后继 */
     } else {
         Bptree_extent_inner_node_t *ci = (Bptree_extent_inner_node_t *)child_sess.data;
-        ci->meta.ptrs[1].ptr = PTR_INVALID;   /* 无 ".."（保险） */
+        RFS_PTR_SET_ADDR(ci->meta.ptrs[1], PTR_INVALID);   /* 无 ".."（保险） */
     }
     child_sess.dirty();
 
@@ -320,29 +320,29 @@ result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t
         if (!cs) return RC_ERR_IO;
         Bptree_meta_t *cm = (Bptree_meta_t *)cs.data;
         if (!is_extent_node(cm)) return RC_ERR_STATE;
-        const uint16_t cnt = (uint16_t)cm->parent_ptr.entry_count;
+        const uint16_t cnt = (uint16_t)RFS_PP_COUNT(cm->parent_ptr);
 
-        if (cm->parent_ptr.is_root_node) {
-            if (cm->parent_ptr.is_inner_node && cnt == 1)
+        if (RFS_PP_IS_ROOT(cm->parent_ptr)) {
+            if (RFS_PP_IS_INNER(cm->parent_ptr) && cnt == 1)
                 return extent_root_shrink(root_blk, owner_inode_idx);   /* 合并残留收尾（cur 即根） */
             return RC_OK;                                    /* 根叶/健康根内：链止 */
         }
         if (cnt >= 168) return RC_OK;                        /* 已健康 */
 
-        const uint64_t parent_blk = cm->parent_ptr.ptr;      /* 52 位形态 */
+        const uint64_t parent_blk = RFS_PP_PTR(cm->parent_ptr);      /* 52 位形态 */
         if (parent_blk == PTR_INVALID_52) return RC_ERR_STATE;
 
         mdata_piece_session ps(mdata_piece_mgr, parent_blk);
         if (ps.index_error()) return RC_ERR_STATE;
         if (!ps) return RC_ERR_IO;
         Bptree_extent_inner_node_t *parent = (Bptree_extent_inner_node_t *)ps.data;
-        if (!is_extent_node(&parent->meta) || !parent->meta.parent_ptr.is_inner_node)
+        if (!is_extent_node(&parent->meta) || !RFS_PP_IS_INNER(parent->meta.parent_ptr))
             return RC_ERR_STATE;
-        const uint16_t pcnt = (uint16_t)parent->meta.parent_ptr.entry_count;
+        const uint16_t pcnt = (uint16_t)RFS_PP_COUNT(parent->meta.parent_ptr);
         uint16_t idx = 0;
         bool found = false;
         for (; idx < pcnt; idx++) {
-            if (parent->extents[idx].sub_node_ptr.ptr == cur) { found = true; break; }
+            if (RFS_PTR_ADDR(parent->extents[idx].sub_node_ptr) == cur) { found = true; break; }
         }
         if (!found) return RC_ERR_STATE;
 
@@ -363,8 +363,8 @@ result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t
             if (rps.index_error()) return RC_ERR_STATE;
             if (!rps) return RC_ERR_IO;
             Bptree_meta_t *rm = (Bptree_meta_t *)rps.data;
-            if (rm->parent_ptr.is_root_node && rm->parent_ptr.is_inner_node &&
-                rm->parent_ptr.entry_count == 1)
+            if (RFS_PP_IS_ROOT(rm->parent_ptr) && RFS_PP_IS_INNER(rm->parent_ptr) &&
+                RFS_PP_COUNT(rm->parent_ptr) == 1)
                 return extent_root_shrink(root_blk, owner_inode_idx);
             return RC_OK;
         }

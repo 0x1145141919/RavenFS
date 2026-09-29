@@ -142,14 +142,14 @@ result_code_t RavenFS_juvenile::audit_inode(uint64_t inum, audit_ctx_t &ctx)
 
     raven_Inode_t raw;
     inode_read(inum, &raw);
-    if (raw.type == INODE_TYPE_DIR) {
+    if (RFS_INO1_GET_TYPE(raw.word1) == INODE_TYPE_DIR) {
         audit_dir_inode(ctx, inum, (const raven_dir_Inode_t *)&raw);
-    } else if (raw.type == INODE_TYPE_REGULAR || raw.type == INODE_TYPE_SOFT_SYM) {
+    } else if (RFS_INO1_GET_TYPE(raw.word1) == INODE_TYPE_REGULAR || RFS_INO1_GET_TYPE(raw.word1) == INODE_TYPE_SOFT_SYM) {
         audit_file_inode(ctx, inum, &raw);
     } else {
         ctx.inode_bad++; ctx.flag_set(inum);
         audit_log(ctx, "BAD", "inode %llu 非法 type=%llu",
-                  (unsigned long long)inum, (unsigned long long)raw.type);
+                  (unsigned long long)inum, (unsigned long long)RFS_INO1_GET_TYPE(raw.word1));
     }
     return RC_OK;
 }
@@ -213,7 +213,7 @@ void RavenFS_juvenile::audit_file_inode(audit_ctx_t &ctx, uint64_t inum, const r
     }
 
     const uint64_t blocks = (ino->size + 4095) / 4096;   /* ceil(size/4096) */
-    if (ino->is_data_root_direct_bit) {
+    if (RFS_INO1_GET_DIRECT(ino->word1)) {
         /* direct：连续区 [base, base+blocks) */
         uint64_t base = ino->data_root;
         if (base == PTR_INVALID || base >= total_blocks || base + blocks > total_blocks) {
@@ -287,37 +287,37 @@ uint64_t RavenFS_juvenile::audit_btree_node(audit_ctx_t &ctx, audit_tree_ctx_t &
     }
 
     ctx.nodes++; t.nodes++;
-    const uint16_t cnt = (uint16_t)meta->parent_ptr.entry_count;
+    const uint16_t cnt = (uint16_t)RFS_PP_COUNT(meta->parent_ptr);
     const uint16_t it  = std::min<uint16_t>(cnt, (uint16_t)(order + 1));
 
     if (ctx.opts && ctx.opts->trace_nodes)
         audit_log(ctx, "TRACE", "tree=%s inum=%llu blk=%llu depth=%d inner=%d root=%d cnt=%u",
                   tree, (unsigned long long)owner_inum, (unsigned long long)blk, depth,
-                  (int)meta->parent_ptr.is_inner_node, (int)meta->parent_ptr.is_root_node, cnt);
+                  (int)RFS_PP_IS_INNER(meta->parent_ptr), (int)RFS_PP_IS_ROOT(meta->parent_ptr), cnt);
 
     /* 角色 / 父指针 */
-    if ((bool)meta->parent_ptr.is_root_node != expect_root)
+    if ((bool)RFS_PP_IS_ROOT(meta->parent_ptr) != expect_root)
         audit_bad(ctx, "tree=%s inum=%llu blk=%llu is_root=%d 期望 %d", tree,
                   (unsigned long long)owner_inum, (unsigned long long)blk,
-                  (int)meta->parent_ptr.is_root_node, (int)expect_root);
+                  (int)RFS_PP_IS_ROOT(meta->parent_ptr), (int)expect_root);
     if (expect_root) {
-        if (meta->parent_ptr.ptr != owner_inum)
+        if (RFS_PP_PTR(meta->parent_ptr) != owner_inum)
             audit_bad(ctx, "tree=%s inum=%llu blk=%llu root('.') ptr=%llu != owner %llu", tree,
                       (unsigned long long)owner_inum, (unsigned long long)blk,
-                      (unsigned long long)meta->parent_ptr.ptr, (unsigned long long)owner_inum);
-        if (is_dentry) ctx.dotdot_of[owner_inum] = meta->ptrs[1].ptr;   /* '..' inode */
+                      (unsigned long long)RFS_PP_PTR(meta->parent_ptr), (unsigned long long)owner_inum);
+        if (is_dentry) ctx.dotdot_of[owner_inum] = RFS_PTR_ADDR(meta->ptrs[1]);   /* '..' inode */
     } else {
-        if (meta->parent_ptr.ptr != expect_parent)
+        if (RFS_PP_PTR(meta->parent_ptr) != expect_parent)
             audit_bad(ctx, "tree=%s inum=%llu blk=%llu parent_ptr=%llu != 实际父 %llu", tree,
                       (unsigned long long)owner_inum, (unsigned long long)blk,
-                      (unsigned long long)meta->parent_ptr.ptr, (unsigned long long)expect_parent);
+                      (unsigned long long)RFS_PP_PTR(meta->parent_ptr), (unsigned long long)expect_parent);
     }
     if (cnt > order)
         audit_bad(ctx, "tree=%s inum=%llu blk=%llu entry_count=%u > 阶 %u（瞬时槽落盘？）", tree,
                   (unsigned long long)owner_inum, (unsigned long long)blk, cnt, order);
 
     /* ══════ 叶子 ══════ */
-    if (!meta->parent_ptr.is_inner_node) {
+    if (!RFS_PP_IS_INNER(meta->parent_ptr)) {
         ctx.leaves++; t.leaves++;
         t.dfs_leaves.push_back(blk);
         if (!t.leaf_depth_set) { t.leaf_depth = (uint64_t)depth; t.leaf_depth_set = true; }
@@ -339,11 +339,11 @@ uint64_t RavenFS_juvenile::audit_btree_node(audit_ctx_t &ctx, audit_tree_ctx_t &
         sub_ok = true;   /* 读 + magic 通过（父层 key==max 比对可用） */
 
         if (is_dentry) {
-            auto *leaf = (Bptree_dentry_leaf_node_t *)sess.data;
+            auto *leaf = (Bptree_ddentry_leaf_node_t *)sess.data;
             uint64_t prev_hash = 0; char prev_name[DENTRY_INLINE_NAME_MAX];
             memset(prev_name, 0, sizeof(prev_name));
             for (uint16_t i = 0; i < it; i++) {
-                const Dentry_t &e = leaf->entries[i];
+                const ddentry_t &e = leaf->entries[i];
                 if (i > 0) {
                     const bool bad_order =
                         (e.hash < prev_hash) ||
@@ -356,8 +356,8 @@ uint64_t RavenFS_juvenile::audit_btree_node(audit_ctx_t &ctx, audit_tree_ctx_t &
                 prev_hash = e.hash;
                 memcpy(prev_name, e.name, DENTRY_INLINE_NAME_MAX);
 
-                const uint16_t name_len = (uint16_t)e.inode_ptr.free_to_use;
-                const uint64_t target   = e.inode_ptr.ptr;
+                const uint16_t name_len = (uint16_t)RFS_PTR_FREE(e.inode_ptr);
+                const uint64_t target   = RFS_PTR_ADDR(e.inode_ptr);
 
                 if (name_len > RAVENFS_MAX_NAME_LEN)
                     audit_bad(ctx, "tree=dentry inum=%llu blk=%llu entries[%u] name_len=%u 超上限 %u",
@@ -462,7 +462,7 @@ uint64_t RavenFS_juvenile::audit_btree_node(audit_ctx_t &ctx, audit_tree_ctx_t &
                 audit_bad(ctx, "tree=extent inum=%llu blk=%llu extents[%u] 逻辑越界 end=%llu > size_bound=%llu",
                           (unsigned long long)owner_inum, (unsigned long long)blk, i,
                           (unsigned long long)(e.fblkbase + e.length), (unsigned long long)size_bound);
-            const uint64_t pb = e.block_base.ptr;
+            const uint64_t pb = RFS_PTR_ADDR(e.block_base);
             if (pb == PTR52 || pb >= total_blocks || pb + e.length > total_blocks) {
                 audit_bad(ctx, "tree=extent inum=%llu blk=%llu extents[%u] 物理指针越界 base=%llu len=%llu",
                           (unsigned long long)owner_inum, (unsigned long long)blk, i,
@@ -496,12 +496,12 @@ uint64_t RavenFS_juvenile::audit_btree_node(audit_ctx_t &ctx, audit_tree_ctx_t &
     for (uint16_t i = 0; i < it; i++) {
         uint64_t child, key;
         if (is_dentry) {
-            auto *nd = (Bptree_dentry_inner_node_t *)sess.data;
-            child = nd->hints[i].sub_ptr.ptr;
+            auto *nd = (Bptree_ddentry_inner_node_t *)sess.data;
+            child = RFS_PTR_ADDR(nd->hints[i].sub_ptr);
             key   = nd->hints[i].hash_max;
         } else {
             auto *nd = (Bptree_extent_inner_node_t *)sess.data;
-            child = nd->extents[i].sub_node_ptr.ptr;
+            child = RFS_PTR_ADDR(nd->extents[i].sub_node_ptr);
             key   = nd->extents[i].key;
         }
         if (i > 0 && key <= prev_key)
@@ -546,15 +546,15 @@ void RavenFS_juvenile::audit_leaf_chain(audit_ctx_t &ctx, audit_tree_ctx_t &t,
             return;
         }
         Bptree_meta_t *m = (Bptree_meta_t *)sess.data;
-        if (!m->parent_ptr.is_inner_node) break;
-        const uint16_t c = (uint16_t)m->parent_ptr.entry_count;
+        if (!RFS_PP_IS_INNER(m->parent_ptr)) break;
+        const uint16_t c = (uint16_t)RFS_PP_COUNT(m->parent_ptr);
         if (c == 0) {
             audit_bad(ctx, "tree=%s inum=%llu 叶链下钻遇空内部节点 blk=%llu", tree,
                       (unsigned long long)owner_inum, (unsigned long long)blk);
             return;
         }
-        blk = is_dentry ? ((Bptree_dentry_inner_node_t *)sess.data)->hints[0].sub_ptr.ptr
-                        : ((Bptree_extent_inner_node_t *)sess.data)->extents[0].sub_node_ptr.ptr;
+        blk = is_dentry ? RFS_PTR_ADDR(((Bptree_ddentry_inner_node_t *)sess.data)->hints[0].sub_ptr)
+                        : RFS_PTR_ADDR(((Bptree_extent_inner_node_t *)sess.data)->extents[0].sub_node_ptr);
     }
 
     size_t idx = 0;
@@ -577,14 +577,14 @@ void RavenFS_juvenile::audit_leaf_chain(audit_ctx_t &ctx, audit_tree_ctx_t &t,
             return;
         }
         Bptree_meta_t *m = (Bptree_meta_t *)sess.data;
-        const uint64_t prev = m->ptrs[1].ptr;
-        const uint64_t next = m->ptrs[2].ptr;
+        const uint64_t prev = RFS_PTR_ADDR(m->ptrs[1]);
+        const uint64_t next = RFS_PTR_ADDR(m->ptrs[2]);
         if (prev != PTR52) {
             mdata_piece_session ps(mdata_piece_mgr, prev);
             if (ps.index_error() || !ps) {
                 audit_bad(ctx, "tree=%s inum=%llu 前驱块读取失败 blk=%llu", tree,
                           (unsigned long long)owner_inum, (unsigned long long)prev);
-            } else if (((Bptree_meta_t *)ps.data)->ptrs[2].ptr != cur) {
+            } else if (RFS_PTR_ADDR(((Bptree_meta_t *)ps.data)->ptrs[2]) != cur) {
                 audit_bad(ctx, "tree=%s inum=%llu 兄弟链断裂: blk=%llu.prev=%llu 但前驱.next != blk",
                           tree, (unsigned long long)owner_inum, (unsigned long long)cur,
                           (unsigned long long)prev);
@@ -595,7 +595,7 @@ void RavenFS_juvenile::audit_leaf_chain(audit_ctx_t &ctx, audit_tree_ctx_t &t,
             if (ns.index_error() || !ns) {
                 audit_bad(ctx, "tree=%s inum=%llu 后继块读取失败 blk=%llu", tree,
                           (unsigned long long)owner_inum, (unsigned long long)next);
-            } else if (((Bptree_meta_t *)ns.data)->ptrs[1].ptr != cur) {
+            } else if (RFS_PTR_ADDR(((Bptree_meta_t *)ns.data)->ptrs[1]) != cur) {
                 audit_bad(ctx, "tree=%s inum=%llu 兄弟链断裂: blk=%llu.next=%llu 但后继.prev != blk",
                           tree, (unsigned long long)owner_inum, (unsigned long long)cur,
                           (unsigned long long)next);
@@ -617,10 +617,10 @@ void RavenFS_juvenile::audit_name_heaps(audit_ctx_t &ctx, uint64_t inum, const r
     const name_heap_controller_t *arr = (const name_heap_controller_t *)&d->heaps_8B_8k;
     for (int s = 0; s < 10; s++) {
         const name_heap_controller_t &c = arr[s];
-        const uint64_t bmpb = c.bitmap_base_block_ptr;
-        const uint64_t datab = c.data_base_block_ptr;
-        const uint8_t gran = (uint8_t)c.bytes_per_bit_log2;
-        const uint8_t bits = (uint8_t)c.total_bits_count_log2;
+        const uint64_t bmpb = RFS_NHC_BITMAP(c);
+        const uint64_t datab = RFS_NHC_DATA(c);
+        const uint8_t gran = (uint8_t)RFS_NHC_GRAN(c);
+        const uint8_t bits = (uint8_t)RFS_NHC_BITS(c);
         const bool inactive = (bmpb == NAME_HEAP_INACTIVE && datab == NAME_HEAP_INACTIVE);
         if (inactive) continue;
 
@@ -728,7 +728,7 @@ result_code_t RavenFS_juvenile::audit_filesystem(const audit_opts_t &opts, audit
         }
         if (lit) {
             raven_Inode_t ino; inode_read(inum, &ino);
-            if (ino.type != INODE_TYPE_DIR) {   /* DIR 的 link_count==size+2 已在 audit_dir_inode 查 */
+            if (RFS_INO1_GET_TYPE(ino.word1) != INODE_TYPE_DIR) {   /* DIR 的 link_count==size+2 已在 audit_dir_inode 查 */
                 if ((uint32_t)ino.link_count != refs) {
                     ctx.link_mismatch++; ctx.flag_set(inum);
                     audit_log(ctx, "BAD", "inode %llu link_count=%u != dentry 引用数 %u",

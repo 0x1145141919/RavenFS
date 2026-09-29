@@ -68,19 +68,19 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
         mdata_piece_session root_sess(mdata_piece_mgr, root_blk);
         if (root_sess.index_error()) return RC_ERR_STATE;
         if (!root_sess) return RC_ERR_IO;
-        Bptree_dentry_leaf_node_t *rleaf = (Bptree_dentry_leaf_node_t*)root_sess.data;
+        Bptree_ddentry_leaf_node_t *rleaf = (Bptree_ddentry_leaf_node_t*)root_sess.data;
         memset(root_sess.data, 0, 8192);
         rleaf->meta.magics[0] = DENTRY_MAGIC1;
         rleaf->meta.magics[1] = DENTRY_MAGIC2;
         rleaf->meta.magics[2] = DENTRY_MAGIC3;
         rleaf->meta.magics[3] = DENTRY_MAGIC4;
-        rleaf->meta.parent_ptr.entry_count   = 0;
-        rleaf->meta.parent_ptr.is_inner_node = 0;
-        rleaf->meta.parent_ptr.is_root_node  = 1;
-        rleaf->meta.parent_ptr.ptr           = new_inum;   /* "." = 自身 inode */
-        rleaf->meta.ptrs[0].ptr = PTR_INVALID;
-        rleaf->meta.ptrs[1].ptr = owner_dir_inode;         /* ".." = 父目录 inode */
-        rleaf->meta.ptrs[2].ptr = PTR_INVALID;
+        RFS_PP_SET_COUNT(rleaf->meta.parent_ptr, 0);
+        RFS_PP_SET_IS_INNER(rleaf->meta.parent_ptr, 0);
+        RFS_PP_SET_IS_ROOT(rleaf->meta.parent_ptr, 1);
+        RFS_PP_SET_PTR(rleaf->meta.parent_ptr, new_inum);   /* "." = 自身 inode */
+        RFS_PTR_SET_ADDR(rleaf->meta.ptrs[0], PTR_INVALID);
+        RFS_PTR_SET_ADDR(rleaf->meta.ptrs[1], owner_dir_inode);         /* ".." = 父目录 inode */
+        RFS_PTR_SET_ADDR(rleaf->meta.ptrs[2], PTR_INVALID);
         root_sess.dirty();
 
         {
@@ -88,16 +88,16 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
             if (!ino_sess) return RC_ERR_IO;   /* guard 自动回滚 */
             raven_dir_Inode_t *dino = (raven_dir_Inode_t*)ino_sess.inode;
             memset(dino, 0, sizeof(raven_dir_Inode_t));
-            dino->type            = INODE_TYPE_DIR;
+            RFS_INO1_SET_TYPE(*dino, INODE_TYPE_DIR);
             dino->link_count      = 2;         /* = size + 2（size=0，§3.3） */
-            dino->permission_bits = 0755;
+            RFS_MODE_XATTR_SET(dino->mode_xattr, 0755, RFS_XATTR_NONE);
             dino->size            = 0;         /* 新目录无条目 */
             dino->data_root       = root_blk;  /* 恒有效（不变量 11） */
             /* 名字堆 10 描述符：未激活哨兵（memset 0 是雷 —— 0 是合法块号，
              * dir_name_heap_release 会误当激活堆释放 block 0/1 根块） */
             for (int i = 0; i < 10; i++) {
-                ((name_heap_controller_t *)&dino->heaps_8B_8k)[i].bitmap_base_block_ptr = NAME_HEAP_INACTIVE;
-                ((name_heap_controller_t *)&dino->heaps_8B_8k)[i].data_base_block_ptr   = NAME_HEAP_INACTIVE;
+                RFS_NHC_SET_BITMAP(((name_heap_controller_t *)&dino->heaps_8B_8k)[i], NAME_HEAP_INACTIVE);
+                RFS_NHC_SET_DATA(((name_heap_controller_t *)&dino->heaps_8B_8k)[i], NAME_HEAP_INACTIVE);
             }
             ino_sess.dirty();
         }
@@ -107,9 +107,9 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
         if (!ino_sess) return RC_ERR_IO;   /* guard 自动回滚 */
         raven_Inode_t *ino = ino_sess.inode;
         memset(ino, 0, sizeof(raven_Inode_t));   /* 全零：inline_data = 内联空文件 */
-        ino->type            = inode_type;
+        RFS_INO1_SET_TYPE(*ino, inode_type);
         ino->link_count      = 1;
-        ino->permission_bits = 0644;
+        RFS_MODE_XATTR_SET(ino->mode_xattr, 0644, RFS_XATTR_NONE);
         ino->data_root       = PTR_INVALID;   /* 内联空文件/软链，无数据块 */
         ino_sess.dirty();
     }
@@ -133,11 +133,11 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
     mdata_piece_session sess(mdata_piece_mgr, leaf_blk_base_idx);
     if (sess.index_error()) return RC_ERR_STATE;
     if (!sess) return RC_ERR_IO;
-    Bptree_dentry_leaf_node_t *leaf = (Bptree_dentry_leaf_node_t *)sess.data;
+    Bptree_ddentry_leaf_node_t *leaf = (Bptree_ddentry_leaf_node_t *)sess.data;
     if (!is_dentry_node(&leaf->meta)) return RC_ERR_STATE;
-    if (leaf->meta.parent_ptr.is_inner_node) return RC_ERR_STATE;
+    if (RFS_PP_IS_INNER(leaf->meta.parent_ptr)) return RC_ERR_STATE;
 
-    uint16_t count = (uint16_t)leaf->meta.parent_ptr.entry_count;
+    uint16_t count = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr);
     if (idx > count) return RC_ERR_STATE;
 
     uint64_t old_max_hash = (count > 0) ? leaf->entries[count - 1].hash : 0;
@@ -145,14 +145,14 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
     /* 挪出插入位置 */
     if (idx < count) {
         memmove(&leaf->entries[idx + 1], &leaf->entries[idx],
-                (count - idx) * sizeof(Dentry_t));
+                (count - idx) * sizeof(ddentry_t));
     }
 
     /* 填充新条目 */
-    Dentry_t *entry = &leaf->entries[idx];
+    ddentry_t *entry = &leaf->entries[idx];
     entry->hash = name->hash;
-    entry->inode_ptr.free_to_use = name->name_len;
-    entry->inode_ptr.ptr = name->inum;
+    RFS_PTR_SET_FREE(entry->inode_ptr, name->name_len);
+    RFS_PTR_SET_ADDR(entry->inode_ptr, name->inum);
     /* 前 40B（长名尾部在堆）。按 name_len 拷（≤40），剩余 [name_len,40) 清零——
      * 防源端越界读（name 字面量/短名 buffer 可能不足 40）；比较逻辑按
      * dentry_name_cmp 的 e_inline=min(len,40) 用，但清零保确定性。 */
@@ -164,7 +164,7 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
     entry->full_char_remain_ptr = name->full_char_remain_ptr;
 
     count++;
-    leaf->meta.parent_ptr.entry_count = count;
+    RFS_PP_SET_COUNT(leaf->meta.parent_ptr, count);
 
     /* 判定分裂需求 */
     if (count > 126)
@@ -229,18 +229,18 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_delete(
     mdata_piece_session sess(mdata_piece_mgr, leaf_blk_base_idx);
     if (sess.index_error()) return RC_ERR_STATE;
     if (!sess) return RC_ERR_IO;
-    Bptree_dentry_leaf_node_t *leaf = (Bptree_dentry_leaf_node_t *)sess.data;
+    Bptree_ddentry_leaf_node_t *leaf = (Bptree_ddentry_leaf_node_t *)sess.data;
     if (!is_dentry_node(&leaf->meta)) return RC_ERR_STATE;
-    if (leaf->meta.parent_ptr.is_inner_node) return RC_ERR_STATE;
+    if (RFS_PP_IS_INNER(leaf->meta.parent_ptr)) return RC_ERR_STATE;
 
-    uint16_t count = (uint16_t)leaf->meta.parent_ptr.entry_count;
+    uint16_t count = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr);
     if (idx >= count) return RC_ERR_STATE;
 
     /* ── 树删前：读下游资产信息（memmove 后条目移位不可再读） ──
      * ⚠ 52 位位域读出的 inum 与 PTR_INVALID 比较必须同样截断（64 位比较恒不相等）。
      * PTR_INVALID 悬空条目 = 历史过渡态/结构异常（只删树条目、跳过资产维护）。 */
     const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
-    const uint64_t inum = leaf->entries[idx].inode_ptr.ptr;
+    const uint64_t inum = RFS_PTR_ADDR(leaf->entries[idx].inode_ptr);
     const bool has_inode = (inum != PTR_INVALID_52) && inode_test(inum);
 
     /* ── dir 型目标：删除前置校验（目录必须全空），零副作用 ──
@@ -252,7 +252,7 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_delete(
     if (has_inode) {
         InodeSession tgt_sess(inode_cache_mgr, inum);
         if (!tgt_sess) return RC_ERR_IO;
-        tgt_type = tgt_sess.inode->type;
+        tgt_type = RFS_INO1_GET_TYPE(tgt_sess.inode->word1);
         if (tgt_type == INODE_TYPE_DIR) {
             dir_tree_root = tgt_sess.inode->data_root;
             if (dir_tree_root == PTR_INVALID) return RC_ERR_STATE;   /* 契约违反：dir 必有树根（不变量 11） */
@@ -261,8 +261,8 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_delete(
             if (!root_sess) return RC_ERR_IO;
             Bptree_meta_t *m = (Bptree_meta_t *)root_sess.data;
             if (!is_dentry_node(m)) return RC_ERR_STATE;
-            if (m->parent_ptr.is_inner_node)  return RC_ERR_NOT_EMPTY;
-            if (m->parent_ptr.entry_count != 0) return RC_ERR_NOT_EMPTY;
+            if (RFS_PP_IS_INNER(m->parent_ptr))  return RC_ERR_NOT_EMPTY;
+            if (RFS_PP_COUNT(m->parent_ptr) != 0) return RC_ERR_NOT_EMPTY;
         }
     }
 
@@ -272,14 +272,14 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_delete(
     /* 左移覆盖 */
     if (idx < count - 1) {
         memmove(&leaf->entries[idx], &leaf->entries[idx + 1],
-                (count - idx - 1) * sizeof(Dentry_t));
+                (count - idx - 1) * sizeof(ddentry_t));
     }
-    memset(&leaf->entries[count - 1], 0, sizeof(Dentry_t));
+    memset(&leaf->entries[count - 1], 0, sizeof(ddentry_t));
     count--;
-    leaf->meta.parent_ptr.entry_count = count;
+    RFS_PP_SET_COUNT(leaf->meta.parent_ptr, count);
 
     /* 欠载判定：非根且低于半满 63 */
-    bool is_root = leaf->meta.parent_ptr.is_root_node;
+    bool is_root = RFS_PP_IS_ROOT(leaf->meta.parent_ptr);
     if (!is_root && count < 63)
         result_flags |= 1u;
 

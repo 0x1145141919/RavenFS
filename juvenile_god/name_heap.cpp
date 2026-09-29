@@ -101,7 +101,7 @@ result_code_t RavenFS_juvenile::name_heap_activate(raven_dir_Inode_t *dino, uint
     (void)dir_inode_idx;   /* 写回由调用方 session 负责，本函数只填充控制器 */
     if (!dino || slot >= 10) return RC_ERR_STATE;
     name_heap_controller_t *ctrl = (name_heap_controller_t *)&dino->heaps_8B_8k + slot;
-    if (ctrl->bitmap_base_block_ptr != NAME_HEAP_INACTIVE) return RC_OK;   /* 已激活 */
+    if (RFS_NHC_BITMAP(*ctrl) != NAME_HEAP_INACTIVE) return RC_OK;   /* 已激活 */
 
     const uint8_t gran_log2  = kGranLog2[slot];
     const uint8_t bits_log2  = kBitsLog2[slot];
@@ -129,10 +129,10 @@ result_code_t RavenFS_juvenile::name_heap_activate(raven_dir_Inode_t *dino, uint
         sess.dirty();
     }
 
-    ctrl->bytes_per_bit_log2      = gran_log2;
-    ctrl->total_bits_count_log2   = bits_log2;
-    ctrl->bitmap_base_block_ptr   = bmp_base;
-    ctrl->data_base_block_ptr     = data_base;
+    RFS_NHC_SET_GRAN(*ctrl, gran_log2);
+    RFS_NHC_SET_BITS(*ctrl, bits_log2);
+    RFS_NHC_SET_BITMAP(*ctrl, bmp_base);
+    RFS_NHC_SET_DATA(*ctrl, data_base);
     return RC_OK;   /* 调用方 session dirty 落盘 */
 }
 
@@ -152,7 +152,7 @@ result_code_t RavenFS_juvenile::name_heap_alloc(uint64_t dir_inode_idx, uint16_t
     InodeSession ino_sess(inode_cache_mgr, dir_inode_idx);
     if (!ino_sess) return RC_ERR_IO;
     raven_dir_Inode_t *dino = (raven_dir_Inode_t *)ino_sess.inode;
-    if (dino->type != INODE_TYPE_DIR) return RC_ERR_STATE;
+    if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR) return RC_ERR_STATE;
 
     uint16_t units = 0;
     uint8_t  gran_log2 = 0;
@@ -163,7 +163,7 @@ result_code_t RavenFS_juvenile::name_heap_alloc(uint64_t dir_inode_idx, uint16_t
     for (uint16_t s = slot_lo; s < slot_hi; s++) {
         name_heap_controller_t *ctrl = (name_heap_controller_t *)&dino->heaps_8B_8k + s;
 
-        if (ctrl->bitmap_base_block_ptr == NAME_HEAP_INACTIVE) {
+        if (RFS_NHC_BITMAP(*ctrl) == NAME_HEAP_INACTIVE) {
             /* 懒激活：失败（空间不足）直接返回——同粒度下一档容量更大，不可能成功 */
             result_code_t rc = name_heap_activate(dino, s, dir_inode_idx);
             if (rc != RC_OK) return rc;
@@ -171,14 +171,14 @@ result_code_t RavenFS_juvenile::name_heap_alloc(uint64_t dir_inode_idx, uint16_t
             ctrl = (name_heap_controller_t *)&dino->heaps_8B_8k + s;   /* 同 session 内存，指针稳定 */
         }
 
-        const uint64_t bits_log2 = ctrl->total_bits_count_log2;
+        const uint64_t bits_log2 = RFS_NHC_BITS(*ctrl);
         const uint64_t total_bits = heap_total_bits((uint8_t)bits_log2);
         const uint64_t bmp_blks = heap_bmp_blocks((uint8_t)bits_log2);
 
         /* 分片载入位图到栈缓冲（≤32KB = 4 片），绑定 bitmap_base 视图 */
         alignas(uint64_t) uint8_t bmp[32768];
         for (uint64_t p = 0; p < bmp_blks / 2; p++) {
-            mdata_piece_session sess(mdata_piece_mgr, ctrl->bitmap_base_block_ptr + p * 2);
+            mdata_piece_session sess(mdata_piece_mgr, RFS_NHC_BITMAP(*ctrl) + p * 2);
             if (sess.index_error()) return RC_ERR_STATE;
             if (!sess) return RC_ERR_IO;
             memcpy(bmp + p * 8192, sess.data, 8192);
@@ -196,7 +196,7 @@ result_code_t RavenFS_juvenile::name_heap_alloc(uint64_t dir_inode_idx, uint16_t
             const uint64_t lo = p * BITS_PER_PIECE;
             const uint64_t hi = lo + BITS_PER_PIECE;
             if (bit_start < hi && bit_start + units > lo) {
-                mdata_piece_session sess(mdata_piece_mgr, ctrl->bitmap_base_block_ptr + p * 2);
+                mdata_piece_session sess(mdata_piece_mgr, RFS_NHC_BITMAP(*ctrl) + p * 2);
                 if (sess.index_error()) return RC_ERR_STATE;
                 if (!sess) return RC_ERR_IO;
                 memcpy(sess.data, bmp + p * 8192, 8192);
@@ -206,7 +206,7 @@ result_code_t RavenFS_juvenile::name_heap_alloc(uint64_t dir_inode_idx, uint16_t
 
         /* 物理定位：byte_off = bit_start × 粒度，连续落在数据面内 */
         const uint64_t byte_off = bit_start << gran_log2;
-        out->fblk   = ctrl->data_base_block_ptr + (byte_off >> 12);
+        out->fblk   = RFS_NHC_DATA(*ctrl) + (byte_off >> 12);
         out->offset = (uint16_t)(byte_off & 0xFFF);
         out->slot   = (uint8_t)s;
         return RC_OK;
@@ -240,28 +240,28 @@ result_code_t RavenFS_juvenile::name_heap_free(uint64_t dir_inode_idx, uint16_t 
     InodeSession ino_sess(inode_cache_mgr, dir_inode_idx);
     if (!ino_sess) return RC_ERR_IO;
     raven_dir_Inode_t *dino = (raven_dir_Inode_t *)ino_sess.inode;
-    if (dino->type != INODE_TYPE_DIR) return RC_ERR_STATE;
+    if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR) return RC_ERR_STATE;
 
     for (uint16_t s = slot_lo; s < slot_hi; s++) {
         name_heap_controller_t *ctrl = (name_heap_controller_t *)&dino->heaps_8B_8k + s;
-        if (ctrl->bitmap_base_block_ptr == NAME_HEAP_INACTIVE) continue;   /* 未激活 */
+        if (RFS_NHC_BITMAP(*ctrl) == NAME_HEAP_INACTIVE) continue;   /* 未激活 */
 
-        const uint64_t data_blks = heap_data_blocks((uint8_t)ctrl->total_bits_count_log2,
-                                                    (uint8_t)ctrl->bytes_per_bit_log2);
-        if (blk < ctrl->data_base_block_ptr ||
-            blk >= ctrl->data_base_block_ptr + data_blks) continue;   /* 不在本堆数据区 */
+        const uint64_t data_blks = heap_data_blocks((uint8_t)RFS_NHC_BITS(*ctrl),
+                                                    (uint8_t)RFS_NHC_GRAN(*ctrl));
+        if (blk < RFS_NHC_DATA(*ctrl) ||
+            blk >= RFS_NHC_DATA(*ctrl) + data_blks) continue;   /* 不在本堆数据区 */
 
         /* 命中：反推 bit 区间并清位（按片载入 → 视图 → 区间清位 → 写回） */
-        const uint64_t byte_off = (blk - ctrl->data_base_block_ptr) * 4096 + offset;
-        const uint64_t bit_start = byte_off >> ctrl->bytes_per_bit_log2;
-        const uint64_t bits_log2 = ctrl->total_bits_count_log2;
+        const uint64_t byte_off = (blk - RFS_NHC_DATA(*ctrl)) * 4096 + offset;
+        const uint64_t bit_start = byte_off >> RFS_NHC_GRAN(*ctrl);
+        const uint64_t bits_log2 = RFS_NHC_BITS(*ctrl);
         const uint64_t bmp_blks = heap_bmp_blocks((uint8_t)bits_log2);
 
         for (uint64_t p = 0; p < bmp_blks / 2; p++) {
             const uint64_t lo = p * BITS_PER_PIECE;
             const uint64_t hi = lo + BITS_PER_PIECE;
             if (bit_start < hi && bit_start + units > lo) {
-                mdata_piece_session sess(mdata_piece_mgr, ctrl->bitmap_base_block_ptr + p * 2);
+                mdata_piece_session sess(mdata_piece_mgr, RFS_NHC_BITMAP(*ctrl) + p * 2);
                 if (sess.index_error()) return RC_ERR_STATE;
                 if (!sess) return RC_ERR_IO;
                 bitmap_base view;
@@ -352,22 +352,22 @@ result_code_t RavenFS_juvenile::dir_name_heap_release(uint64_t inode_idx)
     InodeSession ino_sess(inode_cache_mgr, inode_idx);
     if (!ino_sess) return RC_ERR_IO;
     raven_dir_Inode_t *dino = (raven_dir_Inode_t *)ino_sess.inode;
-    if (dino->type != INODE_TYPE_DIR) return RC_ERR_STATE;
+    if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR) return RC_ERR_STATE;
 
     bool changed = false;
     for (uint16_t s = 0; s < 10; s++) {
         name_heap_controller_t *ctrl = (name_heap_controller_t *)&dino->heaps_8B_8k + s;
-        if (ctrl->bitmap_base_block_ptr == NAME_HEAP_INACTIVE) continue;   /* 未激活 */
+        if (RFS_NHC_BITMAP(*ctrl) == NAME_HEAP_INACTIVE) continue;   /* 未激活 */
 
-        const uint8_t bits_log2 = (uint8_t)ctrl->total_bits_count_log2;
-        const uint8_t gran_log2 = (uint8_t)ctrl->bytes_per_bit_log2;
+        const uint8_t bits_log2 = (uint8_t)RFS_NHC_BITS(*ctrl);
+        const uint8_t gran_log2 = (uint8_t)RFS_NHC_GRAN(*ctrl);
         const uint64_t bmp_blks  = heap_bmp_blocks(bits_log2);
         const uint64_t data_blks = heap_data_blocks(bits_log2, gran_log2);
 
         /* 全空判定：位图面全部字节 == 0（无任何分配单元） */
         bool empty = true;
         for (uint64_t p = 0; p < bmp_blks / 2 && empty; p++) {
-            mdata_piece_session sess(mdata_piece_mgr, ctrl->bitmap_base_block_ptr + p * 2);
+            mdata_piece_session sess(mdata_piece_mgr, RFS_NHC_BITMAP(*ctrl) + p * 2);
             if (sess.index_error()) return RC_ERR_STATE;
             if (!sess) return RC_ERR_IO;
             const uint64_t *w = (const uint64_t *)sess.data;
@@ -377,12 +377,12 @@ result_code_t RavenFS_juvenile::dir_name_heap_release(uint64_t inode_idx)
         if (!empty) continue;
 
         /* 归还 + 重置哨兵 */
-        block_free(ctrl->bitmap_base_block_ptr, bmp_blks);
-        block_free(ctrl->data_base_block_ptr, data_blks);
-        ctrl->bitmap_base_block_ptr = NAME_HEAP_INACTIVE;
-        ctrl->data_base_block_ptr   = NAME_HEAP_INACTIVE;
-        ctrl->bytes_per_bit_log2    = 0;
-        ctrl->total_bits_count_log2 = 0;
+        block_free(RFS_NHC_BITMAP(*ctrl), bmp_blks);
+        block_free(RFS_NHC_DATA(*ctrl), data_blks);
+        RFS_NHC_SET_BITMAP(*ctrl, NAME_HEAP_INACTIVE);
+        RFS_NHC_SET_DATA(*ctrl, NAME_HEAP_INACTIVE);
+        RFS_NHC_SET_GRAN(*ctrl, 0);
+        RFS_NHC_SET_BITS(*ctrl, 0);
         changed = true;
     }
     if (changed) ino_sess.dirty();   /* 控制器重置落盘 */
