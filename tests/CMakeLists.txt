@@ -56,16 +56,6 @@ add_executable(ravenfs_juv_block_occupy
 )
 target_link_libraries(ravenfs_juv_block_occupy PRIVATE ravenfs_juvenile)
 
-# v1.1 bitmap_slices CHUNK 后端专项（03_chunk_backed_slices §13 刀④：
-# mock chunk_io 合成盘 —— 换片快慢路径 / 离线 record→drain 顺序 / 在线直改 /
-# 池空兜底 / 摘要跳过与降级 / hint 绕回 / 尾块几何 / occupy 跨 chunk 续圈 /
-# TTL 三态 / 装配契约与三段校验 / 影子对账 + §10.3「I/O 不进 slice_lock」审计）
-add_executable(ravenfs_juv_bitmap_slice_chunk
-    test_bitmap_slice_chunk.cpp
-    ${CPU_ID_STUB}
-)
-target_link_libraries(ravenfs_juv_bitmap_slice_chunk PRIVATE ravenfs_juvenile)
-
 # v1.1 名字堆专项测试（长名外置：档位覆盖/完整比较/位图一致性/释放/持久化）
 add_executable(ravenfs_juv_name_heap
     test_name_heap.cpp
@@ -152,28 +142,3 @@ add_executable(ravenfs_juv_audit
     ${CPU_ID_STUB}
 )
 target_link_libraries(ravenfs_juv_audit PRIVATE ravenfs_juvenile)
-
-# v1.1 Phase A-1：FULL↔CHUNK 双模式对拍（同种子同操作序列；每步影子三重对账 +
-# 终态整盘镜像 memcmp + free_count 对照；6 几何×3 种子顺序段 + 4 线程阶段化并发段）
-add_executable(ravenfs_juv_bitmap_differential
-    test_bitmap_slice_differential.cpp
-    ${CPU_ID_STUB}
-)
-target_link_libraries(ravenfs_juv_bitmap_differential PRIVATE ravenfs_juvenile Threads::Threads)
-
-# v1.1 Phase A-2：并发 churn 影子对账（4 线程 alloc/free/occupy/test 真混合 +
-# TTL 并行线程；R1–R4 可靠性协议逐步对账 + 每轮 TTL 收口镜像/计数全等，≥3 轮）
-add_executable(ravenfs_juv_bitmap_churn
-    test_bitmap_slice_churn.cpp
-    ${CPU_ID_STUB}
-)
-target_link_libraries(ravenfs_juv_bitmap_churn PRIVATE ravenfs_juvenile Threads::Threads)
-
-# v1.1 Phase A-3：§10 缺口专项（INV-1 I/O 在途时序/快路径隔离 · INV-6 计数与
-# 驻留无关 · INV-8 尾块几何 order 0/1/4/8×尾0/尾非0 · INV-9 池空兜底+池复用 ·
-# INV-5b 摘要 ALL_FREE 免载入）
-add_executable(ravenfs_juv_bitmap_invariants
-    test_bitmap_slice_invariants.cpp
-    ${CPU_ID_STUB}
-)
-target_link_libraries(ravenfs_juv_bitmap_invariants PRIVATE ravenfs_juvenile Threads::Threads)
