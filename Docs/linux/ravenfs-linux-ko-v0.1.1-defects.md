@@ -15,8 +15,12 @@
 | **D-2** | **位图分片器全量常驻（80MB），内存浪费 + 30s 全量回写** | 内存/写放大 | 中（对 SparrowOS 目标机为硬伤） | 仅设计 + god 原型（`Docs/runtime_tech/03_*.md`） |
 | **D-3** | **mount / umount 时间戳不回写** | 正确性（元数据） | 低-中 | WIP 未提交（`linux/super.c` 工作区 +180 行） |
 | **D-4** | **O_DIRECT（`direct_IO`）故意留白 → `open(O_DIRECT)` 被拒** | 能力缺口（设计级留白） | 低（实验期）→ 中（长期通用） | **mainline 有意不做**（R-FD-10「可降级」） |
+| **D-5** | **ko 移植时降级：丢掉 god 的叶内 extent 融合（四形态）→ 写请求粒度即碎片** | 功能缺失（移植降级） | 中（元数据膨胀 / 读放大 / 回收负担） | **ko 无对等实现**（仅「出口坍缩」单条特例；**god 侧已完备**） |
+| **D-6** | **inline→extent 不试 direct：>160B 文件恒背 8K 区段树节点（单 extent 也背）** | 元数据膨胀（实现缺口） | 中 | ko 无（`iomap.c:195` 恒建树；direct 仅 truncate 坍缩） |
+| **D-7** | **分配 hint 不持久化：每次 mount 重置到片首 → 低地址被反复复用** | 局部性 / 恢复友好度（实现缺口） | 中 | ko 无（hint 从不落盘） |
+| **D-8** | **元数据与数据共用分配 hint：区段树叶插进数据流 → 自噬式碎片（2 块洞）** | 碎片放大（分配器耦合） | 中 | ko 无（同一 block 分配器/hint） |
 
-> **两类性质，勿混**：**D-1~D-3 = “发布落后 mainline”**（mainline 已有修复，未进包）；**D-4 = mainline 的“有意留白 / 能力缺口”**（非发布落后）。
+> **四类性质，勿混**：**D-1~D-3 = “发布落后 mainline”**（mainline 已有修复，未进包）；**D-4 = “有意留白 / 能力缺口”**（非发布落后）；**D-5 = 移植降级**（god 有完整实现，ko 移植时丢掉）；**D-6~D-8 = ko 实现/分配器层缺口**（D-6/7 迁移与持久化，D-8 为元数据/数据分配器耦合）。
 > D-1 与 D-2 有交集（D-2 的 CHUNK 后端需要 D-1 的计数器做 A/B 判据，见 counters 设计 §3.F）。
 
 ---
@@ -134,7 +138,102 @@ state  : 从未挂载（或挂载路径未回写时间戳）
 
 ---
 
-## 发布建议（D-1~D-3 的统一出口；D-4 另论）
+## D-5 ko 移植降级：丢掉 god 的**叶内 extent 融合**（四形态）→ 碎片化
+
+**现象**：v0.1.1-1 的 ko **不做任何相邻 extent 融合**——每个写请求（及其覆盖的洞）独立成一条 extent，即使**逻辑紧贴 + phys 连续**也不合并。god（用户态）有「**叶内融合四形态**」。结果：一份 `cp` 拷入的 32.5 GiB 文件产生 **133351 条 64 块（256 KiB）extent**。
+
+**证据（本次会话实测真实盘 `/mnt/huge_data`）**
+- `ravenfs-vm-disks/root-ext4.qcow2`（ino **23003140**，size `34957164544`）：**133351 条 extent，条条 `len=64`（=256 KiB）**；逻辑零洞、物理 1042 段；段间 **775 个洞恰为 2 块（8 KiB）** —— 即该文件 **extent 树的叶节点被插进了数据流**（首叶 `blk=91866244` 正落在首个 2 块洞）。
+- **256 KiB 写粒度来自 coreutils `cp`**（`IO_BUFSIZE = 256*1024`，`src/ioblksize.h`）；ko `ravenfs_iomap_begin_write` 洞分配 `cnt = hole_end - blk` → **extent 长 = 写请求长**。
+- **打包源** `/usr/src/ravenfs-0.1.1/linux/extent_write.c:14`：「**无四形态融合：与既有 extent 紧贴承载 phys 连续时不自动合并（v1 允许碎片，交后续收敛）**」；`ravenfs_extent_insert`（636 行起）仅左右邻**重叠防御**，无合并分支。
+- ko 唯一的写回期收敛 = `linux/file.c:568` **`rfs_extent_try_collapse`**（出口坍缩）：**根叶 && count==1 && 单条覆盖 [0,ceil)** → 缩 direct。多条文件（本例 133k 条）**永不触发**（`cnt != 1` 直接 return）。
+
+**god 应有形态（真值源：`juvenile_god/extent_map_unmap.cpp:92` `RavenFS_juvenile::extent_map_range`）**
+- **叶内融合四形态**（2026-09-07 完备）：`none` 纯插 / `left` 扩 GLB 尾 / `right` 并入右邻头 / `both` GLB 扩长吞右邻（count−1）。
+- 判定：`L = (GLB.fblkbase+GLB.length == ext.fblkbase) && (GLB.block_base.ptr+GLB.length == ext.block_base.ptr)`；`R` 同构（**紧贴 + phys 连续**）。
+- **刻意不跨节点**：`L/R` **均为叶内判定**，源码注释「**跨界一律不做（L/R 均为叶内判定）**」——融合只做「同叶」这一层，跨叶紧贴保持分离。
+- 融合在 **pwrite 管线的统一写回点**（phase2 map）随插入自然发生（`Docs/pwrite_pipeline.md` §2；演进：`7bde35c` 降级为纯插 → `2bfda89` 左融合 + 激进重建 → `35f1158` 叶内四形态完备）。
+
+**影响**：ko 同 workload 下**碎片数 ≈ 写请求数**（本例 133k 条，god 叶内融合后应大幅收敛）；**元数据膨胀**（本例 ≈ 794 叶 × 8K ≈ **6.2 MiB** 只为描述一份几乎连续的 32 GiB 文件）、**读放大**（每 256 KiB 跨一条树记录）、**回收/恢复的元数据负担**上升。
+> 附注：对**数据恢复（内容雕复）**而言，细粒度映射反而更友好（局部覆盖最多丢 256 KiB 单元）——这是同一设计的双面。
+
+**mainline 状态**：**ko 无对等实现** —— `linux/extent_write.c:14` 明确留白「**交后续收敛**」，后续只落了单条特例「出口坍缩」（`file.c:568`）；**god 侧已完备**。→ **修复 = 把 god 的叶内四形态（不跨界）移植进 ko 的 map 路径**（顺带：`hint` 持久化，避免每次 mount 从片首重开吃——见会话记录）。
+
+**现场验证（同日 09-29/09-30 恢复实验）**
+
+- **Lv1（元数据）= 几乎全灭**：删掉的 `GTAV Source.rar`（size `5965527705`）在根 dentry 无条目、inode `size` 精确指纹扫描 **0 命中** → inode 槽已被回收/清零。
+- **Lv2（数据）= 基本全可雕复**：以 `~/Downloads` 完整件做 4K 块指纹，全盘 1.79 TiB 命中 **1456379/1456428 = 100.00%**；重建件与原件等长，`cmp` 差异 **200407 B = 0.0034%（仅 49 块）**。4K 落点：1 孤立 @128.5MB、**30 块 @逻辑块 395553–395611「严格隔块」（8K 周期簇，正是 D-5 的树–数据交错同源现象）**、18 块 @5.70–5.79GB 三段。
+- **时间线（GMT+8，打捞自 OpenClaw 原始 session `5db354d8`/`477c1faf`）**：
+  - `09-29 15:37:26` 用户**声明**把 gta5 源码/权重移到 ravenfs（“安全的地方”）；`15:38:20–15:39:08` 执行 `PS_git/GTAV Source.rar → /mnt/huge_data/GTAV Source.rar`。
+  - `09-29 16:16:26 → ~16:37` **刻意在 ravenfs 上跑 `makepkg -si` / `make all -j22` 全量内核编译（linux-7.2.6，树在软链的 `/mnt/huge_data/custom-kernel/…`）**（压测 ravenfs；实测写 ~31 MB/s）。
+  - `09-29 17:28:53` 打开解包源码 `/mnt/huge_data/GTAV Source/GTAV Source/`（19G）。
+  - `09-29 23:30` 恢复实验启动；`09-30 00:02` 全量 100% 命中；`09-30 00:28` cmp 差异 200407 B。
+- **因果**：删除后同日大量写入 ravenfs（19G 解包 + 16:16–16:37 全量内核编译）复用被归还块 → 造成上述 49 块丢失。
+
+**关联**：`Docs/pwrite_pipeline.md` §2；`Docs/lesson_map_fusion_antikiss.md`（融合反 KISS 事故 + 降级史）；`juvenile_god/extent_map_unmap.cpp:92`（四形态真值）；`linux/extent_write.c:14` · `linux/file.c:568`（ko 现状）。
+
+---
+
+## D-6 inline→extent 迁移不试 direct：>160B 文件恒背 8K 区段树节点
+
+**现象**：任何长过 160B 的文件（无论最终几条 extent）**都带一个 8K 区段树根叶节点**；即便它就是一条连续 extent、本该走「direct 零节点最优路径」。实测（`fs/ecryptfs/`，`stat`）：
+
+| 文件 | size | 实占 | 拆解 |
+|---|---|---|---|
+| `dentry.c` | 2003B | **12K** | 1 块数据(4K) + 2 块树节点(8K) |
+| `debug.c` | 2963B | **12K** | 1 + 2 |
+| `kthread.c` | 4382B | **16K** | 2 + 2 |
+| `super.c` | 5728B | **16K** | 2 + 2 |
+| `read_write.c` | 8157B | **16K** | 2 + 2 |
+
+> 规律：**+8K/文件**，与 extent 条数无关。4K 数据的文件 → 实占 12K（3×）。
+
+**证据（打包源）**
+- `iomap.c:195 ravenfs_write_migrate_inline` 结尾写死 `RFS_INO1_SET_DIRECT(*r, 0); r->data_root = root;`——**inline 跨 160 一律建树，从不建 direct**。
+- 全 ko **唯一 `direct=1`** 在 `file.c:439`（`rfs_commit_inode`，`new_direct?1:0`）；其**唯一 `new_direct=1` 调用者** = `file.c:568 rfs_extent_try_collapse`（出口坍缩），只在 **truncate/setattr「出口 3」**（`file.c:888`）触发。
+- 即 **extent→direct 提升只发生在 truncate**；cp/make 生成的「一路 grow、从不 truncate」文件**永远停在区段树**。
+
+**影响**：小文件元数据 2–3×（4K 数据 → 12K 实占）；内核源码树 8 万文件量级 ≈ **数百 MB 纯树节点**；`du` 严重失真。
+
+**应有形态**（不变量 24：direct = 单条连续、零树节点的最优路径）：inline→外置时若**可连续分配**就直接落 direct；否则至少给写路径补一个「单条覆盖 → 坍缩 direct」。
+
+**mainline**：ko 无对等实现；修复 = 迁移/增长时先试 direct，或补写期单条坍缩。
+
+---
+
+## D-7 分配 hint 不持久化：每次 mount 重置到片首
+
+**现象**：位图分配游标 `hint` **纯内存、从不落盘**；每次挂载按 slice 初始化 `hint = (CHUNK)?0:base` 归零 → **每个挂载周期分配从片首重开**。
+
+**证据**
+- `bitmap.c` 所有 hint 写点（352 初始化 / 401·490·1104·1133 alloc / 540·1190 occupy）**没有一个在 free 路径**；`hint` 在**整个 ko 只出现于 `bitmap.c`**（`super.c` 零出现）→ 无持久化入口。
+- free 只清位 + `free_count++`（“只进不退”注释在 occupy，不在 free）。
+
+**影响**
+- **低地址区被反复优先复用**（跨挂载“热点”）→ 越靠片首的数据越先被回首（对“删除后残存”是负面）；本次 `GTAV` 的 18 块尾部丢失即此模型的实证方向。
+- 跨挂载空间局部性意图落空（重启后从头开吃）。
+
+**应有形态**：hint 持久化（SB/backup 专字段或 slice 表），挂载时从上次位置续。
+
+**mainline**：无。
+
+---
+
+## D-8 元数据与数据共用分配 hint：区段树叶插进数据流（自噬式碎片）
+
+**现象**：文件**数据**与它的**区段树节点**走**同一个 block 分配器 / 同一个 hint** → 树节点（8K = 2 块）被夹进数据流，把数据**打出一串 2 块洞**。
+
+**证据**：`ravenfs-vm-disks/root-ext4.qcow2`（ino 23003140）区段统计：1042 个物理段、**775 个洞恰为 2 块（8K）**；其首叶 `blk=91866244` **正落在首个 2 块洞**（与 D-5 的 13.3 万条 64 块 extent 是同一全局现象的两面）。
+
+**影响**：物理连续性被自身元数据破坏；碎片计数放大；**恢复时呈“隔块丢失”**（本次 `GTAV` 的 30 块 8K 周期簇即此）。
+
+**应有形态**：元数据分配与数据分配**分离 hint**（或节点分配不与数据流共用前移游标）。
+
+**mainline**：无。
+
+---
+
+## 发布建议（D-1~D-3 的统一出口；D-4~D-8 另论）
 
 D-1~D-3 的共同点是：**mainline 已有部分/全部修复，但都没进发布包**。因此：
 
@@ -142,6 +241,8 @@ D-1~D-3 的共同点是：**mainline 已有部分/全部修复，但都没进发
 2. **D-1**：随下一版**重打包发布**（版本升号按行为级变更），并跑 counters 设计 §10 的 6 条判据（尤其 debugfs UAF 与开销 <2%）。
 3. **D-2**：**跟 god 的 CHUNK A/B 结论**再决定 ko 是否默认切 CHUNK（当前保持 FULL 保底）；无论切不切，先把**脏标记**（去掉 30s 全量回写）这类低风险改进纳入考量。
 4. **D-4（非发布动作）**：**backlog 立项** + 补**出口条件**（见该节）；实现走 iomap 现成件，同时统一 errno 口径并保持 loud。
-5. 版本纪律：以上任一**行为级**变更 → **`pkgver` 升号**（对齐 `acc9e20` 惯例），否则 DKMS 不重编、`pacman -U` 同版本不生效。
+5. **D-5（非发布动作 / 功能补齐）**：把 **god 的叶内四形态融合（刻意不跨界）** 移植进 ko 的 `ravenfs_iomap_begin`/`extent_insert` 路径；单测须覆盖「同叶紧贴 + phys 连续」四形态与「跨叶紧贴**不**融合」两条边界（后者正是 god 的既有语义）。
+6. **D-6/D-7/D-8（非发布动作 / 结构改进）**：① inline→外置试 direct（消掉小文件 8K 税，D-6）；② hint 持久化（D-7）；③ 元数据与数据**分离分配游标**（D-8）。三项都可先在 god 侧原型 + A/B 再定 ko 移植。
+7. 版本纪律：以上任一**行为级**变更 → **`pkgver` 升号**（对齐 `acc9e20` 惯例），否则 DKMS 不重编、`pacman -U` 同版本不生效。
 
 > 备注：D-1 的设计真值文档已随 linux-ko 工作文档退役（`0860fad`），需要时从 git 取回：`git show a358cc0:Docs/linux/ravenfs-linux-ko-sb-counters-design.md`。
