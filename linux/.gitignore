@@ -1,0 +1,5 @@
+# Arch 打包产物（makepkg 就地运行于本目录，PKGBUILD 已升格至此）
+pkg/
+src/
+*.pkg.tar.zst
+*.pkg.tar.zst.sig

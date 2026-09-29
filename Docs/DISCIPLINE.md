@@ -19,7 +19,7 @@
 
 ## 子项目局部纪律
 
-- **linux 端（内核模块 `ravenfs.ko`）**：`Docs/linux/LINUX_KO_DISCIPLINE.md`（三层约束 / 小步快跑 / 本子项目红线；由已退役的 linux-ko 验收纲领 §0 降级提取）。
+- **linux 端（内核模块 `ravenfs.ko`）**：**存在形式**（pacman 包锚点，只部署源代码+构建脚本）见 `linux/README.md`；**局部纪律**（三层约束 / 小步快跑 / 上线闸门 guest→实体机 / 红线）见 `Docs/linux/LINUX_KO_DISCIPLINE.md`。
 
 ## 待补充领域
 
