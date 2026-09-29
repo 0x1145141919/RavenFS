@@ -14,8 +14,10 @@
 | **D-1** | **无 sb 级性能计数器 / 无 debugfs 出口** | 可观测性 | 中 | 代码已落（`a358cc0`），**未随包发布** |
 | **D-2** | **位图分片器全量常驻（80MB），内存浪费 + 30s 全量回写** | 内存/写放大 | 中（对 SparrowOS 目标机为硬伤） | 仅设计 + god 原型（`Docs/runtime_tech/03_*.md`） |
 | **D-3** | **mount / umount 时间戳不回写** | 正确性（元数据） | 低-中 | WIP 未提交（`linux/super.c` 工作区 +180 行） |
+| **D-4** | **O_DIRECT（`direct_IO`）故意留白 → `open(O_DIRECT)` 被拒** | 能力缺口（设计级留白） | 低（实验期）→ 中（长期通用） | **mainline 有意不做**（R-FD-10「可降级」） |
 
-> 三条互相独立；D-1 与 D-2 有交集（D-2 的 CHUNK 后端需要 D-1 的计数器做 A/B 判据，见 counters 设计 §3.F）。
+> **两类性质，勿混**：**D-1~D-3 = “发布落后 mainline”**（mainline 已有修复，未进包）；**D-4 = mainline 的“有意留白 / 能力缺口”**（非发布落后）。
+> D-1 与 D-2 有交集（D-2 的 CHUNK 后端需要 D-1 的计数器做 A/B 判据，见 counters 设计 §3.F）。
 
 ---
 
@@ -38,7 +40,7 @@
 
 **mainline 状态**
 - 代码**已落**：`a358cc0`（98 字段 + debugfs `stats` + 位图 FULL/CHUNK 双后端打点），`super.c`/`ravenfs.h` 可见 `ravenfs_sb_stats`、`RFS_STAT_INC`、`debugfs_create_dir/file("stats", 0444)`。
-- **未随包发布** → 修复动作 = **重打包发布**（版本纪律见 packaging）。
+- **未随包发布** → 修复动作 = **重打包发布**（版本纪律：`linux/PKGBUILD` 的 `pkgver` 单源）。
 
 **验收判据**（设计 §10）：形状（字段全 / `life_mount==1`）、单调性、派生自洽（`bm_alloc_ok+bm_alloc_fail==bm_alloc_calls`）、生命周期安全（反复 mount/umount + 并发 cat 无 UAF）、行为零变化、开销 < 2%。
 
@@ -107,13 +109,39 @@ state  : 从未挂载（或挂载路径未回写时间戳）
 
 ---
 
-## 发布建议（三条的统一出口）
+## D-4 O_DIRECT 故意留白（设计级留白 · 能力缺口）
 
-三条的共同点是：**mainline 已有部分/全部修复，但都没进发布包**。因此：
+**现象**：`open(O_DIRECT)` 被拒——`ravenfs_aops`（iomap 家族）**无 `.direct_IO`**，VFS 在 `fs/open.c` 直接返 `-EINVAL`（**不经过 write**）；另有 `linux/iomap.c:296` 的 `if (flags & IOMAP_DIRECT) return -EOPNOTSUPP` 作兜底。
+
+**定性（关键：与 D-1~D-3 不同类）**
+- **不是正确性缺陷**：loud 拒绝（**绝不**静默走 page cache）、有先例（**ext2 无 `direct_IO`**）、是已裁的「可降级」项（R-FD-10，优先级 C）——符合第二约束「顺位 2 降级功能」。
+- **是能力缺口（capability gap）**：长期“通用使用”下 O_DIRECT 是**真实用户态用法**（PostgreSQL / MySQL `innodb_flush_method=O_DIRECT`、`dd oflag=direct`、qemu-img/libvirt 部分路径、备份/基准工具）。
+
+**为什么“长期”就不再是合规留白**
+1. **降级的合理性基础已消失**：留白原因为 M4 早期**未接 iomap**；现 `ravenfs_aops` **已是 iomap 家族**，而 iomap direct IO 是**内核成熟框架现成件**（`iomap_dio_rw` + `iomap_dio_ops`）→ 按第二约束「框架优先」，**关掉它才是“照抄框架”**，留着反成“逆框架”。
+2. **成本不对称**：iomap 就位后，补 O_DIRECT ≈ 接线（对齐 / 短读 / 串行化为标准细节），**边际成本低、收益（用户态覆盖 = 第一约束广度）明确**。
+3. **缺出口条件**：第二条边界要求“降级要有退出条件”，而本条**没有触发判据**——这是它真正的缺口。
+
+**必须守的边界（否则会从“缺口”滑成“真缺陷”）**
+1. **永远 loud**：不得改成“接受 O_DIRECT 但偷走 page cache”——那才是静默语义违反（真缺陷）。
+2. **errno 口径统一**：现两处不一致——`fs/open.c` 给 `-EINVAL`，`iomap.c:296` 给 `-EOPNOTSUPP`；按 ext4/xfs 惯例**选一个**（用户态对两者反应不同）。
+
+**方向 / 出口**
+- 实现：挂 `iomap_dio_rw` + `iomap_dio_ops`（框架现成件，“照抄”路径，非“自创”）。
+- 出口条件（待补）：如“声称通用 root FS / 出现真实 O_DIRECT workload 且其失败不可接受”时 → 必须实现。
+
+**mainline 状态**：**有意不做**（D-M4-5 后置，R-FD-10 标 C/可降级）；**非**发布落后。
+
+---
+
+## 发布建议（D-1~D-3 的统一出口；D-4 另论）
+
+D-1~D-3 的共同点是：**mainline 已有部分/全部修复，但都没进发布包**。因此：
 
 1. **D-3**：把工作区 super.c 的改动**提交**（小步快跑：一步一提交 + 验收——挂载后 `sbinfo` 应显示 `mount`=now、干净卸载后 `umount`=now）。
 2. **D-1**：随下一版**重打包发布**（版本升号按行为级变更），并跑 counters 设计 §10 的 6 条判据（尤其 debugfs UAF 与开销 <2%）。
 3. **D-2**：**跟 god 的 CHUNK A/B 结论**再决定 ko 是否默认切 CHUNK（当前保持 FULL 保底）；无论切不切，先把**脏标记**（去掉 30s 全量回写）这类低风险改进纳入考量。
-4. 版本纪律：以上任一**行为级**变更 → **`pkgver` 升号**（对齐 `acc9e20` 惯例），否则 DKMS 不重编、`pacman -U` 同版本不生效。
+4. **D-4（非发布动作）**：**backlog 立项** + 补**出口条件**（见该节）；实现走 iomap 现成件，同时统一 errno 口径并保持 loud。
+5. 版本纪律：以上任一**行为级**变更 → **`pkgver` 升号**（对齐 `acc9e20` 惯例），否则 DKMS 不重编、`pacman -U` 同版本不生效。
 
 > 备注：D-1 的设计真值文档已随 linux-ko 工作文档退役（`0860fad`），需要时从 git 取回：`git show a358cc0:Docs/linux/ravenfs-linux-ko-sb-counters-design.md`。
