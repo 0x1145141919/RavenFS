@@ -54,6 +54,7 @@
 
 > **恒等式**：`i_mode = (type << 12) ｜ mode`；`type` 与 `mode` 是 `i_mode` 的**两个不相交切片**，拼回**零冗余**（无「双真相源」）。
 > **命名**：`permission_bits` 现已名不副实，**建议改名 `mode_xattr`**（或保留旧名 + 语义注释，二选一）。
+> **哨兵与几何（2026-09-30 补）**：`xattr_ptr` 哨兵 = 52 位全 1（`2^52−1`）；有效块号 ∈ `[0, total_blocks)`，而 `total_blocks ≤ 2^52−1`（否则卷 > `2^64` B）→ 哨兵**几何不可达**，无需额外防护。
 
 ### 2.3 完整字节表（**offset 与 v1.1 一致，未变**）
 
@@ -182,16 +183,18 @@ struct rfs_xattr_entry {           // 8B 定长头；名字紧随其后（4B 对
 - 位表见 `include/linux/fs.h:2098`（`S_SYNC/S_NOATIME/S_APPEND/S_IMMUTABLE/S_DIRSYNC/…/S_ANON_INODE`，当前最高 bit 19）。
 - 字段给 57 位，**存值不移位**，余位预留。
 - **v1.2 不实现任何 flag**（`chattr/lsattr` 现为可降级项 R-DG-03；**2026-09-26 定：当前版本不做**）；写 0 即可。字段存在的意义 = **将来支持 `chattr` 不再动盘面**。
+- **读端（2026-09-30 补）**：inode 载入时**不消费** `i_flags`（忽略，不透传 `inode->i_flags`）——与「v1.2 不实现」一致；将来实现 `chattr` 时再定「透传/过滤」。
 
 ---
 
 ## 7. 不变量增补（对 v1.1 §10 的追加/修订）
 
-- **26（新）· 无数据类型**：`type ∈ {1,2,6,12}` ⇒ `size==0` ∧ `data_root==PTR_INVALID` ∧ 无树；`rdev` 仅 `type ∈ {2,6}` 有效（**存 `inline_data[0:4]` 小端 u32**，见 §9-5）。
+- **26（新）· 无数据类型**：`type ∈ {1,2,6,12}` ⇒ `size==0` ∧ `data_root==PTR_INVALID` ∧ 无树；`rdev` 仅 `type ∈ {2,6}` 有效（**存 `inline_data[0:4]` 小端 u32**，见 §9-5）；`link_count` 服从**非 DIR 通用契约 = 指向本 inode 的 dentry 条目数**（见下条）。
 - **27（新）· 类型值域**：`type` 必须 ∈ `{1,2,4,6,8,10,12}`；其余（含 0）= 硬错。
 - **28（新）· 权限/指针**：`permission_bits` 低 12 位 = 权限；高 52 位 = 块号或全 1 哨兵（**不得 0**）。
 - **29（新）· xattr 块**：见 §5.5。
 - **30（修订）· 恒等式**：`i_mode == (type<<12) | mode` 恒成立。
+- **link_count（全类型，2026-09-30 补）**：`link_count` 在 `DIR` = `size + 2`；**其余全部类型（REG / LNK / CHR / BLK / FIFO / SOCK）一律 = 指向本 inode 的 dentry 条目总数（含创建者第一个）**。v1.1 §3.3 原文只点名 `REG / SOFT_SYM`（彼时非 DIR 仅此两型），v1.2 显式补全为「**非 DIR 通用**」；`audit_v1.2`（`tools/audit_v1.2/audit_v1.2.cpp:1057` 跳过 DIR，`:1062` 其余比 dentry 引用数）已按此实做。
 - v1.1 §10 **其余条目不变**（dentry 树 / 区段树 / 名字堆 / link_count / 文件数据区）。
 - **区段树机械参数 31–36**（阶 337 / 分裂左 168 / 欠载 <168 / 合并 ≤337 / 深度 64 / 节点 8K 对齐）见 `disk_layout_v1.1.md` §10。
 
