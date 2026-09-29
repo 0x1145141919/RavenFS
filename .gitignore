@@ -31,6 +31,9 @@ tools/audit_v1.2/m44_attrcmp
 tools/audit_v1.2/mkstates_x
 tools/audit_v1.2/m6_xattr_dump
 
+# tools/sbinfo 产物（只提交源码）
+tools/sbinfo/sbinfo
+
 # IDE / 编辑器
 .vscode/
 .idea/
