@@ -291,6 +291,15 @@ private:
      * 已退役：extent_merge_range（区间 F/M 融合）与 extent_discard_range（lesson 已否的
      * 补偿原语）设计作废，签名一并移除。 */
     result_code_t extent_rebuild_tree(uint64_t &root_blk, uint64_t owner_inode_idx);
+    /* ── 定制接口（2026-09-30，紧急）──
+     * 单 extent 树 → direct 降级：传 owner inode 索引，若其数据形态为 extent 树、
+     * 且树**内部仅单条记录**（根叶 count==1）且该记录**完整覆盖 [0, ceil(size/4K))**
+     * （无前缀洞 / 无尾洞，direct 语义所需）→ 降级：
+     *   · 提交点：一次 InodeSession 写 direct_bit=1、data_root=记录 phys 基址（size 不动）；
+     *   · 后置：free 旧树节点（根叶 = 2 个 FS_block）。先 inode 后 free（孤儿窗口，无悬垂）。
+     * 返回：RC_OK（已检查；*out_collapsed 报是否降级）/ RC_ERR_IO / RC_ERR_STATE。
+     * 不适用（非 REG/LNK、inline/direct 态、树非单条、单条非整域覆盖）= RC_OK + 未降级、零副作用。 */
+    result_code_t extent_tree_collapse_to_direct(uint64_t owner_inode_idx, bool *out_collapsed = nullptr);
     /* ── 位图核心 ── */
     bool bitmaps_load();     /* mount 时：直写=全量 pread 入内存；mmap 后端=窗口切片（不预取）。
                                 * 两模式共用自描述校验(§6.6)；原始内存喂给 bitmap_slices_mgr_t 装配 */

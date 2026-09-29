@@ -1592,3 +1592,68 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
         return RC_OK;
     }
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * extent_tree_collapse_to_direct — 单 extent 树 → direct 降级（定制接口，2026-09-30）
+ *
+ * 传入 owner inode 索引：若其数据形态为 extent 树、且该树**内部只有单条记录**
+ * （根叶 count==1）且该记录完整覆盖 [0, ceil(size/4K))（direct 语义所需：
+ * 无前缀洞 / 无尾洞）→ 降级为 direct：
+ *   · 提交点：一次 InodeSession 写 direct_bit=1、data_root=记录 phys 基址（size 不动）；
+ *   · 后置：free 旧树节点（根叶 = 2 个 FS_block）。
+ * 先 inode 后 free —— 崩溃窗口 = 孤儿 2 块，无悬垂。
+ *
+ * 返回：RC_OK（已检查；*out_collapsed 报是否发生降级）/ RC_ERR_IO（inode 载入失败）/
+ *       RC_ERR_STATE（非 REG/LNK、data_root 悬空等结构异常）。
+ * 不适用（inline/direct 态、树非单条、单条非整域覆盖）= RC_OK + 未降级，零副作用。
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::extent_tree_collapse_to_direct(uint64_t owner_inode_idx, bool *out_collapsed)
+{
+    if (out_collapsed) *out_collapsed = false;
+    constexpr uint64_t FS_BLOCK = 4096;
+    const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+
+    uint64_t fsize = 0, root_blk = 0;
+    {   /* 入口读态：受理校验 + 形态/树根快照（会话内判，关后只用拷贝） */
+        InodeSession s(inode_cache_mgr, owner_inode_idx);
+        if (!s.inode) return RC_ERR_IO;
+        raven_Inode_t *ino = s.inode;
+        const uint32_t t = RFS_INO1_GET_TYPE(ino->word1);
+        if (t != INODE_TYPE_REGULAR && t != INODE_TYPE_SOFT_SYM)
+            return RC_ERR_STATE;                       /* 非 REG/LNK：不受理 */
+        fsize = ino->size;
+        if (fsize <= 160) return RC_OK;                /* inline 态：无树可降级 */
+        if (RFS_INO1_GET_DIRECT(ino->word1)) return RC_OK;  /* 已是 direct */
+        root_blk = ino->data_root;
+    }
+    if (root_blk == PTR_INVALID_52 || root_blk == PTR_INVALID) return RC_ERR_STATE;
+
+    /* 结构判定：根必须是叶 + 单条记录 + 整域覆盖 [0, ceil(size/4K)) */
+    const uint64_t size_ceil = (fsize + FS_BLOCK - 1) / FS_BLOCK;
+    uint64_t direct_base = 0;
+    {
+        mdata_piece_session s(mdata_piece_mgr, root_blk);
+        if (s.index_error()) return RC_ERR_STATE;
+        if (!s) return RC_ERR_IO;
+        Bptree_meta_t *meta = (Bptree_meta_t *)s.data;
+        if (!is_extent_node(meta)) return RC_ERR_STATE;
+        if (RFS_PP_IS_INNER(meta->parent_ptr)) return RC_OK;              /* 内部节点 → 非单条树 */
+        if ((uint16_t)RFS_PP_COUNT(meta->parent_ptr) != 1) return RC_OK;  /* 叶多记录 */
+        const extent_t e0 = ((Bptree_extent_leaf_node_t *)s.data)->extents[0];
+        if (e0.fblkbase != 0 || e0.length != size_ceil) return RC_OK;     /* 非整域覆盖：不可 direct */
+        if (RFS_PTR_ADDR(e0.block_base) == PTR_INVALID_52) return RC_ERR_STATE;
+        direct_base = RFS_PTR_ADDR(e0.block_base);
+    }
+
+    /* 提交点：inode 一次写（direct 态，size 不动）——先于 free */
+    {
+        InodeSession s(inode_cache_mgr, owner_inode_idx);
+        if (!s.inode) return RC_ERR_IO;
+        RFS_INO1_SET_DIRECT(*s.inode, 1);
+        s.inode->data_root = direct_base;
+        s.dirty();
+    }
+    block_free(root_blk, 2);   /* 释放旧树节点（根叶 2 块；孤儿窗口，无悬垂） */
+    if (out_collapsed) *out_collapsed = true;
+    return RC_OK;
+}
