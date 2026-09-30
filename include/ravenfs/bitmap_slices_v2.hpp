@@ -236,6 +236,10 @@ public:
      * alloc_hard：需 bitscount 连续空闲位、起始位 2^align_log2 对齐；不部分分配；
      *             片内全窗迭代（hint 窗起 → 片尾 → 绕回 [0,hint)），全片无 → RC_ERR_NO_BLOCK。
      * alloc_soft：首空闲段取对齐候选，实际 = min(段长, bitscount)；缺口回传。
+     * ⚠ **单窗语义**：一次分配命中恒落在**单个 chunk（窗口）内**——请求 > 单窗容量
+     *   chunk_bits(=32768<<chunk_order) 时，alloc_hard 返 RC_ERR_NO_BLOCK、alloc_soft
+     *   只在单窗内取（缺口回传）。**大跨度连续分配请走 soft_occupy / mgr 的
+     *   block_occupy_soft（跨窗、跨片续圈）。**【2026-09-30 最高规格压测固化】
      * 对齐：**align_log2 仅支持 0..15**（片恒 32768=2^15 位对齐，窗起点又 ≥ 2^15 ⇒
      *       ≤15 的任意对齐点都落在片内整数位，无跨窗歧义）；>15 → RC_ERR_STATE（防御，勿截断）。 */
     result_code_t alloc_hard(uint8_t align_log2, uint64_t bitscount, uint64_t &out_slice_base_idx);
@@ -331,6 +335,8 @@ public:
     bitmap_slices_mgr_t_v2(const bitmap_slices_mgr_t_v2 &) = delete;
     bitmap_slices_mgr_t_v2 &operator=(const bitmap_slices_mgr_t_v2 &) = delete;
 
+    /* ── 分配（**单窗语义**：命中恒在单 chunk 内；require_count 超单窗容量 → hard 返
+     *    PTR_INVALID / soft 部分返。**大跨度连续分配用 block_occupy_soft**，可跨窗跨片）── */
     uint64_t block_alloc_hard(uint64_t require_count, uint8_t align_log2);
     uint64_t block_alloc_soft(uint64_t require_count, uint64_t *remain_count);
     uint64_t block_occupy_soft(uint64_t blkbase, uint64_t require_count, uint64_t *rest_count);
