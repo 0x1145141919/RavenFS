@@ -87,6 +87,7 @@ enum rfs_rc {
     RC_ERR_OVERLAP,         /* extent 区间与既有映射重叠（防御；正常流程 = 契约违反） */
     RC_ERR_IS_DIR,          /* dir 型目标：文件数据操作接口不受理（EISDIR 对齐） */
     RC_ERR_XATTR,           /* v1.2 新增：xattr 块读/校验/超限（>1 FS_block → -E2BIG）失败 */
+    RC_ERR_BUSY,            /* 设备已被 Linux 内核以某 FS 挂载（God 防呆拒挂：防双写者 / 撕裂读） */
 
     RC_NEED_SPLIT = 0x1000  /* 内部使用：本层分裂，需父层处理 */
 };

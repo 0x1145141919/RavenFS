@@ -21,6 +21,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>   /* mmap/munmap：非直写后端整盘映射 + offload canvas 切片 */
+#include <sys/stat.h>      /* fstat/lstat/stat：防呆钩子取设备身份 */
+#include <sys/sysmacros.h> /* major/minor：st_rdev → 内核挂载 dev 号比对 */
+#include <dirent.h>        /* opendir/readdir：扫 /sys/block 反查 loop 设备 */
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -190,6 +193,137 @@ uint64_t RavenFS_juvenile::name_hash(const char *name) const {
     h64 ^= h64 >> 32;
     return h64;
 }
+/* ═══════════════════════════════════════════════════════════════
+ * 防呆钩子：设备已被 Linux 内核以某个 FS 挂载 → 拒绝挂载
+ *   · 双写者：内核 FS + god 同时写同一块设备 → 元数据互相引爆；
+ *   · 撕裂读：挂载中读原始设备可能拿到写一半的状态 → 审计结论不可信。
+ * 判定不依赖任何外部命令（blkid / findmnt / lsblk 一律不用），只用：
+ *   fstat(fd) → 设备身份；/proc/self/mountinfo → 内核已挂载 dev 号集合；
+ *   /sys/dev/block/<maj:min> + /sys/class/block 分区 → 整盘兜底（分区在挂载也算）；
+ *   /sys/block/loopN/loop/backing_file → 普通文件（loop 镜像）反查 loop dev。
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* /proc/self/mountinfo 第 3 栏恒为 "major:minor"（在挂载点路径之前，含空格也安全） */
+static bool rfs_guard_mountinfo_has_dev(unsigned int maj, unsigned int min) {
+    FILE *fp = fopen("/proc/self/mountinfo", "r");
+    if (!fp) return false;
+    char line[4096];
+    bool hit = false;
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned int mj, mn;
+        if (sscanf(line, "%*u %*u %u:%u", &mj, &mn) == 2 && mj == maj && mn == min) { hit = true; break; }
+    }
+    fclose(fp);
+    return hit;
+}
+
+/* /sys/block/loopN/loop/backing_file 反查：backing 文件 == 目标普通文件时，取该 loop 的 dev 号 */
+static bool rfs_guard_loop_dev_of_file(const struct stat &st, unsigned int *maj, unsigned int *min) {
+    DIR *d = opendir("/sys/block");
+    if (!d) return false;
+    struct dirent *e;
+    bool hit = false;
+    while (!hit && (e = readdir(d))) {
+        if (strncmp(e->d_name, "loop", 4) != 0) continue;
+        char p[512];
+        snprintf(p, sizeof(p), "/sys/block/%s/loop/backing_file", e->d_name);
+        FILE *bf = fopen(p, "r");
+        if (!bf) continue;
+        char backing[4096] = {0};
+        bool got = (fgets(backing, sizeof(backing), bf) != nullptr);
+        fclose(bf);
+        if (!got) continue;
+        size_t n = strlen(backing);
+        while (n && (backing[n-1] == '\n' || backing[n-1] == '\r')) backing[--n] = '\0';
+        if (n == 0) continue;
+        struct stat bst;
+        if (stat(backing, &bst) != 0) continue;
+        if (bst.st_dev != st.st_dev || bst.st_ino != st.st_ino) continue;
+        snprintf(p, sizeof(p), "/sys/block/%s/dev", e->d_name);
+        FILE *dv = fopen(p, "r");
+        if (!dv) continue;
+        unsigned int mj, mn;
+        if (fscanf(dv, "%u:%u", &mj, &mn) == 2) { *maj = mj; *min = mn; hit = true; }
+        fclose(dv);
+    }
+    closedir(d);
+    return hit;
+}
+
+/* /proc/self/mounts 第 1 栏（源设备路径）与 fd 真实路径逐字比对（兜底：绑定挂载 / 直挂文件等） */
+static bool rfs_guard_mounts_has_source(const char *path) {
+    if (!path || !*path) return false;
+    FILE *fp = fopen("/proc/self/mounts", "r");
+    if (!fp) return false;
+    char line[4096], src[4096];
+    bool hit = false;
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "%4095s %*s %*s", src) == 1 && strcmp(src, path) == 0) { hit = true; break; }
+    }
+    fclose(fp);
+    return hit;
+}
+
+/* 整盘兜底：fd 是「整盘块设备」（本体无 partition 标记）时，枚举其分区，
+ * 任一分区设备号命中内核挂载集合 → 视为已挂载。
+ * 动机：开整盘（如 /dev/nvme1n1）而只有分区（nvme1n1p6）在挂载时，
+ * 整盘与分区 dev 号不同 → 精确命中抓不到，需此二级检查兜底。
+ * 分区枚举走 realpath(/sys/dev/block/maj:min) 拿到设备目录，
+ * 只取带 partition 标记的子项 —— 彻底避开 "nvme1n1" vs "nvme1n10" 名前缀坑。 */
+static bool rfs_guard_whole_disk_part_mounted(unsigned int maj, unsigned int min) {
+    char lnk[64], devdir[4096];
+    snprintf(lnk, sizeof(lnk), "/sys/dev/block/%u:%u", maj, min);
+    if (!realpath(lnk, devdir)) return false;
+
+    char f[4300];
+    snprintf(f, sizeof(f), "%s/partition", devdir);
+    if (access(f, F_OK) == 0) return false;   /* 自身是分区：精确匹配已管，兜底不适用 */
+
+    DIR *d = opendir(devdir);                 /* 整盘：枚举带 partition 标记的子目录（分区） */
+    if (!d) return false;
+    struct dirent *e;
+    bool hit = false;
+    while (!hit && (e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char pf[4400], df[4400];
+        snprintf(pf, sizeof(pf), "%s/%s/partition", devdir, e->d_name);
+        if (access(pf, F_OK) != 0) continue;
+        snprintf(df, sizeof(df), "%s/%s/dev", devdir, e->d_name);
+        FILE *dv = fopen(df, "r");
+        if (!dv) continue;
+        unsigned int pmj, pmn;
+        if (fscanf(dv, "%u:%u", &pmj, &pmn) == 2 && rfs_guard_mountinfo_has_dev(pmj, pmn)) hit = true;
+        fclose(dv);
+    }
+    closedir(d);
+    return hit;
+}
+
+bool RavenFS_juvenile::device_is_kernel_mounted() const {
+    if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) != 0) return false;
+
+    /* fd 对应的真实路径（/proc/self/fd/N）——mounts 源比对用 */
+    char linkp[64], realp[4096];
+    snprintf(linkp, sizeof(linkp), "/proc/self/fd/%d", fd);
+    ssize_t rl = readlink(linkp, realp, sizeof(realp) - 1);
+    if (rl >= 0) realp[rl] = '\0'; else realp[0] = '\0';
+
+    if (S_ISBLK(st.st_mode)) {                       /* 块设备：st_rdev 即设备号 */
+        unsigned int maj = major(st.st_rdev), min = minor(st.st_rdev);
+        if (rfs_guard_mountinfo_has_dev(maj, min)) return true;       /* 自身命中 */
+        if (rfs_guard_whole_disk_part_mounted(maj, min)) return true; /* 整盘兜底：分区在挂载也算 */
+        return rfs_guard_mounts_has_source(realp);
+    }
+    if (S_ISREG(st.st_mode)) {                       /* 普通文件（loop 镜像）：反查 loop dev */
+        unsigned int maj, min;
+        if (rfs_guard_loop_dev_of_file(st, &maj, &min) && rfs_guard_mountinfo_has_dev(maj, min)) return true;
+        return rfs_guard_mounts_has_source(realp);
+    }
+    return false;                                    /* 其它类型（chr 等）不适用 */
+}
+
 /* ── 获取节点最大 hash（叶子末项 hash 或内部末项 hint.hash_max） ── */
 
 RavenFS_juvenile::RavenFS_juvenile(const linux_userspace_mount_t &mnt, uint64_t *res_code) {
@@ -205,7 +339,17 @@ RavenFS_juvenile::RavenFS_juvenile(const linux_userspace_mount_t &mnt, uint64_t 
 
     /* 契约（结构体自述）：readonly（rfs-audit 静态 mmap 审核）不得配 O_DIRECT */
     if (param.is_readonly && is_device_direct) {
+        fd = -1;                /* 未挂载态（fd 归外部，只弃引用不 close） */
         if (res_code) *res_code = RC_ERR_STATE;
+        return;
+    }
+
+    /* ── 防呆：设备已被 Linux 内核挂载 → 立即拒绝（RC_ERR_BUSY）──
+     * 双写者（内核 FS + god）或挂载中读原始设备（撕裂读）都会毁数据/毁审计；
+     * 必须在任何写盘（如下面的 mount_time 落盘）之前。逃生阀 = param.allow_mounted_device。 */
+    if (!param.allow_mounted_device && device_is_kernel_mounted()) {
+        fd = -1;                /* 未挂载态（fd 归外部，只弃引用不 close） */
+        if (res_code) *res_code = RC_ERR_BUSY;
         return;
     }
 

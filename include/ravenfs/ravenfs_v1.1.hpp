@@ -77,6 +77,7 @@ struct ravenfs_mount_param_t{
     bool if_will_use_inode_cache;//警告：若is_device_direct==false则这个bit最好开着，不开缓存的话，相应的inode_session会一次性读4k,因为nvme盘一次至少一个LBA,也就4k,多线程下UC模式两个访问访问到同一个缓存行不同Inode到时候等着写竞争吧
     bool if_will_use_mdata_piece_cache;
     bool is_readonly;       /* true=只读挂载（rfs-audit），须配 is_device_direct=false */
+    bool allow_mounted_device = false; /* 防呆逃生阀：设备已被内核挂载时仍继续（默认 false=硬拒 → RC_ERR_BUSY）。仅供取证等极端场景；正常恒定 false */
 };
 struct linux_userspace_mount_t{
     ravenfs_mount_device_t dev;
@@ -304,6 +305,11 @@ private:
     bool bitmaps_load();     /* mount 时：直写=全量 pread 入内存；mmap 后端=窗口切片（不预取）。
                                 * 两模式共用自描述校验(§6.6)；原始内存喂给 bitmap_slices_mgr_t 装配 */
     void bitmaps_flush();    /* 析构时：仅直写模式 pwrite 全量写回（mmap 后端由内核页缓存管） */
+    /* 防呆（ctor 最先调，任何写盘前）：当前 fd 指向的设备是否已被 Linux 内核以某 FS 挂载。
+     * true = 已挂载 → ctor 拒绝挂载（RC_ERR_BUSY；防双写者 / 撕裂读）。
+     * 块设备：命中自身 dev 号 **或整盘任一在挂载的分区**（整盘兜底，防"整盘仍在用分区"）；
+     * 普通文件：反查 loop 设备。判定纯 fstat + /proc + /sys，不依赖外部命令。 */
+    bool device_is_kernel_mounted() const;
     /* 缓存子模块编排（ctor 调）：决策树第一层 is_device_direct ——
      *   mmap 后端：inode/mdata_piece 全 offload（canvas 从窗口切）
      *   直写模式 ：inode/mdata_piece 按 param.if_will_use_*_cache 选
