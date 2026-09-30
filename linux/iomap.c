@@ -84,12 +84,103 @@ static int rfs_store_block(struct super_block *sb, u64 fs_blk, const void *buf)
 /* inline→extent 迁移（D-M4-8：越 160 默认升格 extent）
  *
  * 分配策略（**只为真正需要的块分配**，缝隙保留为洞——与 god/验收模型一致）：
+ *   · **D-6a：先试 direct**（整域连续分配成功即落 direct，零树节点，见下 helper）；
  *   · pos 块号 == 0（写从第 0 块起）：单条 extent 覆盖 [0, end_blk)，块 0 物化
  *     旧 inline + 零填，尾块（若 end 未块对齐）零填，返回映射**非 NEW**。
  *   · pos 块号 > 0：旧 inline 物化为单块 extent {0,1}（仅当 old_size>0），写域另
  *     一条 extent {pos_blk, cnt}，返回映射 **NEW**（单次调用，无重入丢标志问题）；
  *     缝隙 [1, pos_blk) 保留为洞（读 0）。
  */
+
+/* D-6a：inline→外置迁移先试 direct。
+ *
+ * 口径对齐 god dfprealloc_and_plan 的「inline 迁出 direct 候选」
+ * （juvenile_god/direct_file_ops.cpp:118-129）：整域 [0, end_blk) 一次连续分配
+ * 成功 → 单条连续 run 覆盖整文件 → 落 direct（不变量 24：direct = 单条连续、
+ * 零树节点最优路径），**不建 8K 区段树根叶**。分配失败（不连续 / 无块 →
+ * PTR_INVALID）→ 返回 RFS_MIGRATE_INLINE_DEGRADE，调用方降级走原 extent 迁移。
+ *
+ * 返回：0 = 已落 direct（iomap 已填、inode 记录已提交）；
+ *       RFS_MIGRATE_INLINE_DEGRADE = 不可 direct（分配失败/不连续）→ 降级；
+ *       <0 = 硬错误（分配已回滚）。
+ */
+#define RFS_MIGRATE_INLINE_DEGRADE	1
+
+static int ravenfs_migrate_inline_direct(struct super_block *sb, struct raven_Inode_t *r,
+					 struct ravenfs_session *ses, loff_t pos, u64 end,
+					 u64 end_blk, struct iomap *iomap)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	u64 old_size = r->size;			/* ≤160 */
+	u64 pos_blk = (u64)pos >> RAVENFS_BLK_SHIFT;
+	u64 run, b;
+	u8 *buf;
+	int err;
+
+	/* 整域 [0, end_blk) 一次连续分配（align=1 块，同既有 direct/坍缩口径）。
+	 * 不连续/无块 → PTR_INVALID → 降级（不建树、不落 direct）。 */
+	run = ravenfs_block_alloc(sb, end_blk, 0);
+	if (run == (u64)PTR_INVALID)
+		return RFS_MIGRATE_INLINE_DEGRADE;
+
+	buf = kzalloc(RAVENFS_BLOCK_SIZE, GFP_KERNEL);
+	if (!buf) {
+		ravenfs_block_free(sb, run, end_blk);
+		return -ENOMEM;
+	}
+
+	/* block 0 = 旧 inline 内容 + 零填（[old_size,4096) 读 0）。
+	 * pos_blk==0 时写域覆盖 [pos,end)，但 block 0 的 [0,pos) 须保留 inline。 */
+	memset(buf, 0, RAVENFS_BLOCK_SIZE);
+	memcpy(buf, r->inline_data, min_t(u64, old_size, RAVENFS_INLINE_BYTES));
+	err = rfs_store_block(sb, run, buf);
+	if (err)
+		goto err_free_run;
+
+	/* 未写占位块 [1, pos_blk) 显式清零：写域之前、恒为洞，但 direct 全覆盖
+	 * 语义下必须读 0（god phase3 ①「占位块批量清零」同机械）。写域首块前导
+	 * [blkstart,pos) 与写尾块未写区由 iomap 零填兜底（block_start ≥ i_size
+	 * 或 NEW；与既有 pos_blk>0 分支同口径）。 */
+	if (pos_blk > 1) {
+		memset(buf, 0, RAVENFS_BLOCK_SIZE);
+		for (b = 1; b < pos_blk; b++) {
+			err = rfs_store_block(sb, run + b, buf);
+			if (err)
+				goto err_free_run;
+		}
+	}
+	/* 尾块零填（end 未块对齐，且非 block 0——block 0 已 inline+零填）。
+	 * end_blk==1 时唯一块即 block 0，无需（且不可）二次零填。 */
+	if (end_blk > 1 && ((u64)end & (RAVENFS_BLOCK_SIZE - 1))) {
+		memset(buf, 0, RAVENFS_BLOCK_SIZE);
+		err = rfs_store_block(sb, run + end_blk - 1, buf);
+		if (err)
+			goto err_free_run;
+	}
+	kfree(buf);
+
+	/* 提交记录：direct=1；data_root=连续 run 首块；size≥end。 */
+	RFS_INO1_SET_DIRECT(*r, 1);
+	r->data_root = run;
+	if (end > r->size)
+		r->size = end;
+	RFS_ROW_MARK_DIRTY(ses->row);
+
+	iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
+	iomap->type = IOMAP_MAPPED;
+	iomap->addr = ravenfs_dev_byte(sbi, run + pos_blk);
+	iomap->length = (end_blk - pos_blk) << RAVENFS_BLK_SHIFT;
+	/* pos_blk==0：非 NEW（保 block 0 内 [0,pos) 的 inline 内容；NEW 会清零
+	 * mapping 前导）。pos_blk>0：NEW（零填写域首块前导之洞）。 */
+	iomap->flags = pos_blk ? IOMAP_F_NEW : 0;
+	return 0;
+
+err_free_run:
+	kfree(buf);
+	ravenfs_block_free(sb, run, end_blk);
+	return err;
+}
+
 static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *inode,
 					struct raven_Inode_t *r, struct ravenfs_session *ses,
 					loff_t pos, u64 end, struct iomap *iomap)
@@ -104,6 +195,13 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 
 	if (!end_blk)
 		end_blk = 1;
+
+	/* ── D-6a：先试 direct（整域连续分配 → 零树节点最优路径）── */
+	err = ravenfs_migrate_inline_direct(sb, r, ses, pos, end, end_blk, iomap);
+	if (err != RFS_MIGRATE_INLINE_DEGRADE)
+		return err;			/* 0 = 已落 direct；<0 = 硬错误 */
+
+	/* ── 降级：原 inline→extent 迁移（建 8K 根叶）── */
 	buf = kzalloc(RAVENFS_BLOCK_SIZE, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
