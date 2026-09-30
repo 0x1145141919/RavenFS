@@ -334,6 +334,7 @@ static int mem_free_interval(struct rfs_bm_group *g, u32 idx, u64 base, u64 len)
 		}
 	}
 	s->free_count += cleared;
+	rfs_bm_stat(&g->stat, RFS_BM_ST_FREE_BLOCKS, cleared);	/* 仅 1→0 实清计 */
 	return 0;
 }
 

@@ -196,6 +196,10 @@ int rfs_bm_init(struct rfs_bm *self, const struct rfs_bm_cfg *cfg)
 	self->ino.cpu_slots = cpu_slots;
 	self->ino.per_bits = bm_per_bits(ino_bits, sc);
 
+	/* 计数出口：两组共用同一 sink（宿主注入；NULL → 不计数）*/
+	self->blk.stat = cfg->stat;
+	self->ino.stat = cfg->stat;
+
 	/* per-CPU preferred：i % n_slices 铺开（仿 FPA；避免所有 CPU 首分配挤片 0） */
 	self->blk.preferred = RFS_ZALLOC(sizeof(u32) * cpu_slots);
 	self->ino.preferred = RFS_ZALLOC(sizeof(u32) * cpu_slots);
@@ -271,8 +275,12 @@ u64 rfs_bm_block_alloc_hard(struct rfs_bm *self, u64 count, u64 align)
 	const struct rfs_bm_ops *ops = rfs_bm_ops_of(self->mode);
 	u32 cpu, round;
 
-	if (!count || !ops || !g->preferred || !g->n_slices)
+	/* P5：入口记 attempt，出口必记 ok/fail 之一 ⇒ ok+fail==calls */
+	rfs_bm_stat(&g->stat, RFS_BM_ST_ALLOC_CALLS, 1);
+	if (!count || !ops || !g->preferred || !g->n_slices) {
+		rfs_bm_stat(&g->stat, RFS_BM_ST_ALLOC_FAIL, 1);
 		return RFS_BM_NO_HIT;
+	}
 	cpu = RFS_CPU_ID() % g->cpu_slots;
 	for (round = 0; round < g->n_slices; round++) {
 		u32 idx = (u32)((RFS_ATOMIC_LOAD_U32(&g->preferred[cpu]) + round) % g->n_slices);
@@ -280,9 +288,12 @@ u64 rfs_bm_block_alloc_hard(struct rfs_bm *self, u64 count, u64 align)
 
 		if (ops->alloc_hard(g, idx, count, (u8)align, &out) == 0) {
 			RFS_ATOMIC_STORE_U32(&g->preferred[cpu], idx);
+			rfs_bm_stat(&g->stat, RFS_BM_ST_ALLOC_OK, 1);
+			rfs_bm_stat(&g->stat, RFS_BM_ST_ALLOC_BLOCKS, count);
 			return bm_to_global(g, idx, out);
 		}
 	}
+	rfs_bm_stat(&g->stat, RFS_BM_ST_ALLOC_FAIL, 1);	/* 全片扫毕 = ENOSPC/碎片 */
 	return RFS_BM_NO_HIT;
 }
 
@@ -310,6 +321,7 @@ u64 rfs_bm_block_alloc_soft(struct rfs_bm *self, u64 count, u64 *remain)
 			RFS_ATOMIC_STORE_U32(&g->preferred[cpu], idx);
 			if (remain)
 				*remain = left;
+			rfs_bm_stat(&g->stat, RFS_BM_ST_SOFT_OK, 1);	/* 软分配成功（D2/D3 实测面）*/
 			return bm_to_global(g, idx, out);
 		}
 	}
@@ -350,7 +362,11 @@ u64 rfs_bm_block_occupy_soft(struct rfs_bm *self, u64 base, u64 count, u64 *rest
 	}
 	if (rest)
 		*rest = remain;
-	return (count - remain > 0) ? base : RFS_BM_NO_HIT;
+	if (count - remain > 0) {
+		rfs_bm_stat(&g->stat, RFS_BM_ST_OCCUPY, 1);	/* 锚定认领（≥1 位）*/
+		return base;
+	}
+	return RFS_BM_NO_HIT;
 }
 
 /*
@@ -364,6 +380,7 @@ void rfs_bm_block_free(struct rfs_bm *self, u64 base, u64 count)
 
 	if (!count || !ops || !g->n_slices)
 		return;
+	rfs_bm_stat(&g->stat, RFS_BM_ST_FREE_CALLS, 1);
 	while (count > 0) {
 		u32 idx;
 		u64 slice_end, n;

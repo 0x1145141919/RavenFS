@@ -94,6 +94,54 @@ enum rfs_bm_slice_state {
 	RFS_BM_SLICE_WORKABLE   = 1,	/* enable 后、shutdown 前 */
 };
 
+/* ═══════════════════════ 计数出口（可选注入；平台中立） ═══════════════════════ */
+/*
+ * 类本体**零 super_block 依赖**，计数只能以「事件 + 增量」上报：字段归属与累加
+ * 语义由宿主决定（内核适配层映射到 `struct ravenfs_sb_stats.bm_*`；用户态压测不注入
+ * → emit 为 NULL → 零开销、零依赖）。
+ * 枚举顺序对齐设计 §3.F 的 F 组字段顺序（勿乱动；增删字段无兼容义务）。
+ *
+ * 模式契合：MEM 后端只会上报 ALLOC_*、FREE_*、SOFT_OK、OCCUPY、SYNC_SLICES 子集
+ * （CHUNK 专属事件在 MEM 下永不发出 ⇒ 对应字段恒 0）；CHUNK 后端则覆盖全集。
+ * 打点代码只写在对应后端，读侧（debugfs）恒呈现全字段、非本后端字段为 0。
+ */
+enum rfs_bm_stat {
+	RFS_BM_ST_ALLOC_CALLS = 0,	/* 组级分配入口次数 */
+	RFS_BM_ST_ALLOC_OK,		/* 分配成功次数 */
+	RFS_BM_ST_ALLOC_FAIL,		/* 分配失败次数（ENOSPC/碎片；P5 完备：OK+FAIL==CALLS）*/
+	RFS_BM_ST_ALLOC_BLOCKS,		/* 实际分配块总量 */
+	RFS_BM_ST_FREE_CALLS,		/* 组级释放入口次数 */
+	RFS_BM_ST_FREE_BLOCKS,		/* 实际 1→0 清位量（挂账未清不重复计）*/
+	RFS_BM_ST_SOFT_OK,		/* 软分配成功次数 */
+	RFS_BM_ST_OCCUPY,		/* 锚定认领次数（认领 ≥1 位）*/
+	RFS_BM_ST_SYNC_SLICES,		/* 写回量：MEM=片数 / CHUNK=态1+态2 chunk 数 */
+	RFS_BM_ST_CHUNK_SWITCH,		/* [CHUNK] 换片次数 */
+	RFS_BM_ST_CHUNK_SWITCH_NS,	/* [CHUNK] 换片累计耗时 ns */
+	RFS_BM_ST_REC_ATTACH,		/* [CHUNK] 离线还账挂账节点数 */
+	RFS_BM_ST_REC_DRAIN,		/* [CHUNK] drain 消费节点数 */
+	RFS_BM_ST_POOL_EMPTY,		/* [CHUNK] 归还记录资源耗尽兜底次数 */
+	RFS_BM_ST_SUMMARY_SKIP,		/* [CHUNK] 摘要免载入跳过次数 */
+	RFS_BM_ST_SCAN_NS,		/* [CHUNK] mount 扫描累计耗时 ns */
+	RFS_BM_ST_TTL_ONLINE,		/* [CHUNK] TTL 态1：在线脏窗同步量 */
+	RFS_BM_ST_TTL_DRAIN,		/* [CHUNK] TTL 态2：离线还账窗同步量 */
+	RFS_BM_ST__NR,
+};
+
+typedef void (rfs_bm_stat_fn)(void *ctx, enum rfs_bm_stat ev, u64 val);
+
+struct rfs_bm_stat_sink {
+	rfs_bm_stat_fn	*emit;		/* NULL → 不计数（保持类零依赖）*/
+	void		*ctx;		/* 宿主上下文（内核传 sb）*/
+};
+
+/* 事件上报（唯一入口；emit 为空则无操作——仅回调/原子，不睡眠，可持锁调用）*/
+static inline void rfs_bm_stat(const struct rfs_bm_stat_sink *sink,
+			       enum rfs_bm_stat ev, u64 val)
+{
+	if (sink && sink->emit)
+		sink->emit(sink->ctx, ev, val);
+}
+
 /* ═══════════════════════ MEM 后端：分片 / 组 ═══════════════════════ */
 
 /* ── 分片（纯内存，god v1 bitmap_slice_t）：片只吃自身状态，位图数据经 words 全局寻址 ── */
@@ -158,6 +206,9 @@ struct rfs_bm_cslice {
 
 	/* 唯一分片锁（可睡；覆盖位运算 + 在线窗 + 归还链 + 盘 I/O）*/
 	rfs_mutex_t		lock;
+
+	/* 计数出口（组 setup 时由 core 拷入；片内 cs_* 事件经此上报，见 enum rfs_bm_stat）*/
+	struct rfs_bm_stat_sink stat;
 };
 
 /* ═══════════════════════════ 组 / 类本体 ═══════════════════════════ */
@@ -181,6 +232,9 @@ struct rfs_bm_group {
 	u64			 disk_base;	/* 本组位图起始 FS_block */
 	u64			 disk_blocks;	/* 本组位图占块数 */
 	u8			 chunk_order;
+
+	/* ── 计数出口（两种模式共用；由 core 在 init 时从 cfg 拷入）── */
+	struct rfs_bm_stat_sink stat;
 };
 
 /* ── ★ 类本体 ── */
@@ -227,6 +281,9 @@ struct rfs_bm_cfg {
 	u8	choose;			/* 0=MEM（纯内存）| 1=CHUNK；其它 → init 报错 */
 	no_chunk_slices_cfg_t	pure_mem_cfg;	/* choose==0 时消费 */
 	chunk_slices_cfg_t	chunk_cfg;	/* choose==1 时消费 */
+	/* 计数出口注入（可选）。宿主把「事件 → 自有计数器」的映射经此传入；类只上报
+	 * 事件。缺省（emit==NULL）表示不计数——用户态压测 memset(cfg,0) 即落到该态。*/
+	struct rfs_bm_stat_sink stat;
 };
 
 /* ═════════════════════ 方法（arg0 恒为类的数据本体）═════════════════════ */

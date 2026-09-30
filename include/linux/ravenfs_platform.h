@@ -44,6 +44,7 @@
 #  include <linux/math.h>       /* DIV_ROUND_UP_ULL */
 #  include <linux/errno.h>      /* -ENOENT / -EIO / -ENOSPC ... */
 #  include <linux/bitops.h>     /* hweight64（popcount 不降级为 libgcc __popcountdi2）*/
+#  include <linux/timekeeping.h> /* ktime_get_ns（累计耗时类计数器）*/
 
 #else  /* 用户态：压测 harness / 离线工具 */
 
@@ -62,6 +63,7 @@
 #  include <stdio.h>
 #  include <string.h>
 #  include <errno.h>          /* -ENOENT / -EIO / -ENOSPC ... */
+#  include <time.h>           /* clock_gettime（累计耗时类计数器）*/
 
 typedef uint8_t  u8;
 typedef uint16_t u16;
@@ -88,6 +90,17 @@ typedef uint64_t u64;
 #else
 #  define RFS_ZALLOC(n)   calloc(1, (n))
 #  define RFS_FREE(p)     free(p)
+#endif
+
+/* ═══════════════════════════ 时间（单调纳秒） ═══════════════════════════ */
+/* 仅供「累计耗时」类计数器用（bm_chunk_switch_ns / bm_scan_ns）；**算法语义不依赖它**
+ * （计时只进计数器，绝不参与控制流）。内核走 ktime_get_ns；用户态走 CLOCK_MONOTONIC。*/
+#ifdef __KERNEL__
+#  define RFS_NOW_NS()   ktime_get_ns()
+#else
+#  define RFS_NOW_NS()   ({ struct timespec __rfs_ts; \
+	clock_gettime(CLOCK_MONOTONIC, &__rfs_ts); \
+	(u64)__rfs_ts.tv_sec * 1000000000ULL + (u64)__rfs_ts.tv_nsec; })
 #endif
 
 /* ═══════════════════════════ CPU 身份 ═══════════════════════════ */

@@ -71,6 +71,39 @@ struct ravenfs_bitmap_mgr {
 
 /* ═══════════════════════ CHUNK I/O 回调（0 / 负 -errno）═══════════════════════ */
 
+/* ── 计数出口：类事件 → sb 级 bm_* 计数器（设计 §3.F）──
+ * 类本体 sb-free，只上报「事件 + 增量」；本函数把事件落到 sbi->stats.bm_*。
+ * ctx = sb（与 CHUNK io_ctx 同源取法）。只做 atomic64_add，可持锁调用（P1）。
+ * 模式契合：MEM 只会发来 ALLOC_*、FREE_*、SOFT_OK、OCCUPY（+adapter 侧 SYNC_SLICES）；
+ * CHUNK 另发来 CHUNK_*、REC_*、POOL_EMPTY、SUMMARY_SKIP、SCAN_NS、TTL_*、SYNC_SLICES。
+ * 未发出的字段在该后端恒 0（debugfs 读侧恒呈现全字段，非本后端为 0）。*/
+static void bm_stat_emit(void *ctx, enum rfs_bm_stat ev, u64 val)
+{
+	struct super_block *sb = ctx;
+
+	switch (ev) {
+	case RFS_BM_ST_ALLOC_CALLS:	RFS_STAT_ADD(sb, bm_alloc_calls, val); break;
+	case RFS_BM_ST_ALLOC_OK:	RFS_STAT_ADD(sb, bm_alloc_ok, val); break;
+	case RFS_BM_ST_ALLOC_FAIL:	RFS_STAT_ADD(sb, bm_alloc_fail, val); break;
+	case RFS_BM_ST_ALLOC_BLOCKS:	RFS_STAT_ADD(sb, bm_alloc_blocks, val); break;
+	case RFS_BM_ST_FREE_CALLS:	RFS_STAT_ADD(sb, bm_free_calls, val); break;
+	case RFS_BM_ST_FREE_BLOCKS:	RFS_STAT_ADD(sb, bm_free_blocks, val); break;
+	case RFS_BM_ST_SOFT_OK:		RFS_STAT_ADD(sb, bm_soft_ok, val); break;
+	case RFS_BM_ST_OCCUPY:		RFS_STAT_ADD(sb, bm_occupy, val); break;
+	case RFS_BM_ST_SYNC_SLICES:	RFS_STAT_ADD(sb, bm_sync_slices, val); break;
+	case RFS_BM_ST_CHUNK_SWITCH:	RFS_STAT_ADD(sb, bm_chunk_switch, val); break;
+	case RFS_BM_ST_CHUNK_SWITCH_NS:	RFS_STAT_ADD(sb, bm_chunk_switch_ns, val); break;
+	case RFS_BM_ST_REC_ATTACH:	RFS_STAT_ADD(sb, bm_rec_attach, val); break;
+	case RFS_BM_ST_REC_DRAIN:	RFS_STAT_ADD(sb, bm_rec_drain, val); break;
+	case RFS_BM_ST_POOL_EMPTY:	RFS_STAT_ADD(sb, bm_pool_empty, val); break;
+	case RFS_BM_ST_SUMMARY_SKIP:	RFS_STAT_ADD(sb, bm_summary_skip, val); break;
+	case RFS_BM_ST_SCAN_NS:		RFS_STAT_ADD(sb, bm_scan_ns, val); break;
+	case RFS_BM_ST_TTL_ONLINE:	RFS_STAT_ADD(sb, bm_ttl_online, val); break;
+	case RFS_BM_ST_TTL_DRAIN:	RFS_STAT_ADD(sb, bm_ttl_drain, val); break;
+	default:			break;
+	}
+}
+
 /* 读 blk_len 个 4096B 块（FS_block 视角）到 buf；任一失败 → -EIO */
 static int bm_io_read(void *io_ctx, u64 blk, u64 blk_len, void *buf)
 {
@@ -82,12 +115,15 @@ static int bm_io_read(void *io_ctx, u64 blk, u64 blk_len, void *buf)
 		struct buffer_head *bh = sb_bread(sb, ravenfs_dev_blk(sbi, blk + i));
 
 		if (!bh) {
+			RFS_STAT_INC(sb, err_meta_io);
 			pr_err("ravenfs: bm chunk read fail at FS_blk %llu\n",
 			       (unsigned long long)(blk + i));
 			return -EIO;
 		}
 		memcpy((u8 *)buf + (i << 12), bh->b_data, RAVENFS_BLOCK_SIZE);
 		brelse(bh);
+		RFS_STAT_INC(sb, io_read_ops);
+		RFS_STAT_ADD(sb, io_read_bytes, RAVENFS_BLOCK_SIZE);
 	}
 	return 0;
 }
@@ -103,6 +139,7 @@ static int bm_io_write(void *io_ctx, u64 blk, u64 blk_len, const void *buf)
 		struct buffer_head *bh = sb_bread(sb, ravenfs_dev_blk(sbi, blk + i));
 
 		if (!bh) {
+			RFS_STAT_INC(sb, err_meta_io);
 			pr_err("ravenfs: bm chunk write fail at FS_blk %llu\n",
 			       (unsigned long long)(blk + i));
 			return -EIO;
@@ -111,6 +148,8 @@ static int bm_io_write(void *io_ctx, u64 blk, u64 blk_len, const void *buf)
 		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);
 		brelse(bh);
+		RFS_STAT_INC(sb, io_write_ops);
+		RFS_STAT_ADD(sb, io_write_bytes, RAVENFS_BLOCK_SIZE);
 	}
 	return 0;
 }
@@ -127,12 +166,15 @@ static int bm_mem_load(struct super_block *sb, u64 *words, u64 nblocks, u64 disk
 		struct buffer_head *bh = sb_bread(sb, ravenfs_dev_blk(sbi, disk_start + b));
 
 		if (!bh) {
+			RFS_STAT_INC(sb, err_meta_io);
 			pr_err("ravenfs: bitmap load fail at FS_blk %llu\n",
 			       (unsigned long long)(disk_start + b));
 			return -EIO;
 		}
 		memcpy((u8 *)words + (b << 12), bh->b_data, RAVENFS_BLOCK_SIZE);
 		brelse(bh);
+		RFS_STAT_INC(sb, io_read_ops);
+		RFS_STAT_ADD(sb, io_read_bytes, RAVENFS_BLOCK_SIZE);
 	}
 	return 0;
 }
@@ -197,9 +239,12 @@ static int bm_mem_flush_group(struct ravenfs_bitmap_mgr *m, bool ino)
 			mark_buffer_dirty(bh);
 			sync_dirty_buffer(bh);	/* 确定性：返回即落盘 */
 			brelse(bh);
+			RFS_STAT_INC(sb, io_write_ops);
+			RFS_STAT_ADD(sb, io_write_bytes, RAVENFS_BLOCK_SIZE);
 		}
 		if (err)
 			break;			/* 一片失败即停，余片下轮/下次重试 */
+		RFS_STAT_INC(sb, bm_sync_slices);	/* FULL：逐片全量写回片数 */
 	}
 	mutex_unlock(&m->wb_lock);
 	kvfree(buf);
@@ -269,6 +314,8 @@ int ravenfs_bitmap_create_mode(struct super_block *sb, const struct ravenfs_bitm
 
 		memset(&cfg, 0, sizeof(cfg));
 		cfg.choose = RFS_BM_MODE_MEM;
+		cfg.stat.emit = bm_stat_emit;		/* 计数出口：类事件 → sbi->stats.bm_* */
+		cfg.stat.ctx = sb;
 		cfg.pure_mem_cfg.block_bits_raw = (u8 *)m->blk_words;
 		cfg.pure_mem_cfg.block_bits_count = blk_bits;
 		cfg.pure_mem_cfg.inode_bits_raw = (u8 *)m->ino_words;
@@ -284,6 +331,8 @@ int ravenfs_bitmap_create_mode(struct super_block *sb, const struct ravenfs_bitm
 
 		memset(&cfg, 0, sizeof(cfg));
 		cfg.choose = RFS_BM_MODE_CHUNK;
+		cfg.stat.emit = bm_stat_emit;		/* 计数出口：类事件 → sbi->stats.bm_* */
+		cfg.stat.ctx = sb;
 		cfg.chunk_cfg.read_block = bm_io_read;
 		cfg.chunk_cfg.write_block = bm_io_write;
 		cfg.chunk_cfg.io_ctx = sb;		/* 核头允许 sb/sbi；取 sb（见文件头）*/

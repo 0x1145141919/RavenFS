@@ -225,9 +225,10 @@ static void chunk_summarize(struct rfs_bm_cmgr *m, const void *src, u64 nbits)
  * 直接当字下标），在线窗缓冲传 wlo（chunk 内局部 = 片内 − 窗首）。节点摘除由
  * chunk_free_recs 负责（asyn/shutdown 先清位、写回成功才摘账）。
  */
-static void chunk_apply_recs(const struct rfs_bm_rec *head, u64 *words, u64 idx_base)
+static u64 chunk_apply_recs(const struct rfs_bm_rec *head, u64 *words, u64 idx_base)
 {
 	const struct rfs_bm_rec *n;
+	u64 cleared = 0;
 
 	for (n = head; n; n = n->next) {
 		u64 i;
@@ -235,24 +236,31 @@ static void chunk_apply_recs(const struct rfs_bm_rec *head, u64 *words, u64 idx_
 		for (i = 0; i < n->len; i++) {
 			u64 idx = n->off + i - idx_base;
 
-			words[idx >> 6] &= ~(1ULL << (idx & 63));
+			if (words[idx >> 6] & (1ULL << (idx & 63))) {
+				words[idx >> 6] &= ~(1ULL << (idx & 63));
+				cleared++;	/* 仅 1→0 实清计（挂账/重复释放不虚高）*/
+			}
 		}
 	}
+	return cleared;
 }
 
-/* 摘链 + 释放全部节点 + 同步 HAS_RECS（链操作全在片锁内） */
-static void chunk_free_recs(struct rfs_bm_cmgr *m)
+/* 摘链 + 释放全部节点 + 同步 HAS_RECS（链操作全在片锁内）；返回摘除节点数 */
+static u32 chunk_free_recs(struct rfs_bm_cmgr *m)
 {
 	struct rfs_bm_rec *p = m->rec_head;
+	u32 freed = 0;
 
 	while (p) {
 		struct rfs_bm_rec *nx = p->next;
 
 		RFS_FREE(p);
+		freed++;
 		p = nx;
 	}
 	m->rec_head = NULL;
 	m->compact_word &= ~RFS_BM_CHUNK_FLAG_HAS_RECS;
+	return freed;
 }
 
 /* 收资源（enable 失败回滚 / disable 共用）：全片链节点 + mgrs[] + buffer */
@@ -274,15 +282,18 @@ static void chunk_release_resources(struct rfs_bm_cmgr *mgrs, u32 nwin, u8 *buf)
  * 逐节点清位 + 释放节点；free_count 挂链时已记账，此处不动（★ 记账）。 */
 static void cs_drain_chunk(struct rfs_bm_cslice *cs, u32 ctl)
 {
-	u64 wlo;
+	u64 wlo, cleared;
+	u32 drained;
 
 	if (!cs->mgrs || !cs->active_chunk_buffer || ctl >= cs->chunks_per_slice)
 		return;
 	if (!cs->mgrs[ctl].rec_head)
 		return;
 	wlo = (u64)ctl << cs_shift(cs);
-	chunk_apply_recs(cs->mgrs[ctl].rec_head, (u64 *)cs->active_chunk_buffer, wlo);
-	chunk_free_recs(&cs->mgrs[ctl]);
+	cleared = chunk_apply_recs(cs->mgrs[ctl].rec_head, (u64 *)cs->active_chunk_buffer, wlo);
+	drained = chunk_free_recs(&cs->mgrs[ctl]);
+	rfs_bm_stat(&cs->stat, RFS_BM_ST_FREE_BLOCKS, cleared);	/* 1→0 实清 */
+	rfs_bm_stat(&cs->stat, RFS_BM_ST_REC_DRAIN, drained);		/* drain 消费量 */
 	/* 清位 = 变更：必须置脏，否则该窗若此前已被清脏，evict 会按 dirty==0 跳过回写 →
 	 * 盘上陈旧 → asyn 重扫把 free_count 校准偏小 + test 把空闲位误判占用（泄漏）。*/
 	cs->mgrs[ctl].compact_word |= RFS_BM_CHUNK_FLAG_DIRTY;
@@ -321,9 +332,10 @@ static void cs_evict_online(struct rfs_bm_cslice *cs)
  */
 static int cs_ensure_online(struct rfs_bm_cslice *cs, u32 ctl)
 {
-	u64 nbits, cw, nblocks;
+	u64 nbits, cw, nblocks, t0;
 	bool drained;
 
+	t0 = RFS_NOW_NS();			/* bm_chunk_switch_ns：换片全程计时 */
 	if (!cs->mgrs || !cs->active_chunk_buffer || ctl >= cs->chunks_per_slice)
 		return -EIO;
 	if (cs->online_idx == ctl)
@@ -350,6 +362,8 @@ static int cs_ensure_online(struct rfs_bm_cslice *cs, u32 ctl)
 	cs->gen++;				/* 换片代号（发布递增） */
 	if (drained)
 		cs->mgrs[ctl].compact_word |= RFS_BM_CHUNK_FLAG_DIRTY;
+	rfs_bm_stat(&cs->stat, RFS_BM_ST_CHUNK_SWITCH, 1);	/* 换片频率 */
+	rfs_bm_stat(&cs->stat, RFS_BM_ST_CHUNK_SWITCH_NS, RFS_NOW_NS() - t0);
 	return 0;
 }
 
@@ -500,8 +514,10 @@ static int cs_alloc_hard(struct rfs_bm_cslice *cs, u8 align_log2, u64 bitscount,
 				u64 cw = cs->mgrs[c].compact_word;
 
 				if (!cs->mgrs[c].rec_head &&
-				    (cw & RFS_BM_CHUNK_SUM_MASK) == RFS_BM_CHUNK_SUM_ALL_USED)
+				    (cw & RFS_BM_CHUNK_SUM_MASK) == RFS_BM_CHUNK_SUM_ALL_USED) {
+					rfs_bm_stat(&cs->stat, RFS_BM_ST_SUMMARY_SKIP, 1);
 					continue;	/* 免载入跳窗 */
+				}
 				if (cs_ensure_online(cs, c) != 0)
 					return -EIO;
 			}
@@ -568,8 +584,10 @@ static int cs_alloc_soft(struct rfs_bm_cslice *cs, u8 align_log2, u64 bitscount,
 				u64 cw = cs->mgrs[c].compact_word;
 
 				if (!cs->mgrs[c].rec_head &&
-				    (cw & RFS_BM_CHUNK_SUM_MASK) == RFS_BM_CHUNK_SUM_ALL_USED)
+				    (cw & RFS_BM_CHUNK_SUM_MASK) == RFS_BM_CHUNK_SUM_ALL_USED) {
+					rfs_bm_stat(&cs->stat, RFS_BM_ST_SUMMARY_SKIP, 1);
 					continue;
+				}
 				if (cs_ensure_online(cs, c) != 0)
 					return -EIO;
 			}
@@ -628,6 +646,7 @@ static int cs_test_interval(struct rfs_bm_cslice *cs, bool val, u64 slice_base, 
 				    sum == RFS_BM_CHUNK_SUM_ALL_FREE) {
 					bool all_ones = (sum == RFS_BM_CHUNK_SUM_ALL_USED);
 
+					rfs_bm_stat(&cs->stat, RFS_BM_ST_SUMMARY_SKIP, 1);
 					if (all_ones != val)
 						return -ENOENT;
 					pos += n;	/* 摘要命 val：免载入整窗跳过 */
@@ -675,8 +694,11 @@ static int cs_free_interval(struct rfs_bm_cslice *cs, u64 slice_base, u64 len)
 		u64 n = (end <= whi) ? end - pos : whi - pos;	/* chunk 边界切段 */
 		struct rfs_bm_rec *node = RFS_ZALLOC(sizeof(*node));
 
-		if (!node)
-			return -ENOMEM;		/* 堆失败：本段未挂账未记账（泄漏方向，自洽）*/
+		if (!node) {
+			/* 归还记录资源耗尽（旧池空兜底的新形态：无固定池，堆分配失败）*/
+			rfs_bm_stat(&cs->stat, RFS_BM_ST_POOL_EMPTY, 1);
+			return -ENOMEM;		/* 本段未挂账未记账（泄漏方向，自洽）*/
+		}
 		node->off = pos;
 		node->len = n;
 		node->next = cs->mgrs[c].rec_head;
@@ -686,6 +708,7 @@ static int cs_free_interval(struct rfs_bm_cslice *cs, u64 slice_base, u64 len)
 			 ~(RFS_BM_CHUNK_SUM_MASK | RFS_BM_CHUNK_FLAG_HAS_RECS)) |
 			RFS_BM_CHUNK_SUM_MIXED | RFS_BM_CHUNK_FLAG_HAS_RECS;
 		cs->free_count += n;		/* 挂链即记账（★ 记账） */
+		rfs_bm_stat(&cs->stat, RFS_BM_ST_REC_ATTACH, 1);	/* 离线还账挂账 */
 		pos += n;
 	}
 	return 0;
@@ -733,8 +756,10 @@ static int cs_occupy_soft(struct rfs_bm_cslice *cs, u64 slice_base, u64 len, u64
 			u64 cw = cs->mgrs[c].compact_word;
 
 			if (!cs->mgrs[c].rec_head &&
-			    (cw & RFS_BM_CHUNK_SUM_MASK) == RFS_BM_CHUNK_SUM_ALL_USED)
+			    (cw & RFS_BM_CHUNK_SUM_MASK) == RFS_BM_CHUNK_SUM_ALL_USED) {
+				rfs_bm_stat(&cs->stat, RFS_BM_ST_SUMMARY_SKIP, 1);
 				break;		/* 锚点窗无货 → 前缀断（免载入） */
+			}
 			if (cs_ensure_online(cs, c) != 0) {
 				*rest = len - claimed;
 				return (claimed > 0) ? 0 : -EIO;
@@ -774,8 +799,8 @@ static int cs_occupy_soft(struct rfs_bm_cslice *cs, u64 slice_base, u64 len, u64
 static int cs_chunks_asyn(struct rfs_bm_cslice *cs)
 {
 	u8 *tmp;
-	u32 sh, c, oc;
-	u64 calib_old;
+	u32 sh, c, oc, drained = 0;
+	u64 calib_old, cleared = 0, ttl_online = 0, ttl_drain = 0;
 
 	RFS_MUTEX_GUARD(lk, &cs->lock);
 	if (cs->state != RFS_BM_SLICE_WORKABLE || !cs->mgrs || !cs->active_chunk_buffer)
@@ -790,12 +815,21 @@ static int cs_chunks_asyn(struct rfs_bm_cslice *cs)
 	}
 	sh = cs_shift(cs);
 	oc = cs->online_idx;
+	/* 态1/态2 分类（须在 chunk_free_recs 摘链前采样）；态3（其余）跳过、零 I/O。
+	 * 新 asyn = 整片读-合并-写，无 per-chunk sync_one —— 按「变更单元」计，不按整片
+	 * chunk 数虚高，保留 FULL↔CHUNK A/B 对照意义，语义等价旧态1+态2。*/
+	if (oc != RFS_BM_CHUNK_NONE &&
+	    (cs->mgrs[oc].compact_word & RFS_BM_CHUNK_FLAG_DIRTY))
+		ttl_online = 1;
+	for (c = 0; c < cs->chunks_per_slice; c++)
+		if (c != oc && cs->mgrs[c].rec_head)
+			ttl_drain++;
 	if (oc != RFS_BM_CHUNK_NONE) {
 		u64 wlo = (u64)oc << sh;
 
 		if (cs->mgrs[oc].rec_head) {
-			chunk_apply_recs(cs->mgrs[oc].rec_head,
-					 (u64 *)cs->active_chunk_buffer, wlo);
+			cleared += chunk_apply_recs(cs->mgrs[oc].rec_head,
+						    (u64 *)cs->active_chunk_buffer, wlo);
 			cs->mgrs[oc].compact_word |= RFS_BM_CHUNK_FLAG_DIRTY;
 		}
 		memcpy(tmp + (wlo >> 3), cs->active_chunk_buffer,
@@ -803,18 +837,24 @@ static int cs_chunks_asyn(struct rfs_bm_cslice *cs)
 	}
 	for (c = 0; c < cs->chunks_per_slice; c++)
 		if (cs->mgrs[c].rec_head)
-			chunk_apply_recs(cs->mgrs[c].rec_head, (u64 *)tmp, 0);
+			cleared += chunk_apply_recs(cs->mgrs[c].rec_head, (u64 *)tmp, 0);
 	if (cs->soul.write_block(cs->soul.io_ctx, cs->soul.chunk_base_blk,
 				 cs->soul.chunk_blk_length, tmp) != 0) {
 		RFS_FREE(tmp);
 		return -EIO;			/* 记录仍在链上 → 下次重跑（幂等） */
 	}
 	for (c = 0; c < cs->chunks_per_slice; c++) {
-		chunk_free_recs(&cs->mgrs[c]);
+		drained += chunk_free_recs(&cs->mgrs[c]);
 		chunk_summarize(&cs->mgrs[c], tmp + (((u64)c << sh) >> 3), cs_limit_of(cs, c));
 	}
 	if (oc != RFS_BM_CHUNK_NONE)
 		cs->mgrs[oc].compact_word &= ~RFS_BM_CHUNK_FLAG_DIRTY;
+	/* 写回成功后计数（同旧 sync_one 口径：读/写失败不计）*/
+	rfs_bm_stat(&cs->stat, RFS_BM_ST_FREE_BLOCKS, cleared);
+	rfs_bm_stat(&cs->stat, RFS_BM_ST_REC_DRAIN, drained);
+	rfs_bm_stat(&cs->stat, RFS_BM_ST_TTL_ONLINE, ttl_online);
+	rfs_bm_stat(&cs->stat, RFS_BM_ST_TTL_DRAIN, ttl_drain);
+	rfs_bm_stat(&cs->stat, RFS_BM_ST_SYNC_SLICES, ttl_online + ttl_drain);
 	calib_old = cs->free_count;
 	cs->free_count = chunk_count_zeros((const u64 *)tmp, cs->slice_bits);
 	if (calib_old != cs->free_count)
@@ -834,7 +874,7 @@ static int cs_chunks_asyn(struct rfs_bm_cslice *cs)
  */
 static int cs_enable(struct rfs_bm_cslice *cs, const struct rfs_bm_soul *soul, u64 base_idx)
 {
-	u64 nblocks, per, nwin, sh;
+	u64 nblocks, per, nwin, sh, t0;
 	u8 *tmp;
 	u32 i;
 
@@ -884,13 +924,16 @@ static int cs_enable(struct rfs_bm_cslice *cs, const struct rfs_bm_soul *soul, u
 		cs->active_chunk_buffer = NULL;
 		return -ENOMEM;
 	}
+	t0 = RFS_NOW_NS();		/* bm_scan_ns：mount 顺序扫描（本片整读）计时 */
 	if (cs->soul.read_block(cs->soul.io_ctx, soul->chunk_base_blk, nblocks, tmp) != 0) {
+		rfs_bm_stat(&cs->stat, RFS_BM_ST_SCAN_NS, RFS_NOW_NS() - t0);
 		RFS_FREE(tmp);
 		chunk_release_resources(cs->mgrs, cs->chunks_per_slice, cs->active_chunk_buffer);
 		cs->mgrs = NULL;
 		cs->active_chunk_buffer = NULL;
 		return -EIO;
 	}
+	rfs_bm_stat(&cs->stat, RFS_BM_ST_SCAN_NS, RFS_NOW_NS() - t0);
 	cs->free_count = chunk_count_zeros((const u64 *)tmp, cs->slice_bits);
 	sh = (u64)15 + soul->chunk_order;
 	for (i = 0; i < cs->chunks_per_slice; i++)
@@ -978,10 +1021,11 @@ static int chunk_group_setup(struct rfs_bm_group *g, const struct rfs_bm_cfg *cf
 	g->cslices = RFS_ZALLOC(sizeof(*g->cslices) * g->n_slices);
 	if (!g->cslices)
 		return -ENOMEM;
-	/* 先统一初始化全部片锁（fini 时逐片 disable 才可安全取锁） */
+	/* 先统一初始化全部片锁与计数出口（fini 时逐片 disable 才可安全取锁） */
 	for (i = 0; i < g->n_slices; i++) {
 		RFS_MUTEX_INIT(&g->cslices[i].lock);
 		g->cslices[i].state = RFS_BM_SLICE_UNWORKABLE;
+		g->cslices[i].stat = g->stat;	/* 片内事件出口（core 已从 cfg 拷入 g->stat）*/
 	}
 	for (i = 0; i < g->n_slices; i++) {
 		struct rfs_bm_cslice *cs = &g->cslices[i];
