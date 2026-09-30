@@ -10,12 +10,12 @@ ravenfs-y := version.o super.o dentry.o dentry_tree.o dentry_node.o inode_cache.
              bitmap_core.o bitmap_mem.o bitmap_chunk.o
 
 # ── 版本：以打包版本为唯一真值（PKGBUILD pkgver）─────────────────────────────
-#   宿主 dev 构建 ：从 packaging/arch/PKGBUILD 提取 pkgver；
+#   宿主 dev 构建 ：从 PKGBUILD 提取 pkgver（PKGBUILD 已升格至 linux/ 本目录）；
 #   dkms 构建     ：dkms.conf 传 RAVENFS_VERSION=${PACKAGE_VERSION}（命令行优先）；
 #   两者都无（独立拷出的源）：退化为 "dev"。
 #   结果经 -DRAVENFS_KO_VERSION 注入 version.c 的 MODULE_VERSION → `modinfo -F version`。
 ifeq ($(origin RAVENFS_VERSION), undefined)
-RAVENFS_VERSION := $(shell sed -n 's/^pkgver=//p' $(if $(src),$(src),$(CURDIR))/../packaging/arch/PKGBUILD 2>/dev/null | head -1)
+RAVENFS_VERSION := $(shell sed -n 's/^pkgver=//p' $(if $(src),$(src),$(CURDIR))/PKGBUILD 2>/dev/null | head -1)
 endif
 RAVENFS_VERSION := $(strip $(RAVENFS_VERSION))
 ifeq ($(RAVENFS_VERSION),)

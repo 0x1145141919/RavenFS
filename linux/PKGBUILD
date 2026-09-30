@@ -2,8 +2,11 @@
 # ravenfs-dkms —— RavenFS（实验性）内核模块。
 #   内核更新：DKMS alpm hook 自动为每个已装内核重编（需对应 *-headers）。
 #   initramfs：自带 /etc/mkinitcpio.conf.d/ravenfs.conf → 自动入镜像。
+# v0.1.2（2026-10-01）：位图模块拆分（rfs_bm 类 MEM/CHUNK）+ 挂载选项 bitmap_mode/bbco/ibco
+#   + D-1 计数器/ debugfs（随模式）/ D-3 时间戳 / D-5 叶内融合（预判法）/ D-6 inline→direct / D-9 show_options。
+#   详见 Docs/linux/ravenfs-linux-ko-v0.1.2-improvements.md。
 pkgname=ravenfs-dkms
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="RavenFS (experimental) kernel module, built via DKMS"
 arch=('x86_64')
