@@ -35,6 +35,7 @@
 #define RFS_EXT_SPLIT		168u	/* 分裂左半条数（左 168 / 右 count-168） */
 #define RFS_EXT_DEPTH_MAX	64u	/* 深度上限（超限判成环） */
 #define RFS_EXT_GLB_NONE	0xFFFFu	/* 叶内 GLB 无下界哨兵（u16） */
+#define RFS_EXT_MIN		168u	/* 非根欠载阈值（count < 168 触发平衡） */
 
 #define RFS_EXT_PTR_INV		RFS_PTR_PACK(0, RFS_MASK52)
 
@@ -50,6 +51,66 @@ struct rfs_epath {
 	bool	hit;
 	u16	ins_idx;
 };
+
+/* 叶内四形态融合（D-5a；对齐 god extent_map_range 融合段） */
+enum rfs_ext_merge {
+	RFS_EXT_MERGE_NONE,	/* 纯插 */
+	RFS_EXT_MERGE_LEFT,	/* 左邻扩尾 */
+	RFS_EXT_MERGE_RIGHT,	/* 并入右邻头 */
+	RFS_EXT_MERGE_BOTH,	/* 左邻扩长吞右邻（count−1） */
+};
+
+/*
+ * 分裂预算池（D-5b 预判法）：**修改叶之前**按树高一次性预分配整条分裂链节点
+ * （叶裂 1 + 每内层至多 1 + 建新根 1 = depth+1，上界恒 depth+1）。级联过程中
+ * 只从池取、不再 alloc → 修改一旦开始绝无「中途才缺节点」的 ENOSPC 半态。
+ * 分配失败 = 树零改动返回（会话未 dirty）。整池容量 = 深度上限 + 1。
+ */
+#define RFS_EXT_RESV_MAX	(RFS_EXT_DEPTH_MAX + 1)
+struct rfs_ext_resv {
+	u64	blk[RFS_EXT_RESV_MAX];
+	u32	n;		/* 已分配节点数 */
+	u32	used;		/* 已被级联取用数 */
+};
+
+/* 预算池：前置分配 n 个节点块；失败即回滚已分配 → -ENOSPC（树零改动） */
+static int rfs_ext_resv_alloc(struct super_block *sb, struct rfs_ext_resv *r, u32 n)
+{
+	u32 i;
+
+	r->n = 0;
+	r->used = 0;
+	if (n > RFS_EXT_RESV_MAX)
+		return -EIO;
+	for (i = 0; i < n; i++) {
+		u64 b = ravenfs_block_alloc(sb, 2, 1);
+
+		if (b == (u64)PTR_INVALID) {
+			while (r->n)
+				ravenfs_block_free(sb, r->blk[--r->n], 2);
+			return -ENOSPC;
+		}
+		r->blk[r->n++] = b;
+	}
+	return 0;
+}
+
+/* 预算池：归还未取用部分（正常收尾与错误路径统一收尾） */
+static void rfs_ext_resv_release(struct super_block *sb, struct rfs_ext_resv *r)
+{
+	while (r->used < r->n)
+		ravenfs_block_free(sb, r->blk[r->used++], 2);
+	r->n = 0;
+	r->used = 0;
+}
+
+/* 预算池：取一个节点块（池空/无池则现分配）；失败返回 PTR_INVALID */
+static u64 rfs_ext_resv_take(struct super_block *sb, struct rfs_ext_resv *r)
+{
+	if (r && r->used < r->n)
+		return r->blk[r->used++];
+	return ravenfs_block_alloc(sb, 2, 1);
+}
 
 /* ══ 节点 / meta 基建 ══ */
 
@@ -362,9 +423,13 @@ static int rfs_ext_propagate(struct super_block *sb, const struct rfs_epath *p,
 	return 0;
 }
 
-/* 叶裂：victim(count=338) → 左 168 / 右 170；维护叶链；返回 low/high max + 新叶块号 */
+/* 叶裂：victim(count=338) → 左 168 / 右 170；维护叶链；返回 low/high max + 新叶块号
+ *
+ * rsv：分裂预算池（D-5b）。非 NULL 时新叶块从池取（池空则现分配）；NULL = 旧口径
+ *      （现分配，unmap 路径沿用）。*/
 static int rfs_ext_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
-			      u64 *out_low, u64 *out_high, bool *out_was_root)
+			      u64 *out_low, u64 *out_high, bool *out_was_root,
+			      struct rfs_ext_resv *rsv)
 {
 	struct ravenfs_msession *vms = ravenfs_mdata_get(sb, victim_blk);
 	struct ravenfs_msession *nms = NULL;
@@ -389,7 +454,7 @@ static int rfs_ext_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_n
 	old_next = RFS_PTR_ADDR(vl->meta.ptrs[2]);	/* ⚠ 先读后写 */
 	ravenfs_mdata_put(vms);
 
-	new_blk = ravenfs_block_alloc(sb, 2, 1);
+	new_blk = rfs_ext_resv_take(sb, rsv);
 	if (new_blk == (u64)PTR_INVALID)
 		return -ENOSPC;
 
@@ -440,9 +505,11 @@ static int rfs_ext_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_n
 	return 0;
 }
 
-/* 内裂：victim(count=338) → 左 168 / 右 170；右半孩子 reparent → 新内块 */
+/* 内裂：victim(count=338) → 左 168 / 右 170；右半孩子 reparent → 新内块
+ *
+ * rsv：分裂预算池（D-5b，语义同 rfs_ext_leaf_split）。*/
 static int rfs_ext_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
-			       u64 *out_low, u64 *out_high)
+			       u64 *out_low, u64 *out_high, struct rfs_ext_resv *rsv)
 {
 	struct ravenfs_msession *vms = ravenfs_mdata_get(sb, victim_blk);
 	struct ravenfs_msession *nms = NULL;
@@ -464,7 +531,7 @@ static int rfs_ext_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_
 	parent = pptr;
 	ravenfs_mdata_put(vms);
 
-	new_blk = ravenfs_block_alloc(sb, 2, 1);
+	new_blk = rfs_ext_resv_take(sb, rsv);
 	if (new_blk == (u64)PTR_INVALID)
 		return -ENOSPC;
 
@@ -525,9 +592,12 @@ static int rfs_ext_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_
 	return 0;
 }
 
-/* 新建根内（根升长）；显式写 ptrs[]（文件树 ".." = PTR_INVALID） */
+/* 新建根内（根升长）；显式写 ptrs[]（文件树 ".." = PTR_INVALID）
+ *
+ * rsv：分裂预算池（D-5b）；非 NULL 时新根块从池取。*/
 static int rfs_ext_new_root_inner(struct super_block *sb, u64 ino, u64 left_blk, u64 left_max,
-				  u64 right_blk, u64 right_max, u64 *root_out)
+				  u64 right_blk, u64 right_max, u64 *root_out,
+				  struct rfs_ext_resv *rsv)
 {
 	struct ravenfs_msession *rms;
 	struct Bptree_extent_inner_node_t *ri;
@@ -535,7 +605,7 @@ static int rfs_ext_new_root_inner(struct super_block *sb, u64 ino, u64 left_blk,
 	int k, err = 0;
 
 	RFS_STAT_INC(sb, ext_new_root);	/* 树长高的次数 */
-	root_blk = ravenfs_block_alloc(sb, 2, 1);
+	root_blk = rfs_ext_resv_take(sb, rsv);
 	if (root_blk == (u64)PTR_INVALID)
 		return -ENOSPC;
 
@@ -582,7 +652,7 @@ static int rfs_ext_new_root_inner(struct super_block *sb, u64 ino, u64 left_blk,
 /* 父层应用（+ 内裂上溯 + 升根）。cur_victim = 父层里被替换/插入的旧子块号 */
 static int rfs_ext_apply_up(struct super_block *sb, u64 ino, const struct rfs_epath *p,
 			    u32 level, u32 child_idx, u64 cur_victim, u64 low_max,
-			    u64 new_blk, u64 high_max, u64 *root_io)
+			    u64 new_blk, u64 high_max, u64 *root_io, struct rfs_ext_resv *rsv)
 {
 	for (;;) {
 		struct ravenfs_msession *ms = ravenfs_mdata_get(sb, p->blk[level]);
@@ -620,12 +690,12 @@ static int rfs_ext_apply_up(struct super_block *sb, u64 ino, const struct rfs_ep
 		{
 			u64 rblk, lmx, hmx;
 
-			err = rfs_ext_inner_split(sb, p->blk[level], &rblk, &lmx, &hmx);
+			err = rfs_ext_inner_split(sb, p->blk[level], &rblk, &lmx, &hmx, rsv);
 			if (err)
 				return err;
 			if (is_root)
 				return rfs_ext_new_root_inner(sb, ino, p->blk[level], lmx,
-							      rblk, hmx, root_io);
+							      rblk, hmx, root_io, rsv);
 			if (level == 0)
 				return -EIO;
 			cur_victim = p->blk[level];
@@ -638,17 +708,38 @@ static int rfs_ext_apply_up(struct super_block *sb, u64 ino, const struct rfs_ep
 	}
 }
 
-/* ══ 插入一条 extent（walk 定位后调用）；含叶裂 + 升根 + 父 key 上溯 ══ */
+/* 欠载链修复（M4.3 定义于本文件后段；D-5a 双融合吞右邻致欠载时前向调用） */
+static int rfs_ext_balance_from(struct super_block *sb, u64 ino, u64 child_blk,
+				u64 *root_io, u64 *old_root);
+
+/* ══ 插入一条 extent（walk 定位后调用）；叶内四形态融合 + 前瞻预算 + 叶裂 + 升根 + 父 key 上溯 ══
+ *
+ * D-5a：重叠防御之后按 merge = L ? (R ? both : left) : (R ? right : none) 做**叶内**
+ *       四形态融合（对齐 god extent_map_range 融合段；god :105「跨界一律不做」）。
+ * D-5b：**预判法（look-ahead）**——在修改叶之前先判定「本步是否需要新节点」（纯插致叶满
+ *       → 叶裂；级联 → 内层裂；触顶 → 建新根），需要则**先**按树高预分配整条分裂链
+ *       节点（预算池，同 god reserve_pool）。分配失败 = 树零改动返回 -ENOSPC，绝不会
+ *       出现「叶已超满却裂不出来」的半态。left/right/both 恒零预算（count 不增或反减）。
+ * P10：根更迭（both 致欠载 → 平衡链 → 根收缩）**旧根不就地 free**，经 *old_root 外抛，
+ *       由调用方在 inode.data_root 提交**之后**统一 free。
+ */
 int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
-			  const struct extent_t *ext)
+			  const struct extent_t *ext, u64 *old_root)
 {
 	struct rfs_epath p;
 	u64 root = *root_io;
-	u64 leaf_blk, old_max, new_max;
-	u32 idx, cnt2;
+	u64 leaf_blk, old_max, new_max = 0;
+	u32 idx, cnt2 = 0;
+	struct rfs_ext_resv rsv;
+	enum rfs_ext_merge merge = RFS_EXT_MERGE_NONE;
+	bool fused_both = false, leaf_is_root = false;
 	int err = 0;
 
 	RFS_STAT_INC(sb, ext_insert);	/* 映射插入次数 */
+	if (old_root)
+		*old_root = (u64)PTR_INVALID;
+	rsv.n = 0;
+	rsv.used = 0;
 	if (ext->length == 0)
 		return 0;
 
@@ -683,6 +774,7 @@ int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
 		struct Bptree_extent_leaf_node_t *lf;
 		u32 c, inner, rootf;
 		u64 pptr;
+		bool L = false, R = false;
 
 		if (IS_ERR(ms))
 			return PTR_ERR(ms);
@@ -709,14 +801,103 @@ int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
 			return -EEXIST;
 		}
 		old_max = (c > 0) ? (lf->extents[c - 1].fblkbase + lf->extents[c - 1].length) : 0;
-		memmove(&lf->extents[idx + 1], &lf->extents[idx],
-			(size_t)(c - idx) * sizeof(struct extent_t));
-		lf->extents[idx] = *ext;
-		cnt2 = c + 1;
-		RFS_EXT_SET_COUNT(&lf->meta, cnt2);
-		new_max = lf->extents[cnt2 - 1].fblkbase + lf->extents[cnt2 - 1].length;
+
+		/* ── D-5a 形态判定（树改动前一次完成；packed 成员禁引用 → 局部拷贝）──
+		 * L/R 仅**叶内**判定（左邻 = GLB = ext[idx-1]；右邻 = ext[idx]）：
+		 *   L = 左邻逻辑尾 == ext 起 ∧ 左邻物理尾 == ext 物理起
+		 *   R = ext 逻辑尾 == 右邻起 ∧ ext 物理尾 == 右邻物理起
+		 * 真重叠已被上列防御拦下（-EEXIST），== 判定与防御互斥 → 融合不误吞。*/
+		if (idx > 0) {
+			const struct extent_t *g = &lf->extents[idx - 1];
+
+			L = (g->fblkbase + g->length == ext->fblkbase &&
+			     RFS_PTR_ADDR(g->block_base) + g->length ==
+			     RFS_PTR_ADDR(ext->block_base));
+		}
+		if (idx < c) {
+			const struct extent_t *r = &lf->extents[idx];
+
+			R = (ext->fblkbase + ext->length == r->fblkbase &&
+			     RFS_PTR_ADDR(ext->block_base) + ext->length ==
+			     RFS_PTR_ADDR(r->block_base));
+		}
+		merge = L ? (R ? RFS_EXT_MERGE_BOTH : RFS_EXT_MERGE_LEFT)
+			  : (R ? RFS_EXT_MERGE_RIGHT : RFS_EXT_MERGE_NONE);
+
+		/* ── D-5b 预判法：先判「本步是否需要新节点」，需要则**先备好** ── */
+		if (merge == RFS_EXT_MERGE_NONE && c + 1 > RFS_EXT_ORDER) {
+			/* 纯插致叶满（c==337）→ 必裂：按树高预分配整条分裂链
+			 * （depth+1 = 叶裂 1 + 每内层至多 1 + 建新根 1）。alloc 在 memmove
+			 * 之前 → 失败 = 回滚已分配 + 返回，会话未 dirty → 树零改动、真原子失败。*/
+			err = rfs_ext_resv_alloc(sb, &rsv, p.depth + 1);
+			if (err) {
+				ravenfs_mdata_put(ms);
+				return err;	/* -ENOSPC：未动树 */
+			}
+		}
+
+		/* ── 执行形态（此刻起预算池已备好 → 无中途缺节点）── */
+		switch (merge) {
+		case RFS_EXT_MERGE_BOTH: {
+			/* 左邻扩长吞右邻（右邻删除、count−1）；L&&R 已证 phys 三连连续
+			 * → 合并单条连续映射合法。叶 max 恒不变（吞并终点 = 原右邻
+			 * 终点）→ 零刷新。*/
+			u64 gfb = lf->extents[idx - 1].fblkbase;
+			struct extent_t r = lf->extents[idx];
+
+			lf->extents[idx - 1].length = (r.fblkbase + r.length) - gfb;
+			if (idx < c - 1)
+				memmove(&lf->extents[idx], &lf->extents[idx + 1],
+					(size_t)(c - idx - 1) * sizeof(struct extent_t));
+			memset(&lf->extents[c - 1], 0, sizeof(struct extent_t));
+			cnt2 = c - 1;
+			RFS_EXT_SET_COUNT(&lf->meta, cnt2);
+			fused_both = true;
+			break;
+		}
+		case RFS_EXT_MERGE_LEFT:
+			/* 左邻扩尾（count/槽位不动）*/
+			lf->extents[idx - 1].length += ext->length;
+			cnt2 = c;
+			break;
+		case RFS_EXT_MERGE_RIGHT: {
+			/* 并入右邻头：起点/phys 同步左移 ext->length（R 条件保证
+			 * r.fblkbase == ext.fblkbase + ext->length → 无下溢）；终点不动
+			 * → 叶 max 不变。count 不变 → 零分配零失败面。*/
+			struct extent_t nr = lf->extents[idx];
+
+			nr.fblkbase -= ext->length;
+			rfs_ext_set_addr(&nr.block_base,
+					 RFS_PTR_ADDR(nr.block_base) - ext->length);
+			nr.length += ext->length;
+			lf->extents[idx] = nr;
+			cnt2 = c;
+			break;
+		}
+		default:	/* RFS_EXT_MERGE_NONE：纯插（GLB 后腾槽） */
+			if (idx < c)
+				memmove(&lf->extents[idx + 1], &lf->extents[idx],
+					(size_t)(c - idx) * sizeof(struct extent_t));
+			lf->extents[idx] = *ext;
+			cnt2 = c + 1;
+			RFS_EXT_SET_COUNT(&lf->meta, cnt2);
+			break;
+		}
+		new_max = (cnt2 > 0) ? (lf->extents[cnt2 - 1].fblkbase +
+					lf->extents[cnt2 - 1].length) : 0;
+		leaf_is_root = (rootf != 0);
 		NODE_DIRTY(ms);
 		ravenfs_mdata_put(ms);
+	}
+
+	if (fused_both) {
+		/* 双融合收尾：count 只减不增 → 永不超满（零分裂面）；叶 max 恒不变 →
+		 * 零刷新。唯一结构路径 = 删记录致非根欠载 → 平衡链（复用 ko 既有
+		 * rfs_ext_balance_from；根收缩旧根经 old_root 外抛，调用方提交后 free
+		 * —— P10）。*/
+		if (leaf_is_root || cnt2 >= RFS_EXT_MIN)
+			return 0;
+		return rfs_ext_balance_from(sb, ino, leaf_blk, root_io, old_root);
 	}
 
 	if (cnt2 <= RFS_EXT_ORDER) {
@@ -724,19 +905,25 @@ int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
 			return rfs_ext_propagate(sb, &p, p.depth - 1, new_max);
 		return 0;
 	}
-	/* 叶溢出 → 分裂 */
+	/* 叶溢出 → 分裂（D-5b：预算池已前置备好 → 级联零分配失败面） */
 	{
 		u64 nblk, low_max, high_max;
 		bool was_root;
 
-		err = rfs_ext_leaf_split(sb, leaf_blk, &nblk, &low_max, &high_max, &was_root);
-		if (err)
-			return err;
-		if (p.depth == 1) {		/* 叶即根 → 升根 */
-			return rfs_ext_new_root_inner(sb, ino, leaf_blk, low_max, nblk, high_max, root_io);
+		err = rfs_ext_leaf_split(sb, leaf_blk, &nblk, &low_max, &high_max,
+					 &was_root, &rsv);
+		if (!err) {
+			if (p.depth == 1) {	/* 叶即根 → 升根 */
+				err = rfs_ext_new_root_inner(sb, ino, leaf_blk, low_max,
+							     nblk, high_max, root_io, &rsv);
+			} else {
+				err = rfs_ext_apply_up(sb, ino, &p, p.depth - 2,
+						       p.cidx[p.depth - 2], leaf_blk,
+						       low_max, nblk, high_max, root_io, &rsv);
+			}
 		}
-		return rfs_ext_apply_up(sb, ino, &p, p.depth - 2, p.cidx[p.depth - 2],
-					leaf_blk, low_max, nblk, high_max, root_io);
+		rfs_ext_resv_release(sb, &rsv);	/* 归还未消耗预算（含错误路径） */
+		return err;
 	}
 }
 
@@ -750,7 +937,6 @@ int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
  * 纪律（P10）：`extent_root_shrink` 根更迭时**旧根不 free**，随 `old_root` 上抛；
  *       调用方在 inode.data_root 提交**之后**统一 free（严禁先 free 后翻 inode = 悬挂）。
  * ══════════════════════════════════════════════════════════════════ */
-#define RFS_EXT_MIN	168u	/* 非根欠载阈值（count < 168 触发平衡） */
 
 /* 空根叶：direct→extent 物化 / 整文件打洞的空树终态（size>160 时合法） */
 int ravenfs_extent_new_root_leaf(struct super_block *sb, u64 ino, u64 *root_out)
@@ -1372,16 +1558,17 @@ int ravenfs_extent_unmap_loose(struct super_block *sb, u64 ino, u64 *root_io,
 			u64 nblk, low_max, high_max;
 			bool was_root;
 
+			/* unmap 路径不预判预算（rsv=NULL → 现分配，旧口径）*/
 			err = rfs_ext_leaf_split(sb, leaf_blk, &nblk, &low_max,
-						 &high_max, &was_root);
+						 &high_max, &was_root, NULL);
 			if (err)
 				return err;
 			if (p.depth == 1)
 				return rfs_ext_new_root_inner(sb, ino, leaf_blk, low_max,
-							      nblk, high_max, root_io);
+							      nblk, high_max, root_io, NULL);
 			return rfs_ext_apply_up(sb, ino, &p, p.depth - 2,
 						p.cidx[p.depth - 2], leaf_blk, low_max,
-						nblk, high_max, root_io);
+						nblk, high_max, root_io, NULL);
 		}
 		/* 右段终点 = 原 rec 终点 → 叶 max 不变，零刷新 */
 		return 0;

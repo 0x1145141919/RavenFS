@@ -683,7 +683,7 @@ static int rfs_punch_hole(struct inode *inode, loff_t off, loff_t len)
 			e0.length = db_start;
 			e0.fblkbase = 0;
 			e0.block_base.v = RFS_PTR_PACK(0, base);
-			err = ravenfs_extent_insert(sb, inode->i_ino, &root, &e0);
+			err = ravenfs_extent_insert(sb, inode->i_ino, &root, &e0, NULL);
 			if (err)
 				goto out_free_tree;
 		}
@@ -691,7 +691,7 @@ static int rfs_punch_hole(struct inode *inode, loff_t off, loff_t len)
 			e1.length = oldceil - db_end;
 			e1.fblkbase = db_end;
 			e1.block_base.v = RFS_PTR_PACK(0, base + db_end);
-			err = ravenfs_extent_insert(sb, inode->i_ino, &root, &e1);
+			err = ravenfs_extent_insert(sb, inode->i_ino, &root, &e1, NULL);
 			if (err)
 				goto out_free_tree;
 		}

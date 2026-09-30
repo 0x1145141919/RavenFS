@@ -43,6 +43,7 @@
 #include "ravenfs_iomap.h"
 #include "ravenfs_extent.h"
 #include "ravenfs_cache.h"
+#include "ravenfs_mdata_cache.h"
 #include "ravenfs_bitmap.h"
 
 /* inline 态字节上限（不变量 22）：size ≤ 160 ⇒ 内容在 inode.inline_data */
@@ -232,7 +233,7 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 		e0.fblkbase = 0;
 		e0.block_base.v = RFS_PTR_PACK(0, run);
 		tmp = root;
-		err = ravenfs_extent_insert(sb, inode->i_ino, &tmp, &e0);
+		err = ravenfs_extent_insert(sb, inode->i_ino, &tmp, &e0, NULL);
 		if (err)
 			return err;		/* 孤儿块（inode 未动，§8） */
 		root = tmp;
@@ -262,7 +263,7 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 				e0.fblkbase = 0;
 				e0.block_base.v = RFS_PTR_PACK(0, run0);
 				tmp = root;
-				err = ravenfs_extent_insert(sb, inode->i_ino, &tmp, &e0);
+				err = ravenfs_extent_insert(sb, inode->i_ino, &tmp, &e0, NULL);
 				root = tmp;
 			}
 			if (err) {
@@ -279,7 +280,7 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 		e1.length = cnt;
 		e1.fblkbase = pos_blk;
 		e1.block_base.v = RFS_PTR_PACK(0, run);
-		err = ravenfs_extent_insert(sb, inode->i_ino, &root, &e1);
+		err = ravenfs_extent_insert(sb, inode->i_ino, &root, &e1, NULL);
 		if (err) {
 			ravenfs_block_free(sb, run, cnt);
 			return err;
@@ -346,7 +347,7 @@ static int ravenfs_write_migrate_direct(struct super_block *sb, struct inode *in
 	e0.fblkbase = 0;
 	e0.block_base.v = RFS_PTR_PACK(0, old_base);
 	tmp = root;
-	err = ravenfs_extent_insert(sb, inode->i_ino, &tmp, &e0);
+	err = ravenfs_extent_insert(sb, inode->i_ino, &tmp, &e0, NULL);
 	if (err)
 		return err;
 	root = tmp;
@@ -354,7 +355,7 @@ static int ravenfs_write_migrate_direct(struct super_block *sb, struct inode *in
 	e1.length = grow;
 	e1.fblkbase = old_ceil;
 	e1.block_base.v = RFS_PTR_PACK(0, run);
-	err = ravenfs_extent_insert(sb, inode->i_ino, &root, &e1);
+	err = ravenfs_extent_insert(sb, inode->i_ino, &root, &e1, NULL);
 	if (err)
 		return err;
 
@@ -469,7 +470,7 @@ static int ravenfs_iomap_begin_write(struct inode *inode, loff_t pos, loff_t len
 			iomap->flags = 0;
 		} else {			/* 洞 → 立刻分配 + 插树（D-M4-6） */
 			u64 hole_end = next ? min(next, end_blk) : end_blk;
-			u64 cnt, run, newroot;
+			u64 cnt, run, newroot, old_root = (u64)PTR_INVALID;
 			struct extent_t ne;
 
 			if (hole_end <= blk)
@@ -484,14 +485,20 @@ static int ravenfs_iomap_begin_write(struct inode *inode, loff_t pos, loff_t len
 			ne.fblkbase = blk;
 			ne.block_base.v = RFS_PTR_PACK(0, run);
 			newroot = r->data_root;
-			err = ravenfs_extent_insert(sb, inode->i_ino, &newroot, &ne);
+			err = ravenfs_extent_insert(sb, inode->i_ino, &newroot, &ne, &old_root);
 			if (err) {
 				ravenfs_block_free(sb, run, cnt);
 				return err;
 			}
 			if (newroot != r->data_root) {
-				r->data_root = newroot;	/* 叶裂升根 → 新根 */
+				r->data_root = newroot;	/* 叶裂升根 / both 根收缩 → 新根 */
 				RFS_ROW_MARK_DIRTY(ses->row);
+			}
+			/* P10 延迟 free：both 致根收缩的旧根，在 data_root 提交**之后**统一释放
+			 * （先 free = 悬挂）。*/
+			if (old_root != (u64)PTR_INVALID) {
+				ravenfs_mdata_drop(sb, old_root);
+				ravenfs_block_free(sb, old_root, 2);
 			}
 			iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
 			iomap->type = IOMAP_MAPPED;
