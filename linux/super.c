@@ -114,8 +114,21 @@ static int ravenfs_stats_show(struct seq_file *m, void *v)
 	for (i = 0; i < ARRAY_SIZE(ravenfs_stat_names); i++)
 		seq_printf(m, "%s\t%llu\n", ravenfs_stat_names[i],
 			   (unsigned long long)atomic64_read(&st[i]));
-	/* §5：shutdown 布尔（gauge；零成本，独立状态段，勿与 counter 混读） */
+	/* §5：状态段（gauge + 本次挂载锁定的位图后端，便于读侧解释 bm_ 字段子集）*/
 	seq_printf(m, "# state\nshutdown\t%d\n", ravenfs_is_shutdown(sb) ? 1 : 0);
+	{
+		struct ravenfs_bitmap_opts bo;
+
+		/* 位图后端随挂载锁定（mem/chunk）；F 组非本后端的专属字段恒 0 ——
+		 * 本行让读侧知道该按哪套子集解释，避免把「恒 0」误读为「没打点」。*/
+		if (ravenfs_bitmap_opts_get(sb, &bo) == 0) {
+			seq_printf(m, "bitmap_mode\t%s\n",
+				   bo.mode == RFS_BM_MODE_CHUNK ? "chunk" : "mem");
+			if (bo.mode == RFS_BM_MODE_CHUNK)
+				seq_printf(m, "bitmap_chunk_order\tblk=%u ino=%u\n",
+					   bo.blk_chunk_order, bo.ino_chunk_order);
+		}
+	}
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(ravenfs_stats);
