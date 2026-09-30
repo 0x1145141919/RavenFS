@@ -133,6 +133,7 @@ static int rfs_heap_activate(struct super_block *sb, struct raven_Inode_t *r, u3
 		RFS_ROW_MARK_DIRTY(ms->row);
 	}
 	RFS_NHC_SET(*ctrl, gran, bits, bmp_base, 0, data_base);
+	RFS_STAT_INC(sb, nh_activate);		/* 堆激活（首个大名字触发的晋升）*/
 	return 0;
 }
 
@@ -175,6 +176,7 @@ int ravenfs_name_heap_alloc(struct super_block *sb, u64 dir_ino, u32 name_len,
 
 	if (name_len <= DENTRY_INLINE_NAME_MAX || name_len > RAVENFS_MAX_NAME_LEN)
 		return -EINVAL;
+	RFS_STAT_INC(sb, nh_alloc);			/* 名字堆分配入口 */
 	tail = name_len - DENTRY_INLINE_NAME_MAX;
 	group = rfs_heap_pick(tail, &units, &gran);
 	lo = rfs_heap_group_lo[group];
@@ -240,7 +242,8 @@ int ravenfs_name_heap_alloc(struct super_block *sb, u64 dir_ino, u32 name_len,
 				  (byte_off & 0xFFF);
 		return 0;
 	}
-	return -ENOSPC;					/* 该粒度档全部耗尽 */
+	RFS_STAT_INC(sb, nh_alloc_fail);		/* 该粒度档全部耗尽 */
+	return -ENOSPC;
 }
 
 /* 写尾部数据（起点可能在片内第二块高偏移 → 跨 8K 片，≤2 片） */
@@ -252,6 +255,7 @@ int ravenfs_name_heap_write(struct super_block *sb, u32 name_len, u64 remain_ptr
 
 	if (name_len <= DENTRY_INLINE_NAME_MAX || !tail)
 		return -EINVAL;
+	RFS_STAT_INC(sb, nh_write);			/* 尾部名字数据写入 */
 	len = name_len - DENTRY_INLINE_NAME_MAX;
 	blk = remain_ptr >> 12;
 	offset = (u32)(remain_ptr & 0xFFF);
@@ -296,6 +300,7 @@ int ravenfs_name_heap_free(struct super_block *sb, u64 dir_ino, u32 name_len,
 		return 0;
 	if (remain_ptr == (u64)PTR_INVALID)
 		return -EINVAL;
+	RFS_STAT_INC(sb, nh_free);			/* 尾部名字存储释放 */
 	tail = name_len - DENTRY_INLINE_NAME_MAX;
 	group = rfs_heap_pick(tail, &units, &gran);
 	lo = rfs_heap_group_lo[group];
@@ -406,6 +411,7 @@ int ravenfs_dir_name_heap_release(struct super_block *sb, u64 dir_ino)
 		ravenfs_block_free(sb, RFS_NHC_BITMAP(*ctrl), bmp_blks);
 		ravenfs_block_free(sb, RFS_NHC_DATA(*ctrl), data_blks);
 		RFS_NHC_SET(*ctrl, 0, 0, (u64)NAME_HEAP_INACTIVE, 0, (u64)NAME_HEAP_INACTIVE);
+		RFS_STAT_INC(sb, nh_release);		/* 空堆回收 */
 		changed = true;
 	}
 	if (changed) {

@@ -216,6 +216,16 @@ struct ravenfs_sb_stats {
 	atomic64_t	life_umount;
 	atomic64_t	life_iget_new;
 	atomic64_t	life_evict;
+
+	/* L. 名字堆 nh_（6；v0.1.2 新增）—— 大名字/长目录尾部名字存储的名字堆操作。
+	 * 该模块不做直接磁盘 I/O（经 mdata 片，已并入 md_/io_）；本组只记"名字堆"这一层
+	 * 自身的操作面，使「全模块」每模块都有自己的计数器。*/
+	atomic64_t	nh_alloc;		/* 名字堆分配入口次数 */
+	atomic64_t	nh_alloc_fail;		/* 名字堆分配失败（当前粒度档全满 -> -ENOSPC）*/
+	atomic64_t	nh_write;		/* 尾部名字数据写入次数 */
+	atomic64_t	nh_free;		/* 尾部名字存储释放次数 */
+	atomic64_t	nh_activate;		/* 堆激活次数（首个大名字触发的晋升频率）*/
+	atomic64_t	nh_release;		/* 空堆回收次数（目录折构时释放的堆数）*/
 };
 
 struct ravenfs_sb_info {

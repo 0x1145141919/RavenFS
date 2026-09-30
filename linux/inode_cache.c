@@ -143,6 +143,8 @@ static int ravenfs_row_store(struct super_block *sb, struct ravenfs_cache *c,
 		mark_buffer_dirty(bh);
 		sync_dirty_buffer(bh);		/* 确定性：返回即落盘 */
 		brelse(bh);
+		RFS_STAT_INC(sb, io_write_ops);		/* inode 行写回（元数据写放大）*/
+		RFS_STAT_ADD(sb, io_write_bytes, RAVENFS_BLOCK_SIZE);
 	}
 	return 0;
 }

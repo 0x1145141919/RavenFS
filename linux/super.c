@@ -94,6 +94,8 @@ static const char *const ravenfs_stat_names[] = {
 	/* J err_ */ "err_shutdown_hits", "err_shutdown_trig", "err_meta_io",
 	"err_sb_read", "err_enospc", "err_other",
 	/* K life_ */"life_mount", "life_umount", "life_iget_new", "life_evict",
+	/* L nh_ */  "nh_alloc", "nh_alloc_fail", "nh_write", "nh_free",
+	"nh_activate", "nh_release",
 };
 
 static int ravenfs_stats_show(struct seq_file *m, void *v)
@@ -102,6 +104,7 @@ static int ravenfs_stats_show(struct seq_file *m, void *v)
 	struct ravenfs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
 	const atomic64_t *st;
 	unsigned int i;
+	const char *cur_grp = NULL;
 
 	/* 结构体成员全为 atomic64_t 且无填充 → 当连续数组读（下面断言守着） */
 	BUILD_BUG_ON(sizeof(struct ravenfs_sb_stats) !=
@@ -111,9 +114,19 @@ static int ravenfs_stats_show(struct seq_file *m, void *v)
 	st = (const atomic64_t *)&sbi->stats;
 	seq_printf(m, "# ravenfs stats  sb=%s  mounted_at=%llu\n",
 		   sb->s_id, (unsigned long long)sbi->mounted_at_ns);
-	for (i = 0; i < ARRAY_SIZE(ravenfs_stat_names); i++)
-		seq_printf(m, "%s\t%llu\n", ravenfs_stat_names[i],
+	for (i = 0; i < ARRAY_SIZE(ravenfs_stat_names); i++) {
+		const char *nm = ravenfs_stat_names[i];
+		const char *us = strchr(nm, '_');
+		size_t gl = us ? (size_t)(us - nm) : strlen(nm);
+
+		/* 分组小节头（`# [op]` …）：名字前缀即组名；便于 grep/人读，勿作为解析依据 */
+		if (!cur_grp || strlen(cur_grp) != gl || memcmp(cur_grp, nm, gl)) {
+			seq_printf(m, "# [%.*s]\n", (int)gl, nm);
+			cur_grp = nm;
+		}
+		seq_printf(m, "%s\t%llu\n", nm,
 			   (unsigned long long)atomic64_read(&st[i]));
+	}
 	/* §5：状态段（gauge + 本次挂载锁定的位图后端，便于读侧解释 bm_ 字段子集）*/
 	seq_printf(m, "# state\nshutdown\t%d\n", ravenfs_is_shutdown(sb) ? 1 : 0);
 	{
@@ -1253,6 +1266,8 @@ static int ravenfs_sb_write_timestamp(struct super_block *sb, bool is_mount)
 		err = -EIO;
 		goto out;
 	}
+	RFS_STAT_INC(sb, io_write_ops);		/* SB 自身写（4K）*/
+	RFS_STAT_ADD(sb, io_write_bytes, RAVENFS_BLOCK_SIZE);
 	/* 再一道屏障过掉电写缓存（头注耐久性段：umount_time 要在掉电后仍可信）。 */
 	err = ravenfs_issue_flush(sb);
 	if (err)
