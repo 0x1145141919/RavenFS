@@ -1,6 +1,10 @@
 # tools/audit_v1.2 — RavenFS v1.2 递归只读校验员
 
-Host 侧独立执行的只读审计工具（不依赖 juvenile_god / 内核模块）。
+Host 侧只读审计工具，**基于上帝类**（`RavenFS_juvenile`）：挂载 readonly + mmap 后端后
+驱动 `audit_dfs_root`（可达性审计：root 先序 DFS + 两张影子图 + 收口 XOR）。
+> **2026-09-30 重写**：由「自带独立解析的 v1.2 审计器（不依赖 juvenile_god）」改为
+> **上帝类薄壳**（链接 `libravenfs_juvenile.a`）。旧独立实现见 git 历史。
+> 审计模型详见 `Docs/audit_dfs_design.md`。
 
 ## 构建
 
@@ -14,7 +18,15 @@ make mkstates_x            # → ./mkstates_x（M6 xattr/ACL/capability 靶子�
 make m6_xattr_dump         # → ./m6_xattr_dump（M6 host 侧 xattr 回放/校验器）
 ```
 
-等价单命令（编译约定）：`g++ -Wall -Wextra -O2 -g -I../../include audit_v1.2.cpp -o audit_v1.2 -lxxhash`
+等价单命令（编译约定）：先构建上帝类静态库，再由 Makefile 链接：
+
+```sh
+cmake --build ../../build_fresh --target ravenfs_juvenile    # → libravenfs_juvenile.a
+make audit_v1.2
+```
+
+(`audit_v1.2` 目标：`g++ ... audit_v1.2.cpp ../../tests/cpu_id_stub.cpp
+../../build_fresh/juvenile_god/libravenfs_juvenile.a -lxxhash -lpthread`)
 
 依赖：系统 xxhash（`-lxxhash`，host 已装 0.8.4）。`dents_dump` 无第三方依赖（纯 libc）。
 

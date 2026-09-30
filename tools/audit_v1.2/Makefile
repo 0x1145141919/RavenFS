@@ -5,11 +5,14 @@ LDLIBS    = -lxxhash
 
 TARGET    = audit_v1.2
 SRCS      = audit_v1.2.cpp
+LIB       = ../../build_fresh/juvenile_god/libravenfs_juvenile.a
+STUB      = ../../tests/cpu_id_stub.cpp
 
 all: $(TARGET) mkcontent mkbigdir dents_dump mkstates readback mkstates_w mkstates_t mkstates_a m44_attrcmp mkstates_s mkstates_x m6_xattr_dump
 
-$(TARGET): $(SRCS) ../../include/disk_struct_v1.2.h ../../include/magics.h
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $(SRCS) $(LDLIBS)
+# 2026-09-30：audit_v1.2 改用上帝类（链接 libravenfs_juvenile.a + cpu_id_stub）
+$(TARGET): $(SRCS) $(LIB)
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $(SRCS) $(STUB) $(LIB) $(LDLIBS) -lpthread
 
 # 仅供测试的最小内容填充器（写副本；auditor 自身不写盘）
 mkcontent: mkcontent.cpp ../../include/disk_struct_v1.2.h ../../include/magics.h

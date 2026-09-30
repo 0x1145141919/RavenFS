@@ -122,7 +122,8 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
             rc = dentry_new_root_inner(split_res.low_node_blkidx,
                                        split_res.low_node_maxhash,
                                        split_res.high_node_blkidx,
-                                       inode_idx);
+                                       inode_idx,
+                                       split_res.old_root_ptrs1);
             if (rc) return rc;
             return RC_OK;
         }
@@ -151,7 +152,8 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
                 rc = dentry_new_root_inner(inner_split.low_node_blkidx,
                                            inner_split.low_node_maxhash,
                                            inner_split.high_node_blkidx,
-                                           inode_idx);
+                                           inode_idx,
+                                           inner_split.old_root_ptrs1);
                 if (rc) return rc;
                 need_parent_split = false;
                 break;

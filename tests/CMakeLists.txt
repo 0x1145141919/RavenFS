@@ -136,9 +136,9 @@ add_executable(ravenfs_juv_pwrite_big
 )
 target_link_libraries(ravenfs_juv_pwrite_big PRIVATE ravenfs_juvenile)
 
-# v1.1 audit_inode 静态审计（B+树一致性 + 名字堆归属 + 对账；Docs/audit_inode_design.md）
-add_executable(ravenfs_juv_audit
-    test_audit_inode.cpp
+# 可达性审计（新模型，2026-09-30）：root 先序 DFS + 两张影子图 + XOR 对账
+add_executable(ravenfs_juv_audit_dfs
+    test_audit_dfs.cpp
     ${CPU_ID_STUB}
 )
-target_link_libraries(ravenfs_juv_audit PRIVATE ravenfs_juvenile)
+target_link_libraries(ravenfs_juv_audit_dfs PRIVATE ravenfs_juvenile)

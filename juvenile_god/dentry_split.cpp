@@ -71,6 +71,8 @@ RavenFS_juvenile::split_result_t RavenFS_juvenile::dentry_leaf_split(uint64_t vi
      * 分裂后 victim 变为非根叶子，前驱/后继必须落成真实链表语义：
      * 无前驱/无后继 → 老实写 PTR_INVALID。 */
     const bool victim_is_root = RFS_PP_IS_ROOT(victim->meta.parent_ptr);
+    /* 根叶 ptrs[1] = '..'（下面会改写为前驱）→ 分裂前先捕获，供建新根继承 */
+    res.old_root_ptrs1 = victim_is_root ? victim->meta.ptrs[1].v : PTR_INVALID;
 
     /* ⚠ 旧后继必须在改写 victim.ptrs[2] **之前**取，否则读到的是 new_blk
      * ⚠ 位域读出的值是 52 位形态，与 PTR_INVALID 比较必须同样截断 */
@@ -150,6 +152,8 @@ RavenFS_juvenile::split_result_t RavenFS_juvenile::dentry_inner_split(uint64_t v
     Bptree_ddentry_inner_node_t *victim = (Bptree_ddentry_inner_node_t *)victim_sess.data;
     if (!is_dentry_node(&victim->meta)) { res.rc = RC_ERR_STATE; return res; }
     if (!RFS_PP_IS_INNER(victim->meta.parent_ptr)) { res.rc = RC_ERR_STATE; return res; }
+    /* 根内部节点 ptrs[1] = '..' → 捕获供建新根继承（本函数不改 ptrs，仍先捕） */
+    res.old_root_ptrs1 = RFS_PP_IS_ROOT(victim->meta.parent_ptr) ? victim->meta.ptrs[1].v : PTR_INVALID;
 
     uint16_t count = (uint16_t)RFS_PP_COUNT(victim->meta.parent_ptr);
     if (count <= 126) { res.rc = RC_ERR_STATE; return res; }
@@ -296,7 +300,8 @@ result_code_t RavenFS_juvenile::dentry_spilt_parent_apply(
  * → 写回 → 更新 root inode.data_root 与 root_dentry_blk。
  * ═══════════════════════════════════════════════════════════════════ */
 result_code_t RavenFS_juvenile::dentry_new_root_inner(uint64_t low_blk, uint64_t low_max,
-                                                      uint64_t high_blk, uint64_t root_inode_idx)
+                                                      uint64_t high_blk, uint64_t root_inode_idx,
+                                                      uint64_t root_dotdot_v)
 {
     uint64_t new_root_blk = block_alloc_hard(2, 1);
     if (new_root_blk == PTR_INVALID) return RC_ERR_NO_BLOCK;
@@ -307,6 +312,13 @@ result_code_t RavenFS_juvenile::dentry_new_root_inner(uint64_t low_blk, uint64_t
     if (!root_sess) return RC_ERR_IO;
     Bptree_ddentry_inner_node_t *new_root = (Bptree_ddentry_inner_node_t *)root_sess.data;
     dentry_node_meta_init(root_sess.data, 2, true, true, root_inode_idx);   /* "." */
+
+    /* 新根继承旧根的 '..'（dir 根节点 ptrs[1] = 上级 inode）。
+     * 2026-09-30 修：根分裂建新根必须携带 '..'，否则根目录一分裂就丢（v1.2
+     * root=16 下暴露；旧 v1.1 root=0 时丢成 0 恰好==root，被掩盖）→ 审计
+     * dotdot_mismatch。值由 split 前由调用方捕获（叶分裂会把 root 叶 ptrs[1]
+     * 改写成前驱，故不能在分裂后读）。 */
+    new_root->meta.ptrs[1].v = root_dotdot_v;
 
     RFS_PTR_SET_ADDR(new_root->hints[0].sub_ptr, low_blk);
     new_root->hints[0].hash_max   = low_max;

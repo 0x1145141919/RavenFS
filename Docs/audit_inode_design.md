@@ -1,3 +1,8 @@
+> ⚠️ **已退役（2026-09-30）**：本文档描述的「枚举全 inode + 侧账本反推」模型已由
+> **可达性审计（`audit_dfs_root`）** 取代 —— 见 `Docs/audit_dfs_design.md`。
+> 代码（`audit_ctx_t`/`audit_begin`/`audit_inode`/`audit_filesystem` 等）已移除。
+> 保留本文仅作历史设计留档。
+
 # RavenFS — `audit_inode` 静态合法性审计 设计基线
 
 > 2026-09-10 定稿（设计方 Raven，据 Sparrow 五轮口径确认）。

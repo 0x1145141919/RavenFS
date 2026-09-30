@@ -359,6 +359,10 @@ result_code_t RavenFS_juvenile::dentry_root_shrink(uint64_t root_blk, uint64_t r
     if (cnt != 1) return RC_OK;
 
     uint64_t child_blk = RFS_PTR_ADDR(root->hints[0].sub_ptr);
+    /* 旧根的 '..'（= 本目录父 inode；FS 根则自指）→ 提升的新根必须继承。
+     * 2026-09-30 修：原写 root_inode_idx（自身）→ 子目录收缩后 '..' 错指自身
+     * （与 dentry_new_root_inner 同源家族缺陷）。 */
+    const uint64_t dotdot_v = root->meta.ptrs[1].v;
 
     /* ── 读唯一孩子，提升为新根 ── */
     mdata_piece_session child_sess(mdata_piece_mgr, child_blk);
@@ -376,11 +380,11 @@ result_code_t RavenFS_juvenile::dentry_root_shrink(uint64_t root_blk, uint64_t r
     if (!RFS_PP_IS_INNER(child_meta->parent_ptr)) {
         auto *child_leaf = (Bptree_ddentry_leaf_node_t *)child_sess.data;
         RFS_PTR_SET_ADDR(child_leaf->meta.ptrs[0], PTR_INVALID);
-        RFS_PTR_SET_ADDR(child_leaf->meta.ptrs[1], root_inode_idx);   /* ".." */
+        child_leaf->meta.ptrs[1].v = dotdot_v;   /* ".." = 继承旧根（父目录 inode） */
         RFS_PTR_SET_ADDR(child_leaf->meta.ptrs[2], PTR_INVALID);
     } else {
         auto *child_inner = (Bptree_ddentry_inner_node_t *)child_sess.data;
-        RFS_PTR_SET_ADDR(child_inner->meta.ptrs[1], root_inode_idx);   /* ".." */
+        child_inner->meta.ptrs[1].v = dotdot_v;   /* ".." = 继承旧根（父目录 inode） */
     }
 
     child_sess.dirty();

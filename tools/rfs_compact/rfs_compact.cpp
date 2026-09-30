@@ -239,14 +239,13 @@ int main(int argc, char **argv) {
     }
 
     if (do_audit) {
-        audit_opts_t o{}; audit_report_t r{};
-        fs.audit_filesystem(o, r);
-        uint64_t bad = r.btree_bad + r.inode_bad + r.double_claim + r.leaked_blocks +
-                       r.orphan_blocks + r.dangling_refs + r.orphan_inodes + r.link_mismatch +
-                       r.dotdot_mismatch + r.heap_bad;
-        printf(" [audit] bad=%llu (btree=%llu inode=%llu leak=%llu orphan=%llu)\n",
-               (unsigned long long)bad, (unsigned long long)r.btree_bad, (unsigned long long)r.inode_bad,
-               (unsigned long long)r.leaked_blocks, (unsigned long long)r.orphan_blocks);
+        audit_walk_report_t r{};                      /* 可达性审计（新模型） */
+        fs.audit_dfs_root(&r, stdout);
+        uint64_t bad = r.total_bad();
+        printf(" [audit] bad=%llu (btree=%llu inode=%llu heap=%llu unprot_b=%llu leak_b=%llu)\n",
+               (unsigned long long)bad, (unsigned long long)r.btree_bad,
+               (unsigned long long)r.inode_bad, (unsigned long long)r.heap_bad,
+               (unsigned long long)r.unprotected_blk, (unsigned long long)r.leaked_blk);
     }
     return st.failed ? 1 : 0;
 }
