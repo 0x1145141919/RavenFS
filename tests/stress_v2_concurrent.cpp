@@ -191,8 +191,12 @@ static void worker_mgr(bitmap_slices_mgr_t_v2 *mgr, uint32_t cpu, int ops,
         } else if (r < 90) {                 /* block_free */
             if (!br.empty()) {
                 rec_t x = br.back(); br.pop_back();
-                mgr->block_free(x.base, x.cnt);
+                /* 2026-09-30 修：影子先释放、再调分配器释放。
+                 * 若反序（free 先、release 后），会出现「分配器已空闲、影子仍占用」的
+                 * 窗口 → 另线程合法重新分配该块后 claim 撞影子置位 → 假 RACE。
+                 * 影子语义 = 分配器活块集，须在分配器转空闲**不晚于**其时刻转空闲。 */
                 bs->release(x.base, x.cnt);
+                mgr->block_free(x.base, x.cnt);
             }
         } else {                             /* inode_alloc / inode_free */
             if (ir.empty() || (rng() & 1)) {
@@ -204,14 +208,14 @@ static void worker_mgr(bitmap_slices_mgr_t_v2 *mgr, uint32_t cpu, int ops,
                 }
             } else {
                 rec_t x = ir.back(); ir.pop_back();
-                mgr->inode_free(x.base);
                 is->release(x.base, 1);
+                mgr->inode_free(x.base);
             }
         }
     }
     /* 收束：归还本线程全部持有 → 影子清零（对账前置） */
-    for (const rec_t &x : br) { mgr->block_free(x.base, x.cnt); bs->release(x.base, x.cnt); }
-    for (const rec_t &x : ir) { mgr->inode_free(x.base); is->release(x.base, 1); }
+    for (const rec_t &x : br) { bs->release(x.base, x.cnt); mgr->block_free(x.base, x.cnt); }
+    for (const rec_t &x : ir) { is->release(x.base, 1); mgr->inode_free(x.base); }
 }
 
 /* ═══ P2：slice 级并发 worker ═══ */
@@ -265,12 +269,12 @@ static void worker_slice(chunk_slice_mgr_t *s, uint32_t cpu, int ops, shadow_t *
         } else {                             /* free_interval（阻塞锁） */
             if (!recs.empty()) {
                 rec_t x = recs.back(); recs.pop_back();
-                (void)s->free_interval(x.base, x.cnt);
                 sh->release(x.base, x.cnt);
+                (void)s->free_interval(x.base, x.cnt);
             }
         }
     }
-    for (const rec_t &x : recs) { (void)s->free_interval(x.base, x.cnt); sh->release(x.base, x.cnt); }
+    for (const rec_t &x : recs) { sh->release(x.base, x.cnt); (void)s->free_interval(x.base, x.cnt); }
 }
 
 /* ═══ BUSY 定向压测：asyn 慢 I/O 持锁，3 线程 alloc try_lock → RC_ERR_BUSY ═══ */
@@ -314,6 +318,7 @@ int main() {
     g_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(50);
     watchdog(60);
     auto t0 = std::chrono::steady_clock::now();
+    uint64_t dup_prev = g_dup.load();   /* 分阶段基线：g_dup 全局不复位 */
 
     /* ═══ P1：mgr 级并发 ═══ */
     std::printf("[P1] mgr 级：4 线程 × 4000 次（block hard/soft/free/occupy + inode）\n");
@@ -350,8 +355,9 @@ int main() {
 
         CK(bs.live() == 0, "P1 block shadow live=%llu (want 0)", (unsigned long long)bs.live());
         CK(is.live() == 0, "P1 inode shadow live=%llu (want 0)", (unsigned long long)is.live());
-        CK(g_dup.load() == 0, "P1 double-alloc count=%llu (want 0)",
-           (unsigned long long)g_dup.load());
+        CK(g_dup.load() == dup_prev, "P1 double-alloc count=%llu (want %llu)",
+           (unsigned long long)g_dup.load(), (unsigned long long)dup_prev);
+        dup_prev = g_dup.load();
         CK(mgr.block_free_total() == BLK_TOTAL,
            "P1 block_free_total=%llu (want %llu)", (unsigned long long)mgr.block_free_total(),
            (unsigned long long)BLK_TOTAL);
@@ -397,12 +403,14 @@ int main() {
            (unsigned long long)s.get_free_count(), (unsigned long long)SLICE_BITS);
         CK(s.shutdown() == RC_OK, "P2 shutdown");
     }
-    CK(g_dup.load() == 0, "P2 double-alloc count=%llu (want 0)",
-       (unsigned long long)g_dup.load());
+    CK(g_dup.load() == dup_prev, "P2 double-alloc count=%llu (want %llu)",
+       (unsigned long long)g_dup.load(), (unsigned long long)dup_prev);
+    dup_prev = g_dup.load();
 
     busy_probe();
-    CK(g_dup.load() == 0, "P3 double-alloc count=%llu (want 0)",
-       (unsigned long long)g_dup.load());
+    CK(g_dup.load() == dup_prev, "P3 double-alloc count=%llu (want %llu)",
+       (unsigned long long)g_dup.load(), (unsigned long long)dup_prev);
+    dup_prev = g_dup.load();
 
     auto us = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - t0).count();
