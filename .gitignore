@@ -65,3 +65,8 @@ linux/compile_commands.json
 
 # 独立虚拟机环境（脚本 + 磁盘镜像，不随仓库走）
 linux/vm/
+
+# tests/bitmap_core_v2 产物（只提交源码）
+tests/bitmap_core_v2/bm_test
+tests/bitmap_core_v2/bm_test_san
+tests/bitmap_core_v2/bm_test_tsan

@@ -1,6 +1,6 @@
 # RavenFS Linux KO · v0.1.1-1 缺陷集（Defects）
 
-> 2026-09-29 · Raven
+> 2026-09-29 · Raven（2026-09-30 修订：D-2 部分落地 / D-9 修复）
 > **对象**：已发布的软件包 `ravenfs-dkms 0.1.1-1`（安装版 `Build Date 2026-09-28 17:51`；DKMS 源 `/usr/src/ravenfs-0.1.1/`）。
 > **方法**：以**打包源**（`/usr/src/ravenfs-0.1.1/linux/`，即模块真正的编译输入）为准，与 **repo mainline**（`PS_git/OS_pj_uefi/ravenfs/linux/`）逐条对照。
 > **口径**：本文件记录 **v0.1.1-1 发布版的缺陷**；"mainline 状态"一栏标明修复是否已在仓库落地 / 仅设计 / 仅原型。
@@ -12,15 +12,16 @@
 | 编号 | 缺陷 | 类别 | 严重度 | mainline 状态 |
 |---|---|---|---|---|
 | **D-1** | **无 sb 级性能计数器 / 无 debugfs 出口** | 可观测性 | 中 | 代码已落（`a358cc0`），**未随包发布** |
-| **D-2** | **位图分片器全量常驻（80MB），内存浪费 + 30s 全量回写** | 内存/写放大 | 中（对 SparrowOS 目标机为硬伤） | 仅设计 + god 原型（`Docs/runtime_tech/03_*.md`） |
-| **D-3** | **mount / umount 时间戳不回写** | 正确性（元数据） | 低-中 | WIP 未提交（`linux/super.c` 工作区 +180 行） |
+| **D-2** | **位图分片器全量常驻（80MB），内存浪费 + 30s 全量回写** | 内存/写放大 | 中（对 SparrowOS 目标机为硬伤） | **ko 已落地 CHUNK 后端**（`rfs_bm` 类 + 挂载选项 `bitmap_mode=chunk`；运行时常驻内存 ↓）；「30s 全量回写」未收敛（**2026-09-30 用户接受**，NVMe SLC 写量小） |
+| **D-3** | **mount / umount 时间戳不回写** | 正确性（元数据） | 低-中 | **已修 + 已提交**（`linux/super.c` 时间戳回写；随 `8b32497` 入仓）——仍未随包发布 |
 | **D-4** | **O_DIRECT（`direct_IO`）故意留白 → `open(O_DIRECT)` 被拒** | 能力缺口（设计级留白） | 低（实验期）→ 中（长期通用） | **mainline 有意不做**（R-FD-10「可降级」） |
 | **D-5** | **ko 移植时降级：丢掉 god 的叶内 extent 融合（四形态）→ 写请求粒度即碎片** | 功能缺失（移植降级） | 中（元数据膨胀 / 读放大 / 回收负担） | **ko 无对等实现**（仅「出口坍缩」单条特例；**god 侧已完备**） |
 | **D-6** | **inline→extent 不试 direct：>160B 文件恒背 8K 区段树节点（单 extent 也背）** | 元数据膨胀（实现缺口） | 中 | ko 无（`iomap.c:195` 恒建树；direct 仅 truncate 坍缩） |
 | **D-7** | **分配 hint 不持久化：每次 mount 重置到片首 → 低地址被反复复用** | 局部性 / 恢复友好度（实现缺口） | 中 | ko 无（hint 从不落盘） |
 | **D-8** | **元数据与数据共用分配 hint：区段树叶插进数据流 → 自噬式碎片（2 块洞）** | 碎片放大（分配器耦合） | 中 | ko 无（同一 block 分配器/hint） |
+| **D-9** | **挂载参数只进不出：无 `show_options` 回读出口（`row_size=` 静默）** | 接口完整性 / 可观测性 | 低（实验期）→ 中（长期通用） | **已修**（`ravenfs_show_options` 落地，回读集与接受集同构；**2026-09-30**） |
 
-> **四类性质，勿混**：**D-1~D-3 = “发布落后 mainline”**（mainline 已有修复，未进包）；**D-4 = “有意留白 / 能力缺口”**（非发布落后）；**D-5 = 移植降级**（god 有完整实现，ko 移植时丢掉）；**D-6~D-8 = ko 实现/分配器层缺口**（D-6/7 迁移与持久化，D-8 为元数据/数据分配器耦合）。
+> **四类性质，勿混**：**D-1~D-3 = “发布落后 mainline”**（mainline 已有修复，未进包）；**D-4 = “有意留白 / 能力缺口”**（非发布落后）；**D-5 = 移植降级**（god 有完整实现，ko 移植时丢掉）；**D-6~D-8 = ko 实现/分配器层缺口**（D-6/7 迁移与持久化，D-8 为元数据/数据分配器耦合）；**D-9 = 两版共有的接口缺口**（发布版与 mainline 都缺，**非“发布落后”**）。
 > D-1 与 D-2 有交集（D-2 的 CHUNK 后端需要 D-1 的计数器做 A/B 判据，见 counters 设计 §3.F）。
 
 ---
@@ -73,11 +74,12 @@
 
 **影响**：host（32GB）无感；**对 SparrowOS 目标机（小内存）是硬收益**——这也是本次改制的动机。另：恒定 80MB/30s 写放大对闪存寿命与吞吐都是负担。
 
-**mainline 状态**
-- **ko**：`linux/bitmap.c` 已有 CHUNK 化（`bitmap_backing` / `bitmap_chunk_order` 模块参数，默认仍 `FULL`）；但**未随包发布**。
-- **god（上帝类）**：`juvenile_god/bitmap_slices.cpp` 正在做 **CHUNK 原型验证**（施工拆刀 ①→④，见 03 文档 §13）。
-- **决策口径（用户 2026-09-28）**：**以上帝类为改制锚点，先改 god、A/B 测完再定 ko 移植取舍** → 即 **ko 侧暂以 FULL 保底**，等 god 的 A/B 结论。
-- **A/B 判据（预设）**：CHUNK 常态吞吐 ≥ FULL 的 **95%** 且 RSS ↓ ≥ **10×** → 选 CHUNK；否则 FULL 保底。
+**mainline 状态（2026-09-30 修订）**
+- **ko 已落地**：位图重构为独立 C 类 `rfs_bm`（`linux/bitmap_core.c` 路由 + `bitmap_mem.c` MEM 后端 + `bitmap_chunk.c` CHUNK 后端），驱动侧适配层 `linux/bitmap_adapter.c`（旧 `linux/bitmap.c` **已清除**）；CHUNK 经**挂载选项 `bitmap_mode=chunk`**（`bbco`/`ibco` 选 chunk 几何，默认 3/0）开启。
+- **达成**：chunk 模式运行时常驻内存 ↓（懒加载窗口，不再全量 `vzalloc`）——**D-2 的“内存浪费”主诉已解**。
+- **未收敛（用户 2026-09-30 明确接受）**：`chunks_asyn` 仍是逐片**整片读+整片写**，未改造为**按脏写** → “30s 全量回写”的写放大仍在；用户判断对 NVMe SLC 为毛毛雨，**接受**。故本项记**部分达成**。
+- **旧口径作废**：早先 `linux/bitmap.c` 的 `bitmap_backing`/`bitmap_chunk_order` 模块参数方案已随该文件清除 → 改为**挂载选项**（与 D-9 回读同源）。
+- **god（上帝类）**：仍为移植真值来源（`juvenile_god/bitmap_slices.cpp` v1 / `bitmap_slices_v2.cpp` v2）；A/B 判据（吞吐 ≥95% 且 RSS ↓≥10×）保留为参考。
 
 **关联**：`Docs/runtime_tech/{02_bitmap_slices.md,03_chunk_backed_slices.md,03_progress.md}`；ko 侧落点见 counters 设计 §3.F（F 组 18 字段专为 FULL/CHUNK 双后端打点）。
 
@@ -107,9 +109,10 @@ state  : 从未挂载（或挂载路径未回写时间戳）
 - 元数据**自描述失效**：盘面无法回答"上次是否干净卸载 / 现在是否挂载中"；
 - 连累**非正常关机检测**（panic 检测 / 恢复判据）——本应靠这对时间戳兜底。
 
-**mainline 状态**
-- **WIP，未提交**：当前工作区 `linux/super.c`（相对 `a358cc0` **+180 行未提交**）已实现——`rfs_sb_timestamp_write()`（`mount_time`/`umount_time` 二选一写）、`fill_super` 写 mount、`put_super` 写 umount（含 `mounted_at_ns` 哨兵耦合与失败日志）。
-- 即：**修复已在工作区，但既没提交、更没随包发布** → v0.1.1-1 缺此功能。
+**mainline 状态（2026-09-30 修订）**
+- **已修 + 已入仓**：`linux/super.c` 实现 `ravenfs_sb_write_timestamp(sb, is_mount)`（`mount_time`/`umount_time` 二选一写 + crc 重验 + flush 屏障）；`fill_super` 写 mount（非 readonly；`sb_write_timestamp(sb,true)` @:1321）、`put_super` 写 umount（在**全部元数据写回之后**；`sb_write_timestamp(sb,false)` @:786），含 `mounted_at_ns` 哨兵耦合与失败日志。
+- **入仓**：随 `8b32497`（位图模块拆分那次）一并提交。
+- **仍缺**：**未随包发布** → v0.1.1-1 仍缺此功能（待下一版重打包）。
 
 ---
 
@@ -233,16 +236,49 @@ state  : 从未挂载（或挂载路径未回写时间戳）
 
 ---
 
-## 发布建议（D-1~D-3 的统一出口；D-4~D-8 另论）
+## D-9 挂载参数只进不出：无 `show_options` 回读出口
+
+**现象**：模块**接受** `row_size=` 挂载选项（解析后落 sbi），但 `super_operations` **无 `.show_options`** → VFS 读 `/proc/mounts` / `/proc/self/mountinfo`、`mount`/`findmnt` 回显时**拿不到任何 ravenfs 自有选项**；`mount -o remount,…` 与一切“复制/回读挂载选项”的工具链都看不到当前生效值。结果：`row_size=8k` 挂出来的盘与默认盘在**用户可见面完全无差别**——**参数只进不出**。
+
+**证据**
+- 打包源 `/usr/src/ravenfs-0.1.1/linux/super.c`：`show_options` **0 次出现**；`grep -rn show_options /usr/src/ravenfs-0.1.1/linux/`（含 `*.[ch]`、去 `.o`/`.cmd`）**= 0**（全树）。
+- 同一打包源**已有 row_size 入口**：`ravenfs_fs_context{row_size}`（:522）、`ravenfs_fs_parameters[]`（:530）、`ravenfs_parse_param`（:559）、`ravenfs_fill_super` 消费（:937）——即“**吃选项有、回读选项无**”。
+- mainline `linux/super.c` 同样：`ravenfs_sops`（:810）仅 `alloc_inode/destroy_inode/write_inode/evict_inode/put_super/statfs/sync_fs`，**无 `show_options`**；全仓 `grep -rn show_options linux/*.c *.h` = 0（`git log -S show_options` 的命中全是退役文档，无代码）。
+- 需求真值（已退役规格，可 `git show 0860fad^:Docs/linux/ravenfs-linux-ko-requirements-spec.md` 取回）：**R-LM-08**「`show_options`：`/proc/mounts` 输出挂载选项（参照 `ext2_show_options`）」——优先级 **L**，状态 **❌**（立项以来未落）。
+
+**定性**：**不是正确性缺陷**（挂载本身正常、loud 拒绝非法值、不静默改语义），而是**接口完整性 / 可观测性缺口**（R-LM-08 未落）。与 D-1 同类（观测面缺失），但 D-1 缺的是**性能计数器**，本条缺的是**挂载参数自描述**。
+
+**与既有文档的口径冲突（须厘清）**：`Docs/linux_vfs_iface_spec.md:250` 把 `show_options` 标“**可选**”；但上游 `Documentation/filesystems/mount_api.rst` 为 **MUST**：「If a filesystem accepts mount options, it must define show_options() to show all the currently active options.」——**触发前提正是“吃了 mount option”**。ravenfs 已吃 `row_size=` → 本项在本仓语境下应从“可选”**升为“必须”**（该 spec 行建议一并订正）。
+
+**应有形态**
+- `static int ravenfs_show_options(struct seq_file *m, struct dentry *root)`（本树 `super_operations` 签名为 `struct dentry *dentry`，见 `linux-7.2.6/include/linux/fs/super_types.h:102`）；从 `root->d_sb->s_fs_info` 取生效值——`row_size` 存于 `sbi->icache->row_size`（`ravenfs.h:236` → `ravenfs_cache.h:81`）；非默认时 `seq_printf(m, ",row_size=%uk", sbi->icache->row_size >> 10)`。
+- 挂接：`ravenfs_sops.show_options = ravenfs_show_options`。
+- 纪律：**回读集必须与 `parse_param` 接受集同构**（将来加选项两处同步，防“吃了不回显”复发）；bool/flag 类选项用 `fsparam_flag` + `seq_show_option()` 统一；ro/rw 等 VFS 级选项由 VFS 经 `fc->sb_flags` 自动输出，driver 只管自有选项。
+
+**影响**
+- `mount`/`findmnt`/`/proc/mounts` 无法显示 ravenfs 挂载参数 → `mount -a`、fstab 复制、审计脚本、迁移/复现**取不到 `row_size`**（几何参数不可见，实占/容量口径对不上时难定位）。
+- 与 D-3（时间戳）+ D-1（计数器）叠加效应：**盘面自描述（D-3）+ 运行时性能面（D-1）+ 挂载参数面（D-9）全线缺失**，ravenfs 挂载在用户态几乎“隐形”。
+
+**mainline 状态（2026-09-30 修订）**：**已修**。`linux/super.c` 实现 `ravenfs_show_options(struct seq_file *, struct dentry *)` 并挂 `ravenfs_sops.show_options`；回读集与 `parse_param` 接受集**同构**：恒显 `bitmap_mode=mem|chunk`，chunk 时显**短名** `bbco=`/`ibco=`（remount 复制不需写全名），`row_size=` 仅非默认时显。v0.1.1-1 发布版仍缺（非 ABI，随下版打包）。R-LM-08 落地。
+
+**验收判据**
+- `mount -t ravenfs -o row_size=8k <dev> /mnt` 后，`cat /proc/mounts`（或 `findmnt -o OPTIONS`）**应出现 `row_size=8k`**。
+- 默认 4K 挂载时的口径（不显 / 显 `row_size=4k`）**二选一并锁死**，避免同构歧义。
+- 非法值仍走 loud 拒挂（`-EINVAL`），与 D-4 的 errno 口径纪律一致。
+
+---
+
+## 发布建议（D-1~D-3 的统一出口；D-4~D-9 另论）
 
 D-1~D-3 的共同点是：**mainline 已有部分/全部修复，但都没进发布包**。因此：
 
-1. **D-3**：把工作区 super.c 的改动**提交**（小步快跑：一步一提交 + 验收——挂载后 `sbinfo` 应显示 `mount`=now、干净卸载后 `umount`=now）。
+1. **D-3（已提交，2026-09-30）**：`super.c` 时间戳回写已随 `8b32497` 入仓。**遗留**：仍待**重打包发布**；发布后验收 = 挂载后 `sbinfo` 显示 `mount`=now、干净卸载后 `umount`=now。
 2. **D-1**：随下一版**重打包发布**（版本升号按行为级变更），并跑 counters 设计 §10 的 6 条判据（尤其 debugfs UAF 与开销 <2%）。
-3. **D-2**：**跟 god 的 CHUNK A/B 结论**再决定 ko 是否默认切 CHUNK（当前保持 FULL 保底）；无论切不切，先把**脏标记**（去掉 30s 全量回写）这类低风险改进纳入考量。
+3. **D-2（部分达成，2026-09-30）**：ko 已可经 `bitmap_mode=chunk` 用 CHUNK 后端（常驻内存 ↓）——内存主诉已解，用户接受；**遗留**：`chunks_asyn` 未改按脏写（30s 全量回写仍在，判断为 SLC 毛毛雨，缓行）。
 4. **D-4（非发布动作）**：**backlog 立项** + 补**出口条件**（见该节）；实现走 iomap 现成件，同时统一 errno 口径并保持 loud。
 5. **D-5（非发布动作 / 功能补齐）**：把 **god 的叶内四形态融合（刻意不跨界）** 移植进 ko 的 `ravenfs_iomap_begin`/`extent_insert` 路径；单测须覆盖「同叶紧贴 + phys 连续」四形态与「跨叶紧贴**不**融合」两条边界（后者正是 god 的既有语义）。
 6. **D-6/D-7/D-8（非发布动作 / 结构改进）**：① inline→外置试 direct（消掉小文件 8K 税，D-6）；② hint 持久化（D-7）；③ 元数据与数据**分离分配游标**（D-8）。三项都可先在 god 侧原型 + A/B 再定 ko 移植。
-7. 版本纪律：以上任一**行为级**变更 → **`pkgver` 升号**（对齐 `acc9e20` 惯例），否则 DKMS 不重编、`pacman -U` 同版本不生效。
+7. **D-9（已修，2026-09-30）**：`ravenfs_show_options` 已落地并挂接，回读集与 `parse_param` 同构（`bitmap_mode` 恒显、chunk 时 `bbco/ibco` 短名）。遗留：订正 `Docs/linux_vfs_iface_spec.md:250` 的“可选”口径；随下版发布（属行为级变更 → 走第 8 条版本纪律）。
+8. 版本纪律：以上任一**行为级**变更 → **`pkgver` 升号**（对齐 `acc9e20` 惯例），否则 DKMS 不重编、`pacman -U` 同版本不生效。
 
 > 备注：D-1 的设计真值文档已随 linux-ko 工作文档退役（`0860fad`），需要时从 git 取回：`git show a358cc0:Docs/linux/ravenfs-linux-ko-sb-counters-design.md`。

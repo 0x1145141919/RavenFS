@@ -42,6 +42,7 @@
 #include "ravenfs_cache.h"
 #include "ravenfs_mdata_cache.h"
 #include "ravenfs_bitmap.h"
+#include "ravenfs_bitmap_adapter.h"
 #include "ravenfs_xattr.h"
 
 /* ── 前向声明（ops 表在 read_inode 里被引用） ── */
@@ -51,6 +52,7 @@ static const struct file_operations ravenfs_dir_operations;
 static const struct file_operations ravenfs_file_operations;
 static const struct fs_context_operations ravenfs_context_ops;
 static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc);
+static int ravenfs_sb_write_timestamp(struct super_block *sb, bool is_mount);
 static int ravenfs_sync_fs(struct super_block *sb, int wait);
 static int ravenfs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
 
@@ -589,14 +591,28 @@ static int ravenfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 struct ravenfs_fs_context {
 	unsigned int	row_size;	/* 0 = 默认 4K；mount option `row_size=` */
+	u8		bitmap_mode;	/* RFS_BM_MODE_MEM（默认）| _CHUNK；`bitmap_mode=` */
+	u8		blk_chunk_order;	/* 短名 `bbco=`（主键）/ 全名 `block_bitmap_chunk_order=`（别名）；默认 3 */
+	u8		ino_chunk_order;	/* 短名 `ibco=`（主键）/ 全名 `inode_bitmap_chunk_order=`（别名）；默认 0 */
+	bool		blk_order_seen;	/* 用户显式给了 block 几何（mem 下 → 拒挂）*/
+	bool		ino_order_seen;
 };
 
 enum ravenfs_param {
 	Opt_row_size,
+	Opt_bitmap_mode,
+	Opt_block_chunk_order,	/* 短名 bbco = 主键；全名 block_bitmap_chunk_order = 别名，同指此 */
+	Opt_inode_chunk_order,	/* 短名 ibco = 主键；全名 inode_bitmap_chunk_order = 别名，同指此 */
 };
 
 static const struct fs_parameter_spec ravenfs_fs_parameters[] = {
 	fsparam_string("row_size", Opt_row_size),
+	fsparam_string("bitmap_mode", Opt_bitmap_mode),
+	/* 两个键名都支持；**短名为 canonical**（回读用短名），全名仅作解析别名 */
+	fsparam_string("block_bitmap_chunk_order", Opt_block_chunk_order),
+	fsparam_string("bbco", Opt_block_chunk_order),
+	fsparam_string("inode_bitmap_chunk_order", Opt_inode_chunk_order),
+	fsparam_string("ibco", Opt_inode_chunk_order),
 	{}
 };
 
@@ -641,6 +657,38 @@ static int ravenfs_parse_param(struct fs_context *fc, struct fs_parameter *param
 		}
 		ctx->row_size = sz;
 		return 0;
+	case Opt_bitmap_mode:
+		/* 字面量 mem|chunk；非法 → loud 拒挂 */
+		if (ravenfs_bm_mode_from_str(param->string, &ctx->bitmap_mode)) {
+			pr_err("ravenfs: invalid bitmap_mode= (支持 mem|chunk)\n");
+			return -EINVAL;
+		}
+		return 0;
+	case Opt_block_chunk_order:
+	case Opt_inode_chunk_order: {
+		unsigned int v;
+		u8 ord;
+
+		if (!param->string)
+			return -EINVAL;
+		/* 越界（<0 或 >6）→ loud 拒挂；0..6 由 check 统一守 */
+		if (kstrtouint(param->string, 0, &v) ||
+		    ravenfs_bm_order_check(v, &ord)) {
+			pr_err("ravenfs: invalid %s= (取值 0..6)\n",
+			       opt == Opt_block_chunk_order ?
+			       "block_bitmap_chunk_order/bbco" :
+			       "inode_bitmap_chunk_order/ibco");
+			return -EINVAL;
+		}
+		if (opt == Opt_block_chunk_order) {
+			ctx->blk_chunk_order = ord;
+			ctx->blk_order_seen = true;
+		} else {
+			ctx->ino_chunk_order = ord;
+			ctx->ino_order_seen = true;
+		}
+		return 0;
+	}
 	}
 	return -EINVAL;
 }
@@ -711,6 +759,37 @@ static void ravenfs_put_super(struct super_block *sb)
 		ravenfs_bitmap_flush(sb);
 	ravenfs_issue_flush(sb);
 	ravenfs_bitmap_destroy(sb);
+
+	/*
+	 * 干净卸载时间戳 umount_time（Docs/disk_layout_v1.1.md #15）：写 now。
+	 *
+	 * 【位置：全部元数据写回（mdata → inode → 位图）之后】umount_time 是
+	 * 「本会话数据已完整落盘」的收据——先开收据再落数据 = 掉电时盘面声称干净
+	 * 而数据没落，收据必须最后开。SB 自身写不依赖位图/mdata，放 bitmap_destroy
+	 * 之后、debugfs 摘除之前即可。
+	 *
+	 * 【三重闸（少一重都可能报假干净）】
+	 *   ① ravenfs_sb_writable：readonly 挂载纪律不写（helper 内第一道闸也拦，双保险）；
+	 *   ② !ravenfs_is_shutdown：本会话发生过 force_shutdown → 写路径故障、数据一致性
+	 *      无保证 → 不写，让盘上留 mount > umount，下次 sbinfo 照样报「非正常关机」；
+	 *      写了就是给可能损坏的数据盖「干净」章；
+	 *   ③ sbi->mounted_at_ns != 0：本次挂载的 mount_time 确实写成功过（见 fill_super
+	 *      处哨兵耦合注释）——mount 写失败的回滚路径不许开「只有 umount 没有 mount」
+	 *      的错序收据（sbinfo 会把 umount ≥ mount 读成「干净卸载历史」= 假干净）。
+	 *
+	 * 【失败只记日志】put_super 是 void，无处传错；写失败 → 盘上留旧时间戳 →
+	 * 读侧判非正常关机（保守安全方向），折构照常进行，不能因时间戳写不进而
+	 * 卡住卸载。【crc/flush 细节见 ravenfs_sb_write_timestamp 头注】。
+	 */
+	if (sbi && sbi->mounted_at_ns && ravenfs_sb_writable(sb) &&
+	    !ravenfs_is_shutdown(sb)) {
+		int e = ravenfs_sb_write_timestamp(sb, false);
+
+		if (e)
+			pr_err("ravenfs: umount_time not written (%d) — 盘上留旧值，读侧将判非正常关机\n",
+			       e);
+	}
+
 	/* §8.2 UAF 红线：stats 文件 i_private 持 sb/sbi 指针 → debugfs 目录必须
 	 * **早于** kfree(sbi) 摘除；debugfs_remove 会等进行中的 read 结束。 */
 	debugfs_remove_recursive(sbi ? sbi->dbg_dir : NULL);
@@ -775,6 +854,38 @@ static int ravenfs_sync_fs(struct super_block *sb, int wait)
 	return err;
 }
 
+/*
+ * D-9：挂载选项回读。回读集必须与 `ravenfs_parse_param` 接受集**同构**：
+ *   bitmap_mode（mem|chunk）· bbco= · ibco= · row_size=（非默认才显）。
+ *
+ * 键名口径（**锁死**）：短名 `bbco`/`ibco` = canonical，回读一律用**短名**
+ * （remount / 复制挂载参数要短、要能直接用）；全名 `block_bitmap_chunk_order=`/
+ * `inode_bitmap_chunk_order=` 仅作**解析别名**（接受等价，但不回读）。
+ *
+ * 默认值口径（**锁死**）：
+ *   · 恒显 `bitmap_mode`（后端选择是最关键的语义位，不省）；
+ *   · chunk 时恒显两个 chunk_order（**短名** bbco/ibco）；
+ *   · `row_size=` 仅当非默认（RAVENFS_ROW_DEFAULT=4096）才显。
+ * ro/rw 等 VFS 级选项由 VFS 输出，driver 不管。
+ */
+static int ravenfs_show_options(struct seq_file *m, struct dentry *dentry)
+{
+	struct super_block *sb = dentry->d_sb;
+	struct ravenfs_bitmap_opts o;
+
+	if (ravenfs_bitmap_opts_get(sb, &o))
+		return 0;	/* 无管理器（不应发生）：不输出，不崩 */
+	seq_printf(m, ",bitmap_mode=%s",
+		   o.mode == RFS_BM_MODE_CHUNK ? "chunk" : "mem");
+	if (o.mode == RFS_BM_MODE_CHUNK) {
+		seq_printf(m, ",bbco=%u", (unsigned int)o.blk_chunk_order);
+		seq_printf(m, ",ibco=%u", (unsigned int)o.ino_chunk_order);
+	}
+	if (o.row_size && o.row_size != RAVENFS_ROW_DEFAULT)
+		seq_printf(m, ",row_size=%u", (unsigned int)o.row_size);
+	return 0;
+}
+
 static const struct super_operations ravenfs_sops = {
 	.alloc_inode	= ravenfs_alloc_inode,
 	.destroy_inode	= ravenfs_destroy_inode,
@@ -783,6 +894,7 @@ static const struct super_operations ravenfs_sops = {
 	.put_super	= ravenfs_put_super,
 	.statfs		= ravenfs_statfs,
 	.sync_fs	= ravenfs_sync_fs,
+	.show_options	= ravenfs_show_options,	/* D-9：参数可回读 */
 };
 
 static const struct inode_operations ravenfs_dir_inode_operations = {
@@ -914,7 +1026,8 @@ static const struct file_operations ravenfs_file_operations = {
  * ═══════════════════════════════════════════════════════════════════ */
 
 static int ravenfs_parse_superblock(struct super_block *sb, const void *buf,
-				    unsigned int row_size)
+				    unsigned int row_size,
+				    const struct ravenfs_bitmap_opts *bm_opts)
 {
 	const struct RavenSuperblock *dsb = buf;
 	struct ravenfs_sb_info *sbi;
@@ -996,7 +1109,7 @@ static int ravenfs_parse_superblock(struct super_block *sb, const void *buf,
 		kfree(sbi);
 		return -ENOMEM;
 	}
-	if (ravenfs_bitmap_create(sb)) {	/* 双位图内存分片分配器（bitmap.c） */
+	if (ravenfs_bitmap_create_mode(sb, bm_opts)) {	/* 双位图分片分配器（bitmap_adapter.c）*/
 		ravenfs_ttl_stop(sb);
 		ravenfs_mdata_cache_destroy(sb);
 		ravenfs_cache_destroy(sb);
@@ -1010,12 +1123,139 @@ bad:
 	return -EINVAL;
 }
 
+/*
+ * ── Superblock 卷生命周期时间戳回写（Docs/disk_layout_v1.1.md 变更表 #15）──
+ * 与上面的 ravenfs_parse_superblock（读侧）同段落：读改写同一块、同一 crc 口径。
+ *
+ * 纪律真值（该行原文要点）：mount_time 非 readonly 挂载写 now；umount_time 干净
+ * 卸载写 now；readonly / 审计挂载不写（0 哨兵 = 从未挂载 / 从未干净卸载必须保留）；
+ * born 恒为 mkfs 值、modify 只留扩容工具 → **ko 两字段一律不许动**；**只写 Primary
+ * SB（设备字节 0），Backup SB 不随动**（救急副本保留 mkfs 时刻）；每次写必重算
+ * crc32（原始 4096B、置零 crc 字段、全长重算）。
+ *
+ * 【为什么直写底层 bdev，不走 ravenfs 自己的 VFS】
+ *   SB 在设备字节 0 = FS_block 世界之外；ravenfs 的数据/元数据写路径全在 FS_block
+ *   世界内（先过位图分配），拿它写 SB 是鸡生蛋——SB 写不进，位图分配器本身也没了。
+ *   读侧 fill_super 本就 `sb_bread(sb, 0)` 直读 bdev，写侧对称 sb_bread +
+ *   mark_buffer_dirty + sync_dirty_buffer：同一块号口径、同一缓冲读改写，不会出现
+ *   「读的是 A 写的是 B」的坐标系分叉。
+ *
+ * 【crc32 用内核 crc32_le，不在 ko 里再养一份 256 项表】
+ *   mkfs/audit/sbinfo 三处同口径的表算法：init 0xFFFFFFFF、逐字节
+ *   crc = tab[(crc ^ b) & 0xFF] ^ (crc >> 8)、末尾 ^ 0xFFFFFFFF，反射多项式
+ *   0xEDB88320。内核 crc32_le(seed, buf, len) 正是同多项式的反射实现（lib/crc32.c），
+ *   写成 `crc32_le(~0U, buf, n) ^ ~0U` 即与表算法逐位同式。交叉验证已经存在：
+ *   parse_superblock 一直用这个表达式校验 mkfs 写出的盘且校验通过（本盘 crc OK、
+ *   ko 能挂载）→ 两边逐位一致已被实盘证明。在 ko 内再抄一份表只会多一处真值
+ *   （DISCIPLINE：两份真值必然分叉，且分叉时无从察觉）。
+ *   附带记录（不动文档）：mkfs.cpp 第 23 行把 0xEDB88320 注释成 “Castagnoli”，
+ *   实际它是 CRC-32/ISO-HDLC（zlib/Ethernet）；标签写错了但算法没错，ko 跟算法、
+ *   不跟标签。
+ *
+ * 【写前重验 crc，而不是改完直接回填】
+ *   mount 路径 parse_superblock 刚验过；但 umount 路径距上次校验隔了一整个会话，
+ *   期间盘可能被外部工具改写、或发生介质位翻转。若不验就重算回填，等于把一份
+ *   已损坏的 SB 重新盖章认证，把事故掩盖成「crc 又 OK 了」。验不过 → 拒写，
+ *   盘上留旧时间戳（读侧照样报 mount > umount / 非正常关机），代价只是这次
+ *   时间戳没记上——诚实报错优于盖章。
+ *
+ * 【耐久性：sync_dirty_buffer + 一次 flush 屏障】
+ *   sync_dirty_buffer 只等 bio 完成（本仓写路径惯例「返回即落盘」），设备掉电
+ *   写缓存里的内容仍可能丢。丢的后果方向是「读到旧值」→ umount 缺失或偏旧 →
+ *   被判非正常关机——保守安全方向（宁可误报异常，不误报干净）。但 umount_time
+ *   存在的全部意义就是「掉电之后仍可信」，所以再花一次 blkdev_issue_flush
+ *   （复用 ravenfs_issue_flush；它对 ro 挂载自身 no-op，而本函数 ro 已在第一道闸
+ *   就不进来）。总代价 = 每次挂载/卸载各 1×4K 写 + 1 屏障，正是 #15 写明的运行时
+ *   代价（「每次挂载/卸载各 1×4K 写 + crc32 重算」）。
+ *
+ * 返回 0 = 已写成功，或按纪律本就不该写（readonly）；负值 = 想写没写成。
+ * is_mount=false 时调用方必须自行保证「干净卸载」前提（见 put_super 处三重闸）。
+ */
+static int ravenfs_sb_write_timestamp(struct super_block *sb, bool is_mount)
+{
+	struct buffer_head *bh;
+	struct RavenSuperblock *dsb;
+	void *tmp;
+	u32 stored, calc;
+	int err = 0;
+
+	/* 第一道闸（内置而非只靠调用点）：readonly 挂载一律不写 —— 审计/只读挂载
+	 * 不得把 0 哨兵改成非 0，否则「从未挂载 / 从未干净卸载」的诊断信息当场丢失。 */
+	if (!ravenfs_sb_writable(sb))
+		return 0;
+
+	/* Primary SB = 设备字节 0（与 fill_super 读侧同一块、同一 sb_bread 口径）。
+	 * Backup SB 在别的块号上，本函数根本不碰 → 「Backup 不随动」自动成立。 */
+	bh = sb_bread(sb, 0);
+	if (!bh) {
+		pr_err("ravenfs: cannot read superblock to write timestamp\n");
+		return -EIO;
+	}
+	dsb = (struct RavenSuperblock *)bh->b_data;
+
+	/* 正身核验：magic/version 不符 → 这不是（或已不再是）本 FS 的 Primary SB，
+	 * 一个字节都不动。版本口径与 parse_superblock 相同：只认 RAVENFS_VERSION。 */
+	if (le64_to_cpu(dsb->magic) != (u64)SUPERBLOCK_MAGIC ||
+	    le32_to_cpu(dsb->version) != RAVENFS_VERSION) {
+		pr_err("ravenfs: refusing timestamp write (sb magic/version mismatch)\n");
+		err = -EINVAL;
+		goto out;
+	}
+
+	/* 写前重验 crc（口径同 parse_superblock / mkfs / audit / sbinfo：原始 4096B
+	 * 拷贝 → 置零 crc32 字段 → 全长重算）。验不过拒写，理由见头注。 */
+	stored = le32_to_cpu(dsb->crc32);
+	tmp = kmalloc(RAVENFS_BLOCK_SIZE, GFP_KERNEL);
+	if (!tmp) {
+		err = -ENOMEM;
+		goto out;
+	}
+	memcpy(tmp, bh->b_data, RAVENFS_BLOCK_SIZE);
+	memset(tmp + offsetof(struct RavenSuperblock, crc32), 0, sizeof(u32));
+	calc = crc32_le(~0U, tmp, RAVENFS_BLOCK_SIZE) ^ ~0U;
+	kfree(tmp);
+	if (stored != calc) {
+		pr_err("ravenfs: refusing timestamp write, sb crc mismatch (stored %08x calc %08x)\n",
+		       stored, calc);
+		err = -EIO;
+		goto out;
+	}
+
+	/* 只动本次该动的那一个 u64：born/modify 恒不许 ko 碰，另一个时间戳原样保留
+	 * （mount > umount 是「非正常关机可检出」的全部依据，绝不能顺手“修齐”）。 */
+	if (is_mount)
+		dsb->mount_time = cpu_to_le64(ktime_get_real_seconds());
+	else
+		dsb->umount_time = cpu_to_le64(ktime_get_real_seconds());
+
+	/* crc32 重算回填：此刻 bh->b_data 已是「最终要落盘的 4096B」，置零 crc 字段
+	 * 后全长计算再写回 = mkfs 的 `sb.crc32 = 0; crc32_compute(&sb, 4096)` 同式
+	 * （mkfs 对整个 4096B 结构体算，此处对整个 4096B 缓冲算，逐位一致）。 */
+	dsb->crc32 = 0;
+	dsb->crc32 = cpu_to_le32(crc32_le(~0U, bh->b_data, RAVENFS_BLOCK_SIZE) ^ ~0U);
+
+	mark_buffer_dirty(bh);
+	if (sync_dirty_buffer(bh)) {	/* 等 bio 完成（本仓惯例：确定性落盘） */
+		pr_err("ravenfs: timestamp write failed (bio)\n");
+		err = -EIO;
+		goto out;
+	}
+	/* 再一道屏障过掉电写缓存（头注耐久性段：umount_time 要在掉电后仍可信）。 */
+	err = ravenfs_issue_flush(sb);
+	if (err)
+		pr_err("ravenfs: timestamp flush failed (%d)\n", err);
+out:
+	brelse(bh);
+	return err;
+}
+
 static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct ravenfs_fs_context *ctx = fc->fs_private;
 	struct ravenfs_sb_info *sbi;
 	struct buffer_head *bh;
 	struct inode *root;
+	struct ravenfs_bitmap_opts bm_opts;
 	unsigned int row_size = (ctx && ctx->row_size) ? ctx->row_size : RAVENFS_ROW_DEFAULT;
 	int err;
 
@@ -1025,6 +1265,12 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_time_gran = 1;
 	sb->s_op = &ravenfs_sops;
 
+	/* 位图后端锁定值（= 从 fs_context 取，默认 mem）；随 sbi->bitmap 存下供 show_options 回读 */
+	bm_opts.mode = ctx ? ctx->bitmap_mode : RFS_BM_MODE_MEM;
+	bm_opts.blk_chunk_order = ctx ? ctx->blk_chunk_order : RAVENFS_BM_DEFAULT_BLK_CHUNK_ORDER;
+	bm_opts.ino_chunk_order = ctx ? ctx->ino_chunk_order : RAVENFS_BM_DEFAULT_INO_CHUNK_ORDER;
+	bm_opts.row_size = row_size;
+
 	/* SB 在设备起始 4K（FS_block 世界之外 → bdev 块 0） */
 	bh = sb_bread(sb, 0);
 	if (!bh) {
@@ -1032,7 +1278,7 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		RFS_STAT_INC(sb, err_sb_read);	/* 盘/设备健康 */
 		return -EIO;
 	}
-	err = ravenfs_parse_superblock(sb, bh->b_data, row_size);
+	err = ravenfs_parse_superblock(sb, bh->b_data, row_size, &bm_opts);
 	brelse(bh);
 	if (err)
 		return err;
@@ -1054,6 +1300,28 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (!sb->s_root)
 		return -ENOMEM;
 
+	/*
+	 * 卷生命周期时间戳 mount_time（Docs/disk_layout_v1.1.md #15）：非 readonly
+	 * 挂载写 now；readonly 由 helper 第一道闸跳过（审计挂载不污染 0 哨兵）。
+	 *
+	 * 【为什么卡在这个位置——d_make_root 之后、debugfs/pr_info 之前】
+	 *   · 更早（iget/d_make_root 之前）：s_root 尚未建立时失败不走 put_super，
+	 *     但「mount 写了 / 挂载却失败」与「mount 没写 / 挂载成功」会各留一半状态；
+	 *   · 更晚（debugfs 之后）：对外宣布挂载成功（debugfs 目录 + pr_info）之后
+	 *     再失败，回滚面更大，且 stats 里可能已有本次会话的计数；
+	 *   · 本处写失败直接 return err = 挂载失败：rw 挂载连 4K SB 都写不进，
+	 *     元数据写路径必然也坏 → 早失败符合「拒绝而非静默漏」（M1 诚实边界口径）。
+	 *
+	 * 【与 put_super 的哨兵耦合（不用往 ravenfs_sb_info 加字段的代价）】
+	 *   本函数返错时 s_root 已置位 → VFS 仍会调 put_super。sbi->mounted_at_ns
+	 *   在**本行写成功之后**才被置（kzalloc 清零 → 只有走到这里才非 0），put_super
+	 *   用它非 0 作「本次挂载的 mount_time 已写成功」的判据：写失败的回滚路径
+	 *   不会开出「只有 umount 没有 mount」的错序收据，改动也锁死在 super.c 单文件。
+	 */
+	err = ravenfs_sb_write_timestamp(sb, true);
+	if (err)
+		return err;
+
 	/* §8.2：debugfs 出口 `<s_id>/stats`；kernel.debugfs=off 时 create 返回 ERR_PTR
 	 * → 忽略（IS_ERR_OR_NULL 守卫，不挡挂载）。 */
 	sbi->mounted_at_ns = ktime_get_ns();
@@ -1074,6 +1342,16 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 static int ravenfs_get_tree(struct fs_context *fc)
 {
+	struct ravenfs_fs_context *ctx = fc->fs_private;
+
+	/* 纪律：chunk 专属参数（bbco/ibco）只在 bitmap_mode=chunk 下合法；
+	 * mem（含默认 mem）下给了 → loud 拒挂 -EINVAL。放在此处（已收齐全部参数）
+	 * 才能不依赖参数出现顺序。*/
+	if (ctx && ctx->bitmap_mode != RFS_BM_MODE_CHUNK &&
+	    (ctx->blk_order_seen || ctx->ino_order_seen)) {
+		pr_err("ravenfs: block_bitmap_chunk_order/bbco & inode_bitmap_chunk_order/ibco 仅在 bitmap_mode=chunk 下合法\n");
+		return -EINVAL;
+	}
 	return get_tree_bdev(fc, ravenfs_fill_super);
 }
 
@@ -1084,6 +1362,10 @@ static int ravenfs_init_fs_context(struct fs_context *fc)
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
 		return -ENOMEM;
+	/* 默认 = 现行为红线：mem 后端；chunk 几何默认 3/0（仅 chunk 时消费）*/
+	ctx->bitmap_mode = RFS_BM_MODE_MEM;
+	ctx->blk_chunk_order = RAVENFS_BM_DEFAULT_BLK_CHUNK_ORDER;
+	ctx->ino_chunk_order = RAVENFS_BM_DEFAULT_INO_CHUNK_ORDER;
 	fc->fs_private = ctx;
 	fc->ops = &ravenfs_context_ops;
 	return 0;

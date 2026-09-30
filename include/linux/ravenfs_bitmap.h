@@ -1,20 +1,19 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * ravenfs_bitmap.h —— 双位图分片分配器接口（bitmap.c 实现）
- * 全量常驻内存分片（非缓存行），自有分片级同步；不接入回刷 driver。
+ * ravenfs_bitmap.h —— 双位图分片分配器接口（适配层；老 bitmap.c 实现）
+ *
+ * 本头是**旧的「全量常驻内存」适配面**（= MEM 视角）。新核心类 `ravenfs_bitmap_core.h`
+ * 另提供 CHUNK 后端，两者语义视角**不同**，勿混：
+ *   · MEM   ：**内存里即一等事实**——位态/计数随时可直接采信。
+ *   · CHUNK ：**合成视角**——需在合并点（使用该窗 / `chunks_asyn`）合成后才是一致
+ *             视图；挂账期读数可与真值暂时不一致。判定须按合成后视角。
  */
 #ifndef _RAVENFS_BITMAP_H
 #define _RAVENFS_BITMAP_H
 
 #include "ravenfs.h"
 
-/* ── 双位图分片分配器（bitmap.c）──
- *
- * backing 后端（2026-09-28 CHUNK 化移植，规格 Docs/runtime_tech/03_chunk_backed_slices.md）：
- *   · **默认 FULL** = 全量常驻内存分片（本注前全部现行为逐位不变 = 红线）；
- *   · **CHUNK**（懒加载）= 每片一个固定 chunk 缓冲 + 控制器数组 + 返还记录，
- *     经**模块参数**显式开启：`bitmap_backing=1`（0=FULL 默认）、`bitmap_chunk_order=4`
- *     （chunk = 4K<<order 字节，有效 0..8）。顶层 API 签名/语义不变。 */
+/* ── 双位图分片分配器（bitmap.c）── */
 struct ravenfs_bitmap_mgr;
 int  ravenfs_bitmap_create(struct super_block *sb);
 void ravenfs_bitmap_destroy(struct super_block *sb);

@@ -6,10 +6,26 @@
 #   guest 内构建由 vm/share/install-ravenfs-module.sh 走 `make -C $KDIR M=<src>/linux modules`
 #
 obj-m += ravenfs.o
-ravenfs-y := super.o dentry.o dentry_tree.o dentry_node.o inode_cache.o mdata_cache.o cache_ttl.o bitmap.o name_heap.o iomap.o file.o extent_write.o xattr.o
+ravenfs-y := version.o super.o dentry.o dentry_tree.o dentry_node.o inode_cache.o mdata_cache.o cache_ttl.o bitmap_adapter.o name_heap.o iomap.o file.o extent_write.o xattr.o \
+             bitmap_core.o bitmap_mem.o bitmap_chunk.o
 
-# v1.2 盘面头在 ../include（C/C++ 双兼容，内部按 __KERNEL__ 选 linux/types.h）
-ccflags-y := -I$(src)/../include
+# ── 版本：以打包版本为唯一真值（PKGBUILD pkgver）─────────────────────────────
+#   宿主 dev 构建 ：从 packaging/arch/PKGBUILD 提取 pkgver；
+#   dkms 构建     ：dkms.conf 传 RAVENFS_VERSION=${PACKAGE_VERSION}（命令行优先）；
+#   两者都无（独立拷出的源）：退化为 "dev"。
+#   结果经 -DRAVENFS_KO_VERSION 注入 version.c 的 MODULE_VERSION → `modinfo -F version`。
+ifeq ($(origin RAVENFS_VERSION), undefined)
+RAVENFS_VERSION := $(shell sed -n 's/^pkgver=//p' $(if $(src),$(src),$(CURDIR))/../packaging/arch/PKGBUILD 2>/dev/null | head -1)
+endif
+RAVENFS_VERSION := $(strip $(RAVENFS_VERSION))
+ifeq ($(RAVENFS_VERSION),)
+RAVENFS_VERSION := dev
+endif
+
+# 头文件集中化（2026-09-30）：ko 自有头全部移入 ../include/linux（与 god 的 ../include/ravenfs 并列）；
+# v1.2 盘面头 / magics 仍在 ../include 根（C/C++ 双兼容，内部按 __KERNEL__ 选 linux/types.h）。
+# 注意：-I../include 使 <linux/...> 会先探 ../include/linux → 该目录只准放 ravenfs*.h（勿放与内核同名的头，会遮蔽内核头）。
+ccflags-y := -I$(src)/../include -I$(src)/../include/linux -DRAVENFS_KO_VERSION='"$(RAVENFS_VERSION)"'
 
 ifeq ($(KERNELRELEASE),)
 
@@ -21,6 +37,7 @@ all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 	# 编译完顺手刷新 IDE compile db（失败不挡构建）
 	-@python3 $(PWD)/../tools/ide/gen_compile_commands.py
+	@echo "[ravenfs] built version = $(RAVENFS_VERSION)"
 
 modules_install:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
