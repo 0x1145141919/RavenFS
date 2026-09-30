@@ -58,6 +58,35 @@ static inline u64 ravenfs_dev_byte(struct ravenfs_sb_info *sbi, u64 fs_blk)
 	return (u64)ravenfs_dev_blk(sbi, fs_blk) << RAVENFS_BLK_SHIFT;
 }
 
+/*
+ * D-5c：数据块分配——优先**锚定左邻物理尾**取整段连续 cnt。
+ *
+ * 对齐 god direct_file_ops.cpp:83 phase1 锚定：先 `block_occupy_soft(anchor, cnt, &rest)`
+ * 从锚（左邻 run 的 block_base+length）起贪心占领连续空闲块，使新数据块**物理紧贴左邻**
+ * → D-5a 叶内 `left`/`both` 融合条件（逻辑连续 ∧ phys 连续）成立，使升级不白升。
+ *
+ * ko 取舍（与现状语义一致）：ko 单次 iomap_begin 只描述**一条**连续 phys run（iomap
+ * 无法表达多段），故不做 god 式「前缀 + soft 裂段」多片段；锚定仅当**整段**就绪
+ * （rest==0）才采用，只能取到前缀（有缺口）则归还前缀、回退普通 hard 分配。
+ * 锚不成立（无左邻 / 锚点即占用）同样回退。失败面与旧口径完全相同
+ * （PTR_INVALID → 调用方 -ENOSPC）。
+ */
+static u64 ravenfs_data_alloc_anchored(struct super_block *sb, u64 anchor, u64 cnt)
+{
+	u64 run, rest;
+
+	if (anchor != (u64)PTR_INVALID && cnt) {
+		run = ravenfs_block_occupy_soft(sb, anchor, cnt, &rest);
+		if (run != (u64)PTR_INVALID) {
+			if (rest == 0)
+				return run;		/* 整段紧贴左邻 → 融合可命中 */
+			/* 仅取到前缀（cnt 段内有占用块）→ 单段连续不成立，归前缀回退 */
+			ravenfs_block_free(sb, run, cnt - rest);
+		}
+	}
+	return ravenfs_block_alloc(sb, cnt, 0);
+}
+
 /* 同步落一个 4K 块（迁移物化/零填用；与装载侧同源 sb_bread + sync_dirty_buffer） */
 static int rfs_store_block(struct super_block *sb, u64 fs_blk, const void *buf)
 {
@@ -322,7 +351,9 @@ static int ravenfs_write_migrate_direct(struct super_block *sb, struct inode *in
 	u64 i, blk, phys, run_end_blk;
 	int err;
 
-	run = ravenfs_block_alloc(sb, grow, 0);
+	/* D-5c：增长段锚定旧 direct run 物理尾（data_root+old_ceil）→ 新段 phys 紧贴
+	 * 旧区，D-5a e1 左并 e0 可命中（锚不成立则同样回退普通 hard）。*/
+	run = ravenfs_data_alloc_anchored(sb, old_base + old_ceil, grow);
 	if (run == (u64)PTR_INVALID)
 		return -ENOSPC;
 
@@ -471,12 +502,24 @@ static int ravenfs_iomap_begin_write(struct inode *inode, loff_t pos, loff_t len
 		} else {			/* 洞 → 立刻分配 + 插树（D-M4-6） */
 			u64 hole_end = next ? min(next, end_blk) : end_blk;
 			u64 cnt, run, newroot, old_root = (u64)PTR_INVALID;
+			u64 anchor = (u64)PTR_INVALID;
 			struct extent_t ne;
 
 			if (hole_end <= blk)
 				hole_end = blk + 1;	/* 护栏：长度必 > 0 */
 			cnt = hole_end - blk;
-			run = ravenfs_block_alloc(sb, cnt, 0);
+			/* D-5c：左邻记录终点 == 洞起点 → 锚 = 左邻 phys 尾（对齐 god
+			 * direct_file_ops.cpp:83 phase1 锚定）；否则无锚 → 普通 hard。*/
+			if (blk > 0) {
+				struct extent_t lft;
+				u64 dmy;
+
+				if (ravenfs_extent_lookup(sb, r->data_root, blk - 1,
+							  &lft, &dmy) == 0 &&
+				    lft.fblkbase + lft.length == blk)
+					anchor = RFS_PTR_ADDR(lft.block_base) + lft.length;
+			}
+			run = ravenfs_data_alloc_anchored(sb, anchor, cnt);
 			if (run == (u64)PTR_INVALID) {
 				RFS_STAT_INC(sb, err_enospc);
 				return -ENOSPC;		/* write(2) 即暴露 */
