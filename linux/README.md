@@ -1,7 +1,7 @@
 # RavenFS Linux KO 子项目（`ravenfs.ko`）
 
 > 本目录（`ravenfs/linux/`）= **Linux 端内核模块（`ravenfs.ko`）子项目**的家。源码、构建脚本、打包脚本**同居于此**。
-> 纪律：`../Docs/linux/LINUX_KO_DISCIPLINE.md`（三层约束 / 小步快跑 / 上线闸门 / 红线）。缺陷登记：`../Docs/linux/ravenfs-linux-ko-v0.1.1-defects.md`。
+> 纪律：`../Docs/linux/LINUX_KO_DISCIPLINE.md`（三层约束 / 小步快跑 / 上线闸门 / 红线）。缺陷登记：`../Docs/linux/ravenfs-linux-ko-defects.md`。
 > ⚠️ **实验性文件系统**——勿在真实数据上以 ravenfs 为根使用（除非通过 guest 压测 + 实体机灰测）。
 
 ---

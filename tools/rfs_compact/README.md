@@ -1,7 +1,7 @@
 # tools/rfs_compact — RavenFS extent 树瘦身 + 单条坍缩 direct 修复器
 
 Host 侧、用户态挂载的**离线盘面修复器**，用于清除 ko `ravenfs-dkms 0.1.1-1` 留下的
-元数据/数据失衡创伤（见 `Docs/linux/ravenfs-linux-ko-v0.1.1-defects.md`）：
+元数据/数据失衡创伤（见 `Docs/linux/ravenfs-linux-ko-defects.md`）：
 
 - **D-6**（inline→extent 不试 direct）：>160B 文件恒背一个 8K 区段树根叶（单 extent 也背）
   → 本工具把「单条覆盖 [0, ceil(size/4K))」的树**坍缩为 direct**，消掉节点税。

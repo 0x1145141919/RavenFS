@@ -281,7 +281,7 @@ static void build_superblock(RavenSuperblock *sb, const MkfsParams &p,
     sb->world_base_lba = p.world_base_lba;
     sb->total_blocks   = geo.total_blocks;
     sb->inode_array_count = p.inode_count;
-    sb->root_inode     = p.v11 ? 0 : RAVENFS_ROOT_INODE; /* v1.1 root=0 / v1.2 root=16 */
+    sb->root_inode     = p.v11 ? 0 : MKFS_ROOT_INODE; /* v1.1 root=0 / v1.2 root=MKFS_ROOT_INODE（mkfs 局部值，非契约） */
     memcpy(sb->uuid, p.uuid, 16);
     memcpy(sb->volume_name, p.label, sizeof(sb->volume_name));
     sb->backup_prev  = PTR_INVALID;
@@ -309,7 +309,7 @@ static void build_root_dentry_node(Bptree_ddentry_leaf_node_t *node, uint64_t ro
      *   ptrs[1]     = ".." = 根 inode（根目录的父亲是自己）
      *   ptrs[0]/[2] = 预留（52 位全 1 = 无效）
      *   entries     = 全空 — . / .. 由 parent_ptr / ptrs[1] 提供
-     * ⚠️ v1.2：root_ino = RAVENFS_ROOT_INODE(16)，不再是 0（改 root 索引时必须同步此处） */
+     * ⚠️ v1.2：root_ino = MKFS_ROOT_INODE（mkfs 局部值，非契约，勿外泄；改 root 索引时必须同步此处） */
     memset(node, 0, sizeof(*node));
     node->meta.magics[0] = DENTRY_MAGIC1;
     node->meta.magics[1] = DENTRY_MAGIC2;
@@ -488,8 +488,8 @@ int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
     uint64_t dn_off  = block_to_offset(root_dentry_block, params);
 
     /* 根 inode 索引：v1.1 = 0（god 按 0 挂根，位图片 0 hint 也从 1 起）；
-     * v1.2 = 16（st_ino=0 视为已删除的语义裁定，见 mkfs.hpp RAVENFS_ROOT_INODE） */
-    const uint64_t root_ino = params.v11 ? 0 : RAVENFS_ROOT_INODE;
+     * v1.2 = MKFS_ROOT_INODE（mkfs 为根目录挑的非零索引；**非契约**——消费者一律读 SB）。 */
+    const uint64_t root_ino = params.v11 ? 0 : MKFS_ROOT_INODE;
 
     Bptree_ddentry_leaf_node_t dentry_node;
     build_root_dentry_node(&dentry_node, root_ino);

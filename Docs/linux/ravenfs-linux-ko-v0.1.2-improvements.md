@@ -2,8 +2,8 @@
 
 > 2026-10-01 · Raven
 > **对象**：`ravenfs-dkms 0.1.2`（在 v0.1.1 基础上做**选择性**改进与修复）。
-> **对应基线**：`Docs/linux/ravenfs-linux-ko-v0.1.1-defects.md`（v0.1.1 缺陷集）。
-> **口径**：本文记录 v0.1.1 缺陷集中**被选择处置**的项 + 配套的架构性改动；**未动的缺陷仍以 v0.1.1-defects 为准**（见 §四）。**行为级变更 → 版本升号**。
+> **对应基线**：`Docs/linux/ravenfs-linux-ko-defects.md`（**缺陷名单**；D-1~D-9 首见于 v0.1.1 对照）。
+> **口径**：本文记录缺陷名单中**被选择处置**的项 + 配套的架构性改动；**未动的缺陷仍以 `ravenfs-linux-ko-defects.md` 为准**（见 §四）。**行为级变更 → 版本升号**；**缺陷本身按状态记，不按版本归类**（2026-10-01 定）。
 
 ---
 
@@ -62,6 +62,6 @@
 
 ## 五、关联文档
 
-- `Docs/linux/ravenfs-linux-ko-v0.1.1-defects.md` —— 缺陷基线。
+- `Docs/linux/ravenfs-linux-ko-defects.md` —— 缺陷基线。
 - `Docs/runtime_tech/{02_bitmap_slices.md,03_chunk_backed_slices.md}` —— 位图分片/窗口设计。
 - `Docs/linux/ravenfs-vm-env-notes.md` —— 独立测试 VM 环境。

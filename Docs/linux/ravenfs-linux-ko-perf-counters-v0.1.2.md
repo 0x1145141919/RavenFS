@@ -4,7 +4,7 @@
 > **定位**：`ravenfs.ko` 内置的、**superblock 级**性能/健康计数器 —— 覆盖**全部模块**（超块 / VFS 接待层 / 目录树 / inode 行缓存 / mdata 节点缓存 / TTL 后台 / 数据 IO / extent 树 / xattr&ACL / 名字堆 / 双位图分配器），打点在哪、记什么、为什么记、怎么给用户态看到。
 > **前身**：`Docs/linux/ravenfs-linux-ko-sb-counters-design.md`（v0.1 草案，已退役；可从 `git show a358cc0:…` 取回）。本文 v0.1.2 = v0.1 的**全模块收口 + 覆盖补齐 + 位图随模式**，**以本文为唯一真值**。
 > **地面真值**：`linux/` 下真实函数名逐个指认；本机内核 `7.2.6-1-vfio`（`CONFIG_DEBUG_INFO_BTF=y`、`FUNCTION_TRACER`、`KPROBES` 全开，debugfs 已挂载）；构建版本 `0.1.2`。
-> **关联**：`ravenfs-linux-ko-requirements-spec.md`、`ravenfs-linux-ko-v0.1.1-defects.md` §D-1、`ravenfs-linux-ko-v0.1.2-improvements.md`。
+> **关联**：`ravenfs-linux-ko-requirements-spec.md`、`ravenfs-linux-ko-defects.md` §D-1、`ravenfs-linux-ko-v0.1.2-improvements.md`。
 
 ---
 

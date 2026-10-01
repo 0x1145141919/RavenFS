@@ -1,7 +1,7 @@
 /* ═══════════════════════════════════════════════════════════════════
  * rfs_compact.cpp — RavenFS 离线「extent 树瘦身 + 单条坍缩 direct」定向修复器
  *
- * 目的（修复 ko v0.1.1 的 D-5/D-6 盘面创伤，见 Docs/linux/ravenfs-linux-ko-v0.1.1-defects.md）：
+ * 目的（修复 ko v0.1.1 的 D-5/D-6 盘面创伤，见 Docs/linux/ravenfs-linux-ko-defects.md）：
  *   · D-6：>160B 文件恒背 8K 区段树节点（单 extent 也背）→ 坍缩 direct 消掉节点税。
  *   · D-5：ko 写路径无叶内融合 → 相邻 extent 未合并（如 root-ext4.qcow2 133k 条）→ 激进重建融合。
  *
