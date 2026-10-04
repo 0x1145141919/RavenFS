@@ -63,9 +63,12 @@ static int iv_link_both(struct rfs_slice *self, struct rfs_interval *iv)
 	if (rc)
 		return rc;
 	rc = rfs_rb_insert(&self->size, &iv->by_size, iv_cmp_size, NULL);
-	if (rc)				/* 主树已挂、从树失败 → 回滚主树 */
+	if (rc) {			/* 主树已挂、从树失败 → 回滚主树 */
 		rfs_rb_erase(&self->pos, &iv->by_pos);
-	return rc;
+		return rc;
+	}
+	RFS_AL_STAT1(self->stat, AL_TREE_INSERT);	/* 双挂成功（从 ⊆ 主）*/
+	return 0;
 }
 
 /* 取一个新区间节点挂进双树（取池 + link；失败还节点）。*/
@@ -75,8 +78,11 @@ static int iv_insert_both(struct rfs_slice *self, u64 base, u64 len)
 		self->alloc.alloc(self->alloc.ctx, (u64)sizeof(*iv));
 	int rc;
 
-	if (!iv)
+	if (!iv) {
+		RFS_AL_STAT1(self->stat, AL_POOL_FAIL);	/* 元素池取节点失败 */
 		return -ENOMEM;
+	}
+	RFS_AL_STAT1(self->stat, AL_POOL_ALLOC);
 	iv->base = base;
 	iv->len = len;
 	rc = iv_link_both(self, iv);
@@ -91,6 +97,7 @@ static void iv_erase_both(struct rfs_slice *self, struct rfs_interval *iv)
 	rfs_rb_erase(&self->size, &iv->by_size);
 	rfs_rb_erase(&self->pos, &iv->by_pos);
 	self->alloc.free(self->alloc.ctx, iv);
+	RFS_AL_STAT1(self->stat, AL_TREE_ERASE);
 }
 
 /* 拆空双树并归还全部节点（enable 清底 / 异常回滚 / shutdown 共用）。*/
@@ -141,6 +148,7 @@ int rfs_slice_enable(struct rfs_slice *self, const struct rfs_slice_cfg *cfg)
 		return -EINVAL;			/* 元素池必填 */
 
 	self->alloc = cfg->alloc;		/* 内部化分配器（跨调用保留）*/
+	self->stat = cfg->stat;			/* 内部化 al_ 计数钩子（跨调用保留）*/
 	iv_free_all(self);			/* 清底：挡上次失败残留 */
 	rfs_rb_init(&self->pos);
 	rfs_rb_init(&self->size);
@@ -272,6 +280,7 @@ int rfs_slice_free_interval(struct rfs_slice *self, u64 base, u64 len)
 		return rc;
 	if (len == 0)				/* 空释放：无操作 */
 		return 0;
+	RFS_AL_STAT1(self->stat, AL_SLICE_FREE);
 
 	it = iv_covering_or_after(self, base);	/* 首个 end>base 者 */
 	if (it)
@@ -282,14 +291,25 @@ int rfs_slice_free_interval(struct rfs_slice *self, u64 base, u64 len)
 		left = container_of(leftn, struct rfs_interval, by_pos);
 
 	/* ── 重叠检测（守卫主树不变式）── */
-	if (left && left->base + left->len > base)
-		return -EEXIST;			/* 左邻伸进释放区间 */
-	if (it && it->base < base + len)
-		return -EEXIST;			/* 右邻（或含 base 者）左端落在区间内 */
+	if (left && left->base + left->len > base) {
+		RFS_AL_STAT1(self->stat, AL_SLICE_FREE_EEXIST);	/* 左邻伸进释放区间 */
+		return -EEXIST;
+	}
+	if (it && it->base < base + len) {
+		RFS_AL_STAT1(self->stat, AL_SLICE_FREE_EEXIST);	/* 右邻（或含 base 者）左端落在区间内 */
+		return -EEXIST;
+	}
 
 	/* ── 融合边界（只并纯邻接）── */
 	merge_left = left && (left->base + left->len == base);
 	merge_right = it && (it->base == base + len);
+	/* 融合行为计数（诊断碎片：邻接合并是否真发生；P1 只记不改流）。 */
+	if (merge_left && merge_right)
+		RFS_AL_STAT1(self->stat, AL_MERGE_BOTH);
+	else if (merge_left)
+		RFS_AL_STAT1(self->stat, AL_MERGE_LEFT);
+	else if (merge_right)
+		RFS_AL_STAT1(self->stat, AL_MERGE_RIGHT);
 	new_base = merge_left ? left->base : base;
 	new_end = merge_right ? (it->base + it->len) : (base + len);
 
@@ -445,6 +465,7 @@ int rfs_slice_alloc_hard(struct rfs_slice *self, u8 align_log2, u64 bitscount,
 		return -EINVAL;
 	if (!out_base_idx)
 		return -EINVAL;
+	RFS_AL_STAT1(self->stat, AL_SLICE_ALLOC_HARD);
 
 	align_mask = (align_log2 == 0) ? 0ULL : ((1ULL << align_log2) - 1ULL);
 
@@ -491,7 +512,8 @@ int rfs_slice_alloc_hard(struct rfs_slice *self, u8 align_log2, u64 bitscount,
 		*out_base_idx = s;
 		return 0;
 	}
-	return -ENOSPC;				/* 满片：原子失败，不部分分配 */
+	RFS_AL_STAT1(self->stat, AL_SLICE_ALLOC_ENOSPC);
+	return -ENOSPC;			/* 满片：原子失败，不部分分配 */
 }
 
 /* ══════════════════════════ soft_alloc ══════════════════════════ */
@@ -511,6 +533,7 @@ int rfs_slice_soft_alloc(struct rfs_slice *self, u8 align_log2, u64 bitscount,
 	*all_satisfied = false;
 	if (bitscount == 0)			/* 0 请求视为非法 */
 		return -EINVAL;
+	RFS_AL_STAT1(self->stat, AL_SLICE_SOFT);
 
 	align_mask = (align_log2 == 0) ? 0ULL : ((1ULL << align_log2) - 1ULL);
 	remain = bitscount;
@@ -573,8 +596,10 @@ int rfs_slice_soft_alloc(struct rfs_slice *self, u8 align_log2, u64 bitscount,
 		n = rfs_rb_first(&self->size);	/* 余段可能更小 → 重取最小 */
 	}
 
-	if (taken_total == 0)			/* 一位未扣：原子空手 */
+	if (taken_total == 0) {			/* 一位未扣：原子空手 */
+		RFS_AL_STAT1(self->stat, AL_SLICE_SOFT_ENOSPC);
 		return -ENOSPC;
+	}
 	*all_satisfied = (remain == 0);		/* 分片级是否已满足 */
 	return 0;				/* 允许部分交付 */
 }

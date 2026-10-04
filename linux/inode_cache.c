@@ -40,7 +40,7 @@
 #include "ravenfs.h"
 #include "ravenfs_file.h"
 #include "ravenfs_cache.h"
-#include "ravenfs_bitmap.h"
+#include "ravenfs_allocator_top.h"
 
 /* ── 分片/行几何（与 §4.11.1 + M2.2 逐式一致） ── */
 static void ravenfs_geo_init(struct ravenfs_cache *c, u64 inode_count, u32 row_size)
@@ -400,7 +400,7 @@ int ravenfs_inode_flush(struct super_block *sb, u64 inum)
  */
 int ravenfs_inode_sync_from_vfs(struct super_block *sb, struct inode *inode)
 {
-	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, inode->i_ino);
+	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	struct raven_Inode_t *r;
 	struct timespec64 ts;
 
@@ -452,6 +452,7 @@ void ravenfs_inode_mark_dirty(struct super_block *sb, u64 inum)
  */
 void ravenfs_inode_reclaim(struct super_block *sb, u64 inum)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, inum);
 
 	RFS_STAT_INC(sb, ic_row_evict);	/* 主动逐出（§3.B 打点口径） */
@@ -462,7 +463,7 @@ void ravenfs_inode_reclaim(struct super_block *sb, u64 inum)
 		s->row->wb_stamp = ktime_get_ns();
 		up_write(&s->row->io_lock);
 	}
-	ravenfs_inode_free(sb, inum);	/* 位图槽回收（持久化交 sync/umount flush） */
+	rfs_allocator_inode_free(sbi->alloc, inum);	/* 位图槽回收（持久化交 sync/umount flush） */
 }
 
 /*

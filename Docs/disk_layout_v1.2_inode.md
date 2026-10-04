@@ -198,6 +198,24 @@ struct rfs_xattr_entry {           // 8B 定长头；名字紧随其后（4B 对
 - v1.1 §10 **其余条目不变**（dentry 树 / 区段树 / 名字堆 / link_count / 文件数据区）。
 - **区段树机械参数 31–36**（阶 337 / 分裂左 168 / 欠载 <168 / 合并 ≤337 / 深度 64 / 节点 8K 对齐）见 `disk_layout_v1.1.md` §10。
 
+### 7.A inode 号契约（**ABI**，D-10 新增，2026-10-04）
+
+> **本条为 ABI，v1.2 内不得变更。**（编号独立成节，避开 v1.1 §10 区段树机械参数 31–36 的既有编号。）
+
+**`st_ino = inode_idx + 1`**（盘格式 v1.2 内恒定）：
+
+- `inode_idx` = 盘上 inode 数组下标（`[0, inode_count)`），即 `ravenfs_session_get` / dentry 树 / 区段树 / inode 位图所用的 **idx**；
+- `st_ino` = VFS 面 `inode->i_ino`（→ `stat(2).st_ino`）= **idx + 1**；
+- **无任何保留区**：idx `0` 与 `1..15` 及其后全部合法可分配；
+- `st_ino` 恒 ≠ 0（idx0 → ino1）→ 解 POSIX / glibc「`st_ino==0` = 已删除 / 忽略」哨兵问题；
+- 同 FS 内 `st_ino` 唯一，配合 `s_dev` 满足 POSIX「`(st_dev, st_ino)` 唯一标识文件」；
+- 上限：inode 数 < 2^32（与 `i_ino`/`get_next_ino` 的 32 位口径一致）；
+- **根 inode 按普通契约解析**：读 superblock 的 `root_inode` 字段——该字段是 **idx**；其具体取值是 `mkfs` 的局部实现细节（`MKFS_ROOT_INODE`），**不进入契约**。
+
+**实现纪律（ko）**：运行时路径只认两个访问器 `RFS_INO_TO_IDX()` / `RFS_IDX_TO_INO()`（`include/linux/ravenfs.h`），**禁止散落 `±1`**；`ravenfs_iget()` 入参为 idx，内部 `iget_locked(sb, RFS_IDX_TO_INO(idx))` 构造 ino；`ravenfs_read_inode()` 反向解出 idx。grep `->i_ino` 直用应为零（D-10 验收判据）。
+
+**背景**：本条源于一次 **AI 协作放大事故**——`i_ino` 属对外 ABI，却「从第一天起未被定义」；一次幻觉（"inode [0,15] 保留区"）的铲除（`94f7c6b`）只是表皮，本体是契约缺失。详见 `Docs/linux/ravenfs-linux-ko-defects.md` D-10。
+
 ---
 
 ## 8. 迁移影响面（全端）

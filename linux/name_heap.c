@@ -27,7 +27,7 @@
 #include "ravenfs.h"
 #include "ravenfs_cache.h"
 #include "ravenfs_mdata_cache.h"
-#include "ravenfs_bitmap.h"
+#include "ravenfs_allocator_top.h"
 #include "ravenfs_name_heap.h"
 
 /* 10 槽静态几何（与 raven_dir_Inode_t 字段序一一对应；disk_layout_v1.2 §7.4 容量表） */
@@ -99,6 +99,7 @@ static u64 rfs_heap_find_free(const u64 *w, u64 total_bits, u32 units)
 /* 激活槽：位图面 + 数据面各一次连续分配（2 块对齐）+ 位图面清零 */
 static int rfs_heap_activate(struct super_block *sb, struct raven_Inode_t *r, u32 slot)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct name_heap_controller_t *ctrl =
 		rfs_dir_heap((struct raven_dir_Inode_t *)r, slot);
 	u8 gran = rfs_heap_gran_log2[slot];
@@ -112,12 +113,12 @@ static int rfs_heap_activate(struct super_block *sb, struct raven_Inode_t *r, u3
 	if (RFS_NHC_BITMAP(*ctrl) != (u64)NAME_HEAP_INACTIVE)
 		return 0;			/* 已激活 */
 
-	bmp_base = ravenfs_block_alloc(sb, bmp_blks, 1);
+	bmp_base = rfs_allocator_block_alloc_hard(sbi->alloc, bmp_blks, 1);
 	if (bmp_base == (u64)PTR_INVALID)
 		return -ENOSPC;
-	data_base = ravenfs_block_alloc(sb, data_blks, 1);
+	data_base = rfs_allocator_block_alloc_hard(sbi->alloc, data_blks, 1);
 	if (data_base == (u64)PTR_INVALID) {
-		ravenfs_block_free(sb, bmp_base, bmp_blks);
+		(void)rfs_allocator_block_free(sbi->alloc, bmp_base, bmp_blks);
 		return -ENOSPC;
 	}
 	for (p = 0; p < bmp_blks / 2; p++) {
@@ -125,8 +126,8 @@ static int rfs_heap_activate(struct super_block *sb, struct raven_Inode_t *r, u3
 			ravenfs_mdata_get(sb, bmp_base + p * 2);
 
 		if (IS_ERR(ms)) {
-			ravenfs_block_free(sb, bmp_base, bmp_blks);
-			ravenfs_block_free(sb, data_base, data_blks);
+			(void)rfs_allocator_block_free(sbi->alloc, bmp_base, bmp_blks);
+			(void)rfs_allocator_block_free(sbi->alloc, data_base, data_blks);
 			return PTR_ERR(ms);
 		}
 		memset(ravenfs_msession_node(ms), 0, RAVENFS_MDATA_NODE_BYTES);
@@ -368,6 +369,7 @@ int ravenfs_name_heap_free(struct super_block *sb, u64 dir_ino, u32 name_len,
  */
 int ravenfs_dir_name_heap_release(struct super_block *sb, u64 dir_ino)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, dir_ino);
 	struct raven_Inode_t *r;
 	u32 s;
@@ -408,8 +410,8 @@ int ravenfs_dir_name_heap_release(struct super_block *sb, u64 dir_ino)
 		if (!empty)
 			continue;
 
-		ravenfs_block_free(sb, RFS_NHC_BITMAP(*ctrl), bmp_blks);
-		ravenfs_block_free(sb, RFS_NHC_DATA(*ctrl), data_blks);
+		(void)rfs_allocator_block_free(sbi->alloc, RFS_NHC_BITMAP(*ctrl), bmp_blks);
+		(void)rfs_allocator_block_free(sbi->alloc, RFS_NHC_DATA(*ctrl), data_blks);
 		RFS_NHC_SET(*ctrl, 0, 0, (u64)NAME_HEAP_INACTIVE, 0, (u64)NAME_HEAP_INACTIVE);
 		RFS_STAT_INC(sb, nh_release);		/* 空堆回收 */
 		changed = true;

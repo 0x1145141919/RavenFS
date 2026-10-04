@@ -35,7 +35,7 @@
 #include "ravenfs_extent.h"
 #include "ravenfs_cache.h"
 #include "ravenfs_mdata_cache.h"
-#include "ravenfs_bitmap.h"
+#include "ravenfs_allocator_top.h"
 
 /* inline 态字节上限（不变量 22）：size ≤ 160 ⇒ 内容在 inode.inline_data */
 #define RAVENFS_INLINE_BYTES	160U
@@ -111,7 +111,7 @@ static int ravenfs_writepages_inline(struct inode *inode, struct writeback_contr
 	if (limit == 0)
 		return 0;		/* 空文件：任何 mmap 写都在 size 之外 → 全部丢弃 */
 
-	ses = ravenfs_session_get(sb, inode->i_ino);
+	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
 	r = ravenfs_session_inode(ses);
@@ -269,98 +269,67 @@ out:
 #define RFS_SES_PUT(_s)	do { if (!IS_ERR_OR_NULL(_s)) { ravenfs_session_put(_s); (_s) = NULL; } } while (0)
 
 
-/* 待释放物理块区间（延迟 free 账本：**先 inode 后 free**）。
- * 堆链表、无上限（truncate/punch_hole = 低频路径，容忍少量分配）；相邻区间自动合并。 */
-struct rfs_frerange {
-	struct list_head	link;
-	u64		addr;
-	u64		len;
-};
-
-struct rfs_freelist {
-	struct list_head	ranges;
-	int		n;
-};
-
-static struct rfs_freelist *rfs_fl_new(void)
+/* ── 延迟返还账本（**先 inode 后 free**）—— 2026-10-04 起直用分配器原语 ──
+ * 容器 = `struct rfs_run_list`（分配器接口层 STL 式链，见 ravenfs_run_list.h：
+ * 容器持有节点、push 即分配、fini 即全释放），末尾一次 `rfs_allocator_block_intervals_free`
+ * 整链返还 = 「迭代返还」。
+ *
+ * 取舍（2026-10-04 裁决，见 Docs/runtime_tech/06_new_primitives_usage.md）：
+ *   · **raw 收集、不预合并** —— 相邻合并由树内 `free_interval`（pred/succ O(log n)）承担；
+ *     旧 rfs_fl_add 的线性合并是同一逻辑的重复实现（最坏 O(n²)），已删。
+ *   · **fail-fast（F1）**：原语首错即返、余段留链；返错 = 返还区间重叠/越界 = 上层作乱 /
+ *     原语一致性违例 → loud 报出，余段节点由 rfs_fl_put 回收、区间弃置（交 fsck）。
+ *   · **OOM 口径不变（F2）**：取节点失败 WARN_ON + 放弃该段（宁可泄漏也不破坏纪律）。*/
+static struct rfs_run_list *rfs_fl_new(void)
 {
-	struct rfs_freelist *fl = kmalloc(sizeof(*fl), GFP_KERNEL);
+	struct rfs_run_list *fl = kmalloc(sizeof(*fl), GFP_KERNEL);
 
 	if (!fl)
 		return NULL;
-	INIT_LIST_HEAD(&fl->ranges);
-	fl->n = 0;
+	rfs_run_list_init(fl, rfs_run_alloc_platform());
 	return fl;
 }
 
-static void rfs_fl_put(struct rfs_freelist *fl)
+/* 析构：只回收链节点（**不**返还区间）——错误路径用，口径同旧。*/
+static void rfs_fl_put(struct rfs_run_list *fl)
 {
-	struct rfs_frerange *r, *tmp;
-
 	if (!fl)
 		return;
-	list_for_each_entry_safe(r, tmp, &fl->ranges, link) {
-		list_del(&r->link);
-		kfree(r);
-	}
+	rfs_run_list_fini(fl);
 	kfree(fl);
 }
 
-/* 记一段待释放物理块 [addr, addr+len)；与前/后相邻区间自动合并 */
-static void rfs_fl_add(struct rfs_freelist *fl, u64 addr, u64 len)
+/* 记一段待释放物理块 [addr, addr+len)；**不做相邻合并**（合并归树）。*/
+static void rfs_fl_add(struct rfs_run_list *fl, u64 addr, u64 len)
 {
-	struct rfs_frerange *r, *nr;
-
 	if (len == 0)
 		return;
-
-	list_for_each_entry(r, &fl->ranges, link) {
-		if (r->addr + r->len == addr) {		/* 新段接在 r 尾 */
-			r->len += len;
-			/* 桥接：接上后若又贴住后继 → 合并 */
-			if (!list_is_last(&r->link, &fl->ranges)) {
-				struct rfs_frerange *nx = list_next_entry(r, link);
-
-				if (r->addr + r->len == nx->addr) {
-					r->len += nx->len;
-					list_del(&nx->link);
-					kfree(nx);
-					fl->n--;
-				}
-			}
-			return;
-		}
-		if (addr + len == r->addr) {		/* 新段接在 r 头 */
-			r->addr = addr;
-			r->len += len;
-			return;
-		}
-	}
-
-	nr = kmalloc(sizeof(*nr), GFP_KERNEL);
-	if (!nr) {
+	if (rfs_run_list_push_front(fl, addr, len)) {
 		/* 极端 OOM：宁可泄漏（fsck 可回收）也不破坏「先 inode 后 free」纪律 */
 		WARN_ON_ONCE(1);
-		return;
 	}
-	nr->addr = addr;
-	nr->len = len;
-	list_add_tail(&nr->link, &fl->ranges);
-	fl->n++;
 }
 
-static void rfs_fl_free(struct super_block *sb, struct rfs_freelist *fl)
+/* 一次性返还整链（fail-fast；语义见块首注）。成功时原语逐段取走节点、链归空。*/
+static void rfs_fl_free(struct super_block *sb, struct rfs_run_list *fl)
 {
-	struct rfs_frerange *r;
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	int rc;
 
-	list_for_each_entry(r, &fl->ranges, link)
-		ravenfs_block_free(sb, r->addr, r->len);
+	if (!fl)
+		return;
+	rc = rfs_allocator_block_intervals_free(sbi->alloc, fl);
+	if (rc) {
+		pr_err("ravenfs: 返还区间违例 (%d) —— 上层账本与原语一致性相悖，余段弃置（fail-fast，交 fsck 回收）\n", rc);
+		WARN_ON_ONCE(1);
+	}
 }
 
 /* 释放一棵区段树的全部节点块 + 收集数据块（commit 之后调用） */
-static int rfs_release_tree_rec(struct super_block *sb, u64 root, struct rfs_freelist *fl,
+static int rfs_release_tree_rec(struct super_block *sb, u64 root, struct rfs_run_list *fl,
 				u32 depth)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct Bptree_meta_t *m;
 	u8 *buf;
 	u32 cnt, inner, i;
@@ -403,7 +372,7 @@ static int rfs_release_tree_rec(struct super_block *sb, u64 root, struct rfs_fre
 	}
 	kfree(buf);
 	ravenfs_mdata_drop(sb, root);
-	ravenfs_block_free(sb, root, 2);
+	(void)rfs_allocator_block_free(sbi->alloc, root, 2);
 	return 0;
 }
 
@@ -418,12 +387,13 @@ static int rfs_release_tree_rec(struct super_block *sb, u64 root, struct rfs_fre
  */
 void ravenfs_release_inode_data(struct super_block *sb, u64 data_root, u64 size, bool direct)
 {
-	struct rfs_freelist *fl;
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	struct rfs_run_list *fl;
 
 	if (data_root == (u64)PTR_INVALID)
 		return;
 	if (direct) {
-		ravenfs_block_free(sb, data_root, RFS_NBLK(size));
+		(void)rfs_allocator_block_free(sbi->alloc, data_root, RFS_NBLK(size));
 		return;
 	}
 	fl = rfs_fl_new();
@@ -445,7 +415,7 @@ static int rfs_commit_inode(struct inode *inode, u64 new_size, u64 new_root,
 	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
 	struct raven_Inode_t *r;
 
-	ses = ravenfs_session_get(sb, inode->i_ino);
+	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
 	r = ravenfs_session_inode(ses);
@@ -465,7 +435,7 @@ static int rfs_commit_size(struct inode *inode, u64 new_size)
 	struct super_block *sb = inode->i_sb;
 	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
 
-	ses = ravenfs_session_get(sb, inode->i_ino);
+	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
 	ravenfs_session_inode(ses)->size = new_size;
@@ -508,7 +478,7 @@ static bool rfs_block_mapped(struct inode *inode, u64 blk)
 	u64 next, size;
 	bool ret;
 
-	ses = ravenfs_session_get(sb, inode->i_ino);
+	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return false;
 	r = ravenfs_session_inode(ses);
@@ -543,7 +513,7 @@ static int rfs_zero_mapped_bytes(struct inode *inode, u64 off, u64 end)
 
 /* ── 区段树：删除逻辑块域 [fb0, fb1)（逐记录 loose）；返回可能更迭的新根 ── */
 static int rfs_unmap_range(struct inode *inode, u64 *root_io, u64 fb0, u64 fb1,
-			   struct rfs_freelist *fl, u64 *roots, int *nroots)
+			   struct rfs_run_list *fl, u64 *roots, int *nroots)
 {
 	struct super_block *sb = inode->i_sb;
 	u64 root = *root_io, b = fb0;
@@ -569,7 +539,7 @@ static int rfs_unmap_range(struct inode *inode, u64 *root_io, u64 fb0, u64 fb1,
 		cut.fblkbase = s;
 		cut.block_base.v = RFS_PTR_PACK(0, phys);
 		rfs_fl_add(fl, phys, e - s);
-		err = ravenfs_extent_unmap_loose(sb, inode->i_ino, &root, &cut, &old_root);
+		err = ravenfs_extent_unmap_loose(sb, RFS_INO_TO_IDX(inode->i_ino), &root, &cut, &old_root);
 		if (err && err != -ENOENT)
 			return err;
 		if (old_root != (u64)PTR_INVALID && *nroots < 64)
@@ -619,13 +589,14 @@ out:
 static int rfs_punch_hole(struct inode *inode, loff_t off, loff_t len)
 {
 	struct super_block *sb = inode->i_sb;
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
 	struct raven_Inode_t *r;
 	u64 size, clamp_end, db_start, db_end, oldceil, head_end, tail_start;
 	bool direct;
 	int err = 0;
 
-	ses = ravenfs_session_get(sb, inode->i_ino);
+	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
 	r = ravenfs_session_inode(ses);
@@ -662,8 +633,8 @@ static int rfs_punch_hole(struct inode *inode, loff_t off, loff_t len)
 		/* direct + 整块域非空 → 物化上树（保 direct 不成立） */
 		u64 root = (u64)PTR_INVALID, base;
 		struct extent_t e0, e1;
-		struct ravenfs_session *s2 = ravenfs_session_get(sb, inode->i_ino);
-		struct rfs_freelist *fl;
+		struct ravenfs_session *s2 = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+		struct rfs_run_list *fl;
 
 		if (IS_ERR(s2)) {
 			filemap_invalidate_unlock(inode->i_mapping);
@@ -676,14 +647,14 @@ static int rfs_punch_hole(struct inode *inode, loff_t off, loff_t len)
 			filemap_invalidate_unlock(inode->i_mapping);
 			return -ENOMEM;
 		}
-		err = ravenfs_extent_new_root_leaf(sb, inode->i_ino, &root);
+		err = ravenfs_extent_new_root_leaf(sb, RFS_INO_TO_IDX(inode->i_ino), &root);
 		if (err)
 			goto out_free_fl;
 		if (db_start > 0) {		/* 保留段 [0, db_start) */
 			e0.length = db_start;
 			e0.fblkbase = 0;
 			e0.block_base.v = RFS_PTR_PACK(0, base);
-			err = ravenfs_extent_insert(sb, inode->i_ino, &root, &e0, NULL);
+			err = ravenfs_extent_insert(sb, RFS_INO_TO_IDX(inode->i_ino), &root, &e0, NULL);
 			if (err)
 				goto out_free_tree;
 		}
@@ -691,7 +662,7 @@ static int rfs_punch_hole(struct inode *inode, loff_t off, loff_t len)
 			e1.length = oldceil - db_end;
 			e1.fblkbase = db_end;
 			e1.block_base.v = RFS_PTR_PACK(0, base + db_end);
-			err = ravenfs_extent_insert(sb, inode->i_ino, &root, &e1, NULL);
+			err = ravenfs_extent_insert(sb, RFS_INO_TO_IDX(inode->i_ino), &root, &e1, NULL);
 			if (err)
 				goto out_free_tree;
 		}
@@ -706,7 +677,7 @@ static int rfs_punch_hole(struct inode *inode, loff_t off, loff_t len)
 		if (err)
 			goto out_free_tree;
 		/* 后置 free：被打洞的整块域物理块 */
-		ravenfs_block_free(sb, base + db_start, db_end - db_start);
+		(void)rfs_allocator_block_free(sbi->alloc, base + db_start, db_end - db_start);
 		rfs_fl_put(fl);
 		filemap_invalidate_unlock(inode->i_mapping);
 		return 0;
@@ -739,13 +710,13 @@ out_free_fl:
 		u64 root, roots[64];
 		int nroots = 0, i;
 		struct ravenfs_session *s2;
-		struct rfs_freelist *fl = rfs_fl_new();
+		struct rfs_run_list *fl = rfs_fl_new();
 
 		if (!fl) {
 			filemap_invalidate_unlock(inode->i_mapping);
 			return -ENOMEM;
 		}
-		s2 = ravenfs_session_get(sb, inode->i_ino);
+		s2 = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 		if (IS_ERR(s2)) {
 			rfs_fl_put(fl);
 			filemap_invalidate_unlock(inode->i_mapping);
@@ -774,7 +745,7 @@ out_free_fl:
 		}
 		for (i = 0; i < nroots; i++) {
 			ravenfs_mdata_drop(sb, roots[i]);
-			ravenfs_block_free(sb, roots[i], 2);
+			(void)rfs_allocator_block_free(sbi->alloc, roots[i], 2);
 		}
 		rfs_fl_free(sb, fl);
 		rfs_fl_put(fl);
@@ -790,6 +761,7 @@ out_inval:
 /* ── truncate：缩小三出口 / 增大 ── */
 static int rfs_truncate(struct inode *inode, loff_t new_size){
 	struct super_block *sb = inode->i_sb;
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
 	struct raven_Inode_t *r;
 	u64 old, newceil, oldceil;
@@ -800,7 +772,7 @@ static int rfs_truncate(struct inode *inode, loff_t new_size){
 	if (new_size < 0)
 		return -EINVAL;
 
-	ses = ravenfs_session_get(sb, inode->i_ino);
+	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
 	r = ravenfs_session_inode(ses);
@@ -838,9 +810,9 @@ static int rfs_truncate(struct inode *inode, loff_t new_size){
 			if (err)
 				return err;
 			if (was_direct) {
-				ravenfs_block_free(sb, data_root, oldceil);
+				(void)rfs_allocator_block_free(sbi->alloc, data_root, oldceil);
 			} else {
-				struct rfs_freelist *fl = rfs_fl_new();
+				struct rfs_run_list *fl = rfs_fl_new();
 
 				if (fl) {
 					rfs_release_tree_rec(sb, data_root, fl, 0);
@@ -873,7 +845,7 @@ static int rfs_truncate(struct inode *inode, loff_t new_size){
 				return err;
 			}
 			if (oldceil > newceil)
-				ravenfs_block_free(sb, base + newceil, oldceil - newceil);
+				(void)rfs_allocator_block_free(sbi->alloc, base + newceil, oldceil - newceil);
 			filemap_invalidate_unlock(inode->i_mapping);
 			return 0;
 		}
@@ -882,7 +854,7 @@ static int rfs_truncate(struct inode *inode, loff_t new_size){
 		{
 			u64 root = r->data_root, roots[64], base = 0;
 			int nroots = 0, i, collapse;
-			struct rfs_freelist *fl = rfs_fl_new();
+			struct rfs_run_list *fl = rfs_fl_new();
 
 			RFS_SES_PUT(ses);
 			if (!fl)
@@ -914,11 +886,11 @@ static int rfs_truncate(struct inode *inode, loff_t new_size){
 			/* 后置 free：坍缩旧根 + 收缩产生的旧根 + 被删数据块 */
 			if (collapse) {
 				ravenfs_mdata_drop(sb, root);
-				ravenfs_block_free(sb, root, 2);
+				(void)rfs_allocator_block_free(sbi->alloc, root, 2);
 			}
 			for (i = 0; i < nroots; i++) {
 				ravenfs_mdata_drop(sb, roots[i]);
-				ravenfs_block_free(sb, roots[i], 2);
+				(void)rfs_allocator_block_free(sbi->alloc, roots[i], 2);
 			}
 			rfs_fl_free(sb, fl);
 			rfs_fl_put(fl);
@@ -979,7 +951,7 @@ static int rfs_alloc_range(struct inode *inode, loff_t off, loff_t len)
 	u64 size, end = (u64)off + (u64)len, b, b_end;
 	int err = 0;
 
-	ses = ravenfs_session_get(sb, inode->i_ino);
+	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
 	r = ravenfs_session_inode(ses);

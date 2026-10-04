@@ -48,6 +48,7 @@
 
 #include "ravenfs_platform.h"	/* 类型 / 内存 / 锁 / RAII 守卫（唯一平台收口） */
 #include "ravenfs_run_list.h"	/* run 三型 + 「STL 式自造链轮子」（容器拥有节点 + 绑定分配器）*/
+#include "ravenfs_allocator_stats.h"	/* al_ 计数器钩子（注入式；模块保持平台中立）*/
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,6 +61,9 @@ extern "C" {
 
 /* 硬分配未命中哨兵（⇄ god `PTR_INVALID`；拥有者直接透传）。*/
 #define RFS_IV_NO_HIT		(~0ULL)
+
+/* 打烊排空默认超时（毫秒）：超时即 fail-safe（不释放任何资源），由调用方处置。*/
+#define RFS_ALLOCATOR_DRAIN_TIMEOUT_MS	5000ULL
 
 /* ══════════════════════════ 交付单位：run / 链 ══════════════════════════ */
 
@@ -98,6 +102,43 @@ struct rfs_allocator {
 	struct rfs_alloc_group ino_;	/* inode 组 */
 	u32 slice_count;
 	u32 cpu_slots;
+
+	/* ── 生命周期「关闸 + 在途排空」双字段（C 无 private，语义在此写死）────────────
+	 * 合起来实现「打烊」：把「fini 之后 / fini 期间」到达的调用从「对已释放内存
+	 * 的 UB」变成「干净错误 + 有界等待」。⇄ 片 `rfs_slice.is_workable`；
+	 * ⇄ Linux `percpu_ref` kill/confirm · `blk_mq_quiesce_queue` · VFS `s_active`。
+	 *
+	 * 职责：
+	 *   · is_workable     —— 闸门。init 装配成功置 1；`rfs_allocator_shutdown` 首步置 0。
+	 *   · insession_count —— 在途计数。每个顶层接口「入席」+1、「退席」-1。
+	 *
+	 * 协议（**顺序是正确性的一部分，勿改**）：
+	 *   入席 enter  ：**先** seq_cst +1 → **后** seq_cst 读闸；闸=0 → 立刻 -1 并拒绝
+	 *                （不触碰任何数组）。
+	 *   打烊 shutdown：先 seq_cst 写闸=0（发布）→ 再轮询等 insession_count 归 0（有超时）。
+	 *   退席 leave  ：seq_cst -1。
+	 *   ⇒ 读者读到「闸=1」⇒ 它的 +1 必先于打烊对 count 的读 ⇒ 打烊必看到它、必等它。
+	 *     （「先查闸后 +1」有窗口，会让读者溜过排空 → 禁止。）
+	 *
+	 * 语义：
+	 *   · 只有本模块读写两字段；外部不得触碰。
+	 *   · 闸=0 时，所有触及 `slices`/`preferred` 数组的接口立刻拒绝、不碰数组：
+	 *     `block_alloc_hard`→`RFS_IV_NO_HIT`；int 类→`-EINVAL`；bool 类→`false`；
+	 *     void/取值类→提前返回 0；`dump_slice`→`-EINVAL`。
+	 *     （纯标量几何取值 `slice_count`/`cpu_slots`/`*_per_slice_bits` 不查——fini 的
+	 *      memset 已把它们归 0。）
+	 *   · 打烊**单线程**（`put_super` 满足）；禁止从 in-session 内部调 `shutdown`（自等死锁）。
+	 *   · 保护范围 = `slices`/`preferred` 数组的释放窗口；`struct rfs_allocator` 本身的
+	 *     生命周期仍归调用方。
+	 *   · 等待原语 = 平台收口的「自旋 + 时间轮询」（`RFS_CPU_RELAX`/`RFS_DELAY_MS`/
+	 *     `RFS_NOW_NS`），**环境通用 + 架构通用**（不用 waitqueue/condvar）。*/
+	u32 is_workable;
+	u32 insession_count;
+
+	/* ── 计数器钩子（D-11 连带；平台中立，宿主注入）────────────────────────────
+	 * 本模块不碰内核：`al_` 计数经此上报，由 FS 适配层累加进 `sbi->stats`。
+	 * 装配时从 `rfs_slices_cfg.stat` 拷入，并下传各片（片内埋点）。未注入 = no-op。*/
+	struct rfs_stat_hook stat;
 };
 
 /* 顶层装配配置（⇄ `slices_cfg_t`）。两段位图原始内存**生命周期归调用方**、4K 对齐；
@@ -116,6 +157,9 @@ struct rfs_slices_cfg {
 	/* 装配与元素池的内存来源（router 取 slices/preferred 数组 + 下传各片元素池）。
 	 * 凡分配经此回调，模块零直接分配（同一 `rfs_mem_alloc` 类型，见 ravenfs_platform.h）。*/
 	struct rfs_mem_alloc alloc;
+	/* al_ 计数器钩子（D-11 连带）：注入后由本模块路由/片内埋点累加进宿主 stats。
+	 * 未注入（inc == NULL）→ no-op（用户态压测 / 纯算法单测无需打点）。*/
+	struct rfs_stat_hook stat;
 };
 
 /* ═════════════════════════════ 返回码（F3）═════════════════════════════
@@ -136,8 +180,16 @@ struct rfs_slices_cfg {
  * 位图原始内存**不取所有权**（cfg 只读消费）。*/
 int	rfs_allocator_init(struct rfs_allocator *self, const struct rfs_slices_cfg *cfg);
 
-/* ⇄ `~fs_allocator_t()`：逐片 shutdown + 释放自持资源。*/
+/* ⇄ `~fs_allocator_t()`：逐片 shutdown + 释放自持资源。
+ * 内部先 `rfs_allocator_shutdown(self, 0)`（默认 5s）排空；**超时 → 只记日志、拒绝
+ * 释放**（fail-safe：宁可泄漏不 UAF）。*/ 
 void	rfs_allocator_fini(struct rfs_allocator *self);
+
+/* 打烊：关闸（`is_workable`=0）+ 等在途调用退席（`insession_count`→0）。
+ * timeout_ms=0 → `RFS_ALLOCATOR_DRAIN_TIMEOUT_MS`(5s)。
+ * 返回 0 / -ETIMEDOUT / -EINVAL；**超时不释放任何资源**（由调用方决定处置）。
+ * 仅供 fini / 上层显式排空调用；**单线程调用**。*/
+int	rfs_allocator_shutdown(struct rfs_allocator *self, u64 timeout_ms);
 
 /* ── 片自治单元接口（⇄ mgr_slice_t 各方法）**不在本头** ──
  * 见片头文件（`struct rfs_slice` 同处）：enable_slice / alloc_hard / soft_alloc /

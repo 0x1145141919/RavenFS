@@ -609,6 +609,51 @@ static void test_dump_slice(void)
 	raw_free(&i);
 }
 
+/* ══════════════════════ 8. shutdown「打烊」：关闸拒绝 + 排空超时 ══════════════════════ */
+static void test_shutdown_drain(void)
+{
+	struct raw b, i;
+	struct rfs_slices_cfg cfg;
+	struct rfs_allocator a;
+
+	puts("[8] shutdown：关闸拒绝 / 排空超时 fail-safe");
+
+	raw_init(&b, BITS);
+	raw_init(&i, BITS);
+	raw_clear(&b, 100, 8);
+	make_cfg(&cfg, &b, &i, 4);
+	CHECK(rfs_allocator_init(&a, &cfg) == 0, "ctor ok");
+	CHECK(rfs_allocator_block_alloc_hard(&a, 8, 0) == 100, "online: hard hit");
+
+	/* 排空超时（白盒：伪造一个在途席位）→ -ETIMEDOUT 且 **不释放** */
+	a.insession_count = 1;
+	CHECK(rfs_allocator_shutdown(&a, 100) == -ETIMEDOUT, "drain timeout -> -ETIMEDOUT");
+	CHECK(a.blk_.slices != NULL, "timeout: slices NOT freed (fail-safe)");
+	a.insession_count = 0;
+
+	/* 正常打烊：关闸 → 在途归 0 → 通；此后接口全部拒绝、不碰数组 */
+	CHECK(rfs_allocator_shutdown(&a, 0) == 0, "drain ok on zero in-flight");
+	CHECK(rfs_allocator_slice_count(&a) == 4, "gated: geometry scalar still readable");
+	CHECK(rfs_allocator_block_alloc_hard(&a, 4, 0) == RFS_IV_NO_HIT, "gated: hard -> NO_HIT");
+	CHECK(rfs_allocator_block_free(&a, 100, 4) == -EINVAL, "gated: free -> -EINVAL");
+	CHECK(rfs_allocator_block_test(&a, 100) == false, "gated: test -> false");
+	CHECK(rfs_allocator_block_free_total(&a) == 0, "gated: free_total -> 0");
+	{
+		struct rfs_run_dlist dl;
+
+		rfs_run_dlist_init(&dl, g_ralloc);
+		CHECK(rfs_allocator_dump_slice(&a, false, 0, &dl) == -EINVAL,
+		      "gated: dump -> -EINVAL");
+		rfs_run_dlist_fini(&dl);
+	}
+	/* 幂等 fini（在途 0 → 释放）*/
+	rfs_allocator_fini(&a);
+	CHECK(rfs_allocator_slice_count(&a) == 0, "fini after shutdown clears");
+
+	raw_free(&b);
+	raw_free(&i);
+}
+
 int main(void)
 {
 	printf("=== ravenfs_allocator_router smoke tests ===\n");
@@ -620,6 +665,7 @@ int main(void)
 	test_block_free_chains();
 	test_inode();
 	test_dump_slice();
+	test_shutdown_drain();
 
 	printf("--- pool: allocs=%llu frees=%llu live=%llu\n",
 	       (unsigned long long)g_allocs, (unsigned long long)g_frees,

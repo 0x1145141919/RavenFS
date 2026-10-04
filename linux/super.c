@@ -33,6 +33,7 @@
 #include <linux/string.h>
 #include <linux/fileattr.h>
 #include <linux/debugfs.h>
+#include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/timekeeping.h>
 
@@ -41,8 +42,8 @@
 #include "ravenfs_file.h"
 #include "ravenfs_cache.h"
 #include "ravenfs_mdata_cache.h"
-#include "ravenfs_bitmap.h"
-#include "ravenfs_bitmap_adapter.h"
+#include "ravenfs_allocator_top.h"
+#include "ravenfs_allocator_adapter.h"
 #include "ravenfs_xattr.h"
 
 /* ── 前向声明（ops 表在 read_inode 里被引用） ── */
@@ -60,12 +61,22 @@ static struct kmem_cache *ravenfs_inode_cachep;
 static struct file_system_type ravenfs_fs_type;
 
 /*
- * ── §8 性能计数器出口：debugfs（`/sys/kernel/debug/ravenfs/<s_id>/stats`）──
- * 一个 seq_file kv 文件**全吐**（不拆多文件）：一次 cat = 一次完整观测；root-only、
- * 非 ABI（字段增删改名无兼容义务）。i_private = sb（同 UAF 纪律：删除必须先于
- * kfree(sbi)，见 put_super）。
+ * ── §8 性能计数器出口：一个 seq_file kv 文件**全吐**（不拆多文件）──
+ * 一次 cat = 一次完整观测。**同一个 `ravenfs_stats_show` 注册两处**（数据源单一）：
+ *
+ *   · procfs（D-11，公开面）：`/proc/fs/ravenfs/<s_id>/stats`，0444，**人人可读**。
+ *     fs stat 惯例（同形 `/proc/fs/xfs/stat`）——普通用户 / 监控脚本可读。
+ *   · debugfs（内部探针）：`/sys/kernel/debug/ravenfs/<s_id>/stats`，0444。
+ *     debugfs 挂载点 `/sys/kernel/debug` 默认为 0700 → 事实 root-only（D-11 的由来），
+ *     保留作内核开发期内部探针，**不再当作对外出口**。
+ *
+ * 字段增删改名无兼容义务？——**公开面（procfs）一旦稳定即为事实 ABI**，须为字段名/
+ * 分组的增删改名立兼容纪律（对齐 D-10「对外契约成员清单」教训；见 D-11）。
+ * 生命周期 = UAF 红线（i_private/data 持 sb/sbi 指针）：**两处出口都必须早于
+ * kfree(sbi) 摘除**，见 put_super。
  */
 static struct dentry *ravenfs_dbg_root;
+static struct proc_dir_entry *ravenfs_proc_root;	/* /proc/fs/ravenfs */
 
 static const char *const ravenfs_stat_names[] = {
 	/* A op_ */  "op_lookup", "op_create", "op_mkdir", "op_unlink", "op_rmdir",
@@ -81,11 +92,6 @@ static const char *const ravenfs_stat_names[] = {
 	/* D ttl_ */ "ttl_rounds", "ttl_round_errs",
 	/* E io_ */  "io_read_ops", "io_read_bytes", "io_write_ops", "io_write_bytes",
 	"io_flush_ops",
-	/* F bm_ */  "bm_alloc_calls", "bm_alloc_ok", "bm_alloc_fail", "bm_alloc_blocks",
-	"bm_free_calls", "bm_free_blocks", "bm_soft_ok", "bm_occupy",
-	"bm_sync_slices", "bm_chunk_switch", "bm_chunk_switch_ns", "bm_rec_attach",
-	"bm_rec_drain", "bm_pool_empty", "bm_summary_skip", "bm_scan_ns",
-	"bm_ttl_online", "bm_ttl_drain",
 	/* G ext_ */ "ext_lookup", "ext_insert", "ext_split", "ext_new_root",
 	"ext_balance", "ext_unmap", "ext_node_reads",
 	/* H dir_ */ "dir_leaf_reads", "dir_emit", "dir_nlink_adjust",
@@ -96,6 +102,30 @@ static const char *const ravenfs_stat_names[] = {
 	/* K life_ */"life_mount", "life_umount", "life_iget_new", "life_evict",
 	/* L nh_ */  "nh_alloc", "nh_alloc_fail", "nh_write", "nh_free",
 	"nh_activate", "nh_release",
+};
+
+/*
+ * F 组：运行时树分配器 al_（36）—— **独立子结构 `sbi->al`**，
+ * 下标空间 = `enum rfs_al_stat`（ravenfs_allocator_stats.h），与下面名字表逐一对位。
+ * BUILD_BUG_ON 同时守「子结构是纯 atomic64 无填充」与「名字表数目 == 字段数」。
+ */
+static const char *const ravenfs_al_stat_names[] = {
+	/* A 装配 / 生命周期 */ "al_init", "al_init_fail", "al_slices",
+	"al_shutdown", "al_drain_timeout",
+	/* B block 组顶层 */ "al_blk_alloc_hard_ok", "al_blk_alloc_hard_fail",
+	"al_blk_alloc_soft_ok", "al_blk_alloc_soft_fail", "al_blk_occupy_ok",
+	"al_blk_occupy_partial", "al_blk_occupy_fail", "al_blk_free_calls",
+	"al_blk_free_blocks",
+	/* C inode 组顶层 */ "al_ino_alloc_ok", "al_ino_alloc_fail",
+	"al_ino_free_calls",
+	/* D 片内双树 */ "al_slice_alloc_hard", "al_slice_alloc_enospc",
+	"al_slice_soft", "al_slice_soft_enospc", "al_slice_free",
+	"al_slice_free_eexist", "al_tree_insert", "al_tree_erase",
+	/* E 融合 */ "al_merge_left", "al_merge_right", "al_merge_both",
+	/* F 路由 / 跨片 */ "al_route_first_hit", "al_route_rescan",
+	"al_route_cross_slice",
+	/* G checkpoint / 元素池 */ "al_checkpoint", "al_checkpoint_fail",
+	"al_checkpoint_blocks", "al_pool_alloc", "al_pool_fail",
 };
 
 static int ravenfs_stats_show(struct seq_file *m, void *v)
@@ -109,6 +139,9 @@ static int ravenfs_stats_show(struct seq_file *m, void *v)
 	/* 结构体成员全为 atomic64_t 且无填充 → 当连续数组读（下面断言守着） */
 	BUILD_BUG_ON(sizeof(struct ravenfs_sb_stats) !=
 		     ARRAY_SIZE(ravenfs_stat_names) * sizeof(atomic64_t));
+	BUILD_BUG_ON(sizeof(struct ravenfs_al_stats) !=
+		     ARRAY_SIZE(ravenfs_al_stat_names) * sizeof(atomic64_t));
+	BUILD_BUG_ON(AL_STAT_COUNT != ARRAY_SIZE(ravenfs_al_stat_names));
 	if (!sbi)
 		return 0;
 	st = (const atomic64_t *)&sbi->stats;
@@ -127,21 +160,17 @@ static int ravenfs_stats_show(struct seq_file *m, void *v)
 		seq_printf(m, "%s\t%llu\n", nm,
 			   (unsigned long long)atomic64_read(&st[i]));
 	}
-	/* §5：状态段（gauge + 本次挂载锁定的位图后端，便于读侧解释 bm_ 字段子集）*/
-	seq_printf(m, "# state\nshutdown\t%d\n", ravenfs_is_shutdown(sb) ? 1 : 0);
+	/* F 组：运行时树分配器 al_（独立子结构；下标 = enum rfs_al_stat）。*/
 	{
-		struct ravenfs_bitmap_opts bo;
+		const atomic64_t *ast = (const atomic64_t *)&sbi->al;
 
-		/* 位图后端随挂载锁定（mem/chunk）；F 组非本后端的专属字段恒 0 ——
-		 * 本行让读侧知道该按哪套子集解释，避免把「恒 0」误读为「没打点」。*/
-		if (ravenfs_bitmap_opts_get(sb, &bo) == 0) {
-			seq_printf(m, "bitmap_mode\t%s\n",
-				   bo.mode == RFS_BM_MODE_CHUNK ? "chunk" : "mem");
-			if (bo.mode == RFS_BM_MODE_CHUNK)
-				seq_printf(m, "bitmap_chunk_order\tblk=%u ino=%u\n",
-					   bo.blk_chunk_order, bo.ino_chunk_order);
-		}
+		seq_puts(m, "# [al]\n");
+		for (i = 0; i < ARRAY_SIZE(ravenfs_al_stat_names); i++)
+			seq_printf(m, "%s\t%llu\n", ravenfs_al_stat_names[i],
+				   (unsigned long long)atomic64_read(&ast[i]));
 	}
+	/* §5：状态段（gauge）*/
+	seq_printf(m, "# state\nshutdown\t%d\n", ravenfs_is_shutdown(sb) ? 1 : 0);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(ravenfs_stats);
@@ -254,7 +283,7 @@ static int ravenfs_flush_ddentry_tree(struct super_block *sb, u64 root, u32 dept
 /* 该 inode 是否需要/是否有 mdata 树：DIR → dentry 树；REG/SYM（非 inline 非 direct）→ extent 树 */
 static int ravenfs_flush_inode_trees(struct super_block *sb, struct inode *inode)
 {
-	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, inode->i_ino);
+	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	struct raven_Inode_t *r;
 
 	if (IS_ERR_OR_NULL(s))
@@ -431,7 +460,8 @@ static int ravenfs_read_inode(struct inode *inode)
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
 	const struct raven_Inode_t *r;
-	u64 inum = inode->i_ino;
+	/* D-10 契约：VFS 面 ino → 内部盘 idx（唯一穿越点之一，禁散落 ±1） */
+	u64 inum = RFS_INO_TO_IDX(inode->i_ino);
 	u32 type, perm;
 
 	if (inum >= sbi->inode_count)
@@ -515,7 +545,8 @@ struct inode *ravenfs_iget(struct super_block *sb, u64 inum)
 	struct inode *inode;
 	int err;
 
-	inode = iget_locked(sb, inum);
+	/* 入参 inum = 盘 idx；VFS 面 ino = idx + 1（D-10 契约，唯一构造点） */
+	inode = iget_locked(sb, RFS_IDX_TO_INO(inum));
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
 	if (!(inode_state_read_once(inode) & I_NEW))
@@ -617,28 +648,14 @@ static int ravenfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 struct ravenfs_fs_context {
 	unsigned int	row_size;	/* 0 = 默认 4K；mount option `row_size=` */
-	u8		bitmap_mode;	/* RFS_BM_MODE_MEM（默认）| _CHUNK；`bitmap_mode=` */
-	u8		blk_chunk_order;	/* 短名 `bbco=`（主键）/ 全名 `block_bitmap_chunk_order=`（别名）；默认 3 */
-	u8		ino_chunk_order;	/* 短名 `ibco=`（主键）/ 全名 `inode_bitmap_chunk_order=`（别名）；默认 0 */
-	bool		blk_order_seen;	/* 用户显式给了 block 几何（mem 下 → 拒挂）*/
-	bool		ino_order_seen;
 };
 
 enum ravenfs_param {
 	Opt_row_size,
-	Opt_bitmap_mode,
-	Opt_block_chunk_order,	/* 短名 bbco = 主键；全名 block_bitmap_chunk_order = 别名，同指此 */
-	Opt_inode_chunk_order,	/* 短名 ibco = 主键；全名 inode_bitmap_chunk_order = 别名，同指此 */
 };
 
 static const struct fs_parameter_spec ravenfs_fs_parameters[] = {
 	fsparam_string("row_size", Opt_row_size),
-	fsparam_string("bitmap_mode", Opt_bitmap_mode),
-	/* 两个键名都支持；**短名为 canonical**（回读用短名），全名仅作解析别名 */
-	fsparam_string("block_bitmap_chunk_order", Opt_block_chunk_order),
-	fsparam_string("bbco", Opt_block_chunk_order),
-	fsparam_string("inode_bitmap_chunk_order", Opt_inode_chunk_order),
-	fsparam_string("ibco", Opt_inode_chunk_order),
 	{}
 };
 
@@ -683,38 +700,6 @@ static int ravenfs_parse_param(struct fs_context *fc, struct fs_parameter *param
 		}
 		ctx->row_size = sz;
 		return 0;
-	case Opt_bitmap_mode:
-		/* 字面量 mem|chunk；非法 → loud 拒挂 */
-		if (ravenfs_bm_mode_from_str(param->string, &ctx->bitmap_mode)) {
-			pr_err("ravenfs: invalid bitmap_mode= (支持 mem|chunk)\n");
-			return -EINVAL;
-		}
-		return 0;
-	case Opt_block_chunk_order:
-	case Opt_inode_chunk_order: {
-		unsigned int v;
-		u8 ord;
-
-		if (!param->string)
-			return -EINVAL;
-		/* 越界（<0 或 >6）→ loud 拒挂；0..6 由 check 统一守 */
-		if (kstrtouint(param->string, 0, &v) ||
-		    ravenfs_bm_order_check(v, &ord)) {
-			pr_err("ravenfs: invalid %s= (取值 0..6)\n",
-			       opt == Opt_block_chunk_order ?
-			       "block_bitmap_chunk_order/bbco" :
-			       "inode_bitmap_chunk_order/ibco");
-			return -EINVAL;
-		}
-		if (opt == Opt_block_chunk_order) {
-			ctx->blk_chunk_order = ord;
-			ctx->blk_order_seen = true;
-		} else {
-			ctx->ino_chunk_order = ord;
-			ctx->ino_order_seen = true;
-		}
-		return 0;
-	}
 	}
 	return -EINVAL;
 }
@@ -728,6 +713,7 @@ static int ravenfs_write_inode(struct inode *inode, struct writeback_control *wb
 static void ravenfs_evict_inode(struct inode *inode)
 {
 	struct super_block *sb = inode->i_sb;
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	u64 data_root = (u64)PTR_INVALID;
 	u64 data_size = 0;
 	bool data_direct = false, has_data = false;
@@ -743,7 +729,7 @@ static void ravenfs_evict_inode(struct inode *inode)
 	 */
 	if (!inode->i_nlink) {
 		struct ravenfs_session *s __free(ravenfs_session) =
-			ravenfs_session_get(sb, inode->i_ino);
+			ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 		u64 xptr = (u64)RFS_XATTR_NONE;
 
 		if (!IS_ERR_OR_NULL(s)) {
@@ -758,10 +744,10 @@ static void ravenfs_evict_inode(struct inode *inode)
 				has_data = true;
 			}
 		}
-		ravenfs_inode_reclaim(sb, inode->i_ino);
+		ravenfs_inode_reclaim(sb, RFS_INO_TO_IDX(inode->i_ino));
 		/* M6：释放 xattr 块（先 inode 后 free：记录已清零，引用先消失）*/
 		if (xptr != (u64)RFS_XATTR_NONE)
-			ravenfs_block_free(sb, xptr, 1);
+			(void)rfs_allocator_block_free(sbi->alloc, xptr, 1);
 		if (has_data)
 			ravenfs_release_inode_data(sb, data_root, data_size, data_direct);
 	}
@@ -780,11 +766,11 @@ static void ravenfs_put_super(struct super_block *sb)
 	ravenfs_issue_flush(sb);
 	ravenfs_cache_destroy(sb);		/* ② inode 记录行全量刷回 */
 	ravenfs_issue_flush(sb);
-	/* ③ 位图全量刷回（M3 持久化）；ro 挂载不写 */
+	/* ③ 分配器全量刷回（M3 持久化）：树快照 → 位图字 → 落盘；ro 挂载不写 */
 	if (!(sb->s_flags & SB_RDONLY))
-		ravenfs_bitmap_flush(sb);
+		(void)ravenfs_allocator_flush(sb);
 	ravenfs_issue_flush(sb);
-	ravenfs_bitmap_destroy(sb);
+	ravenfs_allocator_destroy(sb);		/* 排空 + 拆树 + 释放 words（幂等）*/
 
 	/*
 	 * 干净卸载时间戳 umount_time（Docs/disk_layout_v1.1.md #15）：写 now。
@@ -816,9 +802,11 @@ static void ravenfs_put_super(struct super_block *sb)
 			       e);
 	}
 
-	/* §8.2 UAF 红线：stats 文件 i_private 持 sb/sbi 指针 → debugfs 目录必须
-	 * **早于** kfree(sbi) 摘除；debugfs_remove 会等进行中的 read 结束。 */
+	/* §8.2 UAF 红线：stats 文件 data 持 sb/sbi 指针 → 两处出口目录都必须
+	 * **早于** kfree(sbi) 摘除；debugfs_remove_recursive / proc_remove 会等进行中的
+	 * read 结束（proc_remove 对 NULL 安全；内部 remove_proc_subtree 会等在读）。 */
 	debugfs_remove_recursive(sbi ? sbi->dbg_dir : NULL);
+	proc_remove(sbi ? sbi->proc_dir : NULL);
 	kfree(sb->s_fs_info);
 	sb->s_fs_info = NULL;
 }
@@ -866,8 +854,8 @@ static int ravenfs_sync_fs(struct super_block *sb, int wait)
 	if (e && !err)
 		err = e;
 
-	/* ③ 位图（分配落地） */
-	e = ravenfs_bitmap_flush(sb);
+	/* ③ 分配器（分配落地）：树快照 → 位图字 → 落盘（一步到位） */
+	e = ravenfs_allocator_flush(sb);
 	if (e) {
 		if (!err)
 			err = e;
@@ -881,34 +869,14 @@ static int ravenfs_sync_fs(struct super_block *sb, int wait)
 }
 
 /*
- * D-9：挂载选项回读。回读集必须与 `ravenfs_parse_param` 接受集**同构**：
- *   bitmap_mode（mem|chunk）· bbco= · ibco= · row_size=（非默认才显）。
- *
- * 键名口径（**锁死**）：短名 `bbco`/`ibco` = canonical，回读一律用**短名**
- * （remount / 复制挂载参数要短、要能直接用）；全名 `block_bitmap_chunk_order=`/
- * `inode_bitmap_chunk_order=` 仅作**解析别名**（接受等价，但不回读）。
- *
- * 默认值口径（**锁死**）：
- *   · 恒显 `bitmap_mode`（后端选择是最关键的语义位，不省）；
- *   · chunk 时恒显两个 chunk_order（**短名** bbco/ibco）；
- *   · `row_size=` 仅当非默认（RAVENFS_ROW_DEFAULT=4096）才显。
- * ro/rw 等 VFS 级选项由 VFS 输出，driver 不管。
+ * 挂载选项回读（D-9）。位图模块退役后（2026-10-04 硬切）本驱动只剩 `row_size=`
+ * 一个自有选项，且该值不落 sbi（仅 mount 期消费）→ 不再回读；VFS 级选项由 VFS 输出。
+ * 保留本回调（s_op 需要）但不输出 driver 选项。
  */
 static int ravenfs_show_options(struct seq_file *m, struct dentry *dentry)
 {
-	struct super_block *sb = dentry->d_sb;
-	struct ravenfs_bitmap_opts o;
-
-	if (ravenfs_bitmap_opts_get(sb, &o))
-		return 0;	/* 无管理器（不应发生）：不输出，不崩 */
-	seq_printf(m, ",bitmap_mode=%s",
-		   o.mode == RFS_BM_MODE_CHUNK ? "chunk" : "mem");
-	if (o.mode == RFS_BM_MODE_CHUNK) {
-		seq_printf(m, ",bbco=%u", (unsigned int)o.blk_chunk_order);
-		seq_printf(m, ",ibco=%u", (unsigned int)o.ino_chunk_order);
-	}
-	if (o.row_size && o.row_size != RAVENFS_ROW_DEFAULT)
-		seq_printf(m, ",row_size=%u", (unsigned int)o.row_size);
+	(void)m;
+	(void)dentry;
 	return 0;
 }
 
@@ -1013,7 +981,7 @@ static int ravenfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
 	if (e && !err)
 		err = e;
 
-	e = ravenfs_inode_flush(sb, inode->i_ino);
+	e = ravenfs_inode_flush(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (e) {
 		if (!err)
 			err = e;
@@ -1023,11 +991,11 @@ static int ravenfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
 	if (e && !err)
 		err = e;
 
-	e = ravenfs_bitmap_flush(sb);
+	e = ravenfs_allocator_flush(sb);
 	if (e) {
 		if (!err)
 			err = e;
-		ravenfs_force_shutdown(sb, "fsync: bitmap flush failed");
+		ravenfs_force_shutdown(sb, "fsync: allocator flush failed");
 	}
 	e = ravenfs_issue_flush(sb);
 	if (e && !err)
@@ -1052,8 +1020,7 @@ static const struct file_operations ravenfs_file_operations = {
  * ═══════════════════════════════════════════════════════════════════ */
 
 static int ravenfs_parse_superblock(struct super_block *sb, const void *buf,
-				    unsigned int row_size,
-				    const struct ravenfs_bitmap_opts *bm_opts)
+				    unsigned int row_size)
 {
 	const struct RavenSuperblock *dsb = buf;
 	struct ravenfs_sb_info *sbi;
@@ -1135,7 +1102,9 @@ static int ravenfs_parse_superblock(struct super_block *sb, const void *buf,
 		kfree(sbi);
 		return -ENOMEM;
 	}
-	if (ravenfs_bitmap_create_mode(sb, bm_opts)) {	/* 双位图分片分配器（bitmap_adapter.c）*/
+	/* 运行时树分配器：设备读位图镜像 → 建树（挂载必建、无回退）。
+	 * 失败（几何 / IO / 内存）→ 非零 → 按挂载失败回滚。*/
+	if (ravenfs_allocator_create(sb)) {
 		ravenfs_ttl_stop(sb);
 		ravenfs_mdata_cache_destroy(sb);
 		ravenfs_cache_destroy(sb);
@@ -1283,7 +1252,6 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	struct ravenfs_sb_info *sbi;
 	struct buffer_head *bh;
 	struct inode *root;
-	struct ravenfs_bitmap_opts bm_opts;
 	unsigned int row_size = (ctx && ctx->row_size) ? ctx->row_size : RAVENFS_ROW_DEFAULT;
 	int err;
 
@@ -1293,12 +1261,6 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_time_gran = 1;
 	sb->s_op = &ravenfs_sops;
 
-	/* 位图后端锁定值（= 从 fs_context 取，默认 mem）；随 sbi->bitmap 存下供 show_options 回读 */
-	bm_opts.mode = ctx ? ctx->bitmap_mode : RFS_BM_MODE_MEM;
-	bm_opts.blk_chunk_order = ctx ? ctx->blk_chunk_order : RAVENFS_BM_DEFAULT_BLK_CHUNK_ORDER;
-	bm_opts.ino_chunk_order = ctx ? ctx->ino_chunk_order : RAVENFS_BM_DEFAULT_INO_CHUNK_ORDER;
-	bm_opts.row_size = row_size;
-
 	/* SB 在设备起始 4K（FS_block 世界之外 → bdev 块 0） */
 	bh = sb_bread(sb, 0);
 	if (!bh) {
@@ -1306,7 +1268,7 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		RFS_STAT_INC(sb, err_sb_read);	/* 盘/设备健康 */
 		return -EIO;
 	}
-	err = ravenfs_parse_superblock(sb, bh->b_data, row_size, &bm_opts);
+	err = ravenfs_parse_superblock(sb, bh->b_data, row_size);
 	brelse(bh);
 	if (err)
 		return err;
@@ -1359,6 +1321,16 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (!IS_ERR_OR_NULL(sbi->dbg_dir))
 		debugfs_create_file("stats", 0444, sbi->dbg_dir, sb, &ravenfs_stats_fops);
 
+	/* D-11：procfs 公开出口 `/proc/fs/ravenfs/<s_id>/stats`（0444，人人可读）。
+	 * 与 debugfs 同一 `ravenfs_stats_show`（数据源单一；data=sb → m->private=sb）。
+	 * 守卫：proc 根缺失（极罕见，init 已建）→ 只少公开面，不挡挂载（同 debugfs 口径）。*/
+	if (ravenfs_proc_root) {
+		sbi->proc_dir = proc_mkdir(sb->s_id, ravenfs_proc_root);
+		if (sbi->proc_dir)
+			proc_create_single_data("stats", 0444, sbi->proc_dir,
+						ravenfs_stats_show, sb);
+	}
+
 	pr_info("ravenfs: mounted blocks=%llu inodes=%llu root_ino=%llu\n",
 		sbi->total_blocks, sbi->inode_count, sbi->root_ino);
 	return 0;
@@ -1370,16 +1342,6 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 static int ravenfs_get_tree(struct fs_context *fc)
 {
-	struct ravenfs_fs_context *ctx = fc->fs_private;
-
-	/* 纪律：chunk 专属参数（bbco/ibco）只在 bitmap_mode=chunk 下合法；
-	 * mem（含默认 mem）下给了 → loud 拒挂 -EINVAL。放在此处（已收齐全部参数）
-	 * 才能不依赖参数出现顺序。*/
-	if (ctx && ctx->bitmap_mode != RFS_BM_MODE_CHUNK &&
-	    (ctx->blk_order_seen || ctx->ino_order_seen)) {
-		pr_err("ravenfs: block_bitmap_chunk_order/bbco & inode_bitmap_chunk_order/ibco 仅在 bitmap_mode=chunk 下合法\n");
-		return -EINVAL;
-	}
 	return get_tree_bdev(fc, ravenfs_fill_super);
 }
 
@@ -1390,10 +1352,6 @@ static int ravenfs_init_fs_context(struct fs_context *fc)
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
 		return -ENOMEM;
-	/* 默认 = 现行为红线：mem 后端；chunk 几何默认 3/0（仅 chunk 时消费）*/
-	ctx->bitmap_mode = RFS_BM_MODE_MEM;
-	ctx->blk_chunk_order = RAVENFS_BM_DEFAULT_BLK_CHUNK_ORDER;
-	ctx->ino_chunk_order = RAVENFS_BM_DEFAULT_INO_CHUNK_ORDER;
 	fc->fs_private = ctx;
 	fc->ops = &ravenfs_context_ops;
 	return 0;
@@ -1448,6 +1406,9 @@ static int __init ravenfs_init(void)
 	}
 	/* §8.2：debugfs 根目录（`/sys/kernel/debug/ravenfs`）；失败忽略 */
 	ravenfs_dbg_root = debugfs_create_dir("ravenfs", NULL);
+	/* D-11：procfs 公开根 `/proc/fs/ravenfs`（`proc_mkdir("fs/ravenfs", NULL)`
+	 * 会创建中间目录 fs）；失败忽略（仅少公开出口，不挡模块装载）。*/
+	ravenfs_proc_root = proc_mkdir("fs/ravenfs", NULL);
 	pr_info("ravenfs: module loaded\n");
 	return 0;
 }
@@ -1456,6 +1417,8 @@ static void __exit ravenfs_exit(void)
 {
 	debugfs_remove_recursive(ravenfs_dbg_root);
 	ravenfs_dbg_root = NULL;
+	proc_remove(ravenfs_proc_root);
+	ravenfs_proc_root = NULL;
 	unregister_filesystem(&ravenfs_fs_type);
 	rcu_barrier();
 	kmem_cache_destroy(ravenfs_inode_cachep);

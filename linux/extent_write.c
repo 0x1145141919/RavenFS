@@ -15,7 +15,7 @@
  *   · 路由：**严格上界**（`target < key → 左子树`；`key = 子树最大开边界 fblkbase+length`）——
  *     与 dentry 的 `≤ hash_max` 方向**相反**，勿照抄。
  *   · 阈值：阶 337（槽 338，[337] 瞬时槽仅内存）；叶/内裂左 168；深度上限 64；
- *     节点块 = `ravenfs_block_alloc(sb, 2, 1)`（2 块连续 + 8K 对齐）。
+ *     节点块 = `rfs_allocator_block_alloc_hard(self, 2, 1)`（2 块连续 + 8K 对齐）。
  *   · 三态迁移（inline→extent / direct→extent）的**盘面副作用**由 iomap.c 承担；本文件仅树机械。
  */
 #include <linux/module.h>
@@ -28,7 +28,7 @@
 #include "ravenfs.h"
 #include "ravenfs_extent.h"
 #include "ravenfs_mdata_cache.h"
-#include "ravenfs_bitmap.h"
+#include "ravenfs_allocator_top.h"
 
 #define RFS_EXT_ORDER		337u	/* 阶 */
 #define RFS_EXT_MAX_SLOTS	338u	/* 槽 [0,337]；[337] 瞬时 */
@@ -76,6 +76,7 @@ struct rfs_ext_resv {
 /* 预算池：前置分配 n 个节点块；失败即回滚已分配 → -ENOSPC（树零改动） */
 static int rfs_ext_resv_alloc(struct super_block *sb, struct rfs_ext_resv *r, u32 n)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	u32 i;
 
 	r->n = 0;
@@ -83,11 +84,11 @@ static int rfs_ext_resv_alloc(struct super_block *sb, struct rfs_ext_resv *r, u3
 	if (n > RFS_EXT_RESV_MAX)
 		return -EIO;
 	for (i = 0; i < n; i++) {
-		u64 b = ravenfs_block_alloc(sb, 2, 1);
+		u64 b = rfs_allocator_block_alloc_hard(sbi->alloc, 2, 1);
 
 		if (b == (u64)PTR_INVALID) {
 			while (r->n)
-				ravenfs_block_free(sb, r->blk[--r->n], 2);
+				(void)rfs_allocator_block_free(sbi->alloc, r->blk[--r->n], 2);
 			return -ENOSPC;
 		}
 		r->blk[r->n++] = b;
@@ -98,8 +99,9 @@ static int rfs_ext_resv_alloc(struct super_block *sb, struct rfs_ext_resv *r, u3
 /* 预算池：归还未取用部分（正常收尾与错误路径统一收尾） */
 static void rfs_ext_resv_release(struct super_block *sb, struct rfs_ext_resv *r)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	while (r->used < r->n)
-		ravenfs_block_free(sb, r->blk[r->used++], 2);
+		(void)rfs_allocator_block_free(sbi->alloc, r->blk[r->used++], 2);
 	r->n = 0;
 	r->used = 0;
 }
@@ -107,9 +109,10 @@ static void rfs_ext_resv_release(struct super_block *sb, struct rfs_ext_resv *r)
 /* 预算池：取一个节点块（池空/无池则现分配）；失败返回 PTR_INVALID */
 static u64 rfs_ext_resv_take(struct super_block *sb, struct rfs_ext_resv *r)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	if (r && r->used < r->n)
 		return r->blk[r->used++];
-	return ravenfs_block_alloc(sb, 2, 1);
+	return rfs_allocator_block_alloc_hard(sbi->alloc, 2, 1);
 }
 
 /* ══ 节点 / meta 基建 ══ */
@@ -431,6 +434,7 @@ static int rfs_ext_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_n
 			      u64 *out_low, u64 *out_high, bool *out_was_root,
 			      struct rfs_ext_resv *rsv)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_msession *vms = ravenfs_mdata_get(sb, victim_blk);
 	struct ravenfs_msession *nms = NULL;
 	struct Bptree_extent_leaf_node_t *vl, *nl;
@@ -466,7 +470,7 @@ static int rfs_ext_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_n
 			ravenfs_mdata_put(vms);
 		if (!IS_ERR(nms))
 			ravenfs_mdata_put(nms);
-		ravenfs_block_free(sb, new_blk, 2);
+		(void)rfs_allocator_block_free(sbi->alloc, new_blk, 2);
 		return err;
 	}
 	vl = ravenfs_msession_node(vms);
@@ -511,6 +515,7 @@ static int rfs_ext_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_n
 static int rfs_ext_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 			       u64 *out_low, u64 *out_high, struct rfs_ext_resv *rsv)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_msession *vms = ravenfs_mdata_get(sb, victim_blk);
 	struct ravenfs_msession *nms = NULL;
 	struct Bptree_extent_inner_node_t *vi, *ni;
@@ -543,7 +548,7 @@ static int rfs_ext_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_
 			ravenfs_mdata_put(vms);
 		if (!IS_ERR(nms))
 			ravenfs_mdata_put(nms);
-		ravenfs_block_free(sb, new_blk, 2);
+		(void)rfs_allocator_block_free(sbi->alloc, new_blk, 2);
 		return err;
 	}
 	vi = ravenfs_msession_node(vms);
@@ -599,6 +604,7 @@ static int rfs_ext_new_root_inner(struct super_block *sb, u64 ino, u64 left_blk,
 				  u64 right_blk, u64 right_max, u64 *root_out,
 				  struct rfs_ext_resv *rsv)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_msession *rms;
 	struct Bptree_extent_inner_node_t *ri;
 	u64 root_blk, kids[2];
@@ -612,7 +618,7 @@ static int rfs_ext_new_root_inner(struct super_block *sb, u64 ino, u64 left_blk,
 	rms = ravenfs_mdata_get(sb, root_blk);
 	if (IS_ERR(rms)) {
 		err = PTR_ERR(rms);
-		ravenfs_block_free(sb, root_blk, 2);
+		(void)rfs_allocator_block_free(sbi->alloc, root_blk, 2);
 		return err;
 	}
 	ri = ravenfs_msession_node(rms);
@@ -726,6 +732,7 @@ static int rfs_ext_balance_from(struct super_block *sb, u64 ino, u64 child_blk,
 int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
 			  const struct extent_t *ext, u64 *old_root)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct rfs_epath p;
 	u64 root = *root_io;
 	u64 leaf_blk, old_max, new_max = 0;
@@ -746,14 +753,14 @@ int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
 	/* 空树 → 建根叶 */
 	if (root == (u64)PTR_INVALID) {
 		struct ravenfs_msession *rms;
-		u64 rblk = ravenfs_block_alloc(sb, 2, 1);
+		u64 rblk = rfs_allocator_block_alloc_hard(sbi->alloc, 2, 1);
 
 		if (rblk == (u64)PTR_INVALID)
 			return -ENOSPC;
 		rms = ravenfs_mdata_get(sb, rblk);
 		if (IS_ERR(rms)) {
 			err = PTR_ERR(rms);
-			ravenfs_block_free(sb, rblk, 2);
+			(void)rfs_allocator_block_free(sbi->alloc, rblk, 2);
 			return err;
 		}
 		rfs_ext_node_init(ravenfs_msession_node(rms), 0, 0, 1, ino);
@@ -941,6 +948,7 @@ int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
 /* 空根叶：direct→extent 物化 / 整文件打洞的空树终态（size>160 时合法） */
 int ravenfs_extent_new_root_leaf(struct super_block *sb, u64 ino, u64 *root_out)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_msession *ms;
 	u64 blk;
 	int err;
@@ -948,13 +956,13 @@ int ravenfs_extent_new_root_leaf(struct super_block *sb, u64 ino, u64 *root_out)
 	RFS_STAT_INC(sb, ext_new_root);
 	if (*root_out != (u64)PTR_INVALID)
 		return 0;			/* 已有树 */
-	blk = ravenfs_block_alloc(sb, 2, 1);
+	blk = rfs_allocator_block_alloc_hard(sbi->alloc, 2, 1);
 	if (blk == (u64)PTR_INVALID)
 		return -ENOSPC;
 	ms = ravenfs_mdata_get(sb, blk);
 	if (IS_ERR(ms)) {
 		err = PTR_ERR(ms);
-		ravenfs_block_free(sb, blk, 2);
+		(void)rfs_allocator_block_free(sbi->alloc, blk, 2);
 		return err;
 	}
 	rfs_ext_node_init(ravenfs_msession_node(ms), 0, 0, 1, ino);
@@ -1065,6 +1073,7 @@ static int rfs_ext_reparent(struct super_block *sb, struct ravenfs_msession *nod
  */
 static int rfs_ext_node_balance(struct super_block *sb, u64 parent_blk, u32 idx, bool *need)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_msession *pms, *cms = NULL, *nms = NULL;
 	struct Bptree_extent_inner_node_t *pi;
 	struct Bptree_meta_t *cm, *nm;
@@ -1192,7 +1201,7 @@ static int rfs_ext_node_balance(struct super_block *sb, u64 parent_blk, u32 idx,
 		ravenfs_mdata_put(nms);
 		nms = NULL;
 		ravenfs_mdata_drop(sb, nblk);
-		ravenfs_block_free(sb, nblk, 2);
+		(void)rfs_allocator_block_free(sbi->alloc, nblk, 2);
 
 		/* 父删邻居 hint + 刷保留 hint 的 key */
 		{

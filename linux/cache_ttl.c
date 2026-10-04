@@ -31,7 +31,7 @@
 
 #include "ravenfs.h"
 #include "ravenfs_cache.h"
-#include "ravenfs_bitmap.h"
+#include "ravenfs_allocator_adapter.h"
 
 static unsigned int ttl_seconds = 2;
 module_param(ttl_seconds, uint, 0644);
@@ -99,10 +99,11 @@ static void ravenfs_ttl_work(struct work_struct *w)
 			RFS_STAT_INC(sb, ttl_round_errs);	/* 后台刷盘失败累积 */
 	}
 
-	/* 趟3：位图全片同步（闸门 `bitmap_sync_seconds`；无脏标记，整轮全同步） */
+	/* 趟3：分配器同步（闸门 `bitmap_sync_seconds`；无脏标记，整轮全同步）
+	 * `ravenfs_allocator_flush` = 树快照 → 位图 words → 写回设备（落盘一步到位）。*/
 	if (bitmap_sync_seconds &&
 	    now - t->bm_last >= (u64)bitmap_sync_seconds * NSEC_PER_SEC) {
-		if (ravenfs_bitmap_flush(sb))
+		if (ravenfs_allocator_flush(sb))
 			bm = -1;
 		t->bm_last = now;
 		if (bm)

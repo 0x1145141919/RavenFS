@@ -2,11 +2,14 @@
 # ravenfs-dkms —— RavenFS（实验性）内核模块。
 #   内核更新：DKMS alpm hook 自动为每个已装内核重编（需对应 *-headers）。
 #   initramfs：自带 /etc/mkinitcpio.conf.d/ravenfs.conf → 自动入镜像。
-# v0.1.2（2026-10-01）：位图模块拆分（rfs_bm 类 MEM/CHUNK）+ 挂载选项 bitmap_mode/bbco/ibco
-#   + D-1 计数器/ debugfs（随模式）/ D-3 时间戳 / D-5 叶内融合（预判法）/ D-6 inline→direct / D-9 show_options。
-#   详见 Docs/linux/ravenfs-linux-ko-v0.1.2-improvements.md。
+# v0.1.3（2026-10-04）：运行时分配器 v2（树版）cutover —— 位图模块整体退役（`rfs_bm` 类删除），
+#   改多分片主从红黑树（`rfs_allocator`：router/slice/rbtree/run_list + allocator_adapter）。
+#   顺带：D-10 `i_ino = inode_idx + 1` 契约（访问器收敛 91 处 `->i_ino`）；D-11 新增 procfs 公开出口
+#   `/proc/fs/ravenfs/<s_id>/stats`（人人可读，事实 ABI）；计数器 F 组 `bm_`(18) 退役 → `al_`(36) 注入式。
+#   D-7/D-8 由分配器 v2 结构性消解（best-fit 无位置游标 / 独立几何查询取代共用前移游标）。
+#   详见 Docs/linux/ravenfs-linux-ko-defects.md。
 pkgname=ravenfs-dkms
-pkgver=0.1.2
+pkgver=0.1.3
 pkgrel=1
 pkgdesc="RavenFS (experimental) kernel module, built via DKMS"
 arch=('x86_64')
@@ -21,11 +24,13 @@ sha256sums=('SKIP' 'SKIP')
 
 package() {
   local dst="$pkgdir/usr/src/ravenfs-${pkgver}"
-  install -d "$dst/linux" "$dst/include"
+  # 头文件集中化（2026-09-30）：ko 自有头在 include/linux/，盘面头/魔数在 include/ 根。
+  # 目录布局必须与 Makefile 的 -I$(src)/../include -I$(src)/../include/linux 对应。
+  install -d "$dst/linux" "$dst/include" "$dst/include/linux"
   install -m644 "$_srcroot"/linux/*.c  "$dst/linux/"
-  install -m644 "$_srcroot"/linux/*.h  "$dst/linux/"
   install -m644 "$_srcroot"/linux/Makefile "$dst/linux/"
   rm -f "$dst/linux/"*.mod.c "$dst/linux/"*.o "$dst/linux/"*.ko "$dst/linux/".*.cmd
+  install -m644 "$_srcroot"/include/linux/*.h "$dst/include/linux/"
   install -m644 "$_srcroot"/include/*.h "$dst/include/"
   install -m644 "$srcdir/dkms.conf" "$dst/dkms.conf"
   sed -i "s/@PKGVER@/${pkgver}/" "$dst/dkms.conf"

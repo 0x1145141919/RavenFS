@@ -45,6 +45,7 @@
 #  include <linux/errno.h>      /* -ENOENT / -EIO / -ENOSPC ... */
 #  include <linux/bitops.h>     /* hweight64（popcount 不降级为 libgcc __popcountdi2）*/
 #  include <linux/timekeeping.h> /* ktime_get_ns（累计耗时类计数器）*/
+#  include <linux/delay.h>     /* msleep（打烊排空的时间轮询）*/
 
 #else  /* 用户态：压测 harness / 离线工具 */
 
@@ -110,6 +111,33 @@ struct rfs_mem_alloc {
 #  define RFS_NOW_NS()   ({ struct timespec __rfs_ts; \
 	clock_gettime(CLOCK_MONOTONIC, &__rfs_ts); \
 	(u64)__rfs_ts.tv_sec * 1000000000ULL + (u64)__rfs_ts.tv_nsec; })
+#endif
+
+/* ═══════════════════════ 等待 / 自旋（排空用）═══════════════════════
+ * 为什么是「时间轮询」而不是 waitqueue/condvar：**环境通用 + 架构通用**。
+ *   · waitqueue 是内核专属（栈上对象、调度语义），condvar 是 POSIX 专属；
+ *     两者无法用同一份算法代码覆盖内核/用户态/SparrowOS。
+ *   · 时间轮询只要求「自旋提示 + 睡 N 毫秒 + 单调时钟」三件事，任何环境/架构都能给，
+ *     且**天然无丢失唤醒**（无需处理「入队前最后一个引用已释放」的窗口）。
+ * 算法/类文件只用下面三个宏，**不得** #ifdef __KERNEL__；差异只在本头收口。
+ *   · RFS_CPU_RELAX()  自旋提示（架构相关，均有通用回退）
+ *   · RFS_DELAY_MS(ms) 让出 CPU 睡 ms（进程上下文；毫秒级）
+ *   · RFS_NOW_NS()     单调纳秒（已在上文定义）*/
+#ifdef __KERNEL__
+#  define RFS_CPU_RELAX()   cpu_relax()
+#  define RFS_DELAY_MS(ms)  msleep(ms)
+#else
+#  if defined(__i386__) || defined(__x86_64__)
+#    define RFS_CPU_RELAX()  __asm__ __volatile__("pause")
+#  else
+     /* 通用回退：编译屏障即可（架构无需栈/时钟支持）*/
+#    define RFS_CPU_RELAX()  __asm__ __volatile__("" ::: "memory")
+#  endif
+#  define RFS_DELAY_MS(ms)  do { \
+	struct timespec __rfs_d = { (time_t)((ms) / 1000), \
+				    (long)(((ms) % 1000) * 1000000L) }; \
+	nanosleep(&__rfs_d, NULL); \
+} while (0)
 #endif
 
 /* ═══════════════════════════ CPU 身份 ═══════════════════════════ */

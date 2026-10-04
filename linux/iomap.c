@@ -44,7 +44,7 @@
 #include "ravenfs_extent.h"
 #include "ravenfs_cache.h"
 #include "ravenfs_mdata_cache.h"
-#include "ravenfs_bitmap.h"
+#include "ravenfs_allocator_top.h"
 
 /* inline 态字节上限（不变量 22）：size ≤ 160 ⇒ 内容在 inode.inline_data */
 #define RAVENFS_INLINE_BYTES		160U
@@ -73,18 +73,21 @@ static inline u64 ravenfs_dev_byte(struct ravenfs_sb_info *sbi, u64 fs_blk)
  */
 static u64 ravenfs_data_alloc_anchored(struct super_block *sb, u64 anchor, u64 cnt)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	u64 run, rest;
 
 	if (anchor != (u64)PTR_INVALID && cnt) {
-		run = ravenfs_block_occupy_soft(sb, anchor, cnt, &rest);
+		run = (u64)PTR_INVALID;
+		if (rfs_allocator_block_occupy_soft(sbi->alloc, anchor, cnt, &rest) == 0)
+			run = anchor;
 		if (run != (u64)PTR_INVALID) {
 			if (rest == 0)
 				return run;		/* 整段紧贴左邻 → 融合可命中 */
 			/* 仅取到前缀（cnt 段内有占用块）→ 单段连续不成立，归前缀回退 */
-			ravenfs_block_free(sb, run, cnt - rest);
+			(void)rfs_allocator_block_free(sbi->alloc, run, cnt - rest);
 		}
 	}
-	return ravenfs_block_alloc(sb, cnt, 0);
+	return rfs_allocator_block_alloc_hard(sbi->alloc, cnt, 0);
 }
 
 /* 同步落一个 4K 块（迁移物化/零填用；与装载侧同源 sb_bread + sync_dirty_buffer） */
@@ -149,13 +152,13 @@ static int ravenfs_migrate_inline_direct(struct super_block *sb, struct raven_In
 
 	/* 整域 [0, end_blk) 一次连续分配（align=1 块，同既有 direct/坍缩口径）。
 	 * 不连续/无块 → PTR_INVALID → 降级（不建树、不落 direct）。 */
-	run = ravenfs_block_alloc(sb, end_blk, 0);
+	run = rfs_allocator_block_alloc_hard(sbi->alloc, end_blk, 0);
 	if (run == (u64)PTR_INVALID)
 		return RFS_MIGRATE_INLINE_DEGRADE;
 
 	buf = kzalloc(RAVENFS_BLOCK_SIZE, GFP_KERNEL);
 	if (!buf) {
-		ravenfs_block_free(sb, run, end_blk);
+		(void)rfs_allocator_block_free(sbi->alloc, run, end_blk);
 		return -ENOMEM;
 	}
 
@@ -207,7 +210,7 @@ static int ravenfs_migrate_inline_direct(struct super_block *sb, struct raven_In
 
 err_free_run:
 	kfree(buf);
-	ravenfs_block_free(sb, run, end_blk);
+	(void)rfs_allocator_block_free(sbi->alloc, run, end_blk);
 	return err;
 }
 
@@ -239,7 +242,7 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 	if (pos_blk == 0) {
 		struct extent_t e0;
 
-		run = ravenfs_block_alloc(sb, end_blk, 0);
+		run = rfs_allocator_block_alloc_hard(sbi->alloc, end_blk, 0);
 		if (run == (u64)PTR_INVALID) {
 			kfree(buf);
 			return -ENOSPC;
@@ -262,7 +265,7 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 		e0.fblkbase = 0;
 		e0.block_base.v = RFS_PTR_PACK(0, run);
 		tmp = root;
-		err = ravenfs_extent_insert(sb, inode->i_ino, &tmp, &e0, NULL);
+		err = ravenfs_extent_insert(sb, RFS_INO_TO_IDX(inode->i_ino), &tmp, &e0, NULL);
 		if (err)
 			return err;		/* 孤儿块（inode 未动，§8） */
 		root = tmp;
@@ -276,7 +279,7 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 		struct extent_t e1;
 
 		if (old_size > 0) {		/* 旧 inline 单块物化（非 NEW） */
-			u64 run0 = ravenfs_block_alloc(sb, 1, 0);
+			u64 run0 = rfs_allocator_block_alloc_hard(sbi->alloc, 1, 0);
 
 			if (run0 == (u64)PTR_INVALID) {
 				kfree(buf);
@@ -292,26 +295,26 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 				e0.fblkbase = 0;
 				e0.block_base.v = RFS_PTR_PACK(0, run0);
 				tmp = root;
-				err = ravenfs_extent_insert(sb, inode->i_ino, &tmp, &e0, NULL);
+				err = ravenfs_extent_insert(sb, RFS_INO_TO_IDX(inode->i_ino), &tmp, &e0, NULL);
 				root = tmp;
 			}
 			if (err) {
-				ravenfs_block_free(sb, run0, 1);
+				(void)rfs_allocator_block_free(sbi->alloc, run0, 1);
 				kfree(buf);
 				return err;
 			}
 		}
 		kfree(buf);
 
-		run = ravenfs_block_alloc(sb, cnt, 0);
+		run = rfs_allocator_block_alloc_hard(sbi->alloc, cnt, 0);
 		if (run == (u64)PTR_INVALID)
 			return -ENOSPC;
 		e1.length = cnt;
 		e1.fblkbase = pos_blk;
 		e1.block_base.v = RFS_PTR_PACK(0, run);
-		err = ravenfs_extent_insert(sb, inode->i_ino, &root, &e1, NULL);
+		err = ravenfs_extent_insert(sb, RFS_INO_TO_IDX(inode->i_ino), &root, &e1, NULL);
 		if (err) {
-			ravenfs_block_free(sb, run, cnt);
+			(void)rfs_allocator_block_free(sbi->alloc, run, cnt);
 			return err;
 		}
 		iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
@@ -331,7 +334,7 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 
 err_free_run:
 	kfree(buf);
-	ravenfs_block_free(sb, run, end_blk);
+	(void)rfs_allocator_block_free(sbi->alloc, run, end_blk);
 	return err;
 }
 
@@ -360,14 +363,14 @@ static int ravenfs_write_migrate_direct(struct super_block *sb, struct inode *in
 	/* 零填新增长块（非 NEW：部分块读需 0） */
 	zbuf = kzalloc(RAVENFS_BLOCK_SIZE, GFP_KERNEL);
 	if (!zbuf) {
-		ravenfs_block_free(sb, run, grow);
+		(void)rfs_allocator_block_free(sbi->alloc, run, grow);
 		return -ENOMEM;
 	}
 	for (i = 0; i < grow; i++) {
 		err = rfs_store_block(sb, run + i, zbuf);
 		if (err) {
 			kfree(zbuf);
-			ravenfs_block_free(sb, run, grow);
+			(void)rfs_allocator_block_free(sbi->alloc, run, grow);
 			return err;
 		}
 	}
@@ -378,7 +381,7 @@ static int ravenfs_write_migrate_direct(struct super_block *sb, struct inode *in
 	e0.fblkbase = 0;
 	e0.block_base.v = RFS_PTR_PACK(0, old_base);
 	tmp = root;
-	err = ravenfs_extent_insert(sb, inode->i_ino, &tmp, &e0, NULL);
+	err = ravenfs_extent_insert(sb, RFS_INO_TO_IDX(inode->i_ino), &tmp, &e0, NULL);
 	if (err)
 		return err;
 	root = tmp;
@@ -386,7 +389,7 @@ static int ravenfs_write_migrate_direct(struct super_block *sb, struct inode *in
 	e1.length = grow;
 	e1.fblkbase = old_ceil;
 	e1.block_base.v = RFS_PTR_PACK(0, run);
-	err = ravenfs_extent_insert(sb, inode->i_ino, &root, &e1, NULL);
+	err = ravenfs_extent_insert(sb, RFS_INO_TO_IDX(inode->i_ino), &root, &e1, NULL);
 	if (err)
 		return err;
 
@@ -424,7 +427,7 @@ static int ravenfs_iomap_begin_write(struct inode *inode, loff_t pos, loff_t len
 
 	if (flags & IOMAP_DIRECT)
 		return -EOPNOTSUPP;		/* O_DIRECT 后置（D-M4-5） */
-	ses = ravenfs_session_get(sb, inode->i_ino);
+	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
 	r = ravenfs_session_inode(ses);
@@ -528,9 +531,9 @@ static int ravenfs_iomap_begin_write(struct inode *inode, loff_t pos, loff_t len
 			ne.fblkbase = blk;
 			ne.block_base.v = RFS_PTR_PACK(0, run);
 			newroot = r->data_root;
-			err = ravenfs_extent_insert(sb, inode->i_ino, &newroot, &ne, &old_root);
+			err = ravenfs_extent_insert(sb, RFS_INO_TO_IDX(inode->i_ino), &newroot, &ne, &old_root);
 			if (err) {
-				ravenfs_block_free(sb, run, cnt);
+				(void)rfs_allocator_block_free(sbi->alloc, run, cnt);
 				return err;
 			}
 			if (newroot != r->data_root) {
@@ -541,7 +544,7 @@ static int ravenfs_iomap_begin_write(struct inode *inode, loff_t pos, loff_t len
 			 * （先 free = 悬挂）。*/
 			if (old_root != (u64)PTR_INVALID) {
 				ravenfs_mdata_drop(sb, old_root);
-				ravenfs_block_free(sb, old_root, 2);
+				(void)rfs_allocator_block_free(sbi->alloc, old_root, 2);
 			}
 			iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
 			iomap->type = IOMAP_MAPPED;
@@ -576,7 +579,7 @@ int ravenfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 	memset(iomap, 0, sizeof(*iomap));
 	iomap->bdev = sb->s_bdev;
 
-	ses = ravenfs_session_get(sb, inode->i_ino);
+	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
 	r = ravenfs_session_inode(ses);
@@ -684,7 +687,7 @@ static int ravenfs_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 	if (!(flags & IOMAP_WRITE))
 		return 0;		/* 只读：无分配需提交/回滚 */
 
-	ses = ravenfs_session_get(sb, inode->i_ino);
+	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return 0;		/* 提交失败不致命：内存 inode 已更新 */
 	r = ravenfs_session_inode(ses);

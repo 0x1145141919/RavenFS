@@ -1,8 +1,8 @@
 # RavenFS → Linux KO：全模块性能计数器设计（v0.1.2）
 
-> 2026-10-01 · Raven · **v0.1.2（定稿）**
-> **定位**：`ravenfs.ko` 内置的、**superblock 级**性能/健康计数器 —— 覆盖**全部模块**（超块 / VFS 接待层 / 目录树 / inode 行缓存 / mdata 节点缓存 / TTL 后台 / 数据 IO / extent 树 / xattr&ACL / 名字堆 / 双位图分配器），打点在哪、记什么、为什么记、怎么给用户态看到。
-> **前身**：`Docs/linux/ravenfs-linux-ko-sb-counters-design.md`（v0.1 草案，已退役；可从 `git show a358cc0:…` 取回）。本文 v0.1.2 = v0.1 的**全模块收口 + 覆盖补齐 + 位图随模式**，**以本文为唯一真值**。
+> 2026-10-01 · Raven · **v0.1.2（定稿；2026-10-04 修订：F 组 `bm_`→`al_` 改制 + D-11 procfs 出口）**
+> **定位**：`ravenfs.ko` 内置的、**superblock 级**性能/健康计数器 —— 覆盖**全部模块**（超块 / VFS 接待层 / 目录树 / inode 行缓存 / mdata 节点缓存 / TTL 后台 / 数据 IO / extent 树 / xattr&ACL / 名字堆 / **运行时树分配器**），打点在哪、记什么、为什么记、怎么给用户态看到。
+> **前身**：`Docs/linux/ravenfs-linux-ko-sb-counters-design.md`（v0.1 草案，已退役；可从 `git show a358cc0:…` 取回）。本文 v0.1.2 = v0.1 的**全模块收口 + 覆盖补齐 + 分配器改制为 `al_`**，**以本文为唯一真值**。
 > **地面真值**：`linux/` 下真实函数名逐个指认；本机内核 `7.2.6-1-vfio`（`CONFIG_DEBUG_INFO_BTF=y`、`FUNCTION_TRACER`、`KPROBES` 全开，debugfs 已挂载）；构建版本 `0.1.2`。
 > **关联**：`ravenfs-linux-ko-requirements-spec.md`、`ravenfs-linux-ko-defects.md` §D-1、`ravenfs-linux-ko-v0.1.2-improvements.md`。
 
@@ -10,19 +10,19 @@
 
 ## 0. 一句话与决议总表
 
-**只在 superblock 上挂一份 `struct ravenfs_sb_stats`（纯 `atomic64` 计数器，**104** 字段），挂载即清零，通过 debugfs 一个 seq_file 文件**全量吐出**；不做 per-inode、不做持久化、不做直方图、不做 ABI。**
+**只在 superblock 上挂一份 `struct ravenfs_sb_stats`（主表 86 字段）+ 独立子结构 `struct ravenfs_al_stats`（分配器 36 字段），合计 **122** 个 `atomic64` 计数器；挂载即清零，通过一个 seq_file 文件**全量吐出**；不做 per-inode、不做持久化、不做直方图。出口两处：**procfs 公开面**（`/proc/fs/ravenfs/<s_id>/stats`，人人可读，**2026-10-04 D-11 新增，事实 ABI**）+ debugfs 内部探针（非 ABI）。**
 
 | # | 决议 | 一句话 |
 |---|---|---|
 | **S1** | 范围 = **仅 sb 级** | 不做 per-inode；单挂载 = 单份（理由见 §1） |
-| **S2** | 暴露 = **debugfs** | `/sys/kernel/debug/ravenfs/<s_id>/stats`，一个 seq_file kv 文件；root-only、非 ABI |
+| **S2** | 暴露 = **procfs（公开） + debugfs（探针）** | 公开：`/proc/fs/ravenfs/<s_id>/stats`（`0444`，人人可读，**事实 ABI**）；探针：`/sys/kernel/debug/ravenfs/<s_id>/stats`（root-only、非 ABI）。一个 seq_file kv 文件，同一 show（**2026-10-04 D-11 修订**）|
 | **S3** | 语义 = **挂载生命周期** | 计数器随 mount 生、随 umount 灭（`kzalloc(sbi)` 天然清零） |
 | **S4** | 只做 **counter** | 累计原子量；gauge（当前脏行数等现读量）单列 §5，本版仍不做（`shutdown`/位图后端例外，见 §5） |
 | **S5** | 打点 **不改控制流** | 计数是观测不是逻辑；打点失败/读到半旧值不影响正确性 |
 | **S6** | 暴露 **只读** | 无 `clear`；reset = 重新 mount |
 | **S7** | **不加编译开关** | 常开，开销用验收兜（§10） |
 | **S8** | **全模块覆盖**（v0.1.2） | 每个 `.c` 模块都有自己的计数器组（含名字堆 `nh_`）；I/O 覆盖补齐到「所有显式下盘点」 |
-| **S9** | **位图随模式**（v0.1.2） | `bm_` 组随位图后端（mem/chunk）；非本后端专属字段恒 0，打点只写在对应后端 |
+| **S9** | **分配器注入式上报**（2026-10-04 改制） | `al_` 组经注入钩子 `struct rfs_stat_hook` 上报（分配器模块平台中立、不碰内核）；未注入 = no-op。旧 `bm_`「随模式」条款随位图退役失效 |
 
 ---
 
@@ -65,11 +65,18 @@
 | 9 | `extent_write.c`（extent 树） | `ext_` | 7 | §4.G |
 | 10 | `xattr.c`（xattr/ACL） | `xa_`·`acl_`·`op_` | 10 | §4.I |
 | 11 | `name_heap.c`（大名字/长目录尾部名字堆） | `nh_` | 6 | §4.L（v0.1.2 新增） |
-| 12 | `bitmap_core/mem/chunk/adapter.c`（双位图分配器） | `bm_` | 18 | §4.F |
+| 12 | `ravenfs_allocator_router/slice.c`（运行时树分配器 v2） | `al_` | 36 | §4.F（2026-10-04 改制；旧 `bm_` 位图组退役） |
 | — | 跨模块 | `err_`(6) | 6 | §4.J |
 
-**字段总数 = A(26)+B(9)+C(8)+D(2)+E(5)+F(18)+G(7)+H(3)+I(10)+J(6)+K(4)+L(6) = 104。**
-每 mount ≈ **832 B**（104 × 8B）——内存成本可忽略，「要不要」的唯一标准是 P4，不是内存。
+**字段总数 = A(26)+B(9)+C(8)+D(2)+E(5)+F(36)+G(7)+H(3)+I(10)+J(6)+K(4)+L(6) = 122。**
+每 mount ≈ **976 B**（122 × 8B）——内存成本可忽略，「要不要」的唯一标准是 P4，不是内存。
+
+> **F 组改制（2026-10-04）**：旧 `bm_`（位图时代 18 字段）随位图模块整体退役**删除**（死组）；
+> 新分配器 = 多分片主从红黑树（`include/linux/ravenfs_allocator_top.h`），新增 **`al_` 组 36 字段**。
+> `al_` 为**独立子结构** `sbi->al`（`enum rfs_al_stat` = 下标空间），经注入钩子
+> `struct rfs_stat_hook`（`include/linux/ravenfs_allocator_stats.h`）从**平台中立**的分配器模块上报；
+> 落点 `allocator_adapter.c: ko_al_stat_inc`。**为何不并进主 `ravenfs_sb_stats`**：钩子需按**下标**累加，
+> 混入大数组会引入脆弱的绝对偏移；独立子结构使 `enum index == 子结构成员序号`。
 
 ---
 
@@ -129,38 +136,77 @@
 
 | 字段 | 打点位置 | 要回答 |
 |---|---|---|
-| `io_read_ops` / `io_read_bytes` | 下盘点：`ravenfs_row_load`、`ravenfs_mrow_load`（= `ravenfs_read_node`）、`rfs_xb_load`、`bm_mem_load`(MEM) / `bm_io_read`(CHUNK) | 物理读次数/字节 → /`op_lookup`=每操作 IO 数 |
-| `io_write_ops` / `io_write_bytes` | 下盘点：`ravenfs_row_store`、`ravenfs_mrow_store`、`rfs_pwrite_dev`（目录树节点）、`rfs_store_block`（数据）、`rfs_xb_store`、`ravenfs_sb_write_timestamp`（SB）、`bm_mem_flush_group`/`bm_io_write`（位图） | **写放大 = `io_write_bytes / op_write_bytes`** |
+| `io_read_ops` / `io_read_bytes` | 下盘点：`ravenfs_row_load`、`ravenfs_mrow_load`（= `ravenfs_read_node`）、`rfs_xb_load`（位图镜像经 `bm_image_load` 属挂载期，见 §9 盲区）| 物理读次数/字节 → /`op_lookup`=每操作 IO 数 |
+| `io_write_ops` / `io_write_bytes` | 下盘点：`ravenfs_row_store`、`ravenfs_mrow_store`、`rfs_pwrite_dev`（目录树节点）、`rfs_store_block`（数据）、`rfs_xb_store`、`ravenfs_sb_write_timestamp`（SB）、`bm_image_save`（位图镜像 checkpoint）| **写放大 = `io_write_bytes / op_write_bytes`** |
 | `io_flush_ops` | `ravenfs_issue_flush` | flush 屏障次数（每次 fsync/syncfs/umount ≥3 次）|
 
 > **v0.1.2 变更**：把 **inode 行写回（`ravenfs_row_store`）**、**mdata 节点写回（`ravenfs_mrow_store`）**、**SB 写（`ravenfs_sb_write_timestamp`）** 纳入 `io_write_*`。此前只记 `rfs_pwrite_dev`/`rfs_store_block`/`rfs_xb_store`/位图 → §6「元数据写放大」**失真**（漏掉两条最大元数据写流）。**已知盲区**：`ravenfs_bitmap_used`（statfs 的整图直读）与挂载期 SB 初读（此时 `s_fsi` 未就绪）不入 io_，见 §9。
 
-### F. 位图分配（`bm_`，18）—— **随模式**（MEM / CHUNK）
+### F. 运行时树分配器（`al_`，36）—— 2026-10-04 改制（旧 `bm_` 位图组退役）
 
-> 位图已重构为 sb-free 纯算法类 `struct rfs_bm`（`ravenfs_bitmap_core.h`；core 路由 + mem/chunk 双后端 + adapter 适配）。类**不持有 sb**，故计数器经**事件出口注入**：`rfs_bm_cfg.stat`（`enum rfs_bm_stat` + `struct rfs_bm_stat_sink`）→ 适配层 `bm_stat_emit` 映射到 `sbi->stats.bm_*`。**打点代码只写在对应后端**：CHUNK 专属事件在 MEM 恒不发出（字段恒 0），反之亦然。**公共 `rfs_bm_*` 签名不变**。
+> **背景**：位图模块整体退役（`ec92d3c` 起引入树分配器 v2，本批完成 cutover）；旧 `bm_`（18 字段）**无任何埋点**（死组）→ 删除。
+> 新分配器 = **多分片主从红黑树**（`include/linux/ravenfs_allocator_top.h` + `_slice.h`），**平台中立**、
+> C(gnu11)/C++(c++17) 双编、**不得触碰内核**（无 `super_block`、无 `RFS_STAT_INC`）。
+> 故计数器经**注入钩子** `struct rfs_stat_hook`（`include/linux/ravenfs_allocator_stats.h`）上报：
+> `inc(ctx, field, delta)`；宿主 `allocator_adapter.c: ko_al_stat_inc` 按 `enum rfs_al_stat` 下标累加进
+> **独立子结构** `sbi->al`（连续 `atomic64_t` 数组）。未注入 = no-op（用户态压测天然不打点）。
+> **P1/P2**：钩子只累加、不改控制流；**可持片锁调用**（片内埋点 → 不睡眠、不 IO）。
+> `BUILD_BUG_ON` 三重守：`sizeof(struct ravenfs_al_stats) == 36×8` ∧ 名字表 36 ∧ `AL_STAT_COUNT == 36`。
 
-**通用面**（两模式同一语义，落点各自）：
-
-| 字段 | 打点位置 | 要回答 |
-|---|---|---|
-| `bm_alloc_calls` / `bm_alloc_ok` / `bm_alloc_fail` | 路由 `rfs_bm_block_alloc_hard` 入口/命中/全败 | **分配失败率→ENOSPC/碎片**（P5：ok+fail==calls）|
-| `bm_alloc_blocks` | 同函数命中处 `+=count` | 分配块总量 vs 用户请求（元数据膨胀）|
-| `bm_free_calls` | 路由 `rfs_bm_block_free` 入口 | 释放节奏 |
-| `bm_free_blocks` | MEM `mem_free_interval`；CHUNK 实际清位点（drain/asyn 的 `chunk_apply_recs`）| **只按 1→0 实清累计**（挂账未清不重复计）|
-| `bm_soft_ok` | 路由 `rfs_bm_block_alloc_soft` 命中 | 软分配路径占比（D2/D3 是否真在用）|
-| `bm_occupy` | 路由 `rfs_bm_block_occupy_soft` 认领≥1 | 锚定认领使用面 |
-| `bm_sync_slices` | MEM：adapter `bm_mem_flush_group` 逐片 / CHUNK：`cs_chunks_asyn` 态1+态2 | 第三阶段写回量；FULL↔CHUNK A/B 对照 |
-
-**CHUNK 后端专属**（`mode=chunk` 才动；MEM 恒 0）：
+**A 装配 / 生命周期（5）**（落点 `allocator_adapter.c`，用 `RFS_AL_INC`）
 
 | 字段 | 打点位置 | 要回答 |
 |---|---|---|
-| `bm_chunk_switch` / `bm_chunk_switch_ns` | `cs_ensure_online` 发布处 / 全程 `RFS_NOW_NS()` 差 | **换片频率/代价**（hint 局部性；÷switch=单次均耗时）|
-| `bm_rec_attach` / `bm_rec_drain` | `cs_free_interval` 挂账 / `cs_drain_chunk`+`cs_chunks_asyn` 摘账 | **离线还账压力**；净差=尚未还账挂账 |
-| `bm_pool_empty` | `cs_free_interval` 记录节点堆分配失败 | 归还记录**资源耗尽兜底**（旧固定池 → 现堆）|
-| `bm_summary_skip` | `cs_alloc_hard/soft/occupy` ALL_USED 免载入 + `cs_test_interval` 摘要裁决 | **摘要是否挡住 ENOSPC 扫描悬崖** |
-| `bm_scan_ns` | `cs_enable` 整片读计时 | mount 扫描耗时（CHUNK ctor 唯一 I/O）|
-| `bm_ttl_online` / `bm_ttl_drain` | `cs_chunks_asyn` 态1（在线脏窗）/ 态2（离线还账窗）| TTL 三态之同步量；态3 跳过不计 |
+| `al_init` / `al_init_fail` | `ravenfs_allocator_create`（`rfs_allocator_init` 返码后）| 装配成功率（重建树是否稳）|
+| `al_slices` | 同处 `+= rfs_allocator_slice_count()` | 装配片数（几何 `2^n ∩ 满片` 结果）|
+| `al_shutdown` | `ravenfs_allocator_destroy`（关闸）| 卸载/失败回滚次数 |
+| `al_drain_timeout` | 同处 `rfs_allocator_shutdown() != 0` | **排空超时 → fail-safe 拒绝释放**（须为 0）|
+
+**B block 组顶层（9）**（落点 `ravenfs_allocator_router.c`，经钩子）
+
+| 字段 | 打点位置 | 要回答 |
+|---|---|---|
+| `al_blk_alloc_hard_ok` / `_fail` | `rfs_allocator_block_alloc_hard` 命中/全片未命中 | **硬分配失败率→ENOSPC/碎片** |
+| `al_blk_alloc_soft_ok` / `_fail` | `rfs_allocator_block_alloc_soft` 凑满/穷尽 | 软分配路径占比（是否真在用）|
+| `al_blk_occupy_ok` / `_partial` / `_fail` | `rfs_allocator_block_occupy_soft` 全满足/前缀断/一位未占 | 锚定认领使用面与断裂率 |
+| `al_blk_free_calls` / `al_blk_free_blocks` | `rfs_allocator_block_free` + `_intervals_free` 入口 | 释放节奏 / 释放块总量（**rollback 不计**：走内部 `block_free_range`）|
+
+**C inode 组顶层（3）**（`ravenfs_allocator_router.c`）
+
+| 字段 | 打点位置 | 要回答 |
+|---|---|---|
+| `al_ino_alloc_ok` / `_fail` | `rfs_allocator_inode_alloc` 命中 / 全片 ENOSPC | inode 号分配失败率 |
+| `al_ino_free_calls` | `rfs_allocator_inode_free` | inode 号释放节奏 |
+
+**D 片内双树 / 融合（8）**（落点 `ravenfs_allocator_slice.c`，经钩子；**诊断双树同步与碎片的核对心**）
+
+| 字段 | 打点位置 | 要回答 |
+|---|---|---|
+| `al_slice_alloc_hard` / `_enospc` | `rfs_slice_alloc_hard` 入口 / 满片 | 片级 best-fit 尝试与落空 |
+| `al_slice_soft` / `_enospc` | `rfs_slice_soft_alloc` 入口 / 一位未取 | 片级碎片消费与吃干 |
+| `al_slice_free` / `_eexist` | `rfs_slice_free_interval` 入口 / 重叠守卫命中 | 释放量 / **重叠 -EEXIST（应恒 0）** |
+| `al_tree_insert` / `al_tree_erase` | `iv_link_both` 成功 / `iv_erase_both` | 双挂/双摘次数（**从 ⊆ 主不变式的活动量**）|
+
+**E 融合（3）**（`rfs_slice_free_interval`；诊断碎片是否在自愈）
+
+| 字段 | 打点位置 | 要回答 |
+|---|---|---|
+| `al_merge_left` / `_right` / `_both` | 邻接判定处（记行为、不改流）| 邻接合并频率 → **碎片回收是否在工作** |
+
+**F 路由 / 跨片（3）**（`ravenfs_allocator_router.c`）
+
+| 字段 | 打点位置 | 要回答 |
+|---|---|---|
+| `al_route_first_hit` / `_rescan` | `block_alloc_hard` / `inode_alloc` 命中时 `round==0 / >0` | **per-CPU 片亲和度**（首片命中 = 亲和好）|
+| `al_route_cross_slice` | `block_occupy_soft` 逐片循环非锚点原片 | occupy 跨片续圈次数（真实连续性代价）|
+
+**G checkpoint / 元素池（5）**（checkpoint 落点 `allocator_adapter.c`；池落点 `slice.c`）
+
+| 字段 | 打点位置 | 要回答 |
+|---|---|---|
+| `al_checkpoint` / `_fail` | `ravenfs_allocator_flush` 快照+落盘成功 / 失败 | 位图镜像落盘健康度 |
+| `al_checkpoint_blocks` | 同处 `+= bitmap_blocks + inode_bm_blocks` | 写回镜像块量 |
+| `al_pool_alloc` / `al_pool_fail` | `iv_insert_both` 元素池取节点成功 / `-ENOMEM` | 区间节点池压力（诊断内存兜底）|
 
 ### G. extent 树（`ext_`，7）
 
@@ -201,7 +247,7 @@
 | `err_shutdown_trig` | `ravenfs_force_shutdown` | 想停机次数（**每次调用都记**）|
 | `err_meta_io` | 元数据路径（行/节点/xb/位图）IO 失败 | 元数据 IO 失败总量 |
 | `err_sb_read` | `ravenfs_fill_super` SB 读失败 + 运行期 SB 重读失败 | 盘/设备健康 |
-| `err_enospc` | 位图分配失败上抛（dentry/iomap）| 与 `bm_alloc_fail` 配对（底层/对外）|
+| `err_enospc` | 分配失败上抛（dentry/iomap）| 与 `al_blk_alloc_hard_fail` 配对（底层/对外）|
 | `err_other` | 其余未归类错误返回 | 兜底；`err_*` 全家和不应有黑洞 |
 
 ### K. 生命周期（`life_`，4）
@@ -214,12 +260,12 @@
 
 ### L. 名字堆（`nh_`，6）—— v0.1.2 新增（`name_heap.c`）
 
-> 名字堆**不做直接磁盘 I/O**（其尾部数据经 mdata 片，已并入 `md_`/`io_`、块位图并入 `bm_`）→ 本组只记「名字堆」这一层自身的操作面，使「全模块」每模块皆有计数器。
+> 名字堆**不做直接磁盘 I/O**（其尾部数据经 mdata 片，已并入 `md_`/`io_`、块位图并入 `al_`）→ 本组只记「名字堆」这一层自身的操作面，使「全模块」每模块皆有计数器。
 
 | 字段 | 打点位置 | 要回答 |
 |---|---|---|
 | `nh_alloc` | `ravenfs_name_heap_alloc` 入口（大名字分配）| 长名/大目录消耗规模 |
-| `nh_alloc_fail` | 同函数 `-ENOSPC`（当前粒度档全满）| 堆容量压力（配 `ext_`/`bm_` 判碎）|
+| `nh_alloc_fail` | 同函数 `-ENOSPC`（当前粒度档全满）| 堆容量压力（配 `ext_`/`al_` 判碎）|
 | `nh_write` | `ravenfs_name_heap_write` 入口 | 尾部名字写次数 |
 | `nh_free` | `ravenfs_name_heap_free` 入口 | 尾部名字释放次数 |
 | `nh_activate` | `rfs_heap_activate` 成功（`RFS_NHC_SET`）| 堆激活频率（长名晋升信号）|
@@ -252,10 +298,12 @@
 | IO 放大（次数） | `io_write_ops / op_write_iter` | 每次写触发几次盘写 |
 | 每 lookup 盘读 | `io_read_ops / op_lookup` | lookup 有多贵 |
 | 树高（实测） | `ext_node_reads / ext_lookup` | extent 查找摸几个节点 |
-| 分配失败率 | `bm_alloc_fail / bm_alloc_calls` | ENOSPC/碎片 |
-| 软分配占比 | `bm_soft_ok / bm_alloc_ok` | 软分配路径是否真在用 |
-| 换片率 / 单次换片耗时（CHUNK）| `bm_chunk_switch/bm_alloc_calls`；`bm_chunk_switch_ns/bm_chunk_switch` | hint 局部性 / 换片成本（A/B 判据）|
-| record 净挂账（CHUNK）| `bm_rec_attach − bm_rec_drain` | 离线还账是否跟得上 |
+| 分配失败率 | `al_blk_alloc_hard_fail / (al_blk_alloc_hard_ok + al_blk_alloc_hard_fail)` | ENOSPC/碎片 |
+| 软分配占比 | `al_blk_alloc_soft_ok / (al_blk_alloc_soft_ok + al_blk_alloc_soft_fail)` | 软分配路径是否真在用 |
+| 片亲和度 | `al_route_first_hit / (al_route_first_hit + al_route_rescan)` | per-CPU 首选片命中率（高=亲和好）|
+| 双树活动 | `al_tree_insert − al_tree_erase` | 区间数净增（当前空闲区间族规模代理）|
+| 融合强度 | `(al_merge_left+al_merge_right+al_merge_both) / al_slice_free` | 碎片自愈比例 |
+| 重叠守卫命中 | `al_slice_free_eexist` | **应恒 0**（>0 = 双树/账本不一致）|
 | 行淘汰竞争率 | `ic_retry/(ic_hit+ic_miss)` | 淘汰 vs 访问打架程度 |
 | flush 强度 | `io_flush_ops/(op_fsync+op_syncfs+life_umount)` | 屏障是否过度 |
 | inode churn | `life_iget_new/life_evict`（配 `ic_row_evict`）| 两层驱逐是否同步 |
@@ -283,8 +331,10 @@ op_create	2211
 ic_hit		171002
 ic_miss		13211
 ...
-# [bm]
-bm_alloc_calls	90112
+# [al]
+al_init		1
+al_slices	4
+al_blk_alloc_hard_ok	90112
 ...
 # [nh]
 nh_alloc	12
@@ -296,17 +346,17 @@ bitmap_chunk_order	blk=3 ino=0
 ```
 
 - **一个文件全吐**（不拆多文件）：一次 `cat` = 一次完整观测；字段间非严格一致（P3）但足够。
-- **分组小节头 `# [prefix]`**（v0.1.2）：`prefix` 取名字第一个 `_` 前（`op`/`ic`/`md`/`ttl`/`io`/`bm`/`ext`/`dir`/`xa`/`acl`/`err`/`life`/`nh`）。**纯注释行**，解析用 `awk '!/^#/'` 仍得纯 kv；勿把小节头当数据。
-- **`# state` 段**：gauge（`shutdown` + 位图后端）。`bitmap_mode` 让读侧知道该按哪套 `bm_` 子集解释（避免把「恒 0」误读成「没打点」）。
+- **分组小节头 `# [prefix]`**（v0.1.2）：`prefix` 取名字第一个 `_` 前（`op`/`ic`/`md`/`ttl`/`io`/`al`/`ext`/`dir`/`xa`/`acl`/`err`/`life`/`nh`）。**纯注释行**，解析用 `awk '!/^#/'` 仍得纯 kv；勿把小节头当数据。`al_` 组为**独立子结构**，在主循环之后单独打印 `# [al]`。
+- **`# state` 段**：gauge（`shutdown` + 位图后端）。`bitmap_mode` 为**磁盘契约**（位图镜像）的模式，与运行时 `al_` 组无关（运行时恒为树分配器）。
 
 ### 7.2 生命周期（**顺序是重点**）
 
 | 时机 | 动作 |
 |---|---|
-| `ravenfs_init` | `ravenfs_dbg_root = debugfs_create_dir("ravenfs", NULL)`（`ERR_PTR` 忽略——`kernel.debugfs=off`）|
-| `ravenfs_fill_super` 成功末尾 | `sbi->dbg_dir = debugfs_create_dir(sb->s_id, ravenfs_dbg_root)` + `debugfs_create_file("stats", 0444, sbi->dbg_dir, sb, &fops)` |
-| **`ravenfs_put_super`，`kfree(sb->s_fs_info)` 之前** | **`debugfs_remove_recursive(sbi->dbg_dir)`** |
-| `ravenfs_exit` | `debugfs_remove_recursive(ravenfs_dbg_root)` |
+| `ravenfs_init` | debugfs：`ravenfs_dbg_root = debugfs_create_dir("ravenfs", NULL)`（`ERR_PTR` 忽略——`kernel.debugfs=off`）；**procfs（D-11）**：`ravenfs_proc_root = proc_mkdir("fs/ravenfs", NULL)` |
+| `ravenfs_fill_super` 成功末尾 | debugfs：`sbi->dbg_dir = debugfs_create_dir(sb->s_id, ravenfs_dbg_root)` + `debugfs_create_file("stats", 0444, sbi->dbg_dir, sb, &fops)`；**procfs（D-11）**：`sbi->proc_dir = proc_mkdir(sb->s_id, ravenfs_proc_root)` + `proc_create_single_data("stats", 0444, sbi->proc_dir, ravenfs_stats_show, sb)` |
+| **`ravenfs_put_super`，`kfree(sb->s_fs_info)` 之前** | **`debugfs_remove_recursive(sbi->dbg_dir)`** 与 **`proc_remove(sbi->proc_dir)`**（两处均早于 `kfree`）|
+| `ravenfs_exit` | `debugfs_remove_recursive(ravenfs_dbg_root)` 与 `proc_remove(ravenfs_proc_root)` |
 
 ⚠️ **UAF 红线**：`stats` 文件 `i_private` 持 `sb` 指针 → `debugfs_remove_recursive` 必须**早于** `kfree(sbi)`；`debugfs_remove` 会等进行中的 read 结束（dentry active ref）→ 该顺序充分。
 ⚠️ **`kernel.debugfs=off`**：`debugfs_create_dir`/`_file` 返 `ERR_PTR` → **忽略不拒挂**（`IS_ERR_OR_NULL` 守卫）。
@@ -316,30 +366,43 @@ bitmap_chunk_order	blk=3 ino=0
 - reset 需并发读写语义（读者可能读到半清零表），为低频操作引入一致性问题不划算；
 - 「重看一轮」的自然操作是 `umount && mount`，与 S3 语义一致（`life_mount` 顺带证明重挂过）。
 
-### 7.4 root-only（明说不是 bug）
+### 7.4 出口权限（**2026-10-04 D-11 修订：原「root-only 是特性」口径作废**）
 
-debugfs 挂载点 `0700`，普通用户读不到。**这是特性**：调试探针不是 ABI，字段增删改名**无兼容义务**（S2）。
+> **原口径（已作废）**：debugfs 挂载点 `0700`，普通用户读不到；宣称「这是特性：调试探针不是 ABI，字段增删改名无兼容义务」。
+>
+> **修订（D-11）**：该决策被推翻——出口**放错了位置**。数据面早已就绪（`atomic64` 计数），展示面却锁在 root 专属的 `/sys/kernel/debug`（`0700`），普通用户 / 监控脚本读不到 → D-1 的全部观测价值被白白锁死。故**新增人人可读的 procfs 公开出口**：
+
+- **公开面（procfs）**：`/proc/fs/ravenfs/<s_id>/stats`，`0444`（同形惯例 `/proc/fs/xfs/stat`），**人人可读**；
+- **内部探针（debugfs）**：`/sys/kernel/debug/ravenfs/<s_id>/stats`，`0444`，**保留**（root-only，内核开发期用）；
+- 两处**同一 `ravenfs_stats_show`**（数据源单一，`m->private = sb`）。
+- **兼容义务反转**：公开面一旦稳定即为**事实 ABI** → 字段名 / 分组的增删改名**须立兼容纪律**（对齐 D-10「对外契约成员清单」教训）；debugfs 面仍非 ABI。
 
 ---
 
 ## 8. 存储布局与成本
 
 ```c
-/* ravenfs.h：紧邻 struct ravenfs_sb_info 之前 */
-struct ravenfs_sb_stats {   /* 104 × atomic64_t = 832 B */
+/* ravenfs.h */
+struct ravenfs_sb_stats {   /* 主表 86 × atomic64_t = 688 B */
     atomic64_t op_lookup;   /* A 组 */
-    /* … 按 A–L 分段、段间空行 + 注释 … */
+    /* … 按 A–E、G–L 分段、段间空行 + 注释 … */
     atomic64_t nh_release;  /* L 组 */
+};
+struct ravenfs_al_stats {   /* 分配器 36 × atomic64_t = 288 B（独立下标空间 = enum rfs_al_stat）*/
+    atomic64_t al_init;     /* A 组 */
+    /* … */
+    atomic64_t al_pool_fail;
 };
 struct ravenfs_sb_info {
     /* … */
     struct ravenfs_sb_stats stats;   /* 随 kzalloc(sbi) → mount 即清零（S3）*/
+    struct ravenfs_al_stats al;      /* F 组：注入钩子落点（见 §4.F）*/
     struct dentry *dbg_dir;
     u64 mounted_at_ns;
 };
 ```
 
-- **内存**：104 × 8B = **832 B / mount**，多挂载线性叠加，可忽略。
+- **内存**：86 × 8B + 36 × 8B = **976 B / mount**，多挂载线性叠加，可忽略。
 - **零初始化免费**：`kzalloc(sbi)` 已清零 → 无需任何 init 代码，天然给出 S3 语义。
 - **争用（已知代价，暂不优化）**：字段集中 → 高并发多核打同一 `atomic64` 有 cacheline bouncing。初版接受（调试指标非吞吐指标，每次 1–2 ns）。超预算 → 升级路径 = 字段 cacheline 对齐或 per-cpu，**不是**加锁/编译开关。
 
@@ -355,7 +418,7 @@ struct ravenfs_sb_info {
 | 数据块 | iomap 默认 bio | ✅ `io_write`（`rfs_store_block`）| `op_*bytes` | 读走 iomap bio（内核层，不显式记）|
 | xattr 块 | ✅ `io_read`（`rfs_xb_load`）| ✅ `io_write`（`rfs_xb_store`）| `xa_`（10）| |
 | SB | ⚠️ **盲区**：挂载初读（`s_fsi` 未就绪）| ✅ `io_write`（`sb_write_timestamp`）| `err_sb_read`（读失败）| 初读一次性，可忽略 |
-| 位图 | ✅（chunk read / mem load）| ✅（chunk write / mem flush）| `bm_`（18）| |
+| 位图镜像 | ✅ `bm_image_load`（挂载期，§9 盲区）| ✅ `bm_image_save`（checkpoint）| `al_`（36）| 运行时树分配器；镜像=磁盘契约底座 |
 | 名字堆 | （经 mdata）| （经 mdata）| `nh_`（6）| 无直接 I/O |
 | **盲区** | `ravenfs_bitmap_used`（statfs 整图直读，O(bitmap)，未记以免 statfs 污染 io_read）| — | — | §11 |
 
@@ -365,13 +428,14 @@ struct ravenfs_sb_info {
 
 ## 10. 验收判据
 
-1. **形状**：mount 后 `cat …/stats` 返回**全部 104 字段**、初值全 0（`life_mount==1`），含 `# [group]` 小节头与 `# state` 段。
+1. **形状**：mount 后 `cat …/stats` 返回**全部 122 字段**、初值全 0（`life_mount==1`），含 `# [group]` 小节头（含独立 `# [al]`）与 `# state` 段。
 2. **单调性**：跑 `rfsfilechurn`/`rfsdirchurn` 一轮，相关计数器**只增不减**，且 `ic_hit+ic_miss>0`、`io_read_ops>0`、`io_write_ops>0`（证明真接上，不是摆设）。
-3. **派生自洽**：§6 命中率落 (0,1)；`bm_alloc_ok+bm_alloc_fail==bm_alloc_calls`（P5）；**v0.1.2 加**：`io_write_bytes ≥ ic_wb_rows×4096`（行写已被计入）之类方向性校验。
-4. **生命周期安全**：`umount` 时 debugfs 目录消失；**反复 mount/umount + 并发 `cat`** 无 crash / 无 KASAN UAF。
+3. **派生自洽**：§6 命中率落 (0,1)；`al_blk_alloc_hard_ok+al_blk_alloc_hard_fail` 与 `al_blk_free_*` 方向自洽（P5）；`al_slice_free_eexist == 0`；**v0.1.2 加**：`io_write_bytes ≥ ic_wb_rows×4096`（行写已被计入）之类方向性校验。
+4. **生命周期安全**：`umount` 时 **procfs `/proc/fs/ravenfs/<s_id>` 与 debugfs 目录均消失**；**反复 mount/umount + 并发 `cat`（两处出口）** 无 crash / 无 KASAN UAF。
+4b. **非 root 可读（D-11）**：`sudo -u nobody cat /proc/fs/ravenfs/<dev>/stats` **成功**且字段齐全（`life_mount==1`）。
 5. **行为零变化**：现有验收（xfstests `-g quick` 等）**全绿**——计数器不许改变任何返回值与路径（P1）。
 6. **开销**：同 workload 打点前后重编对比，吞吐差 **< 2%**。
-7. **随模式（v0.1.2）**：MEM 挂载下 `# [bm]` 的 CHUNK 专属 9 字段恒 0；CHUNK 挂载下 `bm_chunk_switch>0` 等生效面正确（`bitmap_mode` 与实际一致）。
+7. **分配器上报（2026-10-04 改制）**：`# [al]` 36 字段齐全（`al_init≥1`、`al_slices==装配片数`）；空闲盘 `al_blk_alloc_hard_fail` 随负载增长；`al_slice_free_eexist==0`；`al_drain_timeout==0`（正常卸载）。旧 `bm_`/`bitmap_mode` 随模式条款已废。
 
 ---
 
@@ -395,5 +459,5 @@ struct ravenfs_sb_info {
 - **为什么不存派生率**：P2，公式给在 §6。
 - **为什么常量开着**：S7 + §8 争用评估 + §10.6 兜底。
 - **v0.1.2 为什么补 io_write**：§4.E/§6 元数据写放大此前漏两条最大写流 → 失真；补齐是**修正**而非新增口径。
-- **v0.1.2 为什么加 `nh_`**：S8「全模块」——名字堆是唯一无自有计数器的模块；其 I/O 已被 `md_`/`bm_` 覆盖，故只补该层操作面。
-- **v0.1.2 为什么把 `bm_` 做成随模式**：位图重构成 sb-free 类（`rfs_bm`），类只用 sb-free 事件出口注入；非本后端专属字段恒 0（合法、有读侧 `bitmap_mode` 消歧）。
+- **v0.1.2 为什么加 `nh_`**：S8「全模块」——名字堆是唯一无自有计数器的模块；其 I/O 已被 `md_`/`al_` 覆盖，故只补该层操作面。
+- **2026-10-04 为什么把 `bm_` 整组换成 `al_`**：位图模块（`struct rfs_bm`）整体退役、运行时改为多分片主从红黑树（`rfs_allocator`）→ 旧 `bm_` 事件出口（`rfs_bm_stat_sink`）连同类一起消失，18 字段成为**死组**（无埋点）。新 `al_` 组由**平台中立**的树分配器经注入钩子 `struct rfs_stat_hook` 上报——**保持算法模块不碰内核**（可 C/C++ 双编 + 用户态单测），落点 `ko_al_stat_inc`。旧「随模式」条款（`bitmap_mode` 消歧）随之失效：`bitmap_mode` 现仅指**磁盘契约镜像**的模式，运行时分配器恒为树。

@@ -38,7 +38,7 @@
 
 #include "ravenfs.h"
 #include "ravenfs_cache.h"
-#include "ravenfs_bitmap.h"
+#include "ravenfs_allocator_top.h"
 #include "ravenfs_xattr.h"
 
 #define RFS_XATTR_NAME_MAX	255
@@ -278,6 +278,7 @@ static int rfs_xattr_set_core(struct super_block *sb, u64 inum, int name_index,
 			      const char *name, const void *value,
 			      size_t value_len, int flags)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	u64 ptr;
 	void *blk = NULL;
 	struct rfs_xattr_entry *here = NULL, *last, *it;
@@ -430,13 +431,13 @@ done_mutate:
 			err = rfs_xattr_set_ptr(sb, inum, (u64)RFS_XATTR_NONE);
 			if (err)
 				goto out;
-			ravenfs_block_free(sb, ptr, 1);		/* 先 inode 后 free */
+			(void)rfs_allocator_block_free(sbi->alloc, ptr, 1);		/* 先 inode 后 free */
 		}
 		err = 0;
 		goto out;
 	}
 	if (ptr == (u64)RFS_XATTR_NONE) {
-		u64 nb = ravenfs_block_alloc(sb, 1, 0);
+		u64 nb = rfs_allocator_block_alloc_hard(sbi->alloc, 1, 0);
 
 		if (nb == (u64)PTR_INVALID) {
 			err = -ENOSPC;
@@ -446,7 +447,7 @@ done_mutate:
 		if (!err)
 			err = rfs_xattr_set_ptr(sb, inum, nb);
 		if (err) {
-			ravenfs_block_free(sb, nb, 1);
+			(void)rfs_allocator_block_free(sbi->alloc, nb, 1);
 			goto out;
 		}
 	} else {
@@ -477,7 +478,7 @@ int ravenfs_xattr_get(struct inode *inode, int name_index, const char *name,
 		return -EIO;
 	}
 	down_read(&ri->xattr_sem);
-	err = rfs_xattr_get_core(sb, inode->i_ino, name_index, name,
+	err = rfs_xattr_get_core(sb, RFS_INO_TO_IDX(inode->i_ino), name_index, name,
 				 buffer, size);
 	up_read(&ri->xattr_sem);
 	if (err < 0)
@@ -504,7 +505,7 @@ int ravenfs_xattr_set(struct inode *inode, int name_index, const char *name,
 	if (sb_rdonly(sb))
 		return -EROFS;
 	down_write(&ri->xattr_sem);
-	err = rfs_xattr_set_core(sb, inode->i_ino, name_index, name, value,
+	err = rfs_xattr_set_core(sb, RFS_INO_TO_IDX(inode->i_ino), name_index, name, value,
 				 size, flags);
 	up_write(&ri->xattr_sem);
 	if (err)
@@ -630,7 +631,7 @@ ssize_t ravenfs_listxattr(struct dentry *dentry, char *buffer, size_t buffer_siz
 	}
 
 	down_read(&ri->xattr_sem);
-	err = rfs_xattr_ptr(sb, inode->i_ino, &ptr);
+	err = rfs_xattr_ptr(sb, RFS_INO_TO_IDX(inode->i_ino), &ptr);
 	if (err)
 		goto out;
 	if (ptr == (u64)RFS_XATTR_NONE) {
@@ -803,7 +804,7 @@ int ravenfs_init_acl(struct inode *inode, struct inode *dir)
 	/* 把（可能被 umask / 默认 ACL 改过的）mode 落进盘记录（确定性，不依赖 write_inode 时机） */
 	if (!err) {
 		struct ravenfs_session *s __free(ravenfs_session) =
-			ravenfs_session_get(sb, inode->i_ino);
+			ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 
 		if (!IS_ERR(s)) {
 			struct raven_Inode_t *r;

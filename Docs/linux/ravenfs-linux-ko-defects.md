@@ -1,6 +1,6 @@
 # RavenFS Linux KO · 缺陷名单（Defects）
 
-> 2026-09-29 · Raven（2026-09-30 修订：D-2 部分落地 / D-9 修复；**2026-10-01 修订：去版本化 + 并入 D-10**）
+> 2026-09-29 · Raven（2026-09-30 修订：D-2 部分落地 / D-9 修复；**2026-10-01 修订：去版本化 + 并入 D-10**；**2026-10-04 修订：新增 D-11 / D-12；D-10 修复落地**）
 > **定位**：本文件是 **linux-ko 的缺陷总名单**（跨版本累积），**不按版本归类**。
 > **口径（2026-10-01 定，用户裁定）**：缺陷的组织轴是「**当前处理状态**」，**不是版本**。缺陷真正关心的是「**现在处理到哪一步**」；版本号只作「首次暴露 / 修复落点」的**附注**，不作分类依据。
 > **为何去版本化**：有些缺陷是**设计期就被忽视的点**——把它归到 0.1.0 / 0.1.1 / 0.1.2 **都是错的**（例：D-10，`i_ino` 契约从第一天起就不存在）。故本名单**不设版本归属**。
@@ -19,13 +19,17 @@
 | **D-4** | **O_DIRECT（`direct_IO`）故意留白 → `open(O_DIRECT)` 被拒** | 能力缺口（设计级留白） | 低（实验期）→ 中（长期通用） | **mainline 有意不做**（R-FD-10「可降级」） |
 | **D-5** | **ko 移植时降级：丢掉 god 的叶内 extent 融合（四形态）→ 写请求粒度即碎片** | 功能缺失（移植降级） | 中（元数据膨胀 / 读放大 / 回收负担） | **ko 无对等实现**（仅「出口坍缩」单条特例；**god 侧已完备**） |
 | **D-6** | **inline→extent 不试 direct：>160B 文件恒背 8K 区段树节点（单 extent 也背）** | 元数据膨胀（实现缺口） | 中 | ko 无（`iomap.c:195` 恒建树；direct 仅 truncate 坍缩） |
-| **D-7** | **分配 hint 不持久化：每次 mount 重置到片首 → 低地址被反复复用** | 局部性 / 恢复友好度（实现缺口） | 中 | ko 无（hint 从不落盘） |
-| **D-8** | **元数据与数据共用分配 hint：区段树叶插进数据流 → 自噬式碎片（2 块洞）** | 碎片放大（分配器耦合） | 中 | ko 无（同一 block 分配器/hint） |
+| **D-7** | **分配 hint 不持久化：每次 mount 重置到片首 → 低地址被反复复用** | 局部性 / 恢复友好度（实现缺口） | 中 | **已由分配器 v2（树版）结构性消解（2026-10-04）**——best-fit 无位置游标，hint 生态位被算法消灭 |
+| **D-8** | **元数据与数据共用分配 hint：区段树叶插进数据流 → 自噬式碎片（2 块洞）** | 碎片放大（分配器耦合） | 中 | **已由分配器 v2（树版）结构性消解（2026-10-04）**——独立 best-fit 几何查询取代共用前移游标 |
 | **D-9** | **挂载参数只进不出：无 `show_options` 回读出口（`row_size=` 静默）** | 接口完整性 / 可观测性 | 低（实验期）→ 中（长期通用） | **已修**（`ravenfs_show_options` 落地，回读集与接受集同构；**2026-09-30**） |
-| **D-10** | **`i_ino` / `st_ino` 契约从未被定义（ABI「飞行」事故）** | **契约缺失（设计级 ABI）+ AI 协作事故** | **高（ABI 级）** | **决策已定（`i_ino = idx+1`）；实现待 v0.1.3** |
+| **D-10** | **`i_ino` / `st_ino` 契约从未被定义（ABI「飞行」事故）** | **契约缺失（设计级 ABI）+ AI 协作事故** | **高（ABI 级）** | **已修（2026-10-04，ko + 契约文本落地；未随包发布）** |
+| **D-11** | **计数器出口放错位置：仅 debugfs（`/sys/kernel/debug` 为 `0700`），普通用户不可读** | 可观测性（出口位置） | 中 | **已修（2026-10-04，新增 procfs 公开面；未随包发布）** |
+| **D-12** | **目录 `st_nlink` 不符 POSIX：用「全条目数+2」而非「直属子目录数+2」** | 契约语义（对外 ABI）+ AI 协作放大事故 | 中 | **未做（待办，修复落点 v1.2 + 离线修复程序必须）** |
 
 > **四类性质，勿混**：**D-1~D-3 = “发布落后 mainline”**（mainline 已有修复，未进包）；**D-4 = “有意留白 / 能力缺口”**（非发布落后）；**D-5 = 移植降级**（god 有完整实现，ko 移植时丢掉）；**D-6~D-8 = ko 实现/分配器层缺口**（D-6/7 迁移与持久化，D-8 为元数据/数据分配器耦合）；**D-9 = 两版共有的接口缺口**（发布版与 mainline 都缺，**非“发布落后”**）；**D-10 = 契约缺失（设计级 ABI）+ AI 协作事故**——与全部实现级缺陷**不同类**：不是“实现没跟上”，是“**该契约从第一天起就没被定义过**”。
 > D-1 与 D-2 有交集（D-2 的 CHUNK 后端需要 D-1 的计数器做 A/B 判据，见 counters 设计 §3.F）。
+> **D-11 与 D-1 同族但独立**：D-1 管「有没有观测面」，D-11 管「观测面放的位置是否人人可读」——D-1 已落地**不消解** D-11（出口仍 `0700` root-only）。
+> **D-12 与 D-10 同族**：均为**对外契约层**问题，且**同含 AI 协作放大事故维度**——D-10 是「契约没定义」，D-12 是「把『dentry 条目数』与『直属 DIR 型 inode 数』当成一个量、契约定义得反 POSIX」；D-12 的错语义由 v1.1 #13 落定，本条即推翻该决策（**修复落点 v1.2**）。
 
 ---
 
@@ -223,6 +227,20 @@ state  : 从未挂载（或挂载路径未回写时间戳）
 
 **mainline**：无。
 
+**运行态更新（2026-10-04，分配器 v2 结构性消解）**：**已由「运行时分配器 v2（树版）」结构性解决，非实现补丁**。
+- 旧缺陷的**前提**（分配位置 = 一个可重置的线性游标 `hint`）已**不存在**：新 `rfs_slice_alloc_hard`
+  做 **best-fit + 尾部下挖**（从树 `by_size` 取 `len ≥ bitscount` 最小者，落点 `s = (iv_end - bitscount) & ~align_mask`）——
+  落点**纯由空闲区间几何决定**，与任何「游标当前位置」无关。→ **hint 的生态位被算法消灭**：
+  没有一个「持久化后就能续上次位置」的游标存在，故「不持久化」不再是缺陷面。
+- 旧危害（**跨挂载低地址区被反复优先复用**）随之消失：即便片首有空洞，best-fit 也按**最小够用区间**选，
+  不再「从片首重开、顺序向片尾推进」→ 低地址不再被系统性优先回收。
+- **残留（有意记账，非缺陷）**：per-CPU `blk_.preferred[]` / `ino_.preferred[]` **片亲和**仍是纯内存、
+  挂载初值 `i % slice_count`。但它只是「CPU 先试哪一片」的**亲和度提示**（用于减少跨片扫描），
+  **不是 D-7 的『片内分配位置游标』**——即便停在亲和片 0，片内落点仍由 best-fit 几何决定。
+  故不重新触发 D-7。真值实现：`linux/ravenfs_allocator_router.c:252-266`、`linux/ravenfs_allocator_slice.c:472-514`。
+
+**mainline**：无。
+
 ---
 
 ## D-8 元数据与数据共用分配 hint：区段树叶插进数据流（自噬式碎片）
@@ -234,6 +252,24 @@ state  : 从未挂载（或挂载路径未回写时间戳）
 **影响**：物理连续性被自身元数据破坏；碎片计数放大；**恢复时呈“隔块丢失”**（本次 `GTAV` 的 30 块 8K 周期簇即此）。
 
 **应有形态**：元数据分配与数据分配**分离 hint**（或节点分配不与数据流共用前移游标）。
+
+**mainline**：无。
+
+**运行态更新（2026-10-04，分配器 v2 结构性消解）**：**已由「运行时分配器 v2（树版）」结构性解决，非实现补丁**。
+- 旧缺陷的**祸首是共用『前移游标』的串行化**：数据请求推进游标、紧随的元数据（2 块树节点）请求即落在其后 →
+  把数据流打成 2 块洞。旧 bitmap 分配器「数据与节点走同一个 hint」**必须在同一游标上串行**，这才是耦合本体。
+- 新分配器**没有前移游标**：每次分配是**独立的 best-fit 几何查询**——
+  · 元数据（2 块、`align_log2=1`）由从树取**最小够用区间**（多是既有小碎片）**尾部下挖**；
+  · 数据（大请求）由从树取**最合适的大区间**尾部。
+  两者**不再经由同一前进口**串行，故 2 块洞**不再由游标邻接制造**。→ **耦合机制被算法消灭**。
+  （注意分辨：两侧仍调用同一 `rfs_allocator_block_*` **API**，但「调用同一函数」≠「共享分配游标」——
+  真正的耦合是后者，已不存在。）
+- 真值实现：`linux/ravenfs_allocator_slice.c:451-517`（best-fit + 尾部下挖）、
+  `linux/ravenfs_allocator_router.c:358-393`（per-CPU 片亲和路由，非片内位置游标）。
+- **验收**（待运行态复核）：同一数据集（如 `fs/ecryptfs` / `GTAV`）下重测「恰为 2 块（8K）的洞」计数，
+  应较 D-8 原始证据（775 个）**显著下降**；新埋点 `al_merge_*` / `al_tree_*` 佐证碎片融合行为。
+- **不变量**：D-8 的修复**不依赖**任何「元数据/数据分离游标」的新增字段——是算法几何自然分离，
+  故**无需**在 SB / slice 表引入分离游标（旧『应有形态』的第 2 方案属游标时代的补丁，已无必要）。
 
 **mainline**：无。
 
@@ -336,8 +372,14 @@ state  : 从未挂载（或挂载路径未回写时间戳）
 
 ### 状态与验收
 
-- **状态**：**决策已定（2026-10-01）；实现待 v0.1.3**（变更面已盘，未动手）。
-- **验收**：`stat /mnt/rfs` 的 `Inode` ≠ 0；首建文件 `st_ino = 1`；`st_ino != 0` 恒成立；`(dev,ino)` 唯一；**grep `->i_ino` 直用清零**；M1–M5 + `audit_v1.2` 全绿。
+- **状态**：**已修（2026-10-04）**。ko 侧落地 + 契约文本入盘面规格；**未随包发布**（非发布驱动，随下版 `pkgver` 升号）。
+  - `include/linux/ravenfs.h`：新增访问器对 `RFS_INO_TO_IDX(ino)` / `RFS_IDX_TO_INO(idx)`（含契约注释）；
+  - `linux/super.c`：`ravenfs_iget()` 入参保持 **idx**，内部 `iget_locked(sb, RFS_IDX_TO_INO(inum))`（= `idx+1`）；`ravenfs_read_inode()` 反向 `inum = RFS_INO_TO_IDX(inode->i_ino)`（= `ino-1`）；
+  - **91 处 `->i_ino`** 收敛为 `RFS_INO_TO_IDX(...->i_ino)`（`dentry.c` / `file.c` / `iomap.c` / `xattr.c` / `super.c` / `inode_cache.c`）；grep `->i_ino` **直用清零**（唯余两处穿越点 + 注释）。
+  - 编译：`make`（kver 7.2.6-1-vfio）**通过**。
+  - 契约：`Docs/disk_layout_v1.2_inode.md` §7.A 新增「inode 号契约（ABI）」文本（`st_ino = inode_idx + 1`；root 读 SB `root_inode`，取值不入契约）。
+- **变更面**（相对 §「变更面」清单）：①③ 已落；② 等价落于 `ravenfs_read_inode`；④ 无工具直编码契约（`sbinfo`/`audit_v1.2` 读盘 idx，无需改）；⑤ root 值定性已在 `mkfs`（`MKFS_ROOT_INODE`）。
+- **验收**（待运行态复核）：`stat /mnt/rfs` 的 `Inode` ≠ 0；首建文件 `st_ino = 1`；`st_ino != 0` 恒成立；`(dev,ino)` 唯一；**grep `->i_ino` 直用清零**（✅ 代码级已满足）；M1–M5 + `audit_v1.2` 全绿。
 
 ### 关联
 
@@ -348,7 +390,99 @@ state  : 从未挂载（或挂载路径未回写时间戳）
 
 ---
 
-## 发布建议（D-1~D-3 的统一出口；D-4~D-10 另论）
+## D-11 计数器出口放错位置：仅 debugfs（`0700`），普通用户不可读
+
+> 2026-10-04 新增 · **待办（未做）**
+
+**现象**：D-1 落地的 perf counters 只有**一个**出口——debugfs 的 `/sys/kernel/debug/ravenfs/<s_id>/stats`（`super.c:1357-1360`）。而 debugfs 的挂载点 `/sys/kernel/debug` 本身是 **`0700`（root-only）**：文件虽是 `0444` seq_file，普通用户**连父目录都进不去** → 计数器事实上**只有 root 能读**。即出口**放错了位置**——数据面已就绪，展示面却锁在 root 专属的调试目录里。
+
+**定性**：**可观测性 / 出口位置缺陷**——与 D-1（无计数器）、D-9（无参数回读）同类，但**方向不同**：不是「没有出口」，是「出口放的位置给不了所有人看」。**独立成条，不并入 D-1**（D-1 已落地不消解本条）。
+
+**证据**
+- `super.c:1360`：`debugfs_create_file("stats", 0444, sbi->dbg_dir, sb, &ravenfs_stats_fops)`；`super.c:1450`：`debugfs_create_dir("ravenfs", NULL)`；`super.c:821`：`put_super` 摘除。
+- debugfs 挂载点 `0700`（内核默认），文件 mode `0444` 被**父目录权限**屏蔽——`sudo -u nobody cat …/stats` 报 Permission denied；`chmod` 文件无效（dentry 遍历被 mount 权限挡死）。
+- counters 设计文档 `ravenfs-linux-ko-perf-counters-v0.1.2.md` §7.4 **明文把“root-only”当特性**（“调试探针不是 ABI”）→ 本条**即对该决策的推翻**，两处口径需同步订正。
+
+**应有形态**（换到非 root 专属的成熟出口；对齐第二约束「照抄框架」）
+- **首选 procfs**：`/proc/fs/ravenfs/<s_id>/stats`，`0444`。正是 fs stat 惯例（`/proc/fs/xfs/stat` 同形：多行 kv、`0444`、人人可读）。`proc_create_single_data("stats", 0444, sbi->proc_dir, ravenfs_stats_show, sb)` —— **`ravenfs_stats_show` 零改**（`single_open(file, de->single_show, de->data)`，`m->private` 仍是 `sb`，与 debugfs 路径一致）。
+- **备选 sysfs**：`/sys/fs/ravenfs/<s_id>/stats`（`kset_create_and_add("ravenfs", NULL, fs_kobj)`，btrfs/ext4/f2fs 的位置）。位置最正统，但 sysfs 约定「**一文件一值**」+ `sysfs_emit` **单页（PAGE_SIZE≈4K）上限**；122 字段 kv ≈ 3.2KB 已贴上沿 → 要合规须拆 122 文件 / 上 `bin_attribute`，对「整段文本 dump」属**逆框架**，**不取**。
+- **非方案**：全局 `mount -t debugfs -o mode=0755`（副作用撒全系统 debugfs）——不取。
+- **debugfs 去留**：① 整换 procfs；② 保留 debugfs 作内部探针 + procfs 作公开面（**同一 `ravenfs_stats_show` 注册两处**，数据源单一）。
+
+**生命周期 / UAF（与 debugfs 同款红线）**
+- `init`：`ravenfs_proc_root = proc_mkdir("fs/ravenfs", NULL)`；
+- `fill_super` 末尾：`if (ravenfs_proc_root) { sbi->proc_dir = proc_mkdir(sb->s_id, ravenfs_proc_root); if (sbi->proc_dir) proc_create_single_data("stats", 0444, sbi->proc_dir, ravenfs_stats_show, sb); }`（守卫防 `proc_mkdir(name, NULL)` 落到 `/proc` 根）；
+- `put_super`：`proc_remove(sbi->proc_dir)` **必须早于 `kfree(sbi)`**（`proc_remove` 内部 `remove_proc_subtree`，会等进行中的 read 结束；`proc_remove` 对 NULL 安全）；
+- `exit`：`proc_remove(ravenfs_proc_root)`。
+- 新增字段：`struct ravenfs_sb_info.proc_dir`（`include/linux/ravenfs.h`，`dbg_dir` 旁）。
+
+**影响**
+- D-1 的全部观测价值（§6 派生指标、A/B 判据）被 `0700` 锁死——Arch 普通用户 / 监控脚本非 root 读不到。
+- 一旦人人可读 + 路径稳定 → **事实上的 ABI**：与设计文档 §7.4「非 ABI」自相矛盾，须为字段名/分组的增删改名立**兼容纪律**（对齐 D-10「对外契约成员清单」教训）。
+
+**mainline 状态（2026-10-04 修订）**：**已修**。取「debugfs 去留」的**方案②**（保留 debugfs 作内部探针 + **procfs 作公开面**，**同一 `ravenfs_stats_show` 注册两处**，数据源单一）：
+- `linux/super.c`：新增全局 `ravenfs_proc_root`；`ravenfs_init` 建 `/proc/fs/ravenfs`（`proc_mkdir("fs/ravenfs", NULL)`）；`fill_super` 末尾建 `<s_id>/stats`（`proc_mkdir(sb->s_id, ravenfs_proc_root)` + `proc_create_single_data("stats", 0444, sbi->proc_dir, ravenfs_stats_show, sb)`）；`put_super` **先 `proc_remove(sbi->proc_dir)`** 再 `kfree(sbi)`（UAF 红线）；`exit` `proc_remove(ravenfs_proc_root)`。
+- `include/linux/ravenfs.h`：`struct ravenfs_sb_info` 新增 `struct proc_dir_entry *proc_dir`（`dbg_dir` 旁）。
+- `ravenfs_stats_show` **零改**（procfs `single_open` 亦传 `m->private = sb`，与 debugfs 路径一致）；输出 **122** 计数字段（旧 86 + 新 **`al_` 组 36**）+ state 段。
+  - **字段构成变更（2026-10-04，随分配器 v2）**：旧 `bm_` 组（位图时代 18 字段）随位图模块退役**删除**（死组，无埋点）；新增 **`al_` 组（运行时树分配器 36 字段）**，为**独立子结构** `sbi->al`（下标空间 = `enum rfs_al_stat`），经**注入钩子** `struct rfs_stat_hook` 从平台中立的分配器模块上报（`allocator_adapter.c: ko_al_stat_inc`）。字段清单见 `Docs/linux/ravenfs-linux-ko-perf-counters-v0.1.2.md` §7.4。
+- 编译：`make`（kver 7.2.6-1-vfio）**通过**。
+- **未随包发布**（行为级变更，随下版 `pkgver` 升号）。
+
+**验收判据**
+- `sudo -u nobody cat /proc/fs/ravenfs/<dev>/stats` **成功**且 **122** 字段齐全（`life_mount==1`；含 `al_init`/`al_slices`/`al_blk_*` 等 `al_` 组）；
+- `umount` 后该目录消失；反复 mount/umount + 并发 `cat` 无 crash / 无 KASAN UAF；
+- 行为零变化（P1：打点不改控制流）；
+- 随包发布（**行为级变更 → `pkgver` 升号**，按 §8 版本纪律）。
+
+**关联**：`ravenfs-linux-ko-perf-counters-v0.1.2.md` §7.1/§7.2/§7.4（出口与生命周期）；D-1（计数器本体）、D-9（另一类出口缺口）；`super.c:821/1357/1450`。
+
+---
+
+## D-12 目录 `st_nlink` 不符 POSIX：用「全条目数+2」而非「直属子目录数+2」
+
+> 2026-10-04 新增 · **待办（未做）**
+
+**现象**：目录 inode 的 `link_count` 恒 = `size + 2`，而 `size` = 该目录下**全部条目数（普通文件 + 子目录，一视同仁）**。于是 `ls -l` / `stat` 报出的目录 `st_nlink` = `2 + 条目总数`。POSIX / Linux 惯例应为：目录 `st_nlink` = `2 + 直属子目录数`（`2` = `.` + 父目录里的 `..`；每个直属子目录的 `..` 贡献 1）。例：含 1 个普通文件、0 个子目录的目录应报 `nlink=2`，ravenfs 报 `nlink=3`。
+
+**定性**：**契约 / 语义缺陷（POSIX + 用户态可见 ABI）**——与 D-10 同族（**对外契约层**）。**不是实现遗漏**，也不只是“有意选择”：v1.1 定案时把**两个不同的量**当成了一个——“dir_inode 下的 **dentry 条目数**”与“dir_inode 下的**直属 DIR 型 inode 数**”。这是又一个 **AI 协作放大事故**（与 D-10 同构）：agent 讲了半天，用户当时未意识到二者是两码事，直到**独立 DS web session** 复看才审核出来。
+
+**修复落点**：**v1.2**（用户裁定，2026-10-04）——含实现 + 盘面契约 + **离线修复程序**（见下）。
+
+**证据**
+- ko 全部维护点皆 `link_count = (u32)dr->size + 2`：`dentry.c:174`（create）、`:239`（unlink）、`:383`（mkdir 父）、`:484`（rmdir 父）、`:520`（`rfs_dir_adjust`，rename 用）、`:767`（`rfs_dir_link_inode` 通用插条）；新目录初始化 `:348` `tr->link_count = 2; /* size(0) + 2 */`。`size` 在每次条目插入/删除 `±1`（**不分类型**，见 `:172` create 的 `dr->size += 1` 紧接 `dr->link_count = dr->size + 2`）。
+- god 侧同款：`dentry_insert_delete.cpp:191`、`root_dir.cpp:368` 等 `link_count = size + 2`；`juvenile_god/audit.cpp:347-350` **强制** `link_count == size + 2`（不符即 `bad_inode`）。
+- 盘面契约：`Docs/disk_layout_v1.1.md` §3.3 + 变更 #13（2026-09-01）**明文决策** `DIR link_count = size + 2`，动机是「把维护降为同 inode 内代数关系，无类型判断、无跨目录维护」，并**明说代价** = 「ls 显示目录 nlink = 2+条目数（非 POSIX）」。`Docs/disk_layout_v1.2_inode.md:197` 沿用。
+- 设计期已预登记为 **D3⚠️**：`Docs/concept_iface_design.md` §546–562（「目录 `link_count` 语义冲突」），当时倾向「保持盘上 size+2 / getattr 另算」。
+- 计数器 `dir_nlink_adjust`（perf-counters §4.H）恰是该维护点的实测面。
+
+**应有形态（两个方向，须先裁）**
+- **(a) 盘上新增「子目录计数」字段**（如 `dir_count`），每次 `mkdir`/`rmdir`/`rename(目录)` 维护 → `link_count = dir_count + 2`。精确、`getattr` 零成本；**代价 = 退回 v1.1 #13 刻意躲开的「跨目录维护 + 类型判断」**（LLM 最大漏写点），且改盘格式 + audit。
+- **(b) 报告时另算**：盘上仍存 `size+2`，在 `inode_getattr` / `i_nlink` 报告处**扫描目录树数直属子目录**，报 POSIX 值。不动盘格式；**代价 = 每次 `stat` 扫目录**（O(entries)，性能/一致性），且 `i_nlink` 是 VFS 缓存字段，「报告值 ≠ 内核值」要格外小心。
+- 无论哪条：`size`（rmdir 空判定、条目数）**保持原义不变**，`link_count` 与 `size` 脱钩。
+- **退出条件**：v1.1 #13 的「接受非 POSIX」决策**正式作废**，改以 POSIX 语义为准（用户裁定，2026-10-04）。
+
+**离线修复程序（必须准备，基于上帝类）**
+- **为什么必须**：存量盘（v1.1/v1.2 既有）的 `link_count` 全是旧语义（`size+2`）→ 契约改 POSIX 后**盘上既有值不可信**；“改哪个字段 / 存量盘怎么迁”都绕不开它。必须有一个**离线**工具在迁移时从 dentry 树**重建**目录计数（`link_count` = 直属 DIR 型子 inode 数 + 2；若选 (a) 则连同 `dir_count` 一起回写）——**不能只改 ko 了事**。
+- **基座 = 上帝类 `juvenile_god`**（用户态参考实现，非 ko 内核内）：它已具备所需的**目录 DFS / 可达性审计**骨架——`audit_dfs_root → audit_walk_inode → audit_walk_dir → audit_walk_btree(ctx, heaps, children, …)`（`juvenile_god/audit.cpp`），其中 `children` 即“直属子 inode”集合，天然可数出 DIR 型子节点数；`audit.cpp:347-350` 的 DIR 校验正是**同一处的旧语义断言**，随修复一并改判据。
+- **契约**：离线（可反复跑），复用 god 的存储设施 + 自推导 DFS（不调 `dentry_Bptree_walk`，防共因失效）→ 扫每个 DIR inode 的 dentry 树 → 数直属 DIR 型子 inode → 回写 → 再跑改判据后的 `audit_v1.2` 全绿。
+- **性质**：**离线迁移/修复**（`audit_v1.2` 家族），**不是** ko 运行时路径；ko 只负责**新写入**的正确性。
+
+**影响**
+- `ls -l` 目录链接数、`find -type d`（用 nlink 剪枝）、依赖 nlink 推断子目录数的脚本/工具**全部失真**；`st_nlink` 是 POSIX 用户态 ABI（同 D-10 的严重级别）。
+
+**mainline 状态**：**未做（待办）**，**修复落点 v1.2**。ko 与 god 均 `size+2`；盘面 v1.1 §3.3 / #13 明文、`audit_v1.2` 强制。**离线修复程序（基于上帝类）必须一并准备**（见上）。
+
+**验收判据**
+- 新目录 `mkdir d` → `stat -c %h d == 2`；
+- `touch d/f` → 仍 `== 2`（普通文件不进 nlink）；`mkdir d/sub` → `== 3`；`rmdir d/sub` → 回 `== 2`；
+- 普通文件增减 / `ln -s` **不改**目录 nlink；
+- `audit_v1.2` 的 DIR 校验从 `link_count == size+2` 改为按新契约；跨目录 `rename(目录)` 后计数正确。
+
+**关联**：`Docs/concept_iface_design.md` §546–562（D3⚠️ 预登记）、`Docs/disk_layout_v1.1.md` §3.3 + 变更 #13、`Docs/disk_layout_v1.2_inode.md:197`；`dentry.c:{174,239,348,383,484,520,767}`、`juvenile_god/audit.cpp:347`；**离线修复基座**：`juvenile_god/audit.cpp`（`audit_dfs_root` / `audit_walk_dir` / `audit_walk_btree`）；D-10（同族对外契约缺陷 + 同构协作放大事故）。
+
+---
+
+## 发布建议（D-1~D-3 的统一出口；D-4~D-12 另论）
 
 D-1~D-3 的共同点是：**mainline 已有部分/全部修复，但都没进发布包**。因此：
 
@@ -360,6 +494,8 @@ D-1~D-3 的共同点是：**mainline 已有部分/全部修复，但都没进发
 6. **D-6/D-7/D-8（非发布动作 / 结构改进）**：① inline→外置试 direct（消掉小文件 8K 税，D-6）；② hint 持久化（D-7）；③ 元数据与数据**分离分配游标**（D-8）。三项都可先在 god 侧原型 + A/B 再定 ko 移植。
 7. **D-9（已修，2026-09-30）**：`ravenfs_show_options` 已落地并挂接，回读集与 `parse_param` 同构（`bitmap_mode` 恒显、chunk 时 `bbco/ibco` 短名）。遗留：订正 `Docs/linux_vfs_iface_spec.md:250` 的“可选”口径；随下版发布（属行为级变更 → 走第 8 条版本纪律）。
 8. 版本纪律：以上任一**行为级**变更 → **`pkgver` 升号**（对齐 `acc9e20` 惯例），否则 DKMS 不重编、`pacman -U` 同版本不生效。
-9. **D-10（决策已定 / 实现待 v0.1.3；非发布驱动）**：`i_ino = idx+1`——**跨切面变更**（92 处 `->i_ino`），须**先立访问器**再改；契约文本待入 `disk_layout_v1.2_inode.md` §7 不变量 31。**root 取值不泄露**：`16` 已定性为 mkfs 局部实现（已加注 + 改名 `MKFS_ROOT_INODE`），契约只认“读 SB `root_inode`”这条普通契约。
+9. **D-10（已修，2026-10-04；非发布驱动）**：`i_ino = idx+1` 已落 ko——访问器 `RFS_INO_TO_IDX`/`RFS_IDX_TO_INO` 先立，`ravenfs_iget`/`ravenfs_read_inode` 两处穿越，**91 处 `->i_ino`** 收敛；契约文本入 `disk_layout_v1.2_inode.md` §7.A（避开 v1.1 §10 区段树机械参数 31–36 的既有编号）。**root 取值不泄露**：`16` 已定性为 mkfs 局部实现（已加注 + 改名 `MKFS_ROOT_INODE`），契约只认“读 SB `root_inode`”这条普通契约。
+10. **D-11（已修，2026-10-04；出口换位，属行为级变更）**：新增人人可读的 procfs 出口 `/proc/fs/ravenfs/<s_id>/stats`（`0444`，`ravenfs_stats_show` 零改，data=sb → `m->private`）；debugfs 出口**保留**作内部探针（方案②，数据源单一）。同步订正 counters 设计文档 §7.4「root-only 是特性」的措辞，并为字段名/分组的增删改名立**兼容纪律**（人人可读 → 事实 ABI）。**未随包发布**（随下版**升 `pkgver`**）。
+11. **D-12（POSIX 语义修正；跨切面 ABI + 盘格式）**：目录 `st_nlink` 由「全条目数+2」改为「直属子目录数+2」——先裁 (a) 盘上新增 `dir_count` 字段 / (b) `getattr` 报告时另算，再落；连带修正盘面契约（`disk_layout_v1.1.md` §3.3 / #13 作废）、`audit_v1.2` 的 DIR 校验、全部维护点。**修复落点 v1.2**；且**离线修复程序（基于上帝类 `juvenile_god`）必须一并准备**——存量盘 `link_count` 为旧语义，需从 dentry 树重建（见该节「离线修复程序」）。行为级 + 盘格式级变更 → 升 `pkgver`。
 
 > 备注：D-1 的设计真值文档已随 linux-ko 工作文档退役（`0860fad`），需要时从 git 取回：`git show a358cc0:Docs/linux/ravenfs-linux-ko-sb-counters-design.md`。

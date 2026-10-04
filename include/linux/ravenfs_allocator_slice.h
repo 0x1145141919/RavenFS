@@ -48,6 +48,7 @@
 #include "ravenfs_platform.h"		/* 类型 / 内存 / 锁（唯一平台收口）*/
 #include "ravenfs_rbtree_intrusive.h"	/* 侵入式 RB 核（零分配）*/
 #include "ravenfs_run_list.h"		/* STL 式 run 链（容器持有 + 绑定分配器）*/
+#include "ravenfs_allocator_stats.h"	/* al_ 计数器钩子（注入式；片内埋点）*/
 
 #ifdef __cplusplus
 extern "C" {
@@ -80,6 +81,7 @@ struct rfs_slice_cfg {
 	u64	 in_global_base_idx;	/* 本片在全局位号系的起点 */
 	u64	 slice_bitscount;	/* 本片位数 */
 	struct rfs_slice_alloc alloc;	/* 建树 / 融合取还区间节点 */
+	struct rfs_stat_hook stat;	/* al_ 计数器钩子（router 下传；未注入 = no-op）*/
 };
 
 /* ══════════════════════════ 片自治单元（⇄ mgr_slice_t）══════════════════════════ */
@@ -89,6 +91,7 @@ struct rfs_slice {
 	u64			in_global_base_idx;
 	u64			slice_bitscount;
 	struct rfs_slice_alloc	alloc;		/* 元素池（enable 时从 cfg 拷入，跨调用保留）*/
+	struct rfs_stat_hook	stat;		/* al_ 计数器钩子（enable 时从 cfg 拷入）*/
 	struct rfs_rb_root	pos;		/* 主树 by_pos（户籍 / 真相源）*/
 	struct rfs_rb_root	size;		/* 从树 by_size（派生索引，从 ⊆ 主）*/
 	u64			last_finish_hint;/* 分配游标（只进不退）*/

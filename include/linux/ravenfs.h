@@ -46,6 +46,9 @@
 #include <disk_struct_v1.2.h>
 #include <magics.h>	/* SUPERBLOCK_MAGIC */
 
+/* al_ 分配器计数器：字段枚举（show 表对位 + 钩子下标） */
+#include "ravenfs_allocator_stats.h"
+
 /* ─────────────────────────── 常量 ─────────────────────────── */
 
 /*
@@ -66,6 +69,25 @@
 /* B+tree 节点 = 2×4K（dentry 树 / 区段树通用；几何与 mdata 块粒度同源） */
 #define RAVENFS_NODE_BYTES 8192
 
+/*
+ * ── inode 号契约（ABI，D-10；disk_layout_v1.2_inode.md §7 不变量 31）──
+ *
+ * `st_ino = inode_idx + 1`（盘格式 v1.2 内恒定）：
+ *   · `st_ino` 恒 ≠ 0 → 解「0 = 用户态已删除哨兵」（glibc is_zero_ino 忽略）；
+ *   · 无任何保留区（idx 0 与 1..15 及其后全部合法可分配）；
+ *   · 同 FS 内 `st_ino` 唯一，配合 `s_dev` 满足 POSIX「(st_dev, st_ino) 唯一标识文件」；
+ *   · 上限：inode 数 < 2^32。
+ *
+ * **运行时路径只认这两个访问器**：VFS 面（`inode->i_ino` / `->i_ino`）是 **ino**，
+ * 一切内部数组/缓存/树接口的 inum 类是 **idx**。禁止散落 `±1`——新增代码若需在
+ * 两界间穿越，一律经本对宏（grep `->i_ino` 直用应为零，D-10 验收判据）。
+ *
+ * 注：盘上 SB 的 `root_inode` 是 **idx**（mkfs 局部实现细节，不进入契约）；
+ * `ravenfs_iget()` 入参为 idx，内部构造 ino 后交 `iget_locked()`。
+ */
+#define RFS_INO_TO_IDX(ino)	((u64)(ino) - 1)
+#define RFS_IDX_TO_INO(idx)	((u64)(idx) + 1)
+
 /* fast symlink target 内联上限（不变量 22：size ≤ 160 = 内联态）；
  * == REG 内联上限，便于三态判据复用。 */
 #define RAVENFS_SYMLINK_INLINE_MAX	160U
@@ -79,7 +101,7 @@ struct ravenfs_row;
 struct ravenfs_shard;
 struct ravenfs_session;
 struct ravenfs_ttl;		/* cache_ttl.c：自写 TTL 淘汰器，不透明句柄 */
-struct ravenfs_bitmap_mgr;	/* bitmap.c：双位图分片分配器 */
+struct rfs_allocator;	/* include/linux/ravenfs_allocator_top.h：运行时多分片主从红黑树分配器 */
 struct ravenfs_mdata_cache;	/* mdata_cache.c：元数据节点缓存 */
 struct ravenfs_mrow;
 struct ravenfs_mdata_shard;
@@ -157,25 +179,11 @@ struct ravenfs_sb_stats {
 	atomic64_t	io_write_bytes;
 	atomic64_t	io_flush_ops;
 
-	/* F. 位图分配 bm_（18）—— FULL/CHUNK 双后端；后 9 个 CHUNK 专属（FULL 恒 0） */
-	atomic64_t	bm_alloc_calls;
-	atomic64_t	bm_alloc_ok;
-	atomic64_t	bm_alloc_fail;
-	atomic64_t	bm_alloc_blocks;
-	atomic64_t	bm_free_calls;
-	atomic64_t	bm_free_blocks;
-	atomic64_t	bm_soft_ok;
-	atomic64_t	bm_occupy;
-	atomic64_t	bm_sync_slices;
-	atomic64_t	bm_chunk_switch;
-	atomic64_t	bm_chunk_switch_ns;
-	atomic64_t	bm_rec_attach;
-	atomic64_t	bm_rec_drain;
-	atomic64_t	bm_pool_empty;
-	atomic64_t	bm_summary_skip;
-	atomic64_t	bm_scan_ns;
-	atomic64_t	bm_ttl_online;
-	atomic64_t	bm_ttl_drain;
+	/* F. 运行时树分配器 al_（36）—— **独立子结构**（见 struct ravenfs_al_stats）。
+	 * 旧 `bm_`（位图时代 18 字段）随位图模块退役而**删除**：新分配器是多分片主从红黑树
+	 * （`ravenfs_allocator_top.h`），字段与埋点全变，见 `ravenfs_allocator_stats.h`。
+	 * 单独成块（不进本数组）之理由：其下标须 = `enum rfs_al_stat`，以便注入钩子按
+	 * 下标累加；混入本大数组会引入脆弱的绝对偏移。*/
 
 	/* G. extent 树 ext_（7） */
 	atomic64_t	ext_lookup;
@@ -228,6 +236,61 @@ struct ravenfs_sb_stats {
 	atomic64_t	nh_release;		/* 空堆回收次数（目录折构时释放的堆数）*/
 };
 
+/*
+ * ── F 组：运行时树分配器 al_（36，独立子结构）──
+ * 字段顺序**必须**与 `enum rfs_al_stat`（ravenfs_allocator_stats.h）逐一对位：
+ * 注入钩子按下标累加（`((atomic64_t *)&sbi->al)[field]`），show 表按序打印。
+ * 增删字段 → 同改枚举 + show 名表 + BUILD_BUG_ON 三处。
+ *
+ * 说明：旧 `bm_`（位图时代）字段已删；本组由「平台中立的树分配器」经钩子注入填充
+ * （见 allocator_adapter.c 的 `ko_al_stat_inc`）。
+ */
+struct ravenfs_al_stats {
+	/* A 装配 / 生命周期（5）*/
+	atomic64_t	al_init;
+	atomic64_t	al_init_fail;
+	atomic64_t	al_slices;
+	atomic64_t	al_shutdown;
+	atomic64_t	al_drain_timeout;
+	/* B block 组顶层（9）*/
+	atomic64_t	al_blk_alloc_hard_ok;
+	atomic64_t	al_blk_alloc_hard_fail;
+	atomic64_t	al_blk_alloc_soft_ok;
+	atomic64_t	al_blk_alloc_soft_fail;
+	atomic64_t	al_blk_occupy_ok;
+	atomic64_t	al_blk_occupy_partial;
+	atomic64_t	al_blk_occupy_fail;
+	atomic64_t	al_blk_free_calls;
+	atomic64_t	al_blk_free_blocks;
+	/* C inode 组顶层（3）*/
+	atomic64_t	al_ino_alloc_ok;
+	atomic64_t	al_ino_alloc_fail;
+	atomic64_t	al_ino_free_calls;
+	/* D 片内双树 / 融合（8）*/
+	atomic64_t	al_slice_alloc_hard;
+	atomic64_t	al_slice_alloc_enospc;
+	atomic64_t	al_slice_soft;
+	atomic64_t	al_slice_soft_enospc;
+	atomic64_t	al_slice_free;
+	atomic64_t	al_slice_free_eexist;
+	atomic64_t	al_tree_insert;
+	atomic64_t	al_tree_erase;
+	/* E 融合（3）*/
+	atomic64_t	al_merge_left;
+	atomic64_t	al_merge_right;
+	atomic64_t	al_merge_both;
+	/* F 路由 / 跨片（3）*/
+	atomic64_t	al_route_first_hit;
+	atomic64_t	al_route_rescan;
+	atomic64_t	al_route_cross_slice;
+	/* G checkpoint / 元素池（5）*/
+	atomic64_t	al_checkpoint;
+	atomic64_t	al_checkpoint_fail;
+	atomic64_t	al_checkpoint_blocks;
+	atomic64_t	al_pool_alloc;
+	atomic64_t	al_pool_fail;
+};
+
 struct ravenfs_sb_info {
 	u64	total_blocks;
 	u64	inode_count;
@@ -246,12 +309,14 @@ struct ravenfs_sb_info {
 	struct ravenfs_cache *icache;	/* disk_inode_cache_mgr（§4.11.1） */
 	struct ravenfs_mdata_cache *mcache;	/* mdata_piece_cache_mgr（8K 节点） */
 	struct ravenfs_ttl *ttl;	/* 自写 TTL 淘汰器（cache_ttl.c） */
-	struct ravenfs_bitmap_mgr *bitmap;	/* 双位图分片分配器（bitmap.c；全量常驻内存分片、非缓存行，自有分片级同步） */
+	struct rfs_allocator *alloc;	/* 运行时树分配器（挂载必建、无回退）；定义在 allocator_adapter.c */
 
 	bool	shutdown;	/* RFS_SHUTDOWN（R-LM-09）：自检 / 元数据 I/O 失败 → 全局停机，入口返 -EIO */
 
 	struct ravenfs_sb_stats stats;	/* §3 性能计数器：随 sbi 一起 kzalloc → mount 即清零（S3） */
-	struct dentry	*dbg_dir;	/* debugfs 挂载点目录（§8） */
+	struct ravenfs_al_stats al;	/* F 组：运行时树分配器 al_（钩子注入；独立下标空间）*/
+	struct dentry	*dbg_dir;	/* debugfs 挂载点目录（§8；内部探针，root-only） */
+	struct proc_dir_entry *proc_dir;/* procfs 公开出口目录（D-11；`/proc/fs/ravenfs/<s_id>`，人人可读） */
 	u64		mounted_at_ns;	/* stats 文件头行用（非计数器，§8.1） */
 };
 
@@ -268,6 +333,17 @@ struct ravenfs_sb_info {
 		struct ravenfs_sb_info *__rfs_s = __rfs_sb ? __rfs_sb->s_fs_info : NULL;	\
 		if (__rfs_s)						\
 			atomic64_add((n), &__rfs_s->stats.field);	\
+	} while (0)
+
+/* F 组（al_）打点：字段在**独立子结构** `sbi->al`（下标空间 = enum rfs_al_stat）。
+ * 与 RFS_STAT_* 同纪律（判空 / 只 atomic64 / 可持锁）。新增 al_ 字段用本对宏。*/
+#define RFS_AL_INC(sb, field)		RFS_AL_ADD((sb), field, 1)
+#define RFS_AL_ADD(sb, field, n)					\
+	do {								\
+		struct super_block *__rfs_sb = (sb);			\
+		struct ravenfs_sb_info *__rfs_s = __rfs_sb ? __rfs_sb->s_fs_info : NULL;	\
+		if (__rfs_s)						\
+			atomic64_add((n), &__rfs_s->al.field);		\
 	} while (0)
 
 struct ravenfs_inode_info {

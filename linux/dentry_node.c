@@ -22,7 +22,7 @@
 #include "ravenfs_dentry_node.h"
 #include "ravenfs_cache.h"
 #include "ravenfs_mdata_cache.h"
-#include "ravenfs_bitmap.h"
+#include "ravenfs_allocator_top.h"
 
 /* ── 8K 节点 / 跨块字节读 ── */
 /* ── 8K 节点读取已移至 mdata_cache.c（走 mdata_piece_cache_mgr + session） ── */
@@ -283,6 +283,7 @@ int rfs_propagate(struct super_block *sb, const struct rfs_dpath *p, u32 child_l
 int rfs_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 			  u64 *out_low, u64 *out_high, bool *out_was_root, u64 *out_dotdot)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_msession *vms = ravenfs_mdata_get(sb, victim_blk);
 	struct ravenfs_msession *nms = NULL;
 	struct Bptree_ddentry_leaf_node_t *vl, *nl;
@@ -306,7 +307,7 @@ int rfs_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 	*out_dotdot = dotdot;
 	ravenfs_mdata_put(vms);
 
-	new_blk = ravenfs_block_alloc(sb, 2, 1);	/* 2 块连续、2^1 对齐 */
+	new_blk = rfs_allocator_block_alloc_hard(sbi->alloc, 2, 1);	/* 2 块连续、2^1 对齐 */
 	if (new_blk == (u64)PTR_INVALID)
 		return -ENOSPC;
 
@@ -318,7 +319,7 @@ int rfs_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 			ravenfs_mdata_put(vms);
 		if (!IS_ERR(nms))
 			ravenfs_mdata_put(nms);
-		ravenfs_block_free(sb, new_blk, 2);
+		(void)rfs_allocator_block_free(sbi->alloc, new_blk, 2);
 		return err;
 	}
 	vl = ravenfs_msession_node(vms);
@@ -360,6 +361,7 @@ int rfs_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 static int rfs_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 			   u64 *out_low, u64 *out_high, u64 *out_dotdot)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_msession *vms = ravenfs_mdata_get(sb, victim_blk);
 	struct ravenfs_msession *nms = NULL;
 	struct Bptree_ddentry_inner_node_t *vi, *ni;
@@ -379,7 +381,7 @@ static int rfs_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 	*out_dotdot = (root != 0) ? RFS_PTR_ADDR(vi->meta.ptrs[1]) : (u64)RFS_MASK52;	/* ⚠ 先读后写 */
 	ravenfs_mdata_put(vms);
 
-	new_blk = ravenfs_block_alloc(sb, 2, 1);
+	new_blk = rfs_allocator_block_alloc_hard(sbi->alloc, 2, 1);
 	if (new_blk == (u64)PTR_INVALID)
 		return -ENOSPC;
 
@@ -391,7 +393,7 @@ static int rfs_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 			ravenfs_mdata_put(vms);
 		if (!IS_ERR(nms))
 			ravenfs_mdata_put(nms);
-		ravenfs_block_free(sb, new_blk, 2);
+		(void)rfs_allocator_block_free(sbi->alloc, new_blk, 2);
 		return err;
 	}
 	vi = ravenfs_msession_node(vms);
@@ -446,6 +448,7 @@ static int rfs_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 int rfs_new_root_inner(struct super_block *sb, u64 dir_ino, u64 left_blk, u64 left_max,
 			      u64 right_blk, u64 right_max, u64 dotdot)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, dir_ino);
 	struct ravenfs_msession *rms = NULL;
 	struct Bptree_ddentry_inner_node_t *ri;
@@ -454,14 +457,14 @@ int rfs_new_root_inner(struct super_block *sb, u64 dir_ino, u64 left_blk, u64 le
 
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
-	root_blk = ravenfs_block_alloc(sb, 2, 1);
+	root_blk = rfs_allocator_block_alloc_hard(sbi->alloc, 2, 1);
 	if (root_blk == (u64)PTR_INVALID)
 		return -ENOSPC;
 
 	rms = ravenfs_mdata_get(sb, root_blk);
 	if (IS_ERR(rms)) {
 		err = PTR_ERR(rms);
-		ravenfs_block_free(sb, root_blk, 2);
+		(void)rfs_allocator_block_free(sbi->alloc, root_blk, 2);
 		return err;
 	}
 	ri = ravenfs_msession_node(rms);
@@ -610,6 +613,7 @@ static int rfs_reparent_children(struct super_block *sb,
  */
 static int rfs_node_balance(struct super_block *sb, u64 parent_blk, u32 idx, bool *need)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_msession *pms, *cms = NULL, *nms = NULL;
 	struct Bptree_ddentry_inner_node_t *pi;
 	struct Bptree_meta_t *cm, *nm;
@@ -736,7 +740,7 @@ static int rfs_node_balance(struct super_block *sb, u64 parent_blk, u32 idx, boo
 		ravenfs_mdata_put(nms);
 		nms = NULL;
 		ravenfs_mdata_drop(sb, nblk);
-		ravenfs_block_free(sb, nblk, 2);
+		(void)rfs_allocator_block_free(sbi->alloc, nblk, 2);
 
 		/* 父删 hint + 更新保留 hint 的 hash_max */
 		{
@@ -845,6 +849,7 @@ out:
 /* 根收缩：根（内）只剩 1 孩时，把唯一孩子提升为新根（读 dir inode 的 data_root） */
 static int rfs_root_shrink(struct super_block *sb, u64 dir_ino)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, dir_ino);
 	struct ravenfs_msession *rms, *cms = NULL;
 	struct Bptree_meta_t *rm, *cm;
@@ -899,7 +904,7 @@ static int rfs_root_shrink(struct super_block *sb, u64 dir_ino)
 	RFS_ROW_MARK_DIRTY(ds->row);
 
 	ravenfs_mdata_drop(sb, root_blk);
-	ravenfs_block_free(sb, root_blk, 2);
+	(void)rfs_allocator_block_free(sbi->alloc, root_blk, 2);
 out:
 	if (cms)
 		ravenfs_mdata_put(cms);
