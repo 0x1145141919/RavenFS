@@ -62,6 +62,20 @@ struct audit_walk_report_t {
     uint64_t link_mismatch = 0;      /* link_count 对不上 */
     uint64_t dotdot_mismatch = 0;    /* dir 根 '..' 对不上实际父 */
 
+    /* ── name_heap 分区级统计（观察面；不进 total_bad）──
+     * 粒度分档：按 slot（gran 档）分别累计，便于识别「8B 堆小马拉大车」。
+     * 空堆（used==0）判为泄露 → 计入 heap_bad（已在 total_bad 内），另记 heap_zero_used。 */
+    uint64_t heap_active = 0;             /* 激活的堆条目总数（跨全部目录/档） */
+    uint64_t heap_active_bitmap_blk = 0;  /* 激活堆位图面占块合计（2 块/个） */
+    uint64_t heap_active_data_blk = 0;    /* 激活堆数据面占块合计 */
+    uint64_t heap_used_bits = 0;          /* 全部激活堆占用 bit 合计 */
+    uint64_t heap_total_bits = 0;         /* 全部激活堆容量 bit 合计 */
+    uint64_t heap_zero_used = 0;          /* 占用=0 的激活堆（泄露；判 heap_bad） */
+    uint64_t heap_slot_active[10] = {};   /* 各档激活堆条目数（slot = gran 档） */
+    uint64_t heap_slot_data_blk[10] = {}; /* 各档数据面占块 */
+    uint64_t heap_slot_used_bits[10] = {};/* 各档占用 bit */
+    uint64_t heap_slot_total_bits[10] = {};/* 各档容量 bit */
+
     /* 收口 XOR（核心输出） */
     uint64_t unprotected_blk = 0;    /* 可达 ∧ 块位图暗  → 没有被保护 */
     uint64_t unprotected_ino = 0;    /* 可达 ∧ inode 位图暗 → 没有被保护（悬挂引用） */

@@ -94,6 +94,25 @@ int main(int argc, char **argv) {
                (unsigned long long)rep.link_mismatch, (unsigned long long)rep.dotdot_mismatch,
                (unsigned long long)rep.unprotected_blk, (unsigned long long)rep.unprotected_ino,
                (unsigned long long)rep.leaked_blk, (unsigned long long)rep.leaked_ino);
+        printf("heap: active=%llu blocks=%llu (bmp=%llu data=%llu = %.1f MiB) "
+               "used=%llu/%llu (%.4f%%) zero_used=%llu\n",
+               (unsigned long long)rep.heap_active,
+               (unsigned long long)(rep.heap_active_bitmap_blk + rep.heap_active_data_blk),
+               (unsigned long long)rep.heap_active_bitmap_blk,
+               (unsigned long long)rep.heap_active_data_blk,
+               (double)(rep.heap_active_bitmap_blk + rep.heap_active_data_blk) * 4096.0 / 1048576.0,
+               (unsigned long long)rep.heap_used_bits,
+               (unsigned long long)rep.heap_total_bits,
+               rep.heap_total_bits ? 100.0 * (double)rep.heap_used_bits / (double)rep.heap_total_bits : 0.0,
+               (unsigned long long)rep.heap_zero_used);
+        for (int s = 0; s < 10; s++) {
+            if (rep.heap_slot_active[s] == 0) continue;
+            printf("  heap_slot[%d] active=%llu data_blk=%llu used=%llu/%llu\n",
+                   s, (unsigned long long)rep.heap_slot_active[s],
+                   (unsigned long long)rep.heap_slot_data_blk[s],
+                   (unsigned long long)rep.heap_slot_used_bits[s],
+                   (unsigned long long)rep.heap_slot_total_bits[s]);
+        }
     }
     ::close(fd);
     return bad == 0 ? 0 : 1;

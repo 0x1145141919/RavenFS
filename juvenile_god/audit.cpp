@@ -216,6 +216,30 @@ result_code_t RavenFS_juvenile::audit_dfs_root(audit_walk_report_t *rep, FILE *o
         print_runs("LEAK_BLK",   "疑似泄露（位图亮 ∧ 不可达）", run_leak);
     }
 
+    audit_logf(ctx, "HEAP_SUM",
+               "active=%llu | blocks=%llu (bmp=%llu data=%llu) = %.1f MiB | "
+               "used_bits=%llu/%llu (%.4f%%) | zero_used=%llu(泄露)",
+               (unsigned long long)ctx.rep.heap_active,
+               (unsigned long long)(ctx.rep.heap_active_bitmap_blk + ctx.rep.heap_active_data_blk),
+               (unsigned long long)ctx.rep.heap_active_bitmap_blk,
+               (unsigned long long)ctx.rep.heap_active_data_blk,
+               (double)(ctx.rep.heap_active_bitmap_blk + ctx.rep.heap_active_data_blk) * 4096.0 / 1048576.0,
+               (unsigned long long)ctx.rep.heap_used_bits,
+               (unsigned long long)ctx.rep.heap_total_bits,
+               ctx.rep.heap_total_bits ? 100.0 * (double)ctx.rep.heap_used_bits / (double)ctx.rep.heap_total_bits : 0.0,
+               (unsigned long long)ctx.rep.heap_zero_used);
+    for (int s = 0; s < 10; s++) {
+        if (ctx.rep.heap_slot_active[s] == 0) continue;
+        audit_logf(ctx, "HEAP_SLOT",
+                   "slot=%d gran=%uB active=%llu data_blk=%llu used=%llu/%llu (%.4f%%)",
+                   s, 1u << HEAP_GRAN[s],
+                   (unsigned long long)ctx.rep.heap_slot_active[s],
+                   (unsigned long long)ctx.rep.heap_slot_data_blk[s],
+                   (unsigned long long)ctx.rep.heap_slot_used_bits[s],
+                   (unsigned long long)ctx.rep.heap_slot_total_bits[s],
+                   ctx.rep.heap_slot_total_bits[s] ? 100.0 * (double)ctx.rep.heap_slot_used_bits[s] / (double)ctx.rep.heap_slot_total_bits[s] : 0.0);
+    }
+
     audit_logf(ctx, "SUM",
                "inodes=%llu | nodes=%llu inner=%llu leaves=%llu recs=%llu | "
                "btree_bad=%llu inode_bad=%llu heap_bad=%llu xattr_bad=%llu "
@@ -903,6 +927,27 @@ void RavenFS_juvenile::audit_name_heaps(audit_walk_ctx_t &ctx, uint64_t inum,
                    (unsigned long long)datab, (unsigned long long)data_blks,
                    (unsigned long long)used, (unsigned long long)total_bits,
                    total_bits ? 100.0 * (double)used / (double)total_bits : 0.0);
+
+        /* ── 分区级统计（分档：slot 即 gran 档）── */
+        ctx.rep.heap_active++;
+        ctx.rep.heap_active_bitmap_blk += bmp_blks;
+        ctx.rep.heap_active_data_blk += data_blks;
+        ctx.rep.heap_used_bits += used;
+        ctx.rep.heap_total_bits += total_bits;
+        if (s >= 0 && s < 10) {
+            ctx.rep.heap_slot_active[s]++;
+            ctx.rep.heap_slot_data_blk[s] += data_blks;
+            ctx.rep.heap_slot_used_bits[s] += used;
+            ctx.rep.heap_slot_total_bits[s] += total_bits;
+        }
+        /* 空堆 = 泄露（激活但 0 占用：长名已删/回收未归还） */
+        if (used == 0) {
+            ctx.rep.heap_zero_used++;
+            bad_heap(ctx, "DIR inode %llu heap[%d] 激活但占用=0（空堆泄露）bmp=[%llu,+%llu) data=[%llu,+%llu)",
+                     (unsigned long long)inum, s,
+                     (unsigned long long)bmpb, (unsigned long long)bmp_blks,
+                     (unsigned long long)datab, (unsigned long long)data_blks);
+        }
 
         audit_heap_region_t r;
         r.data_lo = datab; r.data_hi = datab + data_blks;

@@ -53,6 +53,14 @@ make audit_v1.2
   其余命名空间后缀**必须非空**。→ 兼容 `system.posix_acl_access`/`default` 的 ext4 表示。
 - **B+tree**：magic、`(hash,name)` 严格递增、`count<=126`、`hints[i].hash_max` 递增且 == 子树 max、extent 树同构检查。
 - **名字堆**：10 描述符激活/几何自洽 + 长名（>40B）读 + 堆位图置位校验。
+- **名字堆分区级统计 + 空堆泄露判定（2026-10-05 新增）**：
+  - 逐堆打 `HEAP`（gran/几何/占用）；分区级汇总打 `HEAP_SUM`（激活堆数 / 占块 /
+    占用 bit / 利用率）与按 gran 档分档的 `HEAP_SLOT`（8B / 64B / 128B / …）。
+  - **空堆（激活但占用=0）判为泄露** → `heap_bad++`（计入 `bad_total`），并另记
+    `zero_used`。用于暴露「长名删后堆未归还」的惰性堆泄漏。
+  - 报告字段：`heap_active / heap_active_{bitmap,data}_blk / heap_used_bits /
+    heap_total_bits / heap_zero_used / heap_slot_active[10] / heap_slot_data_blk[10] /
+    heap_slot_used_bits[10] / heap_slot_total_bits[10]`。
 - **叶链校验（v1.2 新增）**：每目录从最左叶沿 `ptrs[2]` 走链，必须恰好覆盖全部叶、顺序 = 中序；
   `prev/next` 对称；首叶前驱 invalid、末叶后继 invalid；非根叶 `ptrs[1]` 指回前驱；
   根叶 `ptrs[1]` = `..` inode。失败计入 SUMMARY 的 `chain_bad`。
