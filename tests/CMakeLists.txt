@@ -3,7 +3,99 @@
 # 多线程分片压测自带强定义覆盖（见 cpu_id_stub.cpp 头注释）。
 set(CPU_ID_STUB cpu_id_stub.cpp)
 
+# 平台中立红黑树轮子（2026-10-04）：两个纯 C 轮子（本工程默认仅 CXX），
+# 且只依赖 platform/intrusive 收口——直接编入可执行，**不链** god/ko 其它任何东西。
+#   · intrusive：侵入式 · 零分配（无分配接口；元素内存调用方自管）
+#   · owning   ：STL 式 owning（堆回调注入；insert 分配拷贝、erase/fini 释放）
+# owning 复用 intrusive 核，故同一可执行需同时编两个 .c。
+enable_language(C)
+add_executable(ravenfs_test_rbtree_intrusive
+    test_rbtree_intrusive.c
+    ../linux/ravenfs_rbtree_intrusive.c
+)
+target_include_directories(ravenfs_test_rbtree_intrusive PRIVATE
+    ${CMAKE_SOURCE_DIR}/include/linux
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# 分片自治单元 struct rfs_slice（⇄ god mgr_slice_t）冒烟单测（2026-10-04）：
+# 直接编 ../linux/ravenfs_allocator_slice.c + 侵入 RB 核 + 测试；不链 god/ko 其它东西。
+add_executable(ravenfs_test_allocator_slice
+    test_allocator_slice.c
+    ../linux/ravenfs_allocator_slice.c
+    ../linux/ravenfs_rbtree_intrusive.c
+)
+target_include_directories(ravenfs_test_allocator_slice PRIVATE
+    ${CMAKE_SOURCE_DIR}/include/linux
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# 顶层路由 struct rfs_allocator（⇄ god fs_allocator_t）冒烟单测（2026-10-04）：
+# 直接编 ../linux/ravenfs_allocator_router.c + ../linux/ravenfs_allocator_slice.c
+# + 侵入 RB 核 + 测试（不链 god/ko 其它东西）。
+add_executable(ravenfs_test_allocator_router
+    test_allocator_router.c
+    ../linux/ravenfs_allocator_router.c
+    ../linux/ravenfs_allocator_slice.c
+    ../linux/ravenfs_rbtree_intrusive.c
+)
+target_include_directories(ravenfs_test_allocator_router PRIVATE
+    ${CMAKE_SOURCE_DIR}/include/linux
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# 分配器片 struct rfs_slice 对抗性压力验证（测试组，2026-10-04）：
+# 影子账本 + 朴素参考实现差分 + 每步不变量 + 对抗/边界；直接编
+# ../linux/ravenfs_allocator_slice.c + 侵入 RB 核 + 本测试（不链 god/ko）。
+add_executable(ravenfs_stress_allocator_slice
+    stress_allocator_slice.c
+    ../linux/ravenfs_allocator_slice.c
+    ../linux/ravenfs_rbtree_intrusive.c
+)
+target_include_directories(ravenfs_stress_allocator_slice PRIVATE
+    ${CMAKE_SOURCE_DIR}/include/linux
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# 分配器顶层路由 struct rfs_allocator 集成对抗性压力验证（测试组，2026-10-04）：
+# 全局影子账本 + 朴素全组参考实现差分 + 跨片路由全覆盖 + 每步不变量；直接编
+# ../linux/ravenfs_allocator_router.c + ../linux/ravenfs_allocator_slice.c
+# + 侵入 RB 核 + 本测试（不链 god/ko）。
+add_executable(ravenfs_stress_allocator_router
+    stress_allocator_router.c
+    ../linux/ravenfs_allocator_router.c
+    ../linux/ravenfs_allocator_slice.c
+    ../linux/ravenfs_rbtree_intrusive.c
+)
+target_include_directories(ravenfs_stress_allocator_router PRIVATE
+    ${CMAKE_SOURCE_DIR}/include/linux
+    ${CMAKE_SOURCE_DIR}/include
+)
+add_executable(ravenfs_test_rbtree_owning
+    test_rbtree_owning.c
+    ../linux/ravenfs_rbtree_owning.c
+    ../linux/ravenfs_rbtree_intrusive.c
+)
+target_include_directories(ravenfs_test_rbtree_owning PRIVATE
+    ${CMAKE_SOURCE_DIR}/include/linux
+    ${CMAKE_SOURCE_DIR}/include
+)
+
 find_package(Threads REQUIRED)   # E 组并行压测（test_extent_ops.cpp）用 std::thread
+
+# 分配器顶层路由多线程变体（测试组，2026-10-04）：N 线程并发 alloc/free 跨片，供
+# ThreadSanitizer 探测路由层 data race（preferred 游标原子性 / 跨片路由）。
+add_executable(ravenfs_stress_allocator_router_mt
+    stress_allocator_router_mt.c
+    ../linux/ravenfs_allocator_router.c
+    ../linux/ravenfs_allocator_slice.c
+    ../linux/ravenfs_rbtree_intrusive.c
+)
+target_include_directories(ravenfs_stress_allocator_router_mt PRIVATE
+    ${CMAKE_SOURCE_DIR}/include/linux
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(ravenfs_stress_allocator_router_mt PRIVATE Threads::Threads)
 
 # v1.1 幼年期上帝类：root_dir_insert_dentry 接口专项测试
 add_executable(ravenfs_juv_insert

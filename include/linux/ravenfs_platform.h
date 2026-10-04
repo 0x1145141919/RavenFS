@@ -92,6 +92,15 @@ typedef uint64_t u64;
 #  define RFS_FREE(p)     free(p)
 #endif
 
+/* 注入式分配器（环境无关；算法/容器/分配器各头共用）——“分配依赖外抛”的唯一落点：
+ * 内核绑 kmem_cache / GFP_NOFS，用户态绑 malloc，或绑测试的计数 / 故障注入器。
+ * ⚠ 用时纪律：**轮子内零直接分配**（不得出现 kmalloc/malloc 字面），全经此回调。*/
+struct rfs_mem_alloc {
+	void	*(*alloc)(void *ctx, u64 size);	/* 取 size 字节；失败返 NULL */
+	void	 (*free)(void *ctx, void *p);	/* 还（p 由 alloc 取得） */
+	void	 *ctx;				/* 宿主上下文（可 NULL） */
+};
+
 /* ═══════════════════════════ 时间（单调纳秒） ═══════════════════════════ */
 /* 仅供「累计耗时」类计数器用（bm_chunk_switch_ns / bm_scan_ns）；**算法语义不依赖它**
  * （计时只进计数器，绝不参与控制流）。内核走 ktime_get_ns；用户态走 CLOCK_MONOTONIC。*/

@@ -7,7 +7,8 @@
 #
 obj-m += ravenfs.o
 ravenfs-y := version.o super.o dentry.o dentry_tree.o dentry_node.o inode_cache.o mdata_cache.o cache_ttl.o bitmap_adapter.o name_heap.o iomap.o file.o extent_write.o xattr.o \
-             bitmap_core.o bitmap_mem.o bitmap_chunk.o
+             bitmap_core.o bitmap_mem.o bitmap_chunk.o ravenfs_rbtree_intrusive.o ravenfs_rbtree_owning.o \
+             ravenfs_allocator_slice.o ravenfs_allocator_router.o
 
 # ── 版本：以打包版本为唯一真值（PKGBUILD pkgver）─────────────────────────────
 #   宿主 dev 构建 ：从 PKGBUILD 提取 pkgver（PKGBUILD 已升格至 linux/ 本目录）；
