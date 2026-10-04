@@ -32,7 +32,8 @@
  *
  * 新建 dir 根叶子细节见 dentry_leaf_entry_insert（与 mkfs build_root_dentry_node
  * 对齐，差异仅 ".."=父目录）；dir inode 初始化要点：
- *   link_count = size + 2（size=0 → 2，§3.3）、permission=0755、data_root=新建
+ *   link_count = 2（POSIX：2 + 直属 DIR 型子 inode 数，空目录即 2，§3.3）、
+ *   permission=0755、data_root=新建
  *   树根、**10 名字堆描述符显式未激活哨兵** —— memset 0 是雷：0 是合法块号，
  *   dir 关闭时 dir_name_heap_release 会误把 block 0/1（根 dentry 块）当激活堆释放。
  * ═══════════════════════════════════════════════════════════════════ */
@@ -193,7 +194,7 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
  * 流程：walk → 命中校验 → 叶子删除（dentry_leaf_entry_delete：树删 +
  * 下游资产维护——dir 型目标前置空校验 + 全量回收，REG/SOFT_SYM
  * link_count--/归零回收哨兵）→ 刷父 hash_max → 欠载平衡/合并（向上递归）
- * → owner 目录条目计数维护（size-- / link_count=size+2，§3.3）→ 长名堆释放。
+ * → owner 目录条目计数维护（size--；DIR 型条目 link_count--，§3.3）→ 长名堆释放。
  *
  * 目标 inode 侧资产全部下沉 dentry_leaf_entry_delete（2026-09-01）；本函数
  * 保留 owner 侧（当前目录）计数与长名释放——需 inode_idx，签名无 owner 参数。
@@ -242,6 +243,18 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
     /* 名字堆信息必须在删除（memmove）**之前**取 */
     const uint16_t e_name_len = (uint16_t)RFS_PTR_FREE(leaf->entries[idx].inode_ptr);
     const uint64_t e_remain   = leaf->entries[idx].full_char_remain_ptr;
+
+    /* 目标 inode 类型也须在删除前读出（D-12）：仅 DIR 型条目才影响 owner
+     * 目录 link_count（POSIX：link_count = 2 + 直属 DIR 型子 inode 数）。 */
+    bool tgt_is_dir = false;
+    {
+        const uint64_t tgt_inum = RFS_PTR_ADDR(leaf->entries[idx].inode_ptr);
+        if (tgt_inum != ((uint64_t)PTR_INVALID & ((1ULL << 52) - 1)) && inode_test(tgt_inum)) {
+            InodeSession tgt_sess(inode_cache_mgr, tgt_inum);
+            if (!tgt_sess) return RC_ERR_IO;
+            tgt_is_dir = (RFS_INO1_GET_TYPE(tgt_sess.inode->word1) == INODE_TYPE_DIR);
+        }
+    }
 
     uint64_t flags = 0;
     rc = dentry_leaf_entry_delete(leaf_blk, idx, flags, destroy_data);
@@ -357,7 +370,8 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
     if (e_name_len > DENTRY_INLINE_NAME_MAX)
         name_heap_free(inode_idx, e_name_len, e_remain);
 
-    /* 当前目录（owner）条目计数维护：size--、link_count = size+2（§3.3）。
+    /* 当前目录（owner）条目计数维护：size--（全部条目）；tgt_is_dir 时
+     * link_count--（POSIX：link_count = 2 + 直属 DIR 型子 inode 数，§3.3）。
      * owner 侧留上层——签名无 owner 参数；目标 inode 侧资产已由
      * dentry_leaf_entry_delete 下沉处理。 */
     {
@@ -365,7 +379,8 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
         if (!dir_sess) return RC_ERR_IO;
         if (dir_sess.inode->size > 0)
             dir_sess.inode->size--;
-        dir_sess.inode->link_count = (uint32_t)dir_sess.inode->size + 2;
+        if (tgt_is_dir && dir_sess.inode->link_count > 2)
+            dir_sess.inode->link_count--;
         dir_sess.dirty();
     }
     return orphan_pending ? RC_ERR_NOT_SUPPORTED : RC_OK;

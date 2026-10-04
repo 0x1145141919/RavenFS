@@ -28,7 +28,7 @@
  *      link_count=2）；REG/SOFT_SYM 内联空 inode（link_count=1）
  *   2. 长名（>40B）：owner 目录名字堆分配外置存储 + 写尾部
  *   3. memmove 树插（消费 name->inum / full_char_remain_ptr）
- *   4. owner 目录计数维护：size++、link_count = size+2（§3.3）
+ *   4. owner 目录计数维护：size++（全部条目）；仅 DIR 型条目 link_count++
  *   失败：inode_guard / block_guard / heap_guard 全自动回滚。
  *
  * result_flags：
@@ -89,7 +89,7 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
             raven_dir_Inode_t *dino = (raven_dir_Inode_t*)ino_sess.inode;
             memset(dino, 0, sizeof(raven_dir_Inode_t));
             RFS_INO1_SET_TYPE(*dino, INODE_TYPE_DIR);
-            dino->link_count      = 2;         /* = size + 2（size=0，§3.3） */
+            dino->link_count      = 2;         /* POSIX：空目录 link_count=2（size=0，§3.3） */
             RFS_MODE_XATTR_SET(dino->mode_xattr, 0755, RFS_XATTR_NONE);
             dino->size            = 0;         /* 新目录无条目 */
             dino->data_root       = root_blk;  /* 恒有效（不变量 11） */
@@ -183,12 +183,15 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
 
     sess.dirty();
 
-    /* ── 4. owner 目录计数维护：size++、link_count = size+2（§3.3） ── */
+    /* ── 4. owner 目录计数维护：size++（全部条目）；仅 DIR 型条目 link_count++
+     * POSIX 口径（D-12）：link_count = 2 + 直属 DIR 型子 inode 数，与 size 解耦。
+     * 非目录条目（REGULAR / SOFT_SYM）只增 size，不影响 link_count。 ── */
     {
         InodeSession dir_sess(inode_cache_mgr, owner_dir_inode);
         if (!dir_sess) return RC_ERR_IO;
         dir_sess.inode->size++;
-        dir_sess.inode->link_count = (uint32_t)dir_sess.inode->size + 2;
+        if (inode_type == INODE_TYPE_DIR)
+            dir_sess.inode->link_count++;
         dir_sess.dirty();
     }
 

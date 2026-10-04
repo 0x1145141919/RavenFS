@@ -172,6 +172,11 @@ public:
      * verbose=false（默认）只打发现/HEAP/SUM；true 逐 inode 打 WALK（大盛盘日志巨大）。 */
     result_code_t audit_dfs_root(audit_walk_report_t *rep = nullptr, FILE *out = stdout,
                                  bool verbose = false);
+    /* fsck 修复入口（D-12 骨架，下一战役实现）——本轮仅声明，无实现体：
+     * 复用 audit_dfs_root 的 DFS，在发现 DIR link_count 偏差时（repair=true）
+     * 拟修复并计入 rep->link_repaired；当前签名占位，勿调用。 */
+    result_code_t audit_fsck_root(audit_walk_report_t *rep = nullptr, FILE *out = stdout,
+                                  bool verbose = false, bool repair = false);
 private:
     uint64_t God_CTRL_WORD;
     enum regular_file_type_t{
@@ -566,7 +571,7 @@ private:
      *                     （dir 型空校验+全量回收；REG/SOFT_SYM link_count--，归零触发全量空间回收）
      * DELETE_TREE_ONLY = fsck 清理悬挂条目：inode 可能无效，只删树条目（预留，暂未使用） */
     enum delete_policy_t : uint8_t { DELETE_FULL = 0, DELETE_TREE_ONLY = 1 };
-    result_code_t dentry_leaf_entry_insert(uint64_t leaf_blk_base_idx,name_cmlpx_t* name,uint16_t idx,uint64_t&result_flags,uint8_t inode_type,uint64_t owner_dir_inode);//下沉版（2026-09-01）：分配+初始化目标 inode（DIR 急建树根/REG/SOFT_SYM 内联）+ 长名外置分配 + 树插 + owner 目录 size++/link_count=size+2；失败 guard 全回滚。result_flags: bit0=需分裂, bit1=父层max需刷新
+    result_code_t dentry_leaf_entry_insert(uint64_t leaf_blk_base_idx,name_cmlpx_t* name,uint16_t idx,uint64_t&result_flags,uint8_t inode_type,uint64_t owner_dir_inode);//下沉版（2026-09-01）：分配+初始化目标 inode（DIR 急建树根/REG/SOFT_SYM 内联）+ 长名外置分配 + 树插 + owner 目录计数维护（size++；仅 DIR 型条目 link_count++，POSIX 语义 D-12）；失败 guard 全回滚。result_flags: bit0=需分裂, bit1=父层max需刷新
     result_code_t dentry_leaf_entry_delete(uint64_t leaf_blk_base_idx,uint16_t idx,uint64_t&result_flags,bool destroy_data);//删条目+维护下游资产（DELETE_FULL 语义）：dir 型目标先校验空（NOT_EMPTY 零副作用）再删，删后全量回收（名字堆/树根 2 块/inode 槽；destroy_data 对 dir 无额外效果）；REG/SOFT_SYM 目标 link_count--，归零 → regular_file_reclaim(inum, destroy_data)（inline/direct/extent 全形态释放 + inode 槽，2026-09-07 补票）。回收失败 → RC_ERR_NOT_SUPPORTED 哨兵（树删已生效，inode 孤儿暂挂，fsck 可回收）。成功时result_flags有效，bits[0]=欠载需合并，bits[1]=父层对应entry的max需刷新
     split_result_t dentry_leaf_split(uint64_t victim_node_blkbase);//会内部进行叶子链表的维护，不会进行父节点的修改
     split_result_t dentry_inner_split(uint64_t victim_node_blkbase);//不会进行父节点的修改

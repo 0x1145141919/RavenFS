@@ -344,11 +344,6 @@ void RavenFS_juvenile::audit_walk_dir(audit_walk_ctx_t &ctx, uint64_t inum, uint
     inode_read(inum, &raw);
     const raven_dir_Inode_t *d = (const raven_dir_Inode_t *)&raw;
 
-    /* link_count == size + 2（不变量 18，自足校验） */
-    if ((uint64_t)d->link_count != d->size + 2)
-        bad_inode(ctx, "DIR inode %llu link_count=%u != size+2 (%llu)",
-                  (unsigned long long)inum, d->link_count, (unsigned long long)(d->size + 2));
-
     uint64_t root = d->data_root;
     if (root == PTR_INVALID || root >= total_blocks || (root & 1)) {
         bad_inode(ctx, "DIR inode %llu data_root 非法=%#llx", (unsigned long long)inum,
@@ -374,6 +369,25 @@ void RavenFS_juvenile::audit_walk_dir(audit_walk_ctx_t &ctx, uint64_t inum, uint
         bad_inode(ctx, "DIR inode %llu size=%llu != 实际 dentry 条目 %llu",
                   (unsigned long long)inum, (unsigned long long)d->size,
                   (unsigned long long)t.records_total);
+
+    /* link_count 校验（D-12 新契约）：POSIX 语义 link_count = 2 + 直属 DIR 型
+     * 子 inode 数（与 size 彻底解耦；size 仍 = 全部 dentry 条目数，见上）。
+     * children 为 audit_walk_btree 收集的直属子 inode 列表（可能含重复，按条目
+     * 出现次数计；重复本身由 MULTI_REF 另行捕获，本轮不改既有行为）。 */
+    {
+        uint64_t k = 0;
+        for (uint64_t c : children) {
+            if (c >= inode_count) continue;   /* 越界已由 audit_walk_btree 报 bad */
+            raven_Inode_t craw;
+            inode_read(c, &craw);
+            if (RFS_INO1_GET_TYPE(craw.word1) == INODE_TYPE_DIR) k++;
+        }
+        const uint64_t expect_lc = k + 2;
+        if ((uint64_t)d->link_count != expect_lc)
+            bad_inode(ctx, "DIR inode %llu link_count=%u 期望=%llu (子目录数 %llu)",
+                      (unsigned long long)inum, d->link_count,
+                      (unsigned long long)expect_lc, (unsigned long long)k);
+    }
 
     /* 先序下钻子目录（子目录 inode 由本目录 dentry 条目指向） */
     for (uint64_t c : children)

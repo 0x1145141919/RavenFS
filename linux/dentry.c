@@ -172,16 +172,15 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		return err;
 	}
 
-	/* 父目录计数维护：size++ / link_count = size+2 */
+	/* 父目录计数维护（D-12 POSIX）：create 目标恒为非目录 ⇒ 只 size++，
+	 * 父目录 link_count 不变（link_count = 2 + 直属 DIR 型子 inode 数）。 */
 	dr->size += 1;
-	dr->link_count = (u32)dr->size + 2;
 	dr->mtime = now.tv_sec;
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
 	dr->c_ns_stamp = (u32)now.tv_nsec;
 	RFS_ROW_MARK_DIRTY(ds->row);
 	dir->i_size = dr->size;
-	set_nlink(dir, dr->link_count);
 	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
 	inode_set_ctime(dir, now.tv_sec, now.tv_nsec);
 	mark_inode_dirty(dir);
@@ -238,15 +237,15 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 		return err;
 
 	now = current_time(dir);
+	/* 父目录计数维护（D-12 POSIX）：unlink 目标恒为非目录（目录走 rmdir）⇒
+	 * 只 size--，父目录 link_count 不变。 */
 	dr->size -= 1;
-	dr->link_count = (u32)dr->size + 2;
 	dr->mtime = now.tv_sec;
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
 	dr->c_ns_stamp = (u32)now.tv_nsec;
 	RFS_ROW_MARK_DIRTY(ds->row);
 	dir->i_size = dr->size;
-	set_nlink(dir, dr->link_count);
 	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
 	inode_set_ctime(dir, now.tv_sec, now.tv_nsec);
 	mark_inode_dirty(dir);
@@ -351,7 +350,7 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	tr->uid = i_uid_read(dir);
 	tr->gid = i_gid_read(dir);
 	tr->mode_xattr = RFS_MODE_XATTR_PACK(mode & 0o7777, RFS_XATTR_NONE);
-	tr->link_count = 2;		/* size(0) + 2 */
+	tr->link_count = 2;		/* POSIX: 2 + 0 子目录（空目录） */
 	tr->size = 0;
 	tr->data_root = new_root;
 	tr->mtime = now.tv_sec;
@@ -385,8 +384,10 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		goto fail_root;
 	}
 
+	/* 父目录计数维护（D-12 POSIX）：新条目 size++；新条目指向 DIR ⇒
+	 * 父目录 link_count++（link_count = 2 + 直属 DIR 型子 inode 数）。 */
 	dr->size += 1;
-	dr->link_count = (u32)dr->size + 2;
+	dr->link_count += 1;
 	dr->mtime = now.tv_sec;
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
@@ -487,8 +488,10 @@ int ravenfs_rmdir(struct inode *dir, struct dentry *dentry)
 	(void)rfs_allocator_block_free(sbi->alloc, t_root, 2);
 
 	now = current_time(dir);
+	/* 父目录计数维护（D-12 POSIX）：删条目 size--；被删条目为 DIR ⇒
+	 * 父目录 link_count--（link_count = 2 + 直属 DIR 型子 inode 数）。 */
 	dr->size -= 1;
-	dr->link_count = (u32)dr->size + 2;
+	dr->link_count -= 1;
 	dr->mtime = now.tv_sec;
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
@@ -512,8 +515,14 @@ int ravenfs_rmdir(struct inode *dir, struct dentry *dentry)
 
 /* ── rename（VFS 自做 d_move/d_exchange 与 flag/祖先校验；ko 只需改盘上两条） ── */
 
-/* 目录 size 增减 + link_count=size+2 同步（delta 可负） */
-static int rfs_dir_adjust(struct super_block *sb, struct inode *dir, int delta)
+/*
+ * 目录计数调整（D-12 POSIX）：size delta 与 link_count delta 彻底解耦，
+ * 由调用方显式各给一个（均可负）。
+ *   size_delta   ∈ {+1, 0, -1}：dentry 条目数增减（任何类型条目都算）。
+ *   nlink_delta  ∈ {+1, 0, -1}：直属 DIR 型子 inode 数增减（仅目录型条目算）。
+ * 每次调用都会刷 mtime/ctime 并同步 VFS i_size/i_nlink（保证 write_inode 回写同值）。
+ */
+static int rfs_dir_adjust(struct super_block *sb, struct inode *dir, int size_delta, int nlink_delta)
 {
 	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
 	struct raven_Inode_t *dr;
@@ -523,8 +532,8 @@ static int rfs_dir_adjust(struct super_block *sb, struct inode *dir, int delta)
 		return PTR_ERR(ds);
 	dr = ravenfs_session_inode(ds);
 	RFS_STAT_INC(sb, dir_nlink_adjust);	/* nlink 维护频次 */
-	dr->size = (u64)((s64)dr->size + delta);
-	dr->link_count = (u32)dr->size + 2;
+	dr->size = (u64)((s64)dr->size + size_delta);
+	dr->link_count = (u32)((s64)dr->link_count + nlink_delta);
 	now = current_time(dir);
 	dr->mtime = now.tv_sec;
 	dr->m_ns_stamp = (u32)now.tv_nsec;
@@ -609,9 +618,16 @@ int ravenfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry
 			rfs_dir_set_dotdot(sb, RFS_INO_TO_IDX(old_inode->i_ino), RFS_INO_TO_IDX(new_dir->i_ino));
 		if (new_is_dir)
 			rfs_dir_set_dotdot(sb, RFS_INO_TO_IDX(new_inode->i_ino), RFS_INO_TO_IDX(old_dir->i_ino));
-		/* R-MD-06(b)：条目“改”（EXCHANGE）也要推父目录 mtime/ctime（delta=0 只走时间戳） */
-		rfs_dir_adjust(sb, old_dir, 0);
-		rfs_dir_adjust(sb, new_dir, 0);
+		/* R-MD-06(b)：条目“改”（EXCHANGE）也要推父目录 mtime/ctime。
+		 * D-12 POSIX：size 不变（两侧条目原地交换）；父目录 link_count 按
+		 * “离开/进入该父目录的 inode 是否 DIR”分别计 delta。
+		 *   old_dir：旧名原指 old_inode（old_is_dir），现指 new_inode（new_is_dir）
+		 *            ⇒ nlink += (new_is_dir - old_is_dir)
+		 *   new_dir：旧名原指 new_inode（new_is_dir），现指 old_inode（old_is_dir）
+		 *            ⇒ nlink += (old_is_dir - new_is_dir)
+		 * 同父时两次调用在同一 inode 上复合为 0，符合“同目录内交换子目录数不变”。 */
+		rfs_dir_adjust(sb, old_dir, 0, (new_is_dir ? 1 : 0) - (old_is_dir ? 1 : 0));
+		rfs_dir_adjust(sb, new_dir, 0, (old_is_dir ? 1 : 0) - (new_is_dir ? 1 : 0));
 		now = current_time(old_dir);
 		inode_set_ctime(old_inode, now.tv_sec, now.tv_nsec);
 		mark_inode_dirty(old_inode);
@@ -696,9 +712,14 @@ int ravenfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry
 	if (err)
 		goto out_heap;
 
-	/* 计数：old_dir -1；new_dir = +1(新) - (目标?1:0) */
-	rfs_dir_adjust(sb, old_dir, -1);
-	rfs_dir_adjust(sb, new_dir, new_inode ? 0 : 1);
+	/* ── 计数（D-12 POSIX：size 与 link_count 解耦） ──
+	 * size：old_dir -1；new_dir = +1(新) - (目标?1:0)。
+	 * link_count：old_dir 搬走 DIR 型源条目则 -1；new_dir 搬入 DIR 型源条目 +1，
+	 *             且被覆盖目标若为 DIR 再 -1。
+	 * 注：old_dir 与 new_dir 同 inode（同父）时两次调用顺序复合，结果正确。 */
+	rfs_dir_adjust(sb, old_dir, -1, old_is_dir ? -1 : 0);
+	rfs_dir_adjust(sb, new_dir, new_inode ? 0 : 1,
+		       (old_is_dir ? 1 : 0) - (new_is_dir ? 1 : 0));
 
 	/* 跨目录移动目录 → 改盘上父指针 */
 	if (old_is_dir && old_dir != new_dir)
@@ -722,7 +743,9 @@ out_heap:
  *   ko-requirements-spec §4.3（get_link fast/slow 双态）。
  * ══════════════════════════════════════════════════════════════════ */
 
-/* 在 dir 下插入「名字 → inum」条目，并维护父目录 size/link_count（=size+2）/时间戳。
+/* 在 dir 下插入「名字 → inum」条目，并维护父目录 size / 时间戳。
+ * 本函数仅服务于 link(2)/symlink/mknod（目标恒为非目录）⇒ 只 size++，父目录
+ * link_count 不变（D-12 POSIX：link_count = 2 + 直属 DIR 型子 inode 数）。
  * 含长名（>40）名字堆分配；任何失败自回滚名字堆，零残留（对应 create/mkdir 的同款纪律）。 */
 static int rfs_dir_link_inode(struct super_block *sb, struct inode *dir,
 			      const struct dentry *dentry, u64 inum)
@@ -771,8 +794,8 @@ static int rfs_dir_link_inode(struct super_block *sb, struct inode *dir,
 	}
 
 	now = current_time(dir);
+	/* D-12 POSIX：目标恒为非目录 ⇒ 只 size++，父目录 link_count 不动。 */
 	dr->size += 1;
-	dr->link_count = (u32)dr->size + 2;
 	dr->mtime = now.tv_sec;
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
@@ -870,7 +893,7 @@ int ravenfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *de
 	if (tr->link_count >= (u32)-1)
 		return -EMLINK;
 
-	/* 目标名不存在（内部 walk 查重）→ 插 dentry + 父目录 size/link_count */
+	/* 目标名不存在（内部 walk 查重）→ 插 dentry + 父目录 size++（非 DIR 目标不动 link_count） */
 	err = rfs_dir_link_inode(sb, dir, dentry, RFS_INO_TO_IDX(inode->i_ino));
 	if (err)
 		return err;

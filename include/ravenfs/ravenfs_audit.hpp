@@ -73,6 +73,12 @@ struct audit_walk_report_t {
                multi_claim_blk + link_mismatch + dotdot_mismatch +
                unprotected_blk + unprotected_ino + leaked_blk + leaked_ino;
     }
+
+    /* ── fsck 修复计数（D-12；仅骨架，本轮不写盘）──
+     * link_repaired = 本轮「拟修复」的 DIR link_count 偏差条数。语义是修复
+     * 动作计数，**不是** bad 计数，故显式不纳入 total_bad()（保持 total_bad
+     * 只反映"发现的不变量违例"这一既有口径）。 */
+    uint64_t link_repaired = 0;
 };
 
 /* ── 可达性审计上下文（递归携带；瘦身 = 两张影子图 + 白名单 + 路径栈 + 计数）──
