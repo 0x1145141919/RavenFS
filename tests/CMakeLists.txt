@@ -136,6 +136,38 @@ add_executable(ravenfs_juv_pwrite_big
 )
 target_link_libraries(ravenfs_juv_pwrite_big PRIVATE ravenfs_juvenile)
 
+# v1.1 mgr_slice_t 主从红黑树分片分配器单测（2026-10-03）：
+# enable/test_interval/free_interval/free_intervals/all_dump/soft_occupy
+add_executable(ravenfs_juv_fs_allocator
+    test_fs_allocator.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_fs_allocator PRIVATE ravenfs_juvenile)
+
+# v1.1 fs_allocator_t 路由层单测（2026-10-03）：分片推导 / hard / soft 回滚 /
+# occupy 跨片续圈 / 跨片 free / inode / 审计 / all_syn 缺口
+add_executable(ravenfs_juv_fs_allocator_router
+    test_fs_allocator_router.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_fs_allocator_router PRIVATE ravenfs_juvenile)
+
+# 2026-10-04 新树版分片分配器原型可靠性压测（只增测试，不改生产代码）：
+#   slice 级：mgr_slice_t 单线程随机+对抗（影子账本全量对账，ops ≥ 2e5）
+add_executable(ravenfs_stress_fs_allocator_slice
+    stress_fs_allocator_slice.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_stress_fs_allocator_slice PRIVATE ravenfs_juvenile)
+
+#   mt 级：fs_allocator_t 8 线程集成压力（并发分配/归还 + 无重复交付影子账本；
+#          自带强定义 get_processor_id，逐线程独立伪 CPU）
+add_executable(ravenfs_stress_fs_allocator_mt
+    stress_fs_allocator_mt.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_stress_fs_allocator_mt PRIVATE ravenfs_juvenile Threads::Threads)
+
 # 可达性审计（新模型，2026-09-30）：root 先序 DFS + 两张影子图 + XOR 对账
 add_executable(ravenfs_juv_audit_dfs
     test_audit_dfs.cpp
