@@ -342,6 +342,16 @@ private:
  *   - self_reliat ：用户态缓存（双档：CTRL_ARRAY ≤13 / RADIX >13），
  *                   构造懒加载 + accessor 占坑，dirty() 页粒度脏标记，
  *                   析构 self_reliat_put 释放（blkidx 无需 token，put 重解位域）
+ *
+ * 允许同 blkidx 嵌套（业务大量存在：victim_sess+new_sess、位图面多负载片
+ * sess+sess2；2026-08-30 修复旧「读锁泄漏到 put」导致的内层建链自死锁）：
+ *   · 分片读锁只在 slice::get 内（返回即释，不跨会话）；
+ *   · 会话期只持 accessor 计数（+1/-1 可重入），put/mark_dirty 无锁走
+ *     「只增不删」的表（本会话路径已由 get 物化，locate 必命中）。
+ * 嵌套可见性按后端：
+ *   · self_reliat（CTRL_ARRAY/RADIX）/ offload：同一 8K 页，读写互通；
+ *   · no_cache：每会话自管独立 8K 缓冲，同 blkidx 嵌套无一致性（各自 dirty
+ *     会后写覆盖），仅只读嵌套安全。
  * ═══════════════════════════════════════════════════════════════════ */
 class mdata_piece_session {
     mdata_piece_caches_mgr *mgr_ = nullptr;
@@ -447,7 +457,7 @@ private:
         case cache_work_mode_t::offload_cache:
             break;   /* 内核页缓存管一致性，无需释放 */
         case cache_work_mode_t::self_reliat_cache:
-            if (data) mgr_->self_reliat_put(blkidx_);   /* accessor-1 + RADIX 释放片读锁 */
+            if (data) mgr_->self_reliat_put(blkidx_);   /* accessor-1（无锁；读锁已随 get 释放） */
             break;
         }
         data = nullptr;

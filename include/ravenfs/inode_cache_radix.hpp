@@ -356,6 +356,15 @@ private:
  * InodeSession — RAII 会话（接口统一，决策见 209433a）
  * 锁只维护状态原子性，绝不持锁做 I/O；accessor > 0 保证会话
  * 期间行不被淘汰（RADIX 模式下语义，FULL_RAM/CTRL_ARRAY 天然安全）
+ *
+ * 允许同 inum 嵌套（业务大量存在：tgt_sess + name_data_release 等）：
+ *   · 分片读锁只在 slice::get 内（返回即释，不跨会话）；
+ *   · 会话期只持 accessor 计数（+1/-1 可重入），put/mark_dirty 无锁
+ *     走「只增不删」的表（本会话路径已由 get 物化，locate 必命中）。
+ * 嵌套可见性按后端：
+ *   · self_reliat（FULL_RAM/CTRL_ARRAY/RADIX）/ offload：同一行/页，读写互通；
+ *   · no_cache：每会话自管独立 4K 缓冲，同 inum 嵌套无一致性（各自 dirty
+ *     会后写覆盖），仅只读嵌套安全。
  * ═══════════════════════════════════════════════════════════════════ */
 class InodeSession {
     Inode_cache_mgr_t *mgr_ = nullptr;
@@ -411,7 +420,7 @@ public:
         }
     }
 
-    /* move-only，禁拷贝；token 随会话搬移（RADIX 读锁归属跟随会话）；
+    /* move-only，禁拷贝；token 随会话搬移（RADIX 分片定位用；读锁不跨会话，不随会话搬移）；
      * no_cache 的缓冲与脏标记随搬，源对象置空。 */
     InodeSession(InodeSession &&o) noexcept
         : mgr_(o.mgr_), inum_(o.inum_), token(o.token),

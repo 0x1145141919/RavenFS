@@ -287,7 +287,7 @@ void mdata_piece_caches_mgr::self_reliat_put(uint64_t blkidx) {
         ctrl_array_[piece_idx].ctrl_word.fetch_sub(CTRL_ACCESSOR_INC, std::memory_order_relaxed);
         break;
     case MDP_MODE_RADIX_SHARD:
-        /* 重新 decode 定位分片（与 get 一致）；slice::put 内 accessor-1 + 释放片读锁 */
+        /* 重新 decode 定位分片（与 get 一致）；slice::put 内 accessor-1（无锁） */
         {
             bitfield_decoded_result_t d = decode(piece_idx, global_slice_plan);
             if (d.chunks[0] < n_slices_ && slices_[d.chunks[0]])
@@ -312,7 +312,7 @@ void mdata_piece_caches_mgr::self_reliat_mark_dirty(uint64_t blkidx) {
         break;
     }
     case MDP_MODE_RADIX_SHARD: {
-        /* 会话内调用（本线程已持片读锁）→ slice::mark_dirty 无锁走路径安全 */
+        /* 会话内调用；slice::mark_dirty 无锁走路径安全（树只增不删，读锁不跨会话） */
         bitfield_decoded_result_t d = decode(piece_idx, global_slice_plan);
         if (d.chunks[0] < n_slices_ && slices_[d.chunks[0]])
             slices_[d.chunks[0]]->mark_dirty(&d);

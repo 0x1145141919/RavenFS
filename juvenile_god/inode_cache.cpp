@@ -448,7 +448,7 @@ raven_Inode_t *Inode_cache_mgr_t::self_reliat_get(uint64_t inum, slice_cache_acc
 
     case CACHE_MODE_RADIX_SHARD: {
         /* 分片树：decode 位域 → chunks[0] 选片，树内逐层寻址（见 slice_radix_tree::get）。
-         * token 携带 slice_idx（put 释放片读锁用）。 */
+         * token 携带 slice_idx（put 重新定位同一分片用）。 */
         bitfield_decoded_result_t d = decode(inum, global_slice_plan);
         if (out_token) out_token->slice_idx = d.chunks[0];
         slice_radix_tree *s = slices_[d.chunks[0]];
@@ -462,7 +462,7 @@ raven_Inode_t *Inode_cache_mgr_t::self_reliat_get(uint64_t inum, slice_cache_acc
     }
 }
 
-/* ── self_reliat_put：accessor 计数 -1（须与 get 配对，上层保证；token 供 RADIX 定位分片释放读锁） ── */
+/* ── self_reliat_put：accessor 计数 -1（须与 get 配对，上层保证；token 供 RADIX 定位分片） ── */
 void Inode_cache_mgr_t::self_reliat_put(uint64_t inum, const slice_cache_acces_token_t &token) {
     (void)token;
     if (backed_mode != cache_work_mode_t::self_reliat_cache) return;
@@ -475,7 +475,7 @@ void Inode_cache_mgr_t::self_reliat_put(uint64_t inum, const slice_cache_acces_t
         ctrl_array_[line_of(inum)].ctrl_word.fetch_sub(CTRL_ACCESSOR_INC, std::memory_order_relaxed);
         break;
     case CACHE_MODE_RADIX_SHARD:
-        /* 重新 decode 定位分片（与 get 一致）；slice::put 内 accessor-1 + 释放片读锁 */
+        /* 重新 decode 定位分片（与 get 一致）；slice::put 内 accessor-1（无锁） */
         if (token.slice_idx < n_slices_ && slices_[token.slice_idx]) {
             bitfield_decoded_result_t d = decode(inum, global_slice_plan);
             slices_[token.slice_idx]->put(&d);
@@ -501,7 +501,7 @@ void Inode_cache_mgr_t::self_reliat_mark_dirty(uint64_t inum) {
         break;
     }
     case CACHE_MODE_RADIX_SHARD: {
-        /* 会话内调用（本线程已持片读锁）→ slice::mark_dirty 无锁走路径安全 */
+        /* 会话内调用；slice::mark_dirty 无锁走路径安全（树只增不删，读锁不跨会话） */
         bitfield_decoded_result_t d = decode(inum, global_slice_plan);
         if (d.chunks[0] < n_slices_ && slices_[d.chunks[0]])
             slices_[d.chunks[0]]->mark_dirty(&d);
