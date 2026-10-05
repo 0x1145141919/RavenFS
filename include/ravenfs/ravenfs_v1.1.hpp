@@ -39,8 +39,9 @@ class bitmap_slices_mgr_t;      /* 双位图分片分配器（bitmap_slices.hpp�
  *    读入内存数组（磁盘布局位序原样映射），alloc/free 只改内存态，
  *    **析构（卸载）时全量写回**（速度优先；幼年期接受掉电丢位图更新，
  *    不追求事务安全）。两组接口：block 组 / inode 组。
- * 3. 名字上限 RAVENFS_MAX_NAME_LEN=552B：≤40B 内联（Dentry_t.name），>40B 走
- *    名字堆（每目录固定 10 描述符，见 disk_layout_v1.1.md §7）。
+ * 3. 名字上限 RAVENFS_MAX_NAME_LEN=552B：≤40B 内联（ddentry_t.name），>40B 走
+ *    目录名字数据面（字节粒度逻辑空间 + 映射树 + fr 空闲区间树，见
+ *    Docs/disk_layout_v1.3_name_data_plane.md）。
  * 4. 删除 = 物理删除（v1.1 §6.5）：memmove + 刷父 hash_max（上界路由
  *    对称代价，必走路径）；欠载不合并（min occupancy 待定，幼年期跳过）。
  * 5. hash 用 XXH64（seed=0，v1.1 §9 已定；64 位熵 + 跨挂载稳定，
@@ -114,7 +115,7 @@ public:
      * 全部以根目录为唯一操作对象，path 概念不存在。
      * ══════════════════════════════════════════════════════════ */
     /* 正版入口：按 inode_type 初始化新 inode ——
-     *   INODE_TYPE_DIR    : 新建 dir inode（0755/link_count=2/名字堆哨兵）+
+     *   INODE_TYPE_DIR    : 新建 dir inode（0755/link_count=2/名字数据面空态哨兵）+
      *                       急建其 dentry 树根（根叶子 2 块，magic + . / .. 指针）；
      *   REGULAR/SOFT_SYM  : 内联空 inode（0644/link_count=1/data_root=PTR_INVALID）
      * 之后统一插入 dentry 树。name 已存在 → RC_ERR_EXIST；
@@ -133,8 +134,9 @@ public:
      * destroy_data = 销毁模式：数据块 free 前清零（防恢复）；false = 仅释放（块标
      * free，数据残留盘上，同 TRIM 语义）。
      * dir 型目标：删除前置校验目录必须全空（树根叶子 entry_count==0），
-     * 非空 → RC_ERR_NOT_EMPTY；空目录连带回收名字堆 + 释放树根 2 块；
-     * destroy_data 对 dir 型无额外效果（名字堆块不清零，KISS）。
+     * 非空 → RC_ERR_NOT_EMPTY；空目录连带 name_data_release 全量回收名字数据面
+     * （数据片 + 映射树 + fr 树）+ 释放树根 2 块；
+     * destroy_data 对 dir 型无额外效果（名字数据面块不清零，KISS）。
      * REG/SOFT_SYM 目标：link_count--，归零 → regular_file_reclaim（按形态
      * inline/direct/extent 释放数据 + inode 槽；extent 型叶链遍历释放数据块 +
      * 自底向上释放树节点，零泄露）。回收失败 → RC_ERR_NOT_SUPPORTED 哨兵
@@ -623,7 +625,7 @@ private:
      * DELETE_TREE_ONLY = fsck 清理悬挂条目：inode 可能无效，只删树条目（预留，暂未使用） */
     enum delete_policy_t : uint8_t { DELETE_FULL = 0, DELETE_TREE_ONLY = 1 };
     result_code_t dentry_leaf_entry_insert(uint64_t leaf_blk_base_idx,name_cmlpx_t* name,uint16_t idx,uint64_t&result_flags,uint8_t inode_type,uint64_t owner_dir_inode);//下沉版（2026-09-01）：分配+初始化目标 inode（DIR 急建树根/REG/SOFT_SYM 内联）+ 长名外置分配 + 树插 + owner 目录计数维护（size++；仅 DIR 型条目 link_count++，POSIX 语义 D-12）；失败 guard 全回滚。result_flags: bit0=需分裂, bit1=父层max需刷新
-    result_code_t dentry_leaf_entry_delete(uint64_t leaf_blk_base_idx,uint16_t idx,uint64_t&result_flags,bool destroy_data);//删条目+维护下游资产（DELETE_FULL 语义）：dir 型目标先校验空（NOT_EMPTY 零副作用）再删，删后全量回收（名字堆/树根 2 块/inode 槽；destroy_data 对 dir 无额外效果）；REG/SOFT_SYM 目标 link_count--，归零 → regular_file_reclaim(inum, destroy_data)（inline/direct/extent 全形态释放 + inode 槽，2026-09-07 补票）。回收失败 → RC_ERR_NOT_SUPPORTED 哨兵（树删已生效，inode 孤儿暂挂，fsck 可回收）。成功时result_flags有效，bits[0]=欠载需合并，bits[1]=父层对应entry的max需刷新
+    result_code_t dentry_leaf_entry_delete(uint64_t leaf_blk_base_idx,uint16_t idx,uint64_t&result_flags,bool destroy_data);//删条目+维护下游资产（DELETE_FULL 语义）：dir 型目标先校验空（NOT_EMPTY 零副作用）再删，删后全量回收（名字数据面/树根 2 块/inode 槽；destroy_data 对 dir 无额外效果）；REG/SOFT_SYM 目标 link_count--，归零 → regular_file_reclaim(inum, destroy_data)（inline/direct/extent 全形态释放 + inode 槽，2026-09-07 补票）。回收失败 → RC_ERR_NOT_SUPPORTED 哨兵（树删已生效，inode 孤儿暂挂，fsck 可回收）。成功时result_flags有效，bits[0]=欠载需合并，bits[1]=父层对应entry的max需刷新
     split_result_t dentry_leaf_split(uint64_t victim_node_blkbase);//会内部进行叶子链表的维护，不会进行父节点的修改
     split_result_t dentry_inner_split(uint64_t victim_node_blkbase);//不会进行父节点的修改
     result_code_t dentry_spilt_parent_apply(uint64_t parent_node_blkbase,uint16_t victim_in_node_id,split_result_t result,bool&is_parent_spilt_acquire);

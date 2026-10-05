@@ -13,7 +13,7 @@
  *
  * 与 extent 树的键语义差异（126 阶 dentry vs 337 阶 extent）：
  *   - 叶子序 = 复合序：hash 主序 + 冲突降级完整名字比较（name_cmp，
- *     >40B 自动读名字堆外置部分）——无"区间覆盖"概念，命中 = hash+name 全等；
+ *     >40B 自动读名字数据面外置部分）——无"区间覆盖"概念，命中 = hash+name 全等；
  *   - 内部路由 = hash_max ≥ target（最小上界，lower_bound 语义）；
  *     extent 是 >（半开区间 key），不可互抄；
  *   - child_idx 为 uint8_t 直赋：126 阶 hint_idx 恒 ≤125，无截断问题
@@ -117,7 +117,7 @@ result_code_t RavenFS_juvenile::dentry_Bptree_walk(uint64_t root_blk_idx, bptree
  * 落入名字比较，无需先定位 hash 区间再扫名字。
  *
  * 名字比较：按 (hash, name) 复合序——hash 不等走 hash，相等降级
- * dentry_name_cmp 完整名字比较（>40B 自动读名字堆外置部分，§7）。
+ * dentry_name_cmp 完整名字比较（>40B 自动读名字数据面外置部分，§7）。
  * ═══════════════════════════════════════════════════════════════ */
 /* ── dentry 完整名字比较 ──
  * 树内条目 e 的完整名字 = e.name[0..min(40,e_len)) +（e_len>40 时）堆外置尾部。

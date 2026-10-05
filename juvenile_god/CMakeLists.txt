@@ -18,8 +18,9 @@
 #     extent_balance.cpp     — 欠载平衡域（node_balance / root_shrink / balance_from）
 #     extent_map_unmap.cpp   — map/unmap 原语对（预算池原子，2026-09-07）
 #     extent_rebuild.cpp     — 激进重建（全量融合，可并对全并 + 均分重打包）
-# root_dir.cpp         — root_dir 顶层业务（Sparrow 手写）
-# name_heap.cpp        — 名字堆：长名外置分配/释放/读写（Raven 实现）
+# root_dir.cpp         — dir_* 顶层业务（任意目录；root_dir_* 薄封装转发）
+# name_data_plane.cpp  — 目录名字数据面：长名外置分配/释放/读写（映射树 + fr 树）
+# name_data_freeranges.cpp — fr 空闲区间 B+树机械（best-fit / 分裂级联 / 空叶退役）
 # inode_cache.cpp      — inode 缓存三模式（FULL_RAM / CTRL_ARRAY 已实现，RADIX 草稿）
 # mdata_piece_cache.cpp — 8K 元数据负载片缓存 self_reliat 双档（CTRL_ARRAY ≤13 / RADIX >13）
 # audit.cpp         — 静态合法性审计（audit_inode 模块；复用位图+缓存；Docs/audit_inode_design.md）

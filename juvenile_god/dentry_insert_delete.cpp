@@ -7,11 +7,11 @@
  * （原 dentry_tree.cpp 拆出，2026-09-07）
  *
  * 本文件负责：
- *   dentry_leaf_entry_insert（插条目即建下游：inode/名字堆/树根，guard 回滚）
+ *   dentry_leaf_entry_insert（插条目即建下游：inode/名字数据面/树根，guard 回滚）
  *   dentry_leaf_entry_delete（物理删除 + 下游资产维护，DELETE_FULL）
  *
  * 与纯树机械（split/balance，见兄弟文件）的分界：本文件条目操作携带
- * 下游资产副作用（inode 槽 / 名字堆 / owner 目录计数 / 归零回收），
+ * 下游资产副作用（inode 槽 / 名字数据面 / owner 目录计数 / 归零回收），
  * 失败 guard 全自动回滚；分裂/欠载不在本文件内处理——result_flags
  * 上抛，由上层（root_dir / dentry 调用链）驱动结构机械。
  * ═══════════════════════════════════════════════════════════════════ */
@@ -26,7 +26,7 @@
  * 下游资产创建（宗旨：插条目即建下游，与 delete 对称）：
  *   1. 分配 + 初始化目标 inode：DIR 急建空根叶子 + dir inode（size=0/
  *      link_count=2）；REG/SOFT_SYM 内联空 inode（link_count=1）
- *   2. 长名（>40B）：owner 目录名字堆分配外置存储 + 写尾部
+ *   2. 长名（>40B）：owner 目录名字数据面分配外置存储 + 写尾部
  *   3. memmove 树插（消费 name->inum / full_char_remain_offset）
  *   4. owner 目录计数维护：size++（全部条目）；仅 DIR 型条目 link_count++
  *   失败：inode_guard / block_guard / heap_guard 全自动回滚。
@@ -211,7 +211,7 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
  *
  * 下游资产维护（2026-09-01 下沉，宗旨：删条目即维护下游）：
  *   - dir 型目标：树删**前**校验空（NOT_EMPTY 零副作用），删后全量回收
- *     （名字堆 → 树根 2 块 → inode 槽）；
+ *     （名字数据面 → 树根 2 块 → inode 槽）；
  *   - REG/SOFT_SYM 目标：link_count--，归零 → regular_file_reclaim 全量
  *     回收（2026-09-07 补票：inline/direct/extent 全形态释放数据 + inode 槽，
  *     零泄露；destroy_data=true 时数据块 free 前清零）。回收失败 →

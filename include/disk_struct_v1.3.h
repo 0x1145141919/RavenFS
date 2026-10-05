@@ -276,7 +276,7 @@ struct raven_Inode_t {
     uint32_t  m_ns_stamp;       /* [16:20)  mtime 纳秒余数                          */
     uint32_t  c_ns_stamp;       /* [20:24)  ctime 纳秒余数                          */
     uint32_t  a_ns_stamp;       /* [24:28)  atime 纳秒余数                          */
-    uint32_t  link_count;       /* [28:32)  REG/LNK=指向本 inode 的 dentry 数；DIR=size+2 */
+    uint32_t  link_count;       /* [28:32)  REG/LNK=指向本 inode 的 dentry 数；DIR=2+直属 DIR 子 inode 数（D-12 POSIX） */
     uint64_t  mode_xattr;       /* [32:40)  mode:12 | xattr_ptr:52（原 permission_bits） */
     uint64_t  size;             /* [40:48)  字节数 / 目录条目数                      */
     uint64_t  mtime;            /* [48:56)  秒                                      */
@@ -336,13 +336,13 @@ struct raven_dir_Inode_t {
     uint32_t  m_ns_stamp;
     uint32_t  c_ns_stamp;
     uint32_t  a_ns_stamp;
-    uint32_t  link_count;       /* = size + 2（2 = . .. 合成引用约定，随 size 同步写） */
+    uint32_t  link_count;       /* POSIX：2 + 直属 DIR 型子 inode 数（空目录=2；与 size 解耦，D-12；. / .. 由 ptrs[0]/ptrs[1] 合成） */
     uint64_t  mode_xattr;       /* mode:12 | xattr_ptr:52 */
     uint64_t  size;
     uint64_t  mtime;
     uint64_t  ctime;
     uint64_t  atime;
-    uint64_t  ddentry_Bptree_root;        /* PTR_INVALID说明根B+树没有构建 */
+    uint64_t  ddentry_Bptree_root;        /* dentry 树根块号；dir 恒有效（PTR_INVALID=内部契约违反，不变量 11） */
     uint64_t  name_data_ctl;      /* [0]=direct(1)/tree(0)；[1:52)=数据面映射树根块号（8K 对齐，bit0 借位）；[52:64)=保留 */
     uint64_t  name_data_piece_count;      /* [0:51)=数据片数原值（片=8K）；[51:64)=保留 */
     uint64_t  name_data_free_ranges_ctl;  /* [0]=inline(1)/tree(0)；[1:52)=空闲区间树根块号（8K 对齐，bit0 借位）；[52:64)=保留 */

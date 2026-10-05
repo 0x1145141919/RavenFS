@@ -11,17 +11,16 @@
  *   每目录一个**稠密、无空洞、8K 对齐**的逻辑字节空间：
  *     · 映射     name_data_ctl              direct(1)/tree(0) + 指针（51 位）
  *     · 片数     name_data_piece_count      实际 8K 数据片数原值
- *     · 空闲区间 name_data_free_ranges_ctl   inline 表 / fr B+树（下一阶段）
+ *     · 空闲区间 name_data_free_ranges_ctl   fr B+树（inline 表尚未实现，恒 tree 态）
  *   长名（>40B）tail（≤512B）由本层分配逻辑区间；ddentry 存逻辑偏移
  *   full_char_remain_offset，经映射解析到物理。
  *
- * ── 分配粒度（本轮定：片粒度）──
- *   一个长名 tail 独占一个 8K 数据片（tail ≤512B，片起点对齐），逻辑偏移 =
- *   片序号 × 8K。理由：契约无"已用字节前沿"字段，只有 piece_count（= 片数，
- *   数据面恒 piece_count×8K）。片粒度下逻辑空间 = 稠密片序列，物理可离散；
- *   空闲区间即"已释放的整片"（删长名产生），复用随 fr 树落地。
- *   （若将来要片内打包，需引入前沿字段或把"未分配尾部"也纳入 free_range，
- *    均超出当前契约，另行决策。）
+ * ── 分配粒度（2026-10-05 定：字节粒度）──
+ *   逻辑空间 [0, pieces×8K) 内按**字节**分配：空闲区间 = 删长名释放 ∪ 新片未
+ *   分配尾部，分配取 best-fit（最小 len ≥ 需求，见 name_data_freeranges.cpp）。
+ *   一个 8K 数据片可容纳多个 tail（片内字节打包）；fr 无 len ≥ 需求才
+ *   name_data_grow 增片。可能的优化：inline 空闲表
+ *   （possible_inline_free_ranges[9]）当前未实现，小目录恒走 fr 树。
  *
  * ── 映射（复用通用 extent 树机械，kind = EXTENT_TREE_NAMEDATA）──
  *   direct(1) = 单连续物理段：物理块 = base + 逻辑块；逻辑块 = 偏移>>12。

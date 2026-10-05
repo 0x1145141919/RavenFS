@@ -4,7 +4,7 @@
 #include <cstring>
 
 /* ═══════════════════════════════════════════════════════════════════
- * root_dir.cpp — RavenFS v1.1 目录 dentry 顶层业务（调 dentry 树层 + 名字堆）
+ * root_dir.cpp — 目录 dentry 顶层业务（调 dentry 树层 + 名字数据面）
  *
  * dir_insert_dentry / dir_rm_dentry / dir_lookup —— 任意目录（inode_idx 指定）
  * root_dir_* —— root 专属薄封装（内部转调 dir_*）
@@ -241,9 +241,9 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
     mdata_piece_session leaf_sess(mdata_piece_mgr, leaf_blk);
     if (leaf_sess.index_error()) return RC_ERR_STATE;
     if (!leaf_sess) return RC_ERR_IO;
-    Bptree_ddentry_leaf_node_t *leaf = (Bptree_ddentry_leaf_node_t*)leaf_sess.data;   /* 只读（取名字堆信息） */
+    Bptree_ddentry_leaf_node_t *leaf = (Bptree_ddentry_leaf_node_t*)leaf_sess.data;   /* 只读（取名字数据面信息） */
 
-    /* 名字堆信息必须在删除（memmove）**之前**取 */
+    /* 名字数据面信息必须在删除（memmove）**之前**取 */
     const uint16_t e_name_len = (uint16_t)RFS_PTR_FREE(leaf->entries[idx].inode_ptr);
     const uint64_t e_remain   = leaf->entries[idx].full_char_remain_offset;
 

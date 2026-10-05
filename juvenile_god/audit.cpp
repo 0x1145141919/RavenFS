@@ -365,7 +365,7 @@ void RavenFS_juvenile::audit_walk_inode(audit_walk_ctx_t &ctx, uint64_t inum, ui
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * audit_walk_dir — DIR 字段校验 + 名字堆 + dentry 树 DFS + 子目录下钻
+ * audit_walk_dir — DIR 字段校验 + 名字数据面 + dentry 树 DFS + 子目录下钻
  * ═══════════════════════════════════════════════════════════════════ */
 void RavenFS_juvenile::audit_walk_dir(audit_walk_ctx_t &ctx, uint64_t inum, uint64_t parent_inum)
 {
@@ -617,7 +617,7 @@ uint64_t RavenFS_juvenile::audit_walk_btree(audit_walk_ctx_t &ctx,
                               name_len, (unsigned)RAVENFS_MAX_NAME_LEN);
 
                 /* 名字重建（≤40 内联 / >40 经目录名字数据面读）→ hash 重算。
-                 * v1.3 名字堆已退役；完整双树校验由 audit 独立轨实现（TODO）。 */
+                 * v1.3 名字堆已退役；映射树/fr 树完整校验见 audit_name_data_plane（独立轨）。 */
                 char full[RAVENFS_MAX_NAME_LEN + 1];
                 const uint16_t ncopy = name_len < DENTRY_INLINE_NAME_MAX ? name_len : DENTRY_INLINE_NAME_MAX;
                 std::memcpy(full, e.name, ncopy);
