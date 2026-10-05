@@ -110,7 +110,7 @@ enum rfs_inode_type {
 /* ═══════════════════════════════════════════════════════════════════════════
  * 常量 / 哨兵
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define RAVENFS_VERSION          3u          /* v1.2 = 3（v1.1 = 2，不兼容） */
+#define RAVENFS_VERSION          4u          /* v1.3 = 4（v1.2 = 3，不兼容） */
 #define DENTRY_INLINE_NAME_MAX   40u         /* name 内联上限：≤40 内联，>40 外置 */
 #define RAVENFS_MAX_NAME_LEN     (DENTRY_INLINE_NAME_MAX + 512u)  /* 552B */
 #define PTR_INVALID              (~0ULL)     /* 通用无效指针哨兵 */
@@ -401,6 +401,12 @@ RFS_STATIC_ASSERT(sizeof(struct raven_dir_Inode_t) == 256, "raven_dir_Inode_t mu
     do { (x) = (((x) & ~(RFS_ND_CTL_PTR_MASK << RFS_ND_CTL_PTR_SHIFT)) | \
                ((((uint64_t)(v)) & RFS_ND_CTL_PTR_MASK) << RFS_ND_CTL_PTR_SHIFT)); } while (0)
 
+/* 无效指针 / 空态哨兵（2026-10-05 定）：指针域 [1:52) 全 1 = **无效指针**
+ *   （对齐 NAME_HEAP_INACTIVE / PTR_INVALID 的「全 1 = 无效」惯例）。
+ * 空（未激活）态 = inline=1 ∧ ptr 全 1 ∧ rsv 全 1 ⇒ **整字全 0xF**。*/
+#define RFS_ND_CTL_PTR_INVALID  RFS_MASK51   /* [1:52) 全 1 = 无效指针 */
+#define RFS_ND_CTL_INACTIVE     (~0ULL)      /* 空态整字：inline=1 ∧ ptr=全1 ∧ rsv=全1 */
+
 /* ── name_data_piece_count ──
  * 存储 = 实际片数 / 2（2026-10-05 确认：读 <<1 得实际片数，片 = 8K）。
  * ⚠ 该编码只能表达**偶数**片数（奇数片数无法表示）——若数据面保证偶数片，
@@ -439,6 +445,10 @@ RFS_STATIC_ASSERT(sizeof(struct raven_dir_Inode_t) == 256, "raven_dir_Inode_t mu
 #define RFS_ND_FR_CTL_SET_PTR(x, v) \
     do { (x) = (((x) & ~(RFS_ND_FR_CTL_PTR_MASK << RFS_ND_FR_CTL_PTR_SHIFT)) | \
                ((((uint64_t)(v)) & RFS_ND_FR_CTL_PTR_MASK) << RFS_ND_FR_CTL_PTR_SHIFT)); } while (0)
+
+/* 无效指针 / 空态哨兵（同 name_data_ctl）*/
+#define RFS_ND_FR_CTL_PTR_INVALID  RFS_MASK51   /* [1:52) 全 1 = 无效指针 */
+#define RFS_ND_FR_CTL_INACTIVE     (~0ULL)      /* 空态整字：inline=1 ∧ ptr=全1 ∧ rsv=全1 */
 
 /* ── name_data_free_ranges_count（全域；无位域）── */
 #define RFS_ND_FR_COUNT(x)        ((uint64_t)(x))

@@ -272,16 +272,35 @@ static uint64_t rand_range(uint64_t lo, uint64_t hi, uint64_t *seed) {
     return lo + (*seed % (hi - lo));
 }
 
+/* 格式号 → SB.version（与各版盘面 RAVENFS_VERSION 对齐：v1.1=2 · v1.2=3 · v1.3=4） */
+uint32_t mkfs_fmt_version(MkfsFormat f) {
+    switch (f) {
+    case MKFS_FMT_V1_1: return 2u;
+    case MKFS_FMT_V1_2: return 3u;
+    case MKFS_FMT_V1_3: return 4u;
+    }
+    return 3u;   /* 不可达：枚举错误兜底 = v1.2 */
+}
+
+const char *mkfs_fmt_name(MkfsFormat f) {
+    switch (f) {
+    case MKFS_FMT_V1_1: return "v1.1";
+    case MKFS_FMT_V1_2: return "v1.2";
+    case MKFS_FMT_V1_3: return "v1.3";
+    }
+    return "v1.2";
+}
+
 static void build_superblock(RavenSuperblock *sb, const MkfsParams &p,
                               const FsGeometry &geo,
                               const uint64_t *backup_blocks) {
     memset(sb, 0, sizeof(*sb));
     sb->magic          = SUPERBLOCK_MAGIC;
-    sb->version        = p.v11 ? 2u : RAVENFS_VERSION;   /* v1.1=2 / v1.2=3（god 只认 2） */
+    sb->version        = mkfs_fmt_version(p.fmt);   /* v1.1=2 / v1.2=3 / v1.3=4 */
     sb->world_base_lba = p.world_base_lba;
     sb->total_blocks   = geo.total_blocks;
     sb->inode_array_count = p.inode_count;
-    sb->root_inode     = p.v11 ? 0 : MKFS_ROOT_INODE; /* v1.1 root=0 / v1.2 root=MKFS_ROOT_INODE（mkfs 局部值，非契约） */
+    sb->root_inode     = (p.fmt == MKFS_FMT_V1_1) ? 0 : MKFS_ROOT_INODE; /* v1.1 root=0 / v1.2+v1.3 root=MKFS_ROOT_INODE（mkfs 局部值，非契约） */
     memcpy(sb->uuid, p.uuid, 16);
     memcpy(sb->volume_name, p.label, sizeof(sb->volume_name));
     sb->backup_prev  = PTR_INVALID;
@@ -323,29 +342,56 @@ static void build_root_dentry_node(Bptree_ddentry_leaf_node_t *node, uint64_t ro
 }
 
 static void build_root_inode(raven_Inode_t *inode, uint64_t root_dentry_block,
-                             uint64_t stamp_sec, bool v11) {
+                             uint64_t stamp_sec, MkfsFormat fmt) {
+    const bool legacy = (fmt == MKFS_FMT_V1_1);   /* v1.1：type:2 / 裸权限 / root=0 */
+
     memset(inode, 0, sizeof(*inode));
     /* 时间戳：与 SB born_time 同源（2026-09-28 修 —— 原先三字段留 0，挂载后根目录显示 1970） */
     inode->mtime = inode->ctime = inode->atime = stamp_sec;
     inode->m_ns_stamp = inode->c_ns_stamp = inode->a_ns_stamp = 0;
     /* 第一字语义分叉（盘上同位，编码不同）：
      *   v1.1：type:2 | direct:1 | other:61，DIR 编码 = 1（REGULAR=0 / SOFT_SYM=2）
-     *   v1.2：type:6 | direct:1 | i_flags:57，DIR = S_IFMT>>12 = 4（直接写 1 会被
+     *   v1.2/v1.3：type:6 | direct:1 | i_flags:57，DIR = S_IFMT>>12 = 4（直接写 1 会被
      *        v1.1 的 2 位 type 读成 REGULAR → 根变文件，故必须分叉） */
-    inode->word1                   = v11 ? 1 : RFS_INO1_PACK(INODE_TYPE_DIR, 0, 0);
+    inode->word1                   = legacy ? 1 : RFS_INO1_PACK(INODE_TYPE_DIR, 0, 0);
     inode->uid                     = 0;
     inode->gid                     = 0;
     /* mode 位语义分叉：v1.1 permission_bits 裸值（高 52 位 = 0）；
-     * v1.2 mode_xattr = mode:12 | xattr_ptr:52（无 xattr = 52 位全 1 哨兵） */
-    inode->mode_xattr              = v11 ? 0755
-                                         : RFS_MODE_XATTR_PACK(0755, RFS_XATTR_NONE);
+     * v1.2/v1.3 mode_xattr = mode:12 | xattr_ptr:52（无 xattr = 52 位全 1 哨兵） */
+    inode->mode_xattr              = legacy ? 0755
+                                            : RFS_MODE_XATTR_PACK(0755, RFS_XATTR_NONE);
     inode->size                    = 0;
-    inode->data_root               = root_dentry_block;
+    inode->data_root               = root_dentry_block;   /* DIR：dentry 树根；v1.3 名 ddentry_Bptree_root，同 offset */
     inode->link_count              = 2;
-    /* 名字堆 10 描述符：未激活哨兵（bitmap/data_base 双指针 52 位全 1） */
-    raven_dir_Inode_t *dino = (raven_dir_Inode_t *)inode;
-    for (int i = 0; i < RFS_DIR_HEAP_COUNT; i++)
-        RFS_NHC_SET(*rfs_dir_heap(dino, i), 0, 0, NAME_HEAP_INACTIVE, 0, NAME_HEAP_INACTIVE);
+
+    if (fmt == MKFS_FMT_V1_3) {
+        /* v1.3 DIR 尾段 [80:256)：名字数据面双树描述 + inline 空闲区间表。
+         * 空目录 ⇒ 数据面无 piece、双树均**空态**：
+         *   映射树 name_data_ctl = RFS_ND_CTL_INACTIVE（inline=1 ∧ ptr 全 1 ∧ rsv 全 1，整字全 0xF）
+         *   空闲区间 name_data_free_ranges_ctl = RFS_ND_FR_CTL_INACTIVE（同上）
+         *   piece_count / free_ranges_count = 0；possible_inline_free_ranges[] 由 memset 清 0。
+         * 「ptr 全 1 = 无效指针」对齐 NAME_HEAP_INACTIVE 惯例（全 1 即无效）。 */
+        raven_dir_Inode_t *d = (raven_dir_Inode_t *)(void *)inode;
+        d->name_data_ctl               = RFS_ND_CTL_INACTIVE;
+        d->name_data_piece_count       = RFS_ND_PIECE_PACK(0);
+        d->name_data_free_ranges_ctl   = RFS_ND_FR_CTL_INACTIVE;
+        d->name_data_free_ranges_count = 0;
+    } else {
+        /* v1.1 / v1.2 DIR 尾段 [80:256)：[80:96) padding + 10 × name_heap_controller_t。
+         * 每个堆 = 未激活哨兵（gran=0 / bits=0 / bitmap=data=NAME_HEAP_INACTIVE）。
+         * v1.3.h 已删 v1.2 的 heaps_* 字段与 rfs_dir_heap 访问器，故本地声明该
+         * 尾段布局（与 v1.2 盘面逐字节一致）；name_heap_controller_t / RFS_NHC_SET
+         * / NAME_HEAP_INACTIVE 在 v1.3.h 仍保留，供本 v1.1/v1.2 写路径使用。 */
+        struct v12_dir_tail {
+            uint64_t padding[2];                      /* [80:96)  */
+            struct name_heap_controller_t heaps[10];  /* [96:256) */
+        };
+        struct v12_dir_tail *t =
+            (struct v12_dir_tail *)(void *)((uint8_t *)inode + 80);
+        t->padding[0] = t->padding[1] = 0;
+        for (int i = 0; i < 10; i++)
+            RFS_NHC_SET(t->heaps[i], 0, 0, NAME_HEAP_INACTIVE, 0, NAME_HEAP_INACTIVE);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -488,14 +534,14 @@ int format_fs(int fd, const MkfsParams &params, const FsGeometry &geo) {
     uint64_t dn_off  = block_to_offset(root_dentry_block, params);
 
     /* 根 inode 索引：v1.1 = 0（god 按 0 挂根，位图片 0 hint 也从 1 起）；
-     * v1.2 = MKFS_ROOT_INODE（mkfs 为根目录挑的非零索引；**非契约**——消费者一律读 SB）。 */
-    const uint64_t root_ino = params.v11 ? 0 : MKFS_ROOT_INODE;
+     * v1.2/v1.3 = MKFS_ROOT_INODE（mkfs 为根目录挑的非零索引；**非契约**——消费者一律读 SB）。 */
+    const uint64_t root_ino = (params.fmt == MKFS_FMT_V1_1) ? 0 : MKFS_ROOT_INODE;
 
     Bptree_ddentry_leaf_node_t dentry_node;
     build_root_dentry_node(&dentry_node, root_ino);
 
     raven_Inode_t root_inode;
-    build_root_inode(&root_inode, root_dentry_block, sb.born_time, params.v11);
+    build_root_inode(&root_inode, root_dentry_block, sb.born_time, params.fmt);
 
     {
         BitmapBuf      bitmap(fd, geo, bm_off);

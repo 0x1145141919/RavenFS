@@ -22,7 +22,9 @@ static void print_usage(const char *prog) {
         "  --label=NAME       Volume label (max 48 bytes)\n"
         "  --uuid=UUID        Explicit UUID (auto-generated if omitted)\n"
         "  --v1.1             Write v1.1 disk format (version=2, root inode 0)\n"
-        "                     for juvenile god / tests (default: v1.2)\n"
+        "                     for juvenile god / tests\n"
+        "  --v1.2             Write v1.2 disk format (version=3) [default]\n"
+        "  --v1.3             Write v1.3 disk format (version=4; DIR name-data double tree)\n"
         "  -f, --force        Overwrite existing filesystem\n"
         "  -v, --verbose      Print detailed layout info\n"
         "  -h, --help         Show this help\n"
@@ -42,6 +44,7 @@ int main(int argc, char *argv[]) {
     MkfsParams params{};
     params.inode_ratio = 8;
     params.backups = 3;
+    params.fmt = MKFS_FMT_V1_2;   /* 默认写 v1.2；--v1.3 写 v1.3 */
     uuid_clear(params.uuid);
 
     static struct option long_opts[] = {
@@ -52,6 +55,8 @@ int main(int argc, char *argv[]) {
         {"label",       required_argument, 0, 'l'},
         {"uuid",        required_argument, 0, 'u'},
         {"v1.1",        no_argument,       0, '1'},
+        {"v1.2",        no_argument,       0, '2'},
+        {"v1.3",        no_argument,       0, '3'},
         {"force",       no_argument,       0, 'f'},
         {"verbose",     no_argument,       0, 'v'},
         {"help",        no_argument,       0, 'h'},
@@ -104,7 +109,13 @@ int main(int argc, char *argv[]) {
             }
             break;
         case '1':
-            params.v11 = true;      /* --v1.1：写 v1.1 盘（god/测试团队） */
+            params.fmt = MKFS_FMT_V1_1;   /* --v1.1：写 v1.1 盘（god/测试团队） */
+            break;
+        case '2':
+            params.fmt = MKFS_FMT_V1_2;   /* --v1.2：写 v1.2 盘（现役 mainline） */
+            break;
+        case '3':
+            params.fmt = MKFS_FMT_V1_3;   /* --v1.3：写 v1.3 盘（DIR 名字数据面双树） */
             break;
         case 'f':
             params.force = true;
@@ -262,7 +273,7 @@ int main(int argc, char *argv[]) {
         printf("mkfs.ravenfs: done  device=%s  format=%s  blocks=%lu  "
                "ratio=%lu  inodes=%lu  backups=%u  uuid=%s\n",
                params.device,
-               params.v11 ? "v1.1" : "v1.2",
+               mkfs_fmt_name(params.fmt),
                (unsigned long)geo.total_blocks,
                (unsigned long)params.inode_ratio,
                (unsigned long)params.inode_count,
