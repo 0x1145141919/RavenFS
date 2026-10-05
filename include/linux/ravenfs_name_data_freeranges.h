@@ -28,7 +28,9 @@
 #define _RAVENFS_NAME_DATA_FREERANGES_H
 
 #include "ravenfs_platform.h"	/* 类型 u8..u64 / bool / errno（唯一平台收口）*/
-#include "disk_struct_v1.3.h"	/* free_range_t / 节点族 / 控制字宏 */
+/* v2.0 原子切换：v1.3/v2.0 盘头定义同名类型，不能同 TU 共存 → 名字数据面类型
+ * （free_range_t / 节点族 / 控制字宏 / 魔数）逐字节同构地由 v2.0 头提供。 */
+#include "disk_struct_v2.0.h"	/* free_range_t / 节点族 / 控制字宏 */
 #include "magics.h"		/* NAMEDATA_FREERANGES_MAGIC1..4 */
 
 #ifdef __cplusplus

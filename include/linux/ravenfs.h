@@ -42,9 +42,9 @@
 #include <linux/compiler.h>
 #include <linux/cleanup.h>
 
-/* v1.3 盘面结构（-I$(src)/../include） */
-#include <disk_struct_v1.3.h>
-#include <magics.h>	/* SUPERBLOCK_MAGIC */
+/* v2.0 盘面结构（-I$(src)/../include） */
+#include <disk_struct_v2.0.h>
+#include <magics.h>	/* RFS_SB_MAGIC_W0 前缀（magic[0]）*/
 
 /* al_ 分配器计数器：字段枚举（show 表对位 + 钩子下标） */
 #include "ravenfs_allocator_stats.h"
@@ -52,8 +52,9 @@
 /* ─────────────────────────── 常量 ─────────────────────────── */
 
 /*
- * s_magic（statfs.f_type）—— 与盘上 SB 魔数 **同源**（mkfs 写的 `sb->magic` = SUPERBLOCK_MAGIC）。
- * 不自创 "RAVF"（2026-09-26 深夜，用户裁：对齐 mkfs）。
+ * s_magic（statfs.f_type）—— 内核侧 FS 标识。v2.0 盘上 magic 升 256-bit
+ * （magic[0] = "RAVENFS\0" 前缀），此处沿用历史单字 "RAVN" 作为**内核侧唯一标识**
+ * （不参与盘面识别；盘面识别只比对 magic[0]）。不自创第三值。
  */
 #define RAVENFS_SUPER_MAGIC	((unsigned long)SUPERBLOCK_MAGIC)	/* "RAVN" = 0x5241564E */
 
@@ -82,8 +83,8 @@
  * 一切内部数组/缓存/树接口的 inum 类是 **idx**。禁止散落 `±1`——新增代码若需在
  * 两界间穿越，一律经本对宏（grep `->i_ino` 直用应为零，D-10 验收判据）。
  *
- * 注：盘上 SB 的 `root_inode` 是 **idx**（mkfs 局部实现细节，不进入契约）；
- * `ravenfs_iget()` 入参为 idx，内部构造 ino 后交 `iget_locked()`。
+ * 注：v2.0 root_dir 的 inode 索引 = **契约级硬编码 `RFS_ROOT_INODE_IDX`(=0)**，
+ * SB 已无 root 字段；`ravenfs_iget()` 入参为 idx，内部构造 ino 后交 `iget_locked()`。
  */
 #define RFS_INO_TO_IDX(ino)	((u64)(ino) - 1)
 #define RFS_IDX_TO_INO(idx)	((u64)(idx) + 1)
@@ -293,15 +294,16 @@ struct ravenfs_al_stats {
 
 struct ravenfs_sb_info {
 	u64	total_blocks;
-	u64	inode_count;
-	u64	root_ino;
 
-	u64	bitmap_start;
-	u64	bitmap_blocks;
-	u64	inode_array_base;
-	u64	inode_blocks;
-	u64	inode_bm_base;
-	u64	inode_bm_blocks;
+	/* v2.0 全局 inode 数据面（SB 四字段；装载读盘 → 建面，落盘刷新）。*/
+	u64	inode_data_ctl;			/* 映射面 RFS_IDP_CTL_*（direct/tree + 指针）*/
+	u64	inode_data_plane_pieces_count;	/* 8K 数据面片数原值 RFS_IDP_PIECE_* */
+	u64	inode_data_fr_ctl;		/* 扁 fr 快照区首块 RFS_IDP_FR_CTL_* */
+	u64	inode_data_fr_count;		/* 扁 fr 快照条目数 RFS_IDP_FR_* */
+	u64	ra_inode_count;			/* 派生 = inode_data_plane_pieces × 32 */
+
+	u64	bitmap_start;			/* 块位图所在 FS_block（世界尾巴）*/
+	u64	bitmap_blocks;			/* 块位图块数 = ceil(total/32768) */
 
 	/* FS_block[i] 在设备上的字节偏移 = blk0_off + i*4096；blk0_off 恒 4096 */
 	u64	blk0_off;
@@ -393,18 +395,11 @@ static inline bool ravenfs_type_valid(u32 type)
 	}
 }
 
-/* 几何推导（与 mkfs/mkfs.cpp:calc_geometry 逐式对应） */
+/* 几何推导（与 mkfs/mkfs_v20.cpp:calc_geometry_v20 逐式对应）
+ * v2.0 只有块位图一段尾巴；无固定 inode 数组 / 无 inode 位图（inode 归数据面）。*/
 static inline u64 ravenfs_bitmap_blocks(u64 total_blocks)
 {
 	return (total_blocks + RAVENFS_BITS_PER_BLOCK - 1) / RAVENFS_BITS_PER_BLOCK;
-}
-static inline u64 ravenfs_inode_array_blocks(u64 inode_count)
-{
-	return (inode_count * RAVENFS_INODE_SIZE + RAVENFS_BLOCK_SIZE - 1) / RAVENFS_BLOCK_SIZE;
-}
-static inline u64 ravenfs_inode_bm_blocks(u64 inode_count)
-{
-	return (inode_count + RAVENFS_BITS_PER_BLOCK - 1) / RAVENFS_BITS_PER_BLOCK;
 }
 
 /* ─────────────── 跨模块核心入口（super.c 实现） ─────────────── */
@@ -413,6 +408,10 @@ struct inode *ravenfs_iget(struct super_block *sb, u64 inum);
 /* 读一个 B+tree 节点（8K）到调用方缓冲；实现随 mdata 节点读路径（mdata_cache.c），
  * 但消费方横跨 dentry/extent/file/super → 归核心 */
 int ravenfs_read_node(struct super_block *sb, u64 blk, void *buf);
+
+/* v2.0 周期同步的 SB 落定（super.c）：写入 inode 数据面四字段 + latest_syn_time +
+ * 重算 crc（**最后一步**，须在任何分配器 / mdata 落盘之后调用）。0 / 负 errno。 */
+int ravenfs_sb_write_sync(struct super_block *sb);
 
 /* ── 元数据可写？（ro 挂载不得写盘） ── */
 static inline bool ravenfs_sb_writable(const struct super_block *sb)

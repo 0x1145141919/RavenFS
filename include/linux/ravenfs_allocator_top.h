@@ -50,6 +50,14 @@
 #include "ravenfs_run_list.h"	/* run 三型 + 「STL 式自造链轮子」（容器拥有节点 + 绑定分配器）*/
 #include "ravenfs_allocator_stats.h"	/* al_ 计数器钩子（注入式；模块保持平台中立）*/
 
+/* v2.0：inode 组由「位图分片」换成**全局 inode 数据面**（内核专用：rw_semaphore +
+ * block 组 grow）。**仅内核**下可见；用户态差分测试仍走旧位图分片 inode 组
+ * （见 struct rfs_slices_cfg.inode 与 struct rfs_allocator.ino_plane 的条件编译），
+ * 从而 tests/ 下的差分测试无需改动即可继续编 router.c / slice.c。 */
+#ifdef __KERNEL__
+#include "ravenfs_inode_data_plane.h"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -99,9 +107,16 @@ struct rfs_alloc_group {
  * 禁止拷贝（C 无拷贝构造，按约定：只按指针传；勿 memcpy 本结构）。*/
 struct rfs_allocator {
 	struct rfs_alloc_group blk_;	/* block 组 */
-	struct rfs_alloc_group ino_;	/* inode 组 */
+	struct rfs_alloc_group ino_;	/* inode 组（v2.0 内核下停用；用户态差分测试沿用旧位图分片）*/
 	u32 slice_count;
 	u32 cpu_slots;
+
+#ifdef __KERNEL__
+	/* v2.0（内核）：全局 inode 数据面（映射 interval + fr 主从树）。
+	 * ino_plane.active 时 inode_alloc/free/test/locate 全部转发到它；ino_ 位图分片
+	 * 不再装配（slices/preferred 恒 NULL）。 */
+	struct rfs_inode_plane ino_plane;
+#endif
 
 	/* ── 生命周期「关闸 + 在途排空」双字段（C 无 private，语义在此写死）────────────
 	 * 合起来实现「打烊」：把「fini 之后 / fini 期间」到达的调用从「对已释放内存
@@ -150,8 +165,13 @@ struct rfs_allocator {
 struct rfs_slices_cfg {
 	u8	*block_bits_raw;	/* 块组位图原始内存（已加载，4K 对齐）*/
 	u64	 block_bits_count;	/* 块组位数（= bitmap_blocks × 4096 × 8）*/
-	u8	*inode_bits_raw;	/* inode 组位图原始内存（同上）*/
+	u8	*inode_bits_raw;	/* inode 组位图（**仅用户态差分测试 / 旧位图分片**；
+					 * v2.0 内核挂载不再提供 → inode.pieces 走数据面）*/
 	u64	 inode_bits_count;	/* inode 组位数 */
+#ifdef __KERNEL__
+	/* v2.0 全局 inode 数据面（内核）。pieces==0 → 回退旧位图分片（防御；内核挂载恒 >0）。*/
+	struct rfs_inode_plane_cfg inode;
+#endif
 	u32	 logical_processor_count;	/* preferred 槽数 + 2^n 上界推导；0 → 退化单槽 */
 	u64	 min_slice_bits;	/* 片下限（位数）；0 → RFS_IV_SLICE_MIN_BITS */
 	/* 装配与元素池的内存来源（router 取 slices/preferred 数组 + 下传各片元素池）。
@@ -235,6 +255,12 @@ int	rfs_allocator_inode_alloc(struct rfs_allocator *self, u64 *out_inum);
 void	rfs_allocator_inode_free(struct rfs_allocator *self, u64 inum);
 /* ⇄ `inode_test(inum)`。*/
 bool	rfs_allocator_inode_test(const struct rfs_allocator *self, u64 inum);
+/* v2.0：inode 逻辑容量（当前 pieces×32；随 grow 增长）。0 = 无 inode 面。 */
+u64	rfs_allocator_inode_capacity(const struct rfs_allocator *self);
+/* v2.0（内核）：inum → 物理 8K 片基 + 片内字节偏移（InodeSession 翻译入口）。
+ * 仅 inode 数据面可用（ino_plane.active）；否则 -EIO。返回 0 / 负 errno。 */
+int	rfs_allocator_inode_locate(struct rfs_allocator *self, u64 inum,
+				   u64 *blkbase, u32 *blkoff);
 
 /* ── 几何 / 审计（⇄ fs_allocator_t 只读取值段；F7 统一 const self）── */
 u32	rfs_allocator_slice_count(const struct rfs_allocator *self);

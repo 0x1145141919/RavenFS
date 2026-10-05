@@ -1,40 +1,44 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * ravenfs_cache.h —— 磁盘 inode 行缓存（§4.11.1）接口
- * 实现：inode_cache.c（行/分片/session 主体）；回刷 driver 表跨 inode_cache.c
- *       与 mdata_cache.c 两个后端，接口统一归此头（架构无关，cache_ttl.c 消费）；
- *       TTL 淘汰器（cache_ttl.c）接口也并入 —— 它就是这套缓存的回收器。
- * 依赖：核心 ravenfs.h。mdata 侧的行机制复用（ROWF_* / RFS_ROW_MARK_DIRTY）
- *       由 ravenfs_mdata_cache.h 反向 include 本头表达。
+ * ravenfs_cache.h —— 缓存层公共接口（v2.0）
+ *
+ * 实现：inode_cache.c（inode 会话 = 薄 InodeSession，经 mdata 8K 片访问盘 inode）；
+ *       mdata_cache.c（8K 元数据 / inode 片缓存本体）；cache_ttl.c（淘汰 + 周期回写）。
+ *
+ * v2.0 起 **不再有**「固定 inode 数组上的分片行缓存」：inode 存储 = 全局弹性数据面
+ * （8K 片 + 映射树），inode 记录随所属 8K 片落在 **mdata 缓存**里。故：
+ *   · `ravenfs_session` 只持「翻译出的物理 8K 片 mdata 会话 + 片内槽指针」；
+ *   · 行标脏宏 / 回刷 driver 表继续服务 mdata 后端（inode 后端退化为 no-op）。
+ *
+ * 依赖：核心 ravenfs.h + mdata 行定义（mrow 需完整：会话持其指针供标脏宏）。
  */
 #ifndef _RAVENFS_CACHE_H
 #define _RAVENFS_CACHE_H
 
 #include "ravenfs.h"
+/* mdata 行定义（struct ravenfs_mrow）—— 会话 row 字段 / 标脏宏需其完整定义。
+ * 反向包含由下方 include guard 兜住（mrow 仅按指针用于会话定义，顺序安全）。*/
+#include "ravenfs_mdata_cache.h"
 
-/* ── disk_inode_cache_mgr（§4.11.1 + M2.2 行尺寸解耦）── */
-#define RAVENFS_SHARD_SEL_BITS	7	/* 分片选择位宽：≤128 片（>4096 inode 时生效） */
+/* ── 分片选择位宽（mdata 缓存沿用）── */
+#define RAVENFS_SHARD_SEL_BITS	7	/* 分片选择位宽：≤128 片 */
 
-/* 支持的缓存行尺寸（mount option `row_size=`，默认 4K） */
+/* mount option `row_size=` 支持表（v2.0：inode 缓存不再按行装载，选项被接受但忽略；
+ * 保留宏以维持 super.c 参数解析面）。 */
 #define RAVENFS_ROW_DEFAULT	4096u
 #define RAVENFS_ROW_SIZE_OK(sz)	((sz) == 4096u || (sz) == 8192u || (sz) == 16384u || \
 				 (sz) == 32768u || (sz) == 65536u)
 
-/*
- * 行缓冲直接走**伙伴系统**（不再经 slab）：order = log2(row_size/4K)。
- * 行尺寸均为 2 的幂（4K..64K）→ order 0..4，天然对齐伙伴分配阶。
- * 访问用**直映射物理内存指针**（page_address()；x86_64 无 highmem）。
- */
+/* 行缓冲伙伴系统 order = log2(8K/4K)=1（mdata 节点 / inode 片恒 8K）*/
 #define RAVENFS_ORDER_OF(bytes)	ilog2((bytes) >> PAGE_SHIFT)
 
-/* 行生命周期状态（分片 rwsem 护） */
+/* 行生命周期状态 / 标志（分片 rwsem / io_lock 护；mdata 行沿用） */
 #define ROW_READY	0UL
 #define ROW_EVICTING	1UL
-/* 行标志（io_lock 护） */
 #define ROWF_DIRTY	(1u << 0)	/* 内容脏，待回写 */
 #define ROWF_WB		(1u << 1)	/* copy-out 快照在飞 */
 
-/* 行标脏（io_lock 写护）——inode 行 / mdata 行**通用**（struct 字段同名）。
+/* 行标脏（io_lock 写护）——inode 片 / mdata 节点**通用**（struct 字段同名）。
  * 外部写点统一走此宏（勿再裸写 row->dirty/stamp；调用点需含 linux/{rwsem,timekeeping}.h）。 */
 #define RFS_ROW_MARK_DIRTY(row)					\
 	do {							\
@@ -45,65 +49,24 @@
 	} while (0)
 
 /*
- * 缓存行状态机（详见 Docs/linux/ravenfs-ko-cache-statemachine.md）：
- *   分片 rwsem —— xarray 成员 + ref pinning + state（get 读锁内 ref++；淘汰写锁内 ref==1 判）
- *   per-row io_lock —— 内容 + flags（读=session 读共享；写=session 变异 / copy-out 排他）
- *   acc_stamp(atomic relaxed) —— TTL；wb_stamp(io_lock) —— 回写 aging
- * 铁律：I/O 一律在锁外（copy-out 后 / 淘汰独占窗口）。
+ * inode 会话（v2.0 薄壳）：inum → 物理 8K 片（经 inode 数据面翻译）→ mdata 会话；
+ *   inode 指针 = 片缓冲 + (inum & 31)×256。
+ * `row` 直指 mdata 行（供 `RFS_ROW_MARK_DIRTY(s->row)` 外部标脏点无缝沿用）。
+ * `piece_data` 为片缓冲直地址（ravenfs_session_inode 用它，不依赖 mrow 完整定义）。
  */
-struct ravenfs_row {
-	struct page	*page;		/* 伙伴系统页块（order = cache->order，共 row_size 字节） */
-	void		*data;		/* 直映射物理内存 = page_address(page) */
-	refcount_t	ref;		/* 1=缓存基准；>1=session 持有 / 回写 pin */
-
-	struct rw_semaphore io_lock;	/* 内容 + flags 守护 */
-	unsigned int	flags;		/* ROWF_DIRTY | ROWF_WB */
-	unsigned long	state;		/* ROW_READY | ROW_EVICTING */
-
-	atomic64_t	acc_stamp;	/* 最近访问（ns，relaxed）→ TTL 淘汰 */
-	u64		wb_stamp;	/* 最近落盘/最近 dirty（io_lock 护）→ 回写 aging */
-	u64		line;		/* 行号 = inum>>row_bits（诊断用） */
-};
-
-struct ravenfs_shard {
-	struct xarray		rows;	/* row_key → struct ravenfs_row* */
-	struct rw_semaphore	lock;	/* 睡眠读写锁：行生命周期 + 内容 RMW */
-};
-
-struct ravenfs_cache {
-	struct ravenfs_shard	*shards;
-	u32	n_slices;
-	u32	bits_len;	/* ceil_log2(inode_count) */
-	u32	w0;		/* 分片选择位宽 */
-	u32	shard_bits;	/* 每片 inode 数 = 2^shard_bits */
-
-	/* M2.2：缓存行几何（由 mount 的 row_size 派生） */
-	u32	row_size;	/* 行字节数（4K..64K） */
-	u32	inodes_per_row;	/* = row_size / 256 */
-	u32	row_blocks;	/* = row_size / 4096（连续块数） */
-	u32	row_bits;	/* log2(inodes_per_row) */
-	u32	row_bits_shard;	/* 片内行键位宽 = shard_bits - row_bits */
-	unsigned long row_mask;	/* 片内行键掩码（行键为 unsigned long） */
-	u32	line_mask;	/* inum & line_mask = 行内槽位 */
-
-	u32	order;		/* 行缓冲的伙伴系统 order（4K→0 … 64K→4） */
-};
-
 struct ravenfs_session {
 	struct ravenfs_sb_info	*sbi;
-	struct ravenfs_shard	*shard;
-	struct ravenfs_row	*row;
+	struct ravenfs_msession	*ms;		/* 物理 8K 片 mdata 会话（引用计数归它）*/
+	struct ravenfs_mrow	*row;		/* == ms->row；外部标脏宏用 */
+	void			*piece_data;	/* 片缓冲（8K）直地址 */
 	u64			inum;
-	u32			off_mask;	/* 行内槽位掩码（= inodes_per_row-1） */
 };
 
-/* ── 缓存主体 API（inode_cache.c） ── */
+/* ── 缓存主体 API（inode_cache.c：v2.0 多数为薄壳 / no-op） ── */
 int  ravenfs_cache_create(struct super_block *sb, unsigned int row_size);
 void ravenfs_cache_destroy(struct super_block *sb);
 void ravenfs_cache_flush_all(struct super_block *sb);
-/* TTL 淘汰：对超时（acc_stamp<cutoff）且 ref==1 的行做「脏原地回写 → 释放」 */
 long ravenfs_cache_reap_expired(struct super_block *sb, u64 cutoff_ns);
-/* 驻留回写（copy-out 排他 → 锁外 I/O）：ignore_age=false 时只写 wb_stamp<cutoff 的 */
 int  ravenfs_cache_wb_dirty(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age);
 int  ravenfs_cache_writeback_all(struct super_block *sb);
 int  ravenfs_inode_flush(struct super_block *sb, u64 inum);
@@ -111,7 +74,7 @@ int  ravenfs_inode_sync_from_vfs(struct super_block *sb, struct inode *inode);
 void ravenfs_inode_mark_dirty(struct super_block *sb, u64 inum);
 void ravenfs_inode_reclaim(struct super_block *sb, u64 inum);
 
-/* ── session（行租借；inode_cache.c） ── */
+/* ── session（8K 片租借；inode_cache.c） ── */
 struct ravenfs_session *ravenfs_session_get(struct super_block *sb, u64 inum);
 void ravenfs_session_put(struct ravenfs_session *s);
 
@@ -124,12 +87,13 @@ DEFINE_FREE(ravenfs_session, struct ravenfs_session *,
 
 static inline struct raven_Inode_t *ravenfs_session_inode(struct ravenfs_session *s)
 {
-	return (struct raven_Inode_t *)((char *)s->row->data +
-					(s->inum & s->off_mask) * RAVENFS_INODE_SIZE);
+	return (struct raven_Inode_t *)((char *)s->piece_data +
+					(s->inum & (RFS_IDP_INODES_PER_PIECE - 1)) *
+					RFS_IDP_INODE_BYTES);
 }
 
-/* ── 架构无关回刷 driver（缓存后端：inode 行 / mdata 节点）──
- * 位图（bitmap.c）= 全量常驻内存分片，**非缓存行**、不接入本 driver（自有分片级同步）。 */
+/* ── 架构无关回刷 driver（缓存后端：inode 片 / mdata 节点）──
+ * v2.0：inode 记录随 8K 片落 mdata → inode 后端退化为 no-op；mdata 后端实效。 */
 struct ravenfs_wb_ops {
 	const char	*name;
 	int		(*wb_dirty)(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age);

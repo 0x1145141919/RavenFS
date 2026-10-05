@@ -196,22 +196,25 @@ static void teardown_group(struct rfs_alloc_group *g, u32 slice_count,
 int rfs_allocator_init(struct rfs_allocator *self, const struct rfs_slices_cfg *cfg)
 {
 	struct rfs_mem_alloc mem;
-	u64 msb, n, cap, per_b, per_i;
+	u64 msb, n, cap;
 	u32 i;
+	bool plane = false;
 
 	if (!self)
 		return -EINVAL;
 	memset(self, 0, sizeof(*self));		/* 空态：失败即自清理，fini 幂等 */
 
-	if (!cfg || !cfg->block_bits_raw || !cfg->inode_bits_raw ||
-	    cfg->block_bits_count == 0 || cfg->inode_bits_count == 0)
+	if (!cfg || !cfg->block_bits_raw || cfg->block_bits_count == 0)
 		return -EINVAL;
 	if (!cfg->alloc.alloc || !cfg->alloc.free)
 		return -EINVAL;			/* 模块零直接分配：装配回调必填 */
+#ifdef __KERNEL__
+	plane = (cfg->inode.pieces != 0);	/* v2.0 全局 inode 数据面 */
+#endif
+	if (!plane && (!cfg->inode_bits_raw || cfg->inode_bits_count == 0))
+		return -EINVAL;
 
-	/* 计数器钩子：先内部化，令装配路径（含失败）也能上报（P1）。
-	 * 注：本函数若在装配中途失败会 `memset(self,0)` 清钩子——故**装配成功/失败/片数**
-	 * 由 FS 适配层按其返回码上报（见 allocator_adapter.c），不在此处自报。*/
+	/* 计数器钩子：先内部化，令装配路径（含失败）也能上报（P1）。*/
 	self->stat = cfg->stat;
 	mem = cfg->alloc;
 	msb = cfg->min_slice_bits ? cfg->min_slice_bits : RFS_IV_SLICE_MIN_BITS;
@@ -220,10 +223,11 @@ int rfs_allocator_init(struct rfs_allocator *self, const struct rfs_slices_cfg *
 	n = 1;
 	while (n < cfg->logical_processor_count && n < (1ULL << 30))
 		n <<= 1;
-	/* 满片数约束：两组各须容纳 ≥1 片（每片 ≥ msb 位）。*/
+	/* 满片数约束：参与组各须容纳 ≥1 片（每片 ≥ msb 位）。
+	 * v2.0 内核：inode 面不占片，仅 block 组参与几何。*/
 	{
 		u64 blk_cap = cfg->block_bits_count / msb;
-		u64 ino_cap = cfg->inode_bits_count / msb;
+		u64 ino_cap = plane ? (u64)-1 : cfg->inode_bits_count / msb;
 
 		cap = blk_cap < ino_cap ? blk_cap : ino_cap;
 	}
@@ -231,17 +235,24 @@ int rfs_allocator_init(struct rfs_allocator *self, const struct rfs_slices_cfg *
 		cap = 1;
 	if (n > cap)
 		n = cap;
-	/* 末片非空迭代：per 取整到 msb 倍数后，两组末片都必须非空，否则 n 减半。*/
+	/* 末片非空迭代：per 取整到 msb 倍数后，参与组末片都必须非空，否则 n 减半。*/
 	for (;;) {
-		per_b = ((cfg->block_bits_count + n - 1) / n + msb - 1) / msb * msb;
-		per_i = ((cfg->inode_bits_count + n - 1) / n + msb - 1) / msb * msb;
+		u64 per_b = ((cfg->block_bits_count + n - 1) / n + msb - 1) / msb * msb;
+		u64 per_i = 0;
+
 		if (per_b == 0)
 			per_b = msb;
-		if (per_i == 0)
-			per_i = msb;
-		if ((n - 1) * per_b < cfg->block_bits_count &&
-		    (n - 1) * per_i < cfg->inode_bits_count)
-			break;
+		if (plane) {
+			if ((n - 1) * per_b < cfg->block_bits_count)
+				break;
+		} else {
+			per_i = ((cfg->inode_bits_count + n - 1) / n + msb - 1) / msb * msb;
+			if (per_i == 0)
+				per_i = msb;
+			if ((n - 1) * per_b < cfg->block_bits_count &&
+			    (n - 1) * per_i < cfg->inode_bits_count)
+				break;
+		}
 		if (n == 1)
 			break;
 		n >>= 1;
@@ -254,19 +265,22 @@ int rfs_allocator_init(struct rfs_allocator *self, const struct rfs_slices_cfg *
 			(u64)self->cpu_slots * (u64)sizeof(u32));
 	if (!self->blk_.preferred)
 		return -ENOMEM;
-	self->ino_.preferred = (u32 *)mem.alloc(mem.ctx,
-			(u64)self->cpu_slots * (u64)sizeof(u32));
-	if (!self->ino_.preferred) {
-		mem.free(mem.ctx, self->blk_.preferred);
-		self->blk_.preferred = NULL;
-		return -ENOMEM;
+	if (!plane) {
+		self->ino_.preferred = (u32 *)mem.alloc(mem.ctx,
+				(u64)self->cpu_slots * (u64)sizeof(u32));
+		if (!self->ino_.preferred) {
+			mem.free(mem.ctx, self->blk_.preferred);
+			self->blk_.preferred = NULL;
+			return -ENOMEM;
+		}
 	}
 	for (i = 0; i < self->cpu_slots; i++) {
 		self->blk_.preferred[i] = (u32)(i % self->slice_count);
-		self->ino_.preferred[i] = (u32)(i % self->slice_count);
+		if (!plane)
+			self->ino_.preferred[i] = (u32)(i % self->slice_count);
 	}
 
-	/* 双组 enable：block 组先、inode 组后；任一失败收敛（自清理）。*/
+	/* block 组先 enable；v2.0 内核随后建 inode 数据面（legacy → inode 位图分片）。*/
 	if (setup_group(&self->blk_, cfg->block_bits_raw, cfg->block_bits_count,
 			msb, self->slice_count, &mem, &self->stat) != 0) {
 		teardown_group(&self->blk_, self->slice_count, &mem);
@@ -274,13 +288,24 @@ int rfs_allocator_init(struct rfs_allocator *self, const struct rfs_slices_cfg *
 		memset(self, 0, sizeof(*self));
 		return -EINVAL;
 	}
-	if (setup_group(&self->ino_, cfg->inode_bits_raw, cfg->inode_bits_count,
-			msb, self->slice_count, &mem, &self->stat) != 0) {
-		teardown_group(&self->blk_, self->slice_count, &mem);
-		teardown_group(&self->ino_, self->slice_count, &mem);
-		memset(self, 0, sizeof(*self));
-		return -EINVAL;
+	if (!plane) {
+		if (setup_group(&self->ino_, cfg->inode_bits_raw, cfg->inode_bits_count,
+				msb, self->slice_count, &mem, &self->stat) != 0) {
+			teardown_group(&self->blk_, self->slice_count, &mem);
+			teardown_group(&self->ino_, self->slice_count, &mem);
+			memset(self, 0, sizeof(*self));
+			return -EINVAL;
+		}
 	}
+#ifdef __KERNEL__
+	if (plane) {
+		if (rfs_inode_plane_init(&self->ino_plane, &cfg->inode, self) != 0) {
+			teardown_group(&self->blk_, self->slice_count, &mem);
+			memset(self, 0, sizeof(*self));
+			return -EINVAL;
+		}
+	}
+#endif
 	/* 使能：生命周期闸门（seq_cst 发布；双字段协议见头注）。*/
 	__atomic_store_n(&self->is_workable, 1, __ATOMIC_SEQ_CST);
 	return 0;
@@ -324,6 +349,10 @@ void rfs_allocator_fini(struct rfs_allocator *self)
 		return;
 	}
 	mem = allocator_mem_of(self);
+#ifdef __KERNEL__
+	if (self->ino_plane.active)
+		rfs_inode_plane_fini(&self->ino_plane);
+#endif
 	teardown_group(&self->blk_, self->slice_count, &mem);
 	teardown_group(&self->ino_, self->slice_count, &mem);
 	memset(self, 0, sizeof(*self));
@@ -633,6 +662,20 @@ int rfs_allocator_inode_alloc(struct rfs_allocator *self, u64 *out_inum)
 	if (!rfs_allocator_enter(self))
 		return -EINVAL;
 	RFS_IV_SESSION(rfs_iv_guard, self);
+#ifdef __KERNEL__
+	if (self->ino_plane.active) {		/* v2.0 全局 inode 数据面 */
+		int rc;
+
+		if (!out_inum)
+			return -EINVAL;
+		rc = rfs_inode_plane_alloc(&self->ino_plane, out_inum);
+		if (rc)
+			RFS_AL_STAT1(self->stat, AL_INO_ALLOC_FAIL);
+		else
+			RFS_AL_STAT1(self->stat, AL_INO_ALLOC_OK);
+		return rc;
+	}
+#endif
 	if (!out_inum || !self->ino_.slices || self->slice_count == 0 ||
 	    self->cpu_slots == 0 || !self->ino_.preferred)
 		return -EINVAL;
@@ -670,6 +713,13 @@ void rfs_allocator_inode_free(struct rfs_allocator *self, u64 inum)
 	if (!rfs_allocator_enter(self))
 		return;
 	RFS_IV_SESSION(rfs_iv_guard, self);
+#ifdef __KERNEL__
+	if (self->ino_plane.active) {		/* v2.0 全局 inode 数据面 */
+		RFS_AL_STAT1(self->stat, AL_INO_FREE_CALLS);
+		rfs_inode_plane_free(&self->ino_plane, inum);
+		return;
+	}
+#endif
 	if (!self->ino_.slices ||
 	    self->slice_count == 0 || self->ino_.per_slice_bits == 0)
 		return;
@@ -684,6 +734,19 @@ void rfs_allocator_inode_free(struct rfs_allocator *self, u64 inum)
 	RFS_MUTEX_UNLOCK(&s->lock);
 }
 
+u64 rfs_allocator_inode_capacity(const struct rfs_allocator *self)
+{
+#ifdef __KERNEL__
+	if (self && self->ino_plane.active)
+		return rfs_inode_plane_pieces(
+				&((struct rfs_allocator *)self)->ino_plane) *
+		       RFS_IDP_INODES_PER_PIECE;
+#endif
+	if (self && self->ino_.per_slice_bits && self->slice_count)
+		return self->ino_.per_slice_bits * self->slice_count;
+	return 0;
+}
+
 bool rfs_allocator_inode_test(const struct rfs_allocator *self, u64 inum)
 {
 	u64 idx;
@@ -695,6 +758,11 @@ bool rfs_allocator_inode_test(const struct rfs_allocator *self, u64 inum)
 	if (!rfs_allocator_enter_c(self))
 		return false;
 	RFS_IV_SESSION(rfs_iv_guard, (struct rfs_allocator *)self);
+#ifdef __KERNEL__
+	if (self->ino_plane.active)		/* v2.0 全局 inode 数据面 */
+		return rfs_inode_plane_test(&((struct rfs_allocator *)self)->ino_plane,
+					    inum);
+#endif
 	if (!self->ino_.slices || self->slice_count == 0 ||
 	    self->ino_.per_slice_bits == 0)
 		return false;
@@ -728,6 +796,10 @@ u64 rfs_allocator_block_per_slice_bits(const struct rfs_allocator *self)
 
 u64 rfs_allocator_inode_per_slice_bits(const struct rfs_allocator *self)
 {
+#ifdef __KERNEL__
+	if (self && self->ino_plane.active)
+		return 0;			/* v2.0：inode 面不占片 */
+#endif
 	return self ? self->ino_.per_slice_bits : 0;
 }
 
@@ -763,6 +835,11 @@ u64 rfs_allocator_inode_free_total(const struct rfs_allocator *self)
 	if (!rfs_allocator_enter_c(self))
 		return 0;
 	RFS_IV_SESSION(rfs_iv_guard, (struct rfs_allocator *)self);
+#ifdef __KERNEL__
+	if (self->ino_plane.active)
+		return rfs_inode_plane_free_total(
+			&((struct rfs_allocator *)self)->ino_plane);
+#endif
 	if (!self->ino_.slices || self->slice_count == 0)
 		return 0;
 	for (i = 0; i < self->slice_count; i++) {
@@ -791,6 +868,10 @@ u32 rfs_allocator_inode_preferred_of(const struct rfs_allocator *self, u32 cpu)
 {
 	if (!self)
 		return 0;
+#ifdef __KERNEL__
+	if (self->ino_plane.active)
+		return 0;			/* v2.0：无 inode 亲和片 */
+#endif
 	if (!rfs_allocator_enter_c(self))
 		return 0;
 	RFS_IV_SESSION(rfs_iv_guard, (struct rfs_allocator *)self);
@@ -813,6 +894,10 @@ int rfs_allocator_dump_slice(struct rfs_allocator *self, bool ino, u32 slice,
 	if (!rfs_allocator_enter(self))
 		return -EINVAL;
 	RFS_IV_SESSION(rfs_iv_guard, self);
+#ifdef __KERNEL__
+	if (ino && self->ino_plane.active)
+		return -EINVAL;		/* v2.0：inode 面走 dump_extents/dump_fr，无位图分片 */
+#endif
 	if (slice >= self->slice_count)
 		return -EINVAL;
 	g = ino ? &self->ino_ : &self->blk_;
@@ -822,4 +907,22 @@ int rfs_allocator_dump_slice(struct rfs_allocator *self, bool ino, u32 slice,
 	s = &g->slices[slice];
 	RFS_MUTEX_GUARD(rfs_dump_guard, &s->lock);
 	return rfs_slice_all_dump(s, out);
+}
+
+/* ══════════════════════════ inode 数据面翻译（v2.0，内核）══════════════════════════
+ * InodeSession 唯一翻译入口：inum → 物理 8K 片基 + 片内字节偏移。 */
+int rfs_allocator_inode_locate(struct rfs_allocator *self, u64 inum,
+			       u64 *blkbase, u32 *blkoff)
+{
+#ifdef __KERNEL__
+	if (!self || !self->ino_plane.active)
+		return -EIO;
+	return rfs_inode_plane_locate(&self->ino_plane, inum, blkbase, blkoff);
+#else
+	(void)self;
+	(void)inum;
+	(void)blkbase;
+	(void)blkoff;
+	return -EIO;
+#endif
 }

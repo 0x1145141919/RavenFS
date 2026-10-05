@@ -13,8 +13,9 @@
  * ── 无回退（硬切）────────────────────────────────────────────────────────
  *   `rfs_allocator` 是**运行时唯一真值层**：FS 分配调用点全部直调 `rfs_allocator_*`
  *   （见 `rfs_allocator_top.h`），旧位图模块（`rfs_bm` 类 + bitmap_adapter）已整体删除。
- *   挂载**必建**树；位图几何取自 sbi（`bitmap_start/blocks`、`inode_bm_base/blocks`）→
- *   本层自持 words + IO。无迁移开关、无回退。位图仍作 checkpoint 底座 + 落盘载体（磁盘契约不变）。
+ *   挂载**必建**树；block 位图几何取自 sbi（`bitmap_start/blocks`）→ 本层自持 words + IO。
+ *   v2.0：inode 组不再是位图源 —— 从 SB 四字段装载**全局 inode 数据面**（direct 段 /
+ *   映射 B+tree bulk-load + 扁 fr 快照）；落盘按 §17.4 硬顺序（维护 → mdata → 位图 → SB）。
  *
  * 边界：本头只暴露生命周期三函数，**不含**分配/释放接口（那些属 `rfs_allocator_top.h`，
  *   由上层直调）。`struct super_block` 前向声明。

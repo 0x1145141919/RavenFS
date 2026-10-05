@@ -512,7 +512,7 @@ static int ravenfs_read_inode(struct inode *inode)
 	u64 inum = RFS_INO_TO_IDX(inode->i_ino);
 	u32 type, perm;
 
-	if (inum >= sbi->inode_count)
+	if (inum >= rfs_allocator_inode_capacity(sbi->alloc))
 		return -EIO;
 
 	ses = ravenfs_session_get(sb, inum);	/* 经 disk_inode_cache_mgr + session 取盘记录 */
@@ -673,12 +673,12 @@ static int ravenfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	struct super_block *sb = dentry->d_sb;
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	u64 used_blk, used_ino;
+	u64 used_blk;
+	u64 ino_cap;
 
 	used_blk = ravenfs_bitmap_used(sb, sbi->bitmap_start, sbi->bitmap_blocks,
 				       sbi->total_blocks);
-	used_ino = ravenfs_bitmap_used(sb, sbi->inode_bm_base, sbi->inode_bm_blocks,
-				       sbi->inode_count);
+	ino_cap = rfs_allocator_inode_capacity(sbi->alloc);
 
 	buf->f_type = RAVENFS_SUPER_MAGIC;
 	buf->f_bsize = sb->s_blocksize;
@@ -686,11 +686,11 @@ static int ravenfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_blocks = sbi->total_blocks;
 	buf->f_bfree = sbi->total_blocks > used_blk ? sbi->total_blocks - used_blk : 0;
 	buf->f_bavail = buf->f_bfree;
-	buf->f_files = sbi->inode_count;
-	buf->f_ffree = sbi->inode_count > used_ino ? sbi->inode_count - used_ino : 0;
+	buf->f_files = ino_cap;
+	buf->f_ffree = rfs_allocator_inode_free_total(sbi->alloc);
 	buf->f_namelen = RAVENFS_MAX_NAME_LEN;
 	buf->f_fsid.val[0] = RAVENFS_SUPER_MAGIC;
-	buf->f_fsid.val[1] = (u32)(sbi->total_blocks ^ sbi->inode_count);
+	buf->f_fsid.val[1] = (u32)(sbi->total_blocks ^ ino_cap);
 	return 0;
 }
 
@@ -809,16 +809,14 @@ static void ravenfs_put_super(struct super_block *sb)
 
 	RFS_STAT_INC(sb, life_umount);
 	ravenfs_ttl_stop(sb);		/* 先停 TTL 淘汰器（避免与折构竞争） */
-	/* 干净卸载（R-SY-06/T3）：写序 mdata → inode → 位图，各阶段 + 末尾 flush 屏障 */
-	ravenfs_mdata_cache_destroy(sb);	/* ① 折构：主动全量刷回 mdata 节点（§4.11.1 ②） */
-	ravenfs_issue_flush(sb);
-	ravenfs_cache_destroy(sb);		/* ② inode 记录行全量刷回 */
-	ravenfs_issue_flush(sb);
-	/* ③ 分配器全量刷回（M3 持久化）：树快照 → 位图字 → 落盘；ro 挂载不写 */
-	if (!(sb->s_flags & SB_RDONLY))
+	/* v2.0 干净卸载硬顺序（同 sync_fs；§17.4）：(1) inode 面维护 → (2) mdata 回写 →
+	 * (3) block 位图补集重建 → (4) SB 最后写。require mdata/分配器尚存活。*/
+	if (sbi && ravenfs_sb_writable(sb) && !ravenfs_is_shutdown(sb))
 		(void)ravenfs_allocator_flush(sb);
 	ravenfs_issue_flush(sb);
-	ravenfs_allocator_destroy(sb);		/* 排空 + 拆树 + 释放 words（幂等）*/
+	ravenfs_mdata_cache_destroy(sb);	/* 折构：全量刷回（幂等）+ 释放 mdata 缓存 */
+	ravenfs_cache_destroy(sb);		/* v2.0：inode 缓存空壳 no-op */
+	ravenfs_allocator_destroy(sb);		/* 排空 + 拆 inode 面/block 树 + 释放 words */
 
 	/*
 	 * 干净卸载时间戳 umount_time（Docs/disk_layout_v1.1.md #15）：写 now。
@@ -871,7 +869,8 @@ static void ravenfs_put_super(struct super_block *sb)
  */
 static int ravenfs_sync_fs(struct super_block *sb, int wait)
 {
-	int err = 0, e;
+	int err;
+	(void)wait;
 
 	RFS_STAT_INC(sb, op_syncfs);
 	if (!ravenfs_sb_writable(sb))
@@ -881,38 +880,15 @@ static int ravenfs_sync_fs(struct super_block *sb, int wait)
 		return -EIO;
 	}
 
-	/* ① mdata 树节点（extent / dentry 树；被 inode 行引用者先落盘） */
-	e = ravenfs_mdata_writeback_all(sb);
-	if (e) {
-		err = e;
-		ravenfs_force_shutdown(sb, "sync_fs: mdata writeback failed");
-	}
-	e = ravenfs_issue_flush(sb);
-	if (e && !err)
-		err = e;
-
-	/* ② inode 记录行（data_root / size / 时间戳翻转） */
-	e = ravenfs_cache_writeback_all(sb);
-	if (e) {
-		if (!err)
-			err = e;
-		ravenfs_force_shutdown(sb, "sync_fs: inode writeback failed");
-	}
-	e = ravenfs_issue_flush(sb);
-	if (e && !err)
-		err = e;
-
-	/* ③ 分配器（分配落地）：树快照 → 位图字 → 落盘（一步到位） */
-	e = ravenfs_allocator_flush(sb);
-	if (e) {
-		if (!err)
-			err = e;
-		ravenfs_force_shutdown(sb, "sync_fs: bitmap flush failed");
-	}
-	e = ravenfs_issue_flush(sb);
-	if (e && !err)
-		err = e;
-
+	/* v2.0 硬顺序（Docs/disk_layout_v2.0.md §17.4；⇄ god all_sycn）：
+	 *   (1) inode 数据面维护（建 direct/映射树 + 重写扁 fr；刷新 SB 四字段）
+	 *   (2) mdata 脏节点（新树节点 / inode 片内容）落盘
+	 *   (3) block 位图补集重建 + 落盘
+	 *   (4) SB 最后写（crc + latest_syn_time）
+	 * 全部封装在 ravenfs_allocator_flush 内（cache_ttl 30s 周期同此入口）。 */
+	err = ravenfs_allocator_flush(sb);
+	if (err)
+		ravenfs_force_shutdown(sb, "sync_fs: allocator/inode-plane flush failed");
 	return err;
 }
 
@@ -1075,8 +1051,8 @@ static int ravenfs_parse_superblock(struct super_block *sb, const void *buf,
 	u32 crc_stored, crc_calc;
 	void *tmp;
 
-	if (le64_to_cpu(dsb->magic) != (u64)SUPERBLOCK_MAGIC) {
-		pr_err("ravenfs: bad superblock magic\n");
+	if (le64_to_cpu(dsb->magic[0]) != (u64)RFS_SB_MAGIC_W0) {
+		pr_err("ravenfs: bad superblock magic[0]\n");
 		return -EINVAL;
 	}
 	if (le32_to_cpu(dsb->version) != RAVENFS_VERSION) {
@@ -1105,10 +1081,16 @@ static int ravenfs_parse_superblock(struct super_block *sb, const void *buf,
 		return -ENOMEM;
 
 	sbi->total_blocks = le64_to_cpu(dsb->total_blocks);
-	sbi->inode_count = le64_to_cpu(dsb->inode_array_count);
-	sbi->root_ino = le64_to_cpu(dsb->root_inode);
+	/* v2.0 SB 四字段（全局 inode 数据面）*/
+	sbi->inode_data_ctl = le64_to_cpu(dsb->inode_data_ctl);
+	sbi->inode_data_plane_pieces_count =
+		le64_to_cpu(dsb->inode_data_plane_pieces_count);
+	sbi->inode_data_fr_ctl = le64_to_cpu(dsb->inode_data_fr_ctl);
+	sbi->inode_data_fr_count = le64_to_cpu(dsb->inode_data_fr_count);
+	sbi->ra_inode_count = RFS_IDP_PIECE_COUNT(sbi->inode_data_plane_pieces_count) *
+			      RFS_IDP_INODES_PER_PIECE;
 
-	if (!sbi->total_blocks || !sbi->inode_count) {
+	if (!sbi->total_blocks || !sbi->ra_inode_count) {
 		pr_err("ravenfs: zero geometry\n");
 		goto bad;
 	}
@@ -1123,14 +1105,11 @@ static int ravenfs_parse_superblock(struct super_block *sb, const void *buf,
 		goto bad;
 	}
 
+	/* v2.0 几何：**只有块位图尾巴**（无固定 inode 数组 / 无 inode 位图）*/
 	sbi->bitmap_blocks = ravenfs_bitmap_blocks(sbi->total_blocks);
 	sbi->bitmap_start = sbi->total_blocks - sbi->bitmap_blocks;
-	sbi->inode_blocks = ravenfs_inode_array_blocks(sbi->inode_count);
-	sbi->inode_array_base = sbi->bitmap_start - sbi->inode_blocks;
-	sbi->inode_bm_blocks = ravenfs_inode_bm_blocks(sbi->inode_count);
-	sbi->inode_bm_base = sbi->inode_array_base - sbi->inode_bm_blocks;
 
-	if (sbi->inode_bm_base <= 2) {
+	if (sbi->bitmap_start <= 2) {
 		pr_err("ravenfs: geometry underflow\n");
 		goto bad;
 	}
@@ -1238,7 +1217,7 @@ static int ravenfs_sb_write_timestamp(struct super_block *sb, bool is_mount)
 
 	/* 正身核验：magic/version 不符 → 这不是（或已不再是）本 FS 的 Primary SB，
 	 * 一个字节都不动。版本口径与 parse_superblock 相同：只认 RAVENFS_VERSION。 */
-	if (le64_to_cpu(dsb->magic) != (u64)SUPERBLOCK_MAGIC ||
+	if (le64_to_cpu(dsb->magic[0]) != (u64)RFS_SB_MAGIC_W0 ||
 	    le32_to_cpu(dsb->version) != RAVENFS_VERSION) {
 		pr_err("ravenfs: refusing timestamp write (sb magic/version mismatch)\n");
 		err = -EINVAL;
@@ -1267,9 +1246,9 @@ static int ravenfs_sb_write_timestamp(struct super_block *sb, bool is_mount)
 	/* 只动本次该动的那一个 u64：born/modify 恒不许 ko 碰，另一个时间戳原样保留
 	 * （mount > umount 是「非正常关机可检出」的全部依据，绝不能顺手“修齐”）。 */
 	if (is_mount)
-		dsb->mount_time = cpu_to_le64(ktime_get_real_seconds());
+		dsb->latest_mount_time = cpu_to_le64(ktime_get_real_seconds());
 	else
-		dsb->umount_time = cpu_to_le64(ktime_get_real_seconds());
+		dsb->latest_umount_time = cpu_to_le64(ktime_get_real_seconds());
 
 	/* crc32 重算回填：此刻 bh->b_data 已是「最终要落盘的 4096B」，置零 crc 字段
 	 * 后全长计算再写回 = mkfs 的 `sb.crc32 = 0; crc32_compute(&sb, 4096)` 同式
@@ -1289,6 +1268,80 @@ static int ravenfs_sb_write_timestamp(struct super_block *sb, bool is_mount)
 	err = ravenfs_issue_flush(sb);
 	if (err)
 		pr_err("ravenfs: timestamp flush failed (%d)\n", err);
+out:
+	brelse(bh);
+	return err;
+}
+
+/*
+ * v2.0 周期同步的 SB 落定：把内存 sbi 里的 inode 数据面四字段刷入 Primary SB，
+ * 更新 latest_syn_time，重算 crc32（**最后一步**）。
+ *
+ * 与 ravenfs_sb_write_timestamp 同口径（直写 bdev 块 0；置零 crc 全长重算；写前
+ * 重验 crc；sync_dirty_buffer + flush）。仅动 5 个字段，其余原样保留。
+ */
+int ravenfs_sb_write_sync(struct super_block *sb)
+{
+	struct ravenfs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+	struct buffer_head *bh;
+	struct RavenSuperblock *dsb;
+	void *tmp;
+	u32 stored, calc;
+	int err = 0;
+
+	if (!sbi)
+		return -EINVAL;
+	if (!ravenfs_sb_writable(sb))
+		return 0;
+
+	bh = sb_bread(sb, 0);
+	if (!bh) {
+		pr_err("ravenfs: cannot read superblock for sync write\n");
+		return -EIO;
+	}
+	dsb = (struct RavenSuperblock *)bh->b_data;
+	if (le64_to_cpu(dsb->magic[0]) != (u64)RFS_SB_MAGIC_W0 ||
+	    le32_to_cpu(dsb->version) != RAVENFS_VERSION) {
+		pr_err("ravenfs: refusing sync SB write (magic/version mismatch)\n");
+		err = -EINVAL;
+		goto out;
+	}
+	stored = le32_to_cpu(dsb->crc32);
+	tmp = kmalloc(RAVENFS_BLOCK_SIZE, GFP_KERNEL);
+	if (!tmp) {
+		err = -ENOMEM;
+		goto out;
+	}
+	memcpy(tmp, bh->b_data, RAVENFS_BLOCK_SIZE);
+	memset(tmp + offsetof(struct RavenSuperblock, crc32), 0, sizeof(u32));
+	calc = crc32_le(~0U, tmp, RAVENFS_BLOCK_SIZE) ^ ~0U;
+	kfree(tmp);
+	if (stored != calc) {
+		pr_err("ravenfs: refusing sync SB write, crc mismatch (stored %08x calc %08x)\n",
+		       stored, calc);
+		err = -EIO;
+		goto out;
+	}
+
+	dsb->inode_data_ctl = cpu_to_le64(sbi->inode_data_ctl);
+	dsb->inode_data_plane_pieces_count =
+		cpu_to_le64(sbi->inode_data_plane_pieces_count);
+	dsb->inode_data_fr_ctl = cpu_to_le64(sbi->inode_data_fr_ctl);
+	dsb->inode_data_fr_count = cpu_to_le64(sbi->inode_data_fr_count);
+	dsb->latest_syn_time = cpu_to_le64(ktime_get_real_seconds());
+
+	dsb->crc32 = 0;
+	dsb->crc32 = cpu_to_le32(crc32_le(~0U, bh->b_data, RAVENFS_BLOCK_SIZE) ^ ~0U);
+
+	mark_buffer_dirty(bh);
+	if (sync_dirty_buffer(bh)) {
+		pr_err("ravenfs: sync SB write failed (bio)\n");
+		err = -EIO;
+		goto out;
+	}
+	RFS_STAT_INC(sb, io_write_ops);
+	RFS_STAT_ADD(sb, io_write_bytes, RAVENFS_BLOCK_SIZE);
+	err = ravenfs_issue_flush(sb);
 out:
 	brelse(bh);
 	return err;
@@ -1330,7 +1383,8 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_flags |= SB_POSIXACL;
 
 	sbi = sb->s_fs_info;
-	root = ravenfs_iget(sb, sbi->root_ino);
+	/* v2.0：根 inode 索引 = 契约级硬编码 RFS_ROOT_INODE_IDX(=0) */
+	root = ravenfs_iget(sb, RFS_ROOT_INODE_IDX);
 	if (IS_ERR(root))
 		return PTR_ERR(root);
 
@@ -1379,8 +1433,10 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 						ravenfs_stats_show, sb);
 	}
 
-	pr_info("ravenfs: mounted blocks=%llu inodes=%llu root_ino=%llu\n",
-		sbi->total_blocks, sbi->inode_count, sbi->root_ino);
+	pr_info("ravenfs: mounted blocks=%llu inodes=%llu pieces=%llu root_idx=%llu\n",
+		sbi->total_blocks, sbi->ra_inode_count,
+		RFS_IDP_PIECE_COUNT(sbi->inode_data_plane_pieces_count),
+		(unsigned long long)RFS_ROOT_INODE_IDX);
 	return 0;
 }
 
