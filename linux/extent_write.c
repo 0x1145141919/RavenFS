@@ -1071,7 +1071,11 @@ static int rfs_ext_orphan_free_rec(struct super_block *sb, u32 kind, u64 blk,
 
 void ravenfs_extent_orphan_release_kind(struct super_block *sb, u32 kind, u64 root)
 {
-	if (root == (u64)PTR_INVALID || root == (u64)RFS_MASK52 || root == 0)
+	/* ⚠️ v2.0：0 是合法块号（盘面契约明令禁用 0 作哨兵）——旧树根可能恰为
+	 * block 0（根 dentry 块被 dentry 树释放后经分配器复用为映射树节点）。此处
+	 * **不得**把 0 当无效，否则整棵旧映射树漏释放（audit: LEAK_BLK [0,2)）。
+	 * 仅 PTR_INVALID / ptr 域全 1 为无效。 */
+	if (root == (u64)PTR_INVALID || root == (u64)RFS_MASK52)
 		return;
 	(void)rfs_ext_orphan_free_rec(sb, kind, root, 0);
 }

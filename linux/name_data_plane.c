@@ -562,7 +562,9 @@ void ravenfs_nd_map_reclaim(struct super_block *sb, u64 tree_root)
 	u64 guard;
 	int d;
 
-	if (tree_root == (u64)PTR_INVALID || tree_root == PTR52 || tree_root == 0)
+	/* ⚠️ 0 是合法块号（v2.0 契约明令禁用 0 作哨兵）：映射树根可能恰为 block 0，
+	 * 不得当无效早退（否则整棵映射树 + 数据片漏回收）。 */
+	if (tree_root == (u64)PTR_INVALID || tree_root == PTR52)
 		return;
 
 	/* 1. 下钻到最左叶（深度受限，防环） */
