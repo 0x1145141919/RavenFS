@@ -1,60 +1,51 @@
 {
   "$schema": "https://opencode.ai/config.json",
 
-  "permission": {
-    // bash: 命令执行权限
-    "bash": {
-      "*":                            "ask",     // 默认询问
-      "grep *":                       "allow",   // 搜索自动放行
-      "cat *":                        "allow",   // 文件预览
-      "head *":                       "allow",
-      "tail *":                       "allow",
-      "ls *":                         "allow",   // 目录浏览
-      "find *":                       "allow",
-      "which *":                      "allow",
-      "echo *":                       "allow",
-      "pwd":                          "allow",
-      "dd *":                         "ask",     // dd 写盘/镜像要确认
-      "losetup *":                    "ask",     // loop 设备操作问
-      "sfdisk *":                     "ask",     // 分区操作问
-      "unshare *":                    "ask",
-      "git diff*":                    "allow",   // git diff 安全
-      "git status*":                  "allow",
-      "git log*":                     "allow",
-      "git show*":                    "allow",
-      "git *":                        "ask",     // 其他 git 操作问
-      "git add *":                    "ask",
-      "git commit *":                 "ask",
-      "git push *":                   "deny",    // push 你手动
-      "cmake *":                      "allow",   // cmake configure 安全
-      "make *":                       "allow",   // 编译直接跑
-      "./ravenfs_cli *":              "ask",     // 格式化/扩容等实际写盘操作
-      "*.o *":                        "ask",
-      "rm *":                         "deny",    // 删除禁止
-      "mv *":                         "ask",
-      "cp *":                         "ask",
-      "chmod *":                      "ask",
-      "chown *":                      "ask",
-      "sudo *":                       "deny"     // 提权禁止
-    },
+  // 黑名单制度：默认全放行，只有黑名单（sudo/rm/rmdir）封禁、git 树操纵要审核
+  "permissions": [
+    { "action": "*", "resource": "*", "effect": "allow" },
 
-    // edit: 文件修改
-    "edit": {
-      "*":                                "allow",
-      "/home/PS/.openclaw/workspace/*":   "deny"
-    },
+    // 黑牌：sudo 出现即封；rm/rmdir 黄牌（ask，需审核）
+    { "action": "shell", "resource": "sudo *",    "effect": "deny" },
+    { "action": "shell", "resource": "rm *",      "effect": "ask" },
+    { "action": "shell", "resource": "rmdir *",   "effect": "ask" },
+    { "action": "shell", "resource": "*/rm *",    "effect": "ask" },
+    { "action": "shell", "resource": "*/rmdir *", "effect": "ask" },
 
-    // read: 文件读取
-    "read": {
-      "*":              "allow",
-      ".env*":          "deny",
-      "*.key":          "deny",
-      "*token*":        "deny"
-    },
-
-    // 外部目录访问
-    "external_directory": {
-      "*":              "allow"
-    }
-  }
+    // 黄牌：git 树操纵（要审核）
+    { "action": "shell", "resource": "git add *",            "effect": "ask" },
+    { "action": "shell", "resource": "git am *",             "effect": "ask" },
+    { "action": "shell", "resource": "git apply *",          "effect": "ask" },
+    { "action": "shell", "resource": "git branch -d *",       "effect": "ask" },
+    { "action": "shell", "resource": "git branch -D *",       "effect": "ask" },
+    { "action": "shell", "resource": "git branch -m *",       "effect": "ask" },
+    { "action": "shell", "resource": "git branch -M *",       "effect": "ask" },
+    { "action": "shell", "resource": "git checkout *",        "effect": "ask" },
+    { "action": "shell", "resource": "git cherry-pick *",     "effect": "ask" },
+    { "action": "shell", "resource": "git clean *",          "effect": "ask" },
+    { "action": "shell", "resource": "git commit *",         "effect": "ask" },
+    { "action": "shell", "resource": "git filter-branch *",   "effect": "ask" },
+    { "action": "shell", "resource": "git filter-repo *",     "effect": "ask" },
+    { "action": "shell", "resource": "git gc *",             "effect": "ask" },
+    { "action": "shell", "resource": "git merge *",          "effect": "ask" },
+    { "action": "shell", "resource": "git mv *",             "effect": "ask" },
+    { "action": "shell", "resource": "git pull *",           "effect": "ask" },
+    { "action": "shell", "resource": "git prune *",          "effect": "ask" },
+    { "action": "shell", "resource": "git rebase *",         "effect": "ask" },
+    { "action": "shell", "resource": "git replace *",        "effect": "ask" },
+    { "action": "shell", "resource": "git reset *",          "effect": "ask" },
+    { "action": "shell", "resource": "git restore *",        "effect": "ask" },
+    { "action": "shell", "resource": "git revert *",         "effect": "ask" },
+    { "action": "shell", "resource": "git rm *",             "effect": "ask" },
+    { "action": "shell", "resource": "git sparse-checkout *","effect": "ask" },
+    { "action": "shell", "resource": "git stash *",          "effect": "ask" },
+    { "action": "shell", "resource": "git submodule *",      "effect": "ask" },
+    { "action": "shell", "resource": "git switch *",         "effect": "ask" },
+    { "action": "shell", "resource": "git tag -a *",         "effect": "ask" },
+    { "action": "shell", "resource": "git tag -d *",         "effect": "ask" },
+    { "action": "shell", "resource": "git tag -f *",         "effect": "ask" },
+    { "action": "shell", "resource": "git tag -s *",         "effect": "ask" },
+    { "action": "shell", "resource": "git update-index *",   "effect": "ask" },
+    { "action": "shell", "resource": "git worktree *",       "effect": "ask" }
+  ]
 }

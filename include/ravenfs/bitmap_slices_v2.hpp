@@ -1,5 +1,5 @@
 #pragma once
-#include "../disk_struct_v1.2.h"   /* result_code_t / RC_* / PTR_INVALID */
+#include "rc.hpp"                    /* result_code_t / RC_* / PTR_INVALID（轻量头，零盘结构依赖） */
 #include "../util/lock.h"            /* 锁原语（供上层路由/后续实现取用；本头当前用 std::mutex） */
 #include <cstdint>
 #include <cstddef>

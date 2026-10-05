@@ -1,11 +1,16 @@
 #pragma once
-#include "disk_struct_v1.2.h"
+#include "rc.hpp"        /* result_code_t / RC_*（轻量头；不再拉整份 on-disk 结构契约） */
 #include <atomic>
 #include <shared_mutex>   /* slice_radix_tree::lock — 可睡眠读写锁（允许持锁等 I/O，不烧核） */
 #include "util/tsc.h"    /* x86_64 Invariant TSC：TTL 换算（绑死 x86_64） */
 #include "cache_mgr_mode.hpp"
 class Inode_cache_mgr_t;
 class RavenFS_juvenile;
+/* raven_Inode_t —— 落盘 inode 结构（完整定义在 disk_struct_v1.2.h）。
+ * 本头只出现其指针（cache_data / 会话返回值 / full_ram_array_ 等），故前置声明
+ * 即可；唯一需要完整类型的「4K 页缓冲取槽」已下沉到 inode_cache.cpp
+ * （InodeSession::inode_slot_of），实现 TU 自行 include 盘结构头。 */
+struct raven_Inode_t;
 enum cache_ctrl_state_t{
     idle,      /* 未载入（CAS 状态机：idle → io_ing → working） */
     io_ing,    /* 他人加载中 / 本线程持有加载权 */
@@ -379,7 +384,7 @@ public:
                 nocache_buff = nullptr;
                 return;
             }
-            inode = &((raven_Inode_t*)nocache_buff)[inum_ & 15];
+            inode = inode_slot_of(nocache_buff, inum_ & 15);
             break;
         }
         case cache_work_mode_t::self_reliat_cache:
@@ -429,6 +434,10 @@ public:
     InodeSession(const InodeSession &) = delete;
     InodeSession &operator=(const InodeSession &) = delete;
 private:
+    /* no_cache：从会话自管的页缓冲取第 idx 个 inode 槽指针。
+     * 实现下沉 inode_cache.cpp（那里有 raven_Inode_t 完整定义）——本头只前置
+     * 声明盘结构，避免为一次指针对齐把整份 on-disk 契约拖进所有引用方。 */
+    static raven_Inode_t *inode_slot_of(void *page_buf, uint64_t idx);
     /* 按后端模式释放会话持有：no_cache 脏写回+释放缓冲 / self_reliat_put /
      * offload_put。析构与 move 赋值共用，三模式语义只此一份。 */
     void release() {

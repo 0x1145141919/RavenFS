@@ -64,33 +64,12 @@
 #define RFS_MASK57  ((1ULL << 57) - 1)   /* 0x01FF_FFFF_FFFF_FFFF */
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 结果码（全局共享；原居 disk_struct_v1.1.hpp，沿用）
+ * 结果码（全局共享；2026-10-05 实体迁移至 ravenfs/rc.hpp，本盘头仅转引）
+ *   结果码是纯运行时常量，与落盘字节布局无关：独立成轻量头后，缓存/分配器
+ *   等运行时模块可只拿 RC_*，不必连整份 on-disk 结构契约一起拖进来。
+ *   本盘头仍经此 include 保持 RC_* 对全部盘侧代码可见（对外符号集不变）。
  * ═══════════════════════════════════════════════════════════════════════════ */
-typedef uint64_t result_code_t;
-
-enum rfs_rc {
-    RC_OK = 0,
-    RC_ERR_OPEN,            /* 设备打开失败 */
-    RC_ERR_MAGIC,           /* Primary SB magic 不符 */
-    RC_ERR_VERSION,         /* 版本 != RAVENFS_VERSION(v1.2=3) */
-    RC_ERR_CRC,             /* Primary SB crc32 校验失败 */
-    RC_ERR_BITMAP_SELF,     /* bitmap 自描述校验失败（尾巴三段非全 1） */
-    RC_ERR_EXIST,           /* 同名 dentry 已存在 */
-    RC_ERR_NOT_FOUND,       /* dentry 未找到 */
-    RC_ERR_NO_BLOCK,        /* FS_block 无空闲 */
-    RC_ERR_NO_INODE,        /* inode 槽无空闲 */
-    RC_ERR_NAME_LEN,        /* 名字 > RAVENFS_MAX_NAME_LEN */
-    RC_ERR_IO,              /* 块 I/O 失败（v1.2 起：bio 后端，不再是 pread/pwrite） */
-    RC_ERR_STATE,           /* 内部状态异常（根节点角色不符等） */
-    RC_ERR_NOT_EMPTY,       /* 目录非空：dir 型目标删除前置校验失败（rmdir 语义） */
-    RC_ERR_NOT_SUPPORTED,   /* 功能暂不支持：归零全量空间回收未实现哨兵（inode 暂挂孤儿，fsck 可回收） */
-    RC_ERR_OVERLAP,         /* 区间与既有映射/空闲区重叠（防御；正常流程 = 契约违反） */
-    RC_ERR_IS_DIR,          /* dir 型目标：文件数据操作接口不受理（EISDIR 对齐） */
-    RC_ERR_XATTR,           /* v1.2 新增：xattr 块读/校验/超限（>1 FS_block → -E2BIG）失败 */
-    RC_ERR_BUSY,            /* 设备已被 Linux 内核以某 FS 挂载（God 防呆拒挂：防双写者 / 撕裂读） */
-
-    RC_NEED_SPLIT = 0x1000  /* 内部使用：本层分裂，需父层处理 */
-};
+#include "ravenfs/rc.hpp"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 文件类型常量（v1.2：镜像 S_IFMT，值 = S_IFMT >> 12；其余值含 0 非法）
@@ -111,7 +90,7 @@ enum rfs_inode_type {
 #define RAVENFS_VERSION          3u          /* v1.2 = 3（v1.1 = 2，不兼容） */
 #define DENTRY_INLINE_NAME_MAX   40u         /* name 内联上限：≤40 内联，>40 外置 */
 #define RAVENFS_MAX_NAME_LEN     (DENTRY_INLINE_NAME_MAX + 512u)  /* 552B */
-#define PTR_INVALID              (~0ULL)     /* 通用无效指针哨兵 */
+/* PTR_INVALID —— 通用无效指针哨兵，实体已随结果码移至 ravenfs/rc.hpp */
 #define NAME_HEAP_INACTIVE       RFS_MASK52  /* 名字堆未激活（52 位全 1；禁用 0） */
 #define RFS_XATTR_NONE           RFS_MASK52  /* xattr_ptr 无 xattr（52 位全 1；禁用 0） */
 #define RFS_SB_MAGIC             0x5241564EULL  /* "RAVN" */
