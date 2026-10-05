@@ -1,7 +1,8 @@
 #pragma once
 #include "rc.hpp"   /* result_code_t + RC_* 全局共享结果码（轻量头，零盘结构依赖） */
 #include "cache_mgr_mode.hpp"     /* cache_work_mode_t：三后端枚举（no_cache / self_reliat / offload） */
-#include "inode_cache_radix.hpp"  /* ctrl_word 位域常量 + cache_ctrl_state_t + bitfield 分片轮子（通用共享） */
+#include "cache_wheel.hpp"        /* 共用轮子：ctrl_word 位域常量 + cache_ctrl_state_t + bitfield 分片解码 */
+#include "util/tsc.h"             /* x86_64 Invariant TSC：self_reliat TTL 换算（原经 inode_cache_radix.hpp 传递，2026-10-05 显式化） */
 
 #include <atomic>
 #include <shared_mutex>   /* slice_radix_tree::lock_ — 可睡眠读写锁（允许持锁等 I/O，不烧核） */

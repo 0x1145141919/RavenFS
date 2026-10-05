@@ -27,7 +27,6 @@
 
 add_library(ravenfs_juvenile STATIC
     ravenfs_juvenile.cpp
-    bitmap_slices.cpp
     fs_allocator.cpp
     fs_allocator_router.cpp
     dentry_walk_lookup.cpp

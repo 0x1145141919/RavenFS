@@ -1,7 +1,6 @@
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #include "../include/ravenfs/inode_cache_radix.hpp"   /* Inode_cache_cfg_t_v2：编排构造（头里仅前置声明） */
 #include "../include/ravenfs/mdata_piece_caches.hpp"  /* mdata_piece_caches_cfg_t：编排构造 */
-#include "../include/ravenfs/bitmap_slices.hpp"  /* bitmap_slices_cfg_t / bitmap_slices_mgr_t：位图模块（2026-09-03 顶出） */
 #include <vector>
 #include <algorithm>
 #include <iterator>
@@ -356,7 +355,7 @@ result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset,
     uint64_t newsize = 0;
     std::list<extent_t> affect;
     {
-        InodeSession s(inode_cache_mgr, inode_idx);
+        InodeSession s(inode_io, inode_idx);
         if (!s.inode) return RC_ERR_IO;
         raven_Inode_t *ino = s.inode;
         if (RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_REGULAR && RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_SOFT_SYM)
@@ -643,7 +642,7 @@ result_code_t RavenFS_juvenile::df_pipeline(uint64_t inode_idx, uint64_t offset,
         const uint64_t direct_base = keep_direct
             ? (pre_shape == inline_file ? RFS_PTR_ADDR(segs[0].block_base) : pre_data_root)
             : (collapse ? collapse_base : 0);
-        InodeSession s(inode_cache_mgr, inode_idx);
+        InodeSession s(inode_io, inode_idx);
         if (!s.inode) {
             /* 提交前会话失败：inode 未动，树 + 账本统一回滚后报错 */
             cleanup_after_phase2(tree_path ? segs.size() : 0);
@@ -703,7 +702,7 @@ result_code_t RavenFS_juvenile::regular_file_reclaim(uint64_t inode_idx, bool de
     uint64_t data_root = PTR_INVALID;
     uint64_t fsize = 0;
     {
-        InodeSession ino_sess(inode_cache_mgr, inode_idx);
+        InodeSession ino_sess(inode_io, inode_idx);
         if (!ino_sess) return RC_ERR_IO;
         raven_Inode_t *ino = ino_sess.inode;
         if (RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_REGULAR && RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_SOFT_SYM)
@@ -867,7 +866,7 @@ result_code_t RavenFS_juvenile::direct_file_pread(uint64_t inode_idx, uint64_t o
     uint64_t fsize = 0, base = 0, root = 0;
     bool is_direct = false;
     {
-        InodeSession s(inode_cache_mgr, inode_idx);
+        InodeSession s(inode_io, inode_idx);
         if (!s.inode) return RC_ERR_IO;
         raven_Inode_t *ino = s.inode;
         if (RFS_INO1_GET_TYPE(ino->word1) == INODE_TYPE_DIR) return RC_ERR_IS_DIR;
@@ -1180,7 +1179,7 @@ result_code_t RavenFS_juvenile::direct_file_punch_hole(uint64_t inode_idx, uint6
     bool is_direct = false;
     regular_file_type_t shape = inline_file;
     {
-        InodeSession s(inode_cache_mgr, inode_idx);
+        InodeSession s(inode_io, inode_idx);
         if (!s.inode) return RC_ERR_IO;
         raven_Inode_t *ino = s.inode;
         if (RFS_INO1_GET_TYPE(ino->word1) == INODE_TYPE_DIR) return RC_ERR_IS_DIR;
@@ -1252,7 +1251,7 @@ result_code_t RavenFS_juvenile::direct_file_punch_hole(uint64_t inode_idx, uint6
         }
     };
     auto commit_root = [&](uint64_t new_root) {
-        InodeSession s(inode_cache_mgr, inode_idx);
+        InodeSession s(inode_io, inode_idx);
         if (!s.inode) return;
         s.inode->data_root = new_root;
         s.dirty();
@@ -1282,7 +1281,7 @@ result_code_t RavenFS_juvenile::direct_file_punch_hole(uint64_t inode_idx, uint6
         zero_byte_range(db_end * FS_BLOCK, clamp_end);
         /* 提交：direct_bit=0、data_root=new_root、size 不变 */
         {
-            InodeSession s(inode_cache_mgr, inode_idx);
+            InodeSession s(inode_io, inode_idx);
             if (!s.inode) { extent_orphan_release(new_root); return RC_ERR_IO; }
             RFS_INO1_SET_DIRECT(*s.inode, 0);
             s.inode->data_root = new_root;
@@ -1382,7 +1381,7 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
     regular_file_type_t shape = inline_file;
     bool pipeline_grow = false;
     {
-        InodeSession s(inode_cache_mgr, inode_idx);
+        InodeSession s(inode_io, inode_idx);
         if (!s.inode) return RC_ERR_IO;
         raven_Inode_t *ino = s.inode;
         if (RFS_INO1_GET_TYPE(ino->word1) == INODE_TYPE_DIR) return RC_ERR_IS_DIR;
@@ -1437,7 +1436,7 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
         if (got != len_new) return RC_ERR_STATE;   /* 防御：读不足 */
         /* 提交点：inode 一次写（size + 形态 + data_root 同写）——先于一切 free */
         {
-            InodeSession s(inode_cache_mgr, inode_idx);
+            InodeSession s(inode_io, inode_idx);
             if (!s.inode) return RC_ERR_IO;
             s.inode->size = len_new;
             RFS_INO1_SET_DIRECT(*s.inode, 0);
@@ -1465,7 +1464,7 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
             }
         }
         {
-            InodeSession s(inode_cache_mgr, inode_idx);
+            InodeSession s(inode_io, inode_idx);
             if (!s.inode) return RC_ERR_IO;
             s.inode->size = len_new;   /* base/direct_bit 不动 */
             s.dirty();
@@ -1499,7 +1498,7 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
             if (rc) {
                 /* 部分 shrink：root 若变先提交，防悬挂 */
                 if (root_blk != droot) {
-                    InodeSession s(inode_cache_mgr, inode_idx);
+                    InodeSession s(inode_io, inode_idx);
                     if (s.inode) { s.inode->data_root = root_blk; s.dirty(); }
                 }
                 return rc;
@@ -1535,7 +1534,7 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
             if (rc) {
                 /* 部分 shrink：已 loose 生效不回滚（合法形态）——root 若变先提交，防悬挂 */
                 if (root_blk != droot) {
-                    InodeSession s(inode_cache_mgr, inode_idx);
+                    InodeSession s(inode_io, inode_idx);
                     if (s.inode) { s.inode->data_root = root_blk; s.dirty(); }
                 }
                 return rc;
@@ -1576,7 +1575,7 @@ result_code_t RavenFS_juvenile::direct_file_trunacate(uint64_t inode_idx, uint64
 
         /* 提交点（inode 一次写）——先于一切 free */
         {
-            InodeSession s(inode_cache_mgr, inode_idx);
+            InodeSession s(inode_io, inode_idx);
             if (!s.inode) return RC_ERR_IO;
             s.inode->size = len_new;
             if (collapse) {
@@ -1616,7 +1615,7 @@ result_code_t RavenFS_juvenile::extent_tree_collapse_to_direct(uint64_t owner_in
 
     uint64_t fsize = 0, root_blk = 0;
     {   /* 入口读态：受理校验 + 形态/树根快照（会话内判，关后只用拷贝） */
-        InodeSession s(inode_cache_mgr, owner_inode_idx);
+        InodeSession s(inode_io, owner_inode_idx);
         if (!s.inode) return RC_ERR_IO;
         raven_Inode_t *ino = s.inode;
         const uint32_t t = RFS_INO1_GET_TYPE(ino->word1);
@@ -1648,7 +1647,7 @@ result_code_t RavenFS_juvenile::extent_tree_collapse_to_direct(uint64_t owner_in
 
     /* 提交点：inode 一次写（direct 态，size 不动）——先于 free */
     {
-        InodeSession s(inode_cache_mgr, owner_inode_idx);
+        InodeSession s(inode_io, owner_inode_idx);
         if (!s.inode) return RC_ERR_IO;
         RFS_INO1_SET_DIRECT(*s.inode, 1);
         s.inode->data_root = direct_base;

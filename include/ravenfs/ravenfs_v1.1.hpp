@@ -1,5 +1,5 @@
 #pragma once
-#include "../disk_struct_v1.3.h"
+#include "../disk_struct_v2.0.h"
 #include "cache_mgr_mode.hpp"
 #include "../magics.h"
 #include <list>
@@ -17,9 +17,9 @@ struct audit_fr_tree_t;
  * 若在 ravenfs_v1.1.hpp 直接 include，任何用
  * `#define private public` 包裹本头的测试（test_root_dir_*）会把
  * 标准库模板头一并污染，gcc16 下 sstream 可访问性检查直接报错。 */
-class Inode_cache_mgr_t;        /* inode 缓存管理器（inode_cache_radix.hpp） */
+struct inode_io_t;             /* inode 会话绑定：数据面 + 8K 片缓存（inode_cache_radix.hpp） */
 class mdata_piece_caches_mgr;   /* 8K 元数据负载片缓存管理器（mdata_piece_caches.hpp） */
-class bitmap_slices_mgr_t;      /* 双位图分片分配器（bitmap_slices.hpp；2026-09-03 从上帝类顶出） */class mdata_piece_caches_mgr;   /* 8K 元数据负载片缓存管理器（mdata_piece_caches.hpp） */
+class fs_allocator_t;           /* 双组分配器（block 分片 + 全局 inode 数据面；fs_allocator.hpp） */
 
 #include <cstdint>
 #include <cstddef>
@@ -50,7 +50,7 @@ class bitmap_slices_mgr_t;      /* 双位图分片分配器（bitmap_slices.hpp�
  *    bitmap 自描述四连验）。
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* 磁盘格式版本：由 disk_struct_v1.3.h 的 RAVENFS_VERSION 宏提供（v1.3 = 4）。
+/* 磁盘格式版本：由 disk_struct_v2.0.h 的 RAVENFS_VERSION 宏提供（v2.0 = 0）。
  * v1.1 起版本常量统一下沉到磁盘结构头，避免与宏重定义冲突。 */
 
 /* ── readdir 输出项 ──
@@ -193,6 +193,9 @@ private:
     enum extent_tree_kind_t : uint8_t {
         EXTENT_TREE_FILE     = 0,   /* 文件区段树：BPTREE_MAGIC1..4 */
         EXTENT_TREE_NAMEDATA = 1,   /* 目录名字数据面映射树：NAMEDATA_EXTENT_MAGIC1..4 */
+        EXTENT_TREE_INODE    = 2,   /* 全局 inode 数据面映射树（v2.0）：INODE_DATA_EXTENT_MAGIC1..4
+                                     *   运行时为内存 RBT；盘上快照 B+树走「激进重建」/mount bulk-load/
+                                     *   audit 时用本 kind 认节点族。 */
     };
     /* 按 kind 校验节点 256-bit 魔数（extent 机械内部统一走此谓词）。 */
     static bool is_extent_node_kind(const Bptree_meta_t *meta, extent_tree_kind_t kind);
@@ -283,9 +286,10 @@ private:
      * RC_OK / RC_ERR_STATE(参数非法) / RC_ERR_IO(短读短写) */
     result_code_t read_buff(uint64_t blk, uint64_t blk_len, void *buf);
     result_code_t write_buff(uint64_t blk, uint64_t blk_len, const void *buf);
-    /* ── inode I/O（零缓存）── */
-    void inode_read(uint64_t inum, raven_Inode_t *out) const;
-    void inode_write(uint64_t inum, const raven_Inode_t *in);
+    /* ── inode 访问：统一走 InodeSession（数据面 translate + mdata_piece 缓存）──
+     * v2.0：**inode_read/inode_write 全面废除**——不再直读/直写盘，也不再走自管
+     * inode 缓存机械；一律 InodeSession（见 inode_cache_radix.hpp）。
+     * 内部调用点：InodeSession s(&inode_io, inum)。 */
 
     /* detach 原语对（2026-09-06，pwrite_pipeline.md §9）：
      * root_blk in/out —— 入 = 当前树根，出 = 操作后根（根裂建新根 / 根收缩更迭经引用带出）；
@@ -319,10 +323,16 @@ private:
      * 返回：RC_OK（已检查；*out_collapsed 报是否降级）/ RC_ERR_IO / RC_ERR_STATE。
      * 不适用（非 REG/LNK、inline/direct 态、树非单条、单条非整域覆盖）= RC_OK + 未降级、零副作用。 */
     result_code_t extent_tree_collapse_to_direct(uint64_t owner_inode_idx, bool *out_collapsed = nullptr);
-    /* ── 位图核心 ── */
-    bool bitmaps_load();     /* mount 时：直写=全量 pread 入内存；mmap 后端=窗口切片（不预取）。
-                                * 两模式共用自描述校验(§6.6)；原始内存喂给 bitmap_slices_mgr_t 装配 */
-    void bitmaps_flush();    /* 析构时：仅直写模式 pwrite 全量写回（mmap 后端由内核页缓存管） */
+    /* ── block 位图核心 ──
+     * v2.0：盘上只有 block 位图一段；inode 存储是全局数据面（extent 翻译 + fr 空闲面），
+     * 其装载/刷回由 fs_allocator 的 init/dump 面 + 上帝类 I/O 负责（见 ctor/dtor）。 */
+    bool bitmaps_load();     /* mount：block 位图入内存/切片 + 尾巴白名单校验 */
+    void bitmaps_flush();    /* 卸载：block 位图回写（直写模式）；mmap 由内核页缓存管 */
+    /* ── 同步落盘（P3）：把分配器内存事实落盘 ──
+     * 顺序（硬）：① inode 数据面维护（extent 重建 / fr 释放+重分配+写）→ ② block 位图回写。
+     * 因为 ① 的取块会改 block 分配器，② 在其后重建位图才能捕获，保证「维护事实可落盘」。
+     * SB 最后写（指针全部落定）。需友元访问 fs_allocator_t 私有树。 */
+    result_code_t all_sycn(fs_allocator_t *allocator);
     /* 防呆（ctor 最先调，任何写盘前）：当前 fd 指向的设备是否已被 Linux 内核以某 FS 挂载。
      * true = 已挂载 → ctor 拒绝挂载（RC_ERR_BUSY；防双写者 / 撕裂读）。
      * 块设备：命中自身 dev 号 **或整盘任一在挂载的分区**（整盘兜底，防"整盘仍在用分区"）；
@@ -334,7 +344,7 @@ private:
      *               self_reliat（用户态缓存）/ no_cache（session 直读）
      * 失败 → 非 RC_OK（已清理已建子模块）。mdata_piece 的 self_reliat
      * 未实装（ctor 拒绝），直写+开块缓存目前挂载失败，TODO 待实装。 */
-    result_code_t caches_setup();
+    result_code_t mdata_cache_setup();   /* 建 mdata_piece 8K 片缓存（须在 inode 数据面装载之前，tree 态 bulk-load 走它）*/
     void caches_teardown();  /* 卸载：flush_all（同步点）→ delete 子模块 → 指针置空 */
     /* 缓存回调适配器：私有 read_buff/write_buff → 子模块函数指针（io_ctx = this） */
     static result_code_t fs_io_read(void *io_ctx, uint64_t blk, uint64_t blk_len, void *buf);
@@ -365,16 +375,18 @@ private:
 
     uint64_t total_blocks   = 0;
     uint64_t inode_count    = 0;
-    /* 尾巴三段（block_model §3.2 链式推导，mkfs 同源） */
+    /* ── v2.0 全局 inode 数据面（弹性；无固定数组 / 无 inode 位图）──
+     * inode_data_pieces = SB.inode_data_plane_pieces_count（8K 片数）；
+     * inode_count = pieces × 32（每片 32 个 256B inode）。
+     * inode_array_base = 数据面 direct 段基块（RFS_IDP_CTL_PTR）——**仅 direct 态线性可用**；
+     * tree 态由映射树定位，待分配器切树（P1+）。 */
+    uint64_t inode_data_pieces = 0;
+    /* 尾巴（v2.0：盘上只有 block bitmap 一段） */
     uint64_t bitmap_start       = 0;
     uint64_t bitmap_blocks      = 0;
-    uint64_t inode_array_base   = 0;
-    uint64_t inode_blocks       = 0;
-    uint64_t inode_bm_base      = 0;   /* inode_array_bitmap_base */
-    uint64_t inode_bm_blocks    = 0;
+    uint64_t inode_array_base   = 0;   /* inode 数据面 direct 段基块（tree 态装载待接线）*/
 
-    uint8_t *block_bits = nullptr;      /* 全量内存位图（bitmap_blocks×4096），4K 对齐（posix_memalign） */
-    uint8_t *inode_bits = nullptr;      /* 全量内存位图（inode_bm_blocks×4096），4K 对齐（posix_memalign） */
+    uint8_t *block_bits = nullptr;      /* block 位图（bitmap_blocks×4096），4K 对齐 */
     uint64_t root_inum      = 0;        /* 恒 0（根目录 inode 索引） */
     uint64_t root_dentry_blk = 0;       /* root inode.data_root（树根块号） */
 
@@ -383,9 +395,9 @@ private:
      * 并构造子模块（见 caches_setup）；未接线时各处 mdata_piece_session
      * 构造恒失败（防御路径），8K 元数据访问全部报错 —— 这是预期
      * （编排完成前只编译不跑）。 */
-    Inode_cache_mgr_t      *inode_cache_mgr  = nullptr;   /* inode 缓存（inode_cache_radix.hpp） */
-    mdata_piece_caches_mgr *mdata_piece_mgr  = nullptr;   /* 8K 元数据负载片缓存（mdata_piece_caches.hpp） */
-    bitmap_slices_mgr_t    *bitmap_mgr       = nullptr;   /* 双位图分片分配器（bitmap_slices.hpp；2026-09-03 顶出，ctor 装配/dtor 拆除） */
+    inode_io_t             *inode_io        = nullptr;   /* inode 会话绑定（数据面 + mdata_piece；inode_cache_radix.hpp） */
+    mdata_piece_caches_mgr *mdata_piece_mgr = nullptr;   /* 8K 片缓存（B+tree 节点 + inode 数据面片共用） */
+    fs_allocator_t         *allocator       = nullptr;   /* 双组分配器（block 分片 + 全局 inode 数据面；fs_allocator.hpp） */
 
     /* ── mmap 后端（非直写挂载；决策树第一层） ──
      * is_device_direct=false 时整盘从 offset 0 映射（含 SB 区 byte[0,4096)），
@@ -727,6 +739,9 @@ private:
     /* ── audit 内部机械（juvenile_god/audit.cpp；新可达性模型）── */
     /* 读一个 8K 树节点到 dst（8192B，8K 对齐）；失败 false。 */
     bool audit_node_read(uint64_t blk, void *dst);
+    /* v2.0：认领 inode 数据面结构块（映射树节点 + 数据片 + fr 快照区）到块影子图，
+     * 避免「分配了但 DFS 不可达」误报泄露。 */
+    void audit_claim_inode_plane(audit_walk_ctx_t &ctx);
     /* 单 inode 访问（先序：置影子 → 校验 → 下钻）。parent_inum = 父目录（root 传 PTR_INVALID）。 */
     void audit_walk_inode(audit_walk_ctx_t &ctx, uint64_t inum, uint64_t parent_inum);
     /* DIR：字段校验 + 目录名字数据面（v1.3）+ dentry 树 DFS + 子目录先序下钻。 */

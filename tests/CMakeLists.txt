@@ -143,20 +143,19 @@ add_executable(ravenfs_juv_delete
 )
 target_link_libraries(ravenfs_juv_delete PRIVATE ravenfs_juvenile)
 
-# v1.1 bitmap_slice_t 分片位图自治单元单测（alloc_hard hint 命中/miss +
-# alloc_soft 全量 gather；free_count / hint 变化校验；soft_occupy 锚定软占领）
-add_executable(ravenfs_juv_bitmap_slice
-    test_bitmap_slice.cpp
-    ${CPU_ID_STUB}
-)
-target_link_libraries(ravenfs_juv_bitmap_slice PRIVATE ravenfs_juvenile)
+# v1.1 bitmap_slice_t 分片位图自治单元单测 —— **退役**（v2.0 起 bitmap_slices 整体删除）
+# add_executable(ravenfs_juv_bitmap_slice
+#     test_bitmap_slice.cpp
+#     ${CPU_ID_STUB}
+# )
+# target_link_libraries(ravenfs_juv_bitmap_slice PRIVATE ravenfs_juvenile)
 
-# v1.1 block_occupy_soft 定点占领路由测试（自旋强制抢 + 片尾跨界续圈 + 跨片释放）
-add_executable(ravenfs_juv_block_occupy
-    test_block_occupy.cpp
-    ${CPU_ID_STUB}
-)
-target_link_libraries(ravenfs_juv_block_occupy PRIVATE ravenfs_juvenile)
+# v1.1 block_occupy_soft 定点占领路由测试 —— **退役**（随 bitmap_slices 删除）
+# add_executable(ravenfs_juv_block_occupy
+#     test_block_occupy.cpp
+#     ${CPU_ID_STUB}
+# )
+# target_link_libraries(ravenfs_juv_block_occupy PRIVATE ravenfs_juvenile)
 
 # v1.1 名字堆专项/压测 —— **退役**：v1.3 名字堆（10 档 heaps_*）已由目录名字
 # 数据面（映射 direct/tree + fr 树）取代，旧测试断的正是被删字段。新的
@@ -246,6 +245,14 @@ add_executable(ravenfs_juv_fs_allocator_router
 )
 target_link_libraries(ravenfs_juv_fs_allocator_router PRIVATE ravenfs_juvenile)
 
+# v2.0 全局 inode 数据面专项（2026-10-06，P1）：独立无状态初始化（校验负数例）+
+# locate 回环 + alloc/free 融合 + 用尽 grow（硬分配/物理尾合并）+ 随机压测 + 小并发。
+add_executable(ravenfs_juv_inode_plane
+    test_fs_allocator_inode_plane.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_inode_plane PRIVATE ravenfs_juvenile Threads::Threads)
+
 # 2026-10-04 新树版分片分配器原型可靠性压测（只增测试，不改生产代码）：
 #   slice 级：mgr_slice_t 单线程随机+对抗（影子账本全量对账，ops ≥ 2e5）
 add_executable(ravenfs_stress_fs_allocator_slice
@@ -306,4 +313,12 @@ target_link_libraries(ravenfs_stress_name_data_fr PRIVATE ravenfs_juvenile)
 # 同时以 static_assert 钉死 v1.3 结构尺寸与关键 offset。无运行时符号。
 add_executable(ravenfs_header_selfcheck_v13
     header_selfcheck_v13.cpp
+)
+
+# disk_struct_v2.0.h 自校验 TU：同 v13 套路 —— 让 v2.0 盘面头进入
+# compile_commands.json（真实 -I include / -std=gnu++20），VSCode 不再
+# 退回带 -D__KERNEL__ 的兜底配置而刷假错；同时钉死 SB 32B magic +
+# 全局 inode 数据面四字段的尺寸/offset。无运行时符号。
+add_executable(ravenfs_header_selfcheck_v20
+    header_selfcheck_v20.cpp
 )

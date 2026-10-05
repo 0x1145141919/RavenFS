@@ -1,5 +1,6 @@
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"   /* mdata_piece_session：8K 元数据节点会话（头里仅前置声明） */
+#include "../include/ravenfs/inode_cache_radix.hpp"   /* InodeSession（v2.0） */
 #include <cstring>
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -345,10 +346,13 @@ result_code_t RavenFS_juvenile::dentry_new_root_inner(uint64_t low_blk, uint64_t
 
     root_sess.dirty();
 
-    raven_dir_Inode_t root_inode;
-    inode_read(root_inode_idx, (raven_Inode_t *)&root_inode);
-    root_inode.ddentry_Bptree_root = new_root_blk;
-    inode_write(root_inode_idx, (const raven_Inode_t *)&root_inode);
+    {
+        InodeSession rs(inode_io, root_inode_idx);
+        if (!rs) return RC_ERR_IO;
+        raven_dir_Inode_t *ri = (raven_dir_Inode_t *)rs.inode;
+        ri->ddentry_Bptree_root = new_root_blk;
+        rs.dirty();
+    }
     root_dentry_blk = new_root_blk;
     return RC_OK;
 }

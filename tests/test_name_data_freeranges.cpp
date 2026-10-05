@@ -21,6 +21,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "inode_compat.hpp"   /* v2.0 inode 读写兼容壳 */
 
 #include <cstdio>
 #include <cstring>
@@ -52,7 +53,7 @@ static linux_userspace_mount_t make_mount(const char *path) {
 }
 static uint64_t rd_fr_count(RavenFS_juvenile &fs, uint64_t inum) {
     raven_dir_Inode_t d;
-    fs.inode_read(inum, (raven_Inode_t *)&d);
+    juv_inode_read(fs, inum, (raven_Inode_t *)&d);
     return RFS_ND_FR_COUNT(d.name_data_free_ranges_count);
 }
 
@@ -67,7 +68,7 @@ int main(int argc, char **argv) {
     {
         RavenFS_juvenile fs(mnt, &rc);
         if (!fs.is_mounted()) { printf("mount failed rc=%llu\n", (unsigned long long)rc); return 1; }
-        const uint64_t root = fs.sb.root_inode;
+        const uint64_t root = RFS_ROOT_INODE_IDX;
         const uint64_t SLOT = 512;
 
         printf("\n--- 造足够多的数据片（供 fr 逻辑空间） ---\n");
@@ -90,7 +91,7 @@ int main(int argc, char **argv) {
             if (r != RC_OK) { CHECK(false, "free #%llu rc=%llu", (unsigned long long)i, (unsigned long long)r); break; }
             /* 隐含升级回归：1（遗留）+8 条 = 9 条仍 inline；第 10 条升格 tree。 */
             if (i == 8) {
-                raven_dir_Inode_t d; fs.inode_read(root, (raven_Inode_t *)&d);
+                raven_dir_Inode_t d; juv_inode_read(fs, root, (raven_Inode_t *)&d);
                 CHECK(RFS_ND_FR_CTL_IS_INLINE(d.name_data_free_ranges_ctl) == 1 &&
                       RFS_ND_FR_COUNT(d.name_data_free_ranges_count) == 9 &&
                       RFS_ND_FR_CTL_PTR(d.name_data_free_ranges_ctl) != RFS_ND_FR_CTL_PTR_INVALID,
@@ -99,7 +100,7 @@ int main(int argc, char **argv) {
                       (unsigned long long)RFS_ND_FR_COUNT(d.name_data_free_ranges_count));
             }
             if (i == 9) {
-                raven_dir_Inode_t d; fs.inode_read(root, (raven_Inode_t *)&d);
+                raven_dir_Inode_t d; juv_inode_read(fs, root, (raven_Inode_t *)&d);
                 CHECK(RFS_ND_FR_CTL_IS_INLINE(d.name_data_free_ranges_ctl) == 0 &&
                       RFS_ND_FR_COUNT(d.name_data_free_ranges_count) == 10 &&
                       RFS_ND_FR_CTL_PTR(d.name_data_free_ranges_ctl) != RFS_ND_FR_CTL_PTR_INVALID,
@@ -122,7 +123,7 @@ int main(int argc, char **argv) {
         printf("\n--- Phase 2: best-fit index>255 回归（截断 bug） ---\n");
         {
             uint64_t ctl = 0;
-            raven_dir_Inode_t d; fs.inode_read(root, (raven_Inode_t *)&d);
+            raven_dir_Inode_t d; juv_inode_read(fs, root, (raven_Inode_t *)&d);
             ctl = d.name_data_free_ranges_ctl;
             uint64_t base = 0, len = 0;
             uint64_t r = fs.name_data_fr_find_fit(RFS_ND_FR_CTL_PTR(ctl), 300, &base, &len);
@@ -153,7 +154,7 @@ int main(int argc, char **argv) {
 
         /* 再 best-fit 一次，分裂后仍正确 */
         {
-            uint64_t ctl = 0; raven_dir_Inode_t d; fs.inode_read(root, (raven_Inode_t *)&d);
+            uint64_t ctl = 0; raven_dir_Inode_t d; juv_inode_read(fs, root, (raven_Inode_t *)&d);
             ctl = d.name_data_free_ranges_ctl;
             uint64_t base = 0, len = 0;
             uint64_t r = fs.name_data_fr_find_fit(RFS_ND_FR_CTL_PTR(ctl), 338, &base, &len);

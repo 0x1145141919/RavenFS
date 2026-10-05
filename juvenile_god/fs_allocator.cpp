@@ -512,3 +512,229 @@ result_code_t mgr_slice_t::soft_alloc(uint8_t align_log2, uint64_t bitscount,
     all_satisfied = (remain == 0);                         /* 分片级是否已满足 */
     return RC_OK;                                          /* 允许部分交付 */
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * inode_data_plane_t — 全局 inode 数据面实现（v2.0）
+ *
+ * 复用本文件顶部的匿名 namespace 轮子（insert_both / erase_both / clear_both /
+ * make_pos_probe）维护 fr 主从树；extent 树是普通 std::set（key=lblk）。
+ *
+ * 锁序（见头注，硬）：fr_lock_（空间） > extent_lock_（翻译）；fr_lock_ > block 片锁。
+ *   · locate           : extent 读
+ *   · alloc            : fr 写；用尽 → grow_locked（fr 写内再 extent 写 + block 片锁）
+ *   · free / test / 几何: fr 读或写
+ * ═══════════════════════════════════════════════════════════════════ */
+
+inode_data_plane_t::~inode_data_plane_t() {
+    /* 主从树析构纪律：先摘从树钩子（size_），再析构主树元素（pos_）。 */
+    fr_size_.clear();
+    fr_pos_.clear();
+    extents_.clear();
+}
+
+result_code_t inode_data_plane_t::init(const inode_data_plane_cfg_t &cfg, fs_allocator_t *owner) {
+    if (owner == nullptr) return RC_ERR_STATE;
+    if (cfg.pieces == 0) return RC_ERR_STATE;
+    if (cfg.extent_count == 0 || cfg.extents == nullptr) return RC_ERR_STATE;
+
+    owner_ = owner;
+    grow_batch_ = cfg.grow_batch_pieces ? cfg.grow_batch_pieces : 1;
+    pieces_ = 0;
+    fr_free_ = 0;
+
+    /* ── 翻译面：校验 extent 稠密无洞无重叠 + 8K 对齐 + Σ ──
+     * 不变量（disk_layout_v2.0 §4.5）：lblk 偶、phys_base 偶、length 偶>0，
+     * 排序后 [0] 起于 0 且逐条紧邻，Σlength == pieces×2。任一不符 → 挂载失败。 */
+    {
+        uint64_t expect_lblk = 0;
+        try {
+            for (uint64_t i = 0; i < cfg.extent_count; i++) {
+                const fs_inode_extent_t e = cfg.extents[i];
+                if (e.length == 0 || (e.length & 1ULL) || (e.lblk & 1ULL) || (e.phys_base & 1ULL))
+                    return RC_ERR_STATE;                       /* 尺寸/对齐非法（2 块对齐铁律） */
+                if (e.lblk != expect_lblk) return RC_ERR_STATE;/* 洞 / 重叠 / 未排序 */
+                extents_.insert(e);
+                expect_lblk = e.lblk + e.length;
+            }
+        } catch (const std::bad_alloc &) {
+            extents_.clear();
+            return RC_ERR_STATE;
+        }
+        if (expect_lblk != cfg.pieces * 2ULL) { extents_.clear(); return RC_ERR_STATE; }
+    }
+    pieces_ = cfg.pieces;
+
+    /* ── 空闲面：范围校验（落 [0,pieces×32)、不含 idx0、互不重叠）+ 主从插入 ──
+     * insert_both 只在「邻接」时融合；重叠是契约违反 → 报错挂载失败（绝不静默改写）。 */
+    const uint64_t total_inodes = pieces_ * 32ULL;
+    try {
+        for (uint64_t i = 0; i < cfg.fr_count; i++) {
+            const inode_dataplane_coordinate_free_range_t f = cfg.fr[i];
+            if (f.len == 0) continue;
+            if (f.base == 0) goto fr_fail;                     /* idx0 归 root，永不可空闲 */
+            if (f.base >= total_inodes || f.len > total_inodes - f.base) goto fr_fail;  /* 越界 */
+            {
+                const fs_interval_t probe = make_pos_probe(f.base);
+                auto it = fr_pos_.lower_bound(probe);
+                if (it != fr_pos_.end() && it->base < f.base + f.len) goto fr_fail;      /* 与后继重叠 */
+                if (it != fr_pos_.begin()) {
+                    auto p = std::prev(it);
+                    if (p->base + p->len > f.base) goto fr_fail;                          /* 与前驱重叠 */
+                }
+            }
+            insert_both(fr_pos_, fr_size_, f.base, f.len);
+            fr_free_ += f.len;
+        }
+    } catch (const std::bad_alloc &) {
+        goto fr_fail;
+    }
+    return RC_OK;
+
+fr_fail:
+    fr_size_.clear();
+    fr_pos_.clear();
+    return RC_ERR_STATE;
+}
+
+result_code_t inode_data_plane_t::locate(uint64_t inum, inode_location_t *out) const {
+    if (out == nullptr) return RC_ERR_STATE;
+    std::shared_lock<std::shared_mutex> lk(extent_lock_);
+    const uint64_t lblk = inum >> 4;                       /* 逻辑 4K 块坐标（映射树坐标） */
+    fs_inode_extent_t probe{};
+    probe.lblk = lblk;
+    auto it = extents_.upper_bound(probe);                 /* 第一个 lblk > target */
+    if (it == extents_.begin()) return RC_ERR_NOT_FOUND;
+    --it;
+    if (lblk >= it->lblk + it->length) return RC_ERR_NOT_FOUND;
+    /* 8K 片基 = 覆盖该 lblk 的偶块起点；片内偏移 = (inum & 31)×256。 */
+    out->blkbase = it->phys_base + ((lblk - it->lblk) & ~1ULL);
+    out->inblk_offset = (uint16_t)((inum & 31ULL) * 256ULL);
+    return RC_OK;
+}
+
+/* alloc_locked：fr best-fit 取一个 inode（须持 fr_lock_ 写锁）。
+ * need=1 ⇒ 最小 len 区间即最优；取其 base（碎片复用 + 计数局部性）。 */
+result_code_t inode_data_plane_t::alloc_locked(uint64_t &out_inum) {
+    if (fr_size_.empty()) return RC_ERR_NO_BLOCK;
+    auto it = fr_size_.begin();
+    const uint64_t b = it->base, l = it->len;
+    auto pit = fr_pos_.lower_bound(make_pos_probe(b));
+    if (pit == fr_pos_.end() || pit->base != b || pit->len != l) return RC_ERR_STATE;  /* 双树失配：内部错误 */
+    erase_both(fr_pos_, fr_size_, pit);
+    if (l > 1) insert_both(fr_pos_, fr_size_, b + 1, l - 1);
+    fr_free_ -= 1;
+    out_inum = b;
+    return RC_OK;
+}
+
+/* grow_locked：fr 写锁内增片。先 block 硬分配（2k 块、8K 对齐，k 逐级折半降至 1），
+ * 再**先翻译后 fr**：注入 extent（或与物理尾邻接时扩尾）→ 新片 32k 个 inode 入 fr。
+ * 失败回滚：块已取但 extent 注入抛错 → block_free 退片。 */
+result_code_t inode_data_plane_t::grow_locked() {
+    uint32_t k = grow_batch_ ? grow_batch_ : 1;
+    uint64_t blk = PTR_INVALID;
+    for (;;) {
+        const uint64_t b = owner_->block_alloc_hard((uint64_t)k * 2ULL, 1);  /* 2k 块，8K 对齐 */
+        if (b != PTR_INVALID) { blk = b; break; }
+        if (k <= 1) break;
+        k >>= 1;
+        if (k == 0) k = 1;
+    }
+    if (blk == PTR_INVALID) return RC_ERR_NO_BLOCK;
+
+    const uint64_t new_lblk = pieces_ * 2ULL;   /* 逻辑尾（稠密无洞） */
+    try {
+        std::unique_lock<std::shared_mutex> elk(extent_lock_);   /* 锁序：fr → ext */
+        bool merged = false;
+        if (!extents_.empty()) {
+            auto last = std::prev(extents_.end());
+            if (last->lblk + last->length == new_lblk &&
+                last->phys_base + last->length == blk) {         /* 物理尾邻接 → 扩尾（合并） */
+                fs_inode_extent_t ne = *last;
+                ne.length += (uint64_t)k * 2ULL;
+                extents_.erase(last);
+                extents_.insert(ne);
+                merged = true;
+            }
+        }
+        if (!merged) {
+            fs_inode_extent_t ne{};
+            ne.lblk      = new_lblk;
+            ne.phys_base = blk;
+            ne.length    = (uint64_t)k * 2ULL;
+            extents_.insert(ne);
+        }
+    } catch (const std::bad_alloc &) {
+        owner_->block_free(blk, (uint64_t)k * 2ULL);             /* 回滚：退片 */
+        return RC_ERR_STATE;
+    }
+
+    const uint64_t old_pieces = pieces_;
+    pieces_ += k;
+    insert_both(fr_pos_, fr_size_, old_pieces * 32ULL, (uint64_t)k * 32ULL);
+    fr_free_ += (uint64_t)k * 32ULL;
+    return RC_OK;
+}
+
+result_code_t inode_data_plane_t::alloc(uint64_t &out_inum) {
+    std::unique_lock<std::shared_mutex> lk(fr_lock_);
+    result_code_t rc = alloc_locked(out_inum);
+    if (rc == RC_OK) return rc;
+    if (rc != RC_ERR_NO_BLOCK) return rc;
+    rc = grow_locked();                        /* 用尽：fr 写内 grow（ext 写 + block 片锁） */
+    if (rc != RC_OK) return rc;
+    return alloc_locked(out_inum);
+}
+
+bool inode_data_plane_t::fr_contains(uint64_t inum) const {
+    const fs_interval_t probe = make_pos_probe(inum);
+    auto it = fr_pos_.upper_bound(probe);      /* 第一个 base > inum */
+    if (it == fr_pos_.begin()) return false;
+    --it;
+    return inum < it->base + it->len;
+}
+
+void inode_data_plane_t::free_inode(uint64_t inum) {
+    if (inum == 0) return;                     /* root 永不释放 */
+    std::unique_lock<std::shared_mutex> lk(fr_lock_);
+    if (inum >= pieces_ * 32ULL) return;       /* 越界忽略 */
+    if (fr_contains(inum)) return;             /* 幂等：重复释放忽略 */
+    insert_both(fr_pos_, fr_size_, inum, 1);   /* 邻接自动融合 */
+    fr_free_ += 1;
+}
+
+bool inode_data_plane_t::test_inode(uint64_t inum) const {
+    std::shared_lock<std::shared_mutex> lk(fr_lock_);
+    if (inum >= pieces_ * 32ULL) return false;
+    return !fr_contains(inum);                 /* 在空间内且不在 fr ⇒ 已分配 */
+}
+
+uint64_t inode_data_plane_t::pieces() const {
+    std::shared_lock<std::shared_mutex> lk(fr_lock_);
+    return pieces_;
+}
+
+uint64_t inode_data_plane_t::free_total() const {
+    std::shared_lock<std::shared_mutex> lk(fr_lock_);
+    return fr_free_;
+}
+
+uint64_t inode_data_plane_t::extent_count() const {
+    std::shared_lock<std::shared_mutex> lk(extent_lock_);
+    return extents_.size();
+}
+
+result_code_t inode_data_plane_t::dump_fr(std::list<inode_dataplane_coordinate_free_range_t> *out) const {
+    if (out == nullptr) return RC_ERR_STATE;
+    std::shared_lock<std::shared_mutex> lk(fr_lock_);
+    for (const fs_interval_t &iv : fr_pos_)
+        out->push_back(inode_dataplane_coordinate_free_range_t{iv.base, iv.len});
+    return RC_OK;
+}
+
+result_code_t inode_data_plane_t::dump_extents(std::list<fs_inode_extent_t> *out) const {
+    if (out == nullptr) return RC_ERR_STATE;
+    std::shared_lock<std::shared_mutex> lk(extent_lock_);
+    for (const fs_inode_extent_t &e : extents_) out->push_back(e);
+    return RC_OK;
+}

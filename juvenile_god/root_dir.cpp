@@ -63,7 +63,7 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
 
     uint64_t dentry_root_idx;
     {
-        InodeSession ino_sess(inode_cache_mgr, inode_idx);
+        InodeSession ino_sess(inode_io, inode_idx);
         if (!ino_sess) return RC_ERR_IO;
         raven_dir_Inode_t *ino = (raven_dir_Inode_t *)ino_sess.inode;
         if (RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_DIR)
@@ -224,7 +224,7 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
 
     uint64_t dentry_root_idx;
     {
-        InodeSession ino_sess(inode_cache_mgr, inode_idx);
+        InodeSession ino_sess(inode_io, inode_idx);
         if (!ino_sess) return RC_ERR_IO;
         raven_dir_Inode_t *ino = (raven_dir_Inode_t *)ino_sess.inode;
         if (RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_DIR)
@@ -257,7 +257,7 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
     {
         const uint64_t tgt_inum = RFS_PTR_ADDR(leaf->entries[idx].inode_ptr);
         if (tgt_inum != ((uint64_t)PTR_INVALID & ((1ULL << 52) - 1)) && inode_test(tgt_inum)) {
-            InodeSession tgt_sess(inode_cache_mgr, tgt_inum);
+            InodeSession tgt_sess(inode_io, tgt_inum);
             if (!tgt_sess) return RC_ERR_IO;
             tgt_is_dir = (RFS_INO1_GET_TYPE(tgt_sess.inode->word1) == INODE_TYPE_DIR);
         }
@@ -382,7 +382,7 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
      * owner 侧留上层——签名无 owner 参数；目标 inode 侧资产已由
      * dentry_leaf_entry_delete 下沉处理。 */
     {
-        InodeSession dir_sess(inode_cache_mgr, inode_idx);
+        InodeSession dir_sess(inode_io, inode_idx);
         if (!dir_sess) return RC_ERR_IO;
         if (dir_sess.inode->size > 0)
             dir_sess.inode->size--;
@@ -416,7 +416,7 @@ result_code_t RavenFS_juvenile::dir_lookup(uint64_t inode_idx, const char *name,
 
     uint64_t dentry_root_idx = 0;
     {
-        InodeSession ino_sess(inode_cache_mgr, inode_idx);
+        InodeSession ino_sess(inode_io, inode_idx);
         if (!ino_sess) return RC_ERR_IO;
         raven_dir_Inode_t *ino = (raven_dir_Inode_t *)ino_sess.inode;
         if (RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_DIR) return RC_ERR_STATE;
@@ -448,13 +448,13 @@ result_code_t RavenFS_juvenile::dir_lookup(uint64_t inode_idx, const char *name,
 /* 正版：按 inode_type 初始化（REGULAR 内联文件 / DIR 建根 / SOFT_SYM 内联） */
 result_code_t RavenFS_juvenile::root_dir_insert_dentry(const char *name, uint8_t inode_type)
 {
-    return dir_insert_dentry(sb.root_inode, name, inode_type);
+    return dir_insert_dentry(RFS_ROOT_INODE_IDX, name, inode_type);
 }
 result_code_t RavenFS_juvenile::root_dir_rm_dentry(const char *name, bool destroy_data)
 {
-    return dir_rm_dentry(sb.root_inode, name, destroy_data);
+    return dir_rm_dentry(RFS_ROOT_INODE_IDX, name, destroy_data);
 }
 result_code_t RavenFS_juvenile::root_dir_lookup(const char *name, uint64_t *out_inum)
 {
-    return dir_lookup(sb.root_inode, name, out_inum);
+    return dir_lookup(RFS_ROOT_INODE_IDX, name, out_inum);
 }

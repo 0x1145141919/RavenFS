@@ -20,6 +20,7 @@
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #include "../include/ravenfs/ravenfs_audit.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"
+#include "../include/ravenfs/inode_cache_radix.hpp"   /* InodeSession：inode 访问（v2.0） */
 
 #include <cstdarg>
 #include <cstdio>
@@ -121,6 +122,82 @@ bool RavenFS_juvenile::audit_node_read(uint64_t blk, void *dst)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * audit_claim_inode_plane — 认领 inode 数据面结构块（v2.0）
+ *
+ * 数据面物理结构 = 映射树节点（8K，EXTENT_TREE_INODE 魔数）+ 数据片（extent 覆盖的
+ * 物理块）+ fr 扁快照区。它们被分配器占用但不在 DFS 可达域内——不认领就会在收口
+ * 被误报「泄露」。此处按 SB 控制字独立重画（不借 God 的 is_extent_node_kind 之外假设）：
+ *   · ctl direct → 认领 [ptr, ptr + pieces*2)
+ *   · ctl tree   → DFS 认领全部节点块 + 每条 extent 覆盖的物理片
+ *   · fr 区      → 认领 [fr_ptr, fr_ptr + ceil((64+count*16)/4096))
+ * 只置影子位（blk_set），不计数（结构块非「活结构」）。
+ * ═══════════════════════════════════════════════════════════════════ */
+void RavenFS_juvenile::audit_claim_inode_plane(audit_walk_ctx_t &ctx)
+{
+    auto claim_range = [&](uint64_t base, uint64_t len) {
+        for (uint64_t i = 0; i < len; i++) ctx.blk_set(base + i);
+    };
+
+    /* ① 数据片：用**活值**（allocator 内存翻译树）——覆盖运行期 grow 出、尚未落盘
+     * 的片（SB 此时可能还是 direct）。这是 insert 中途 audit 不误报的关键。 */
+    bool have_live = false;
+    if (allocator) {
+        std::list<fs_inode_extent_t> el;
+        if (allocator->inode_plane().dump_extents(&el) == RC_OK) {
+            for (const fs_inode_extent_t &e : el) claim_range(e.phys_base, e.length);
+            have_live = true;
+        }
+    }
+
+    const uint64_t ctl = sb.inode_data_ctl;
+    const uint64_t ptr = RFS_IDP_CTL_PTR(ctl);
+    const uint64_t pieces = RFS_IDP_PIECE_COUNT(sb.inode_data_plane_pieces_count);
+
+    if (!have_live && ptr != RFS_IDP_CTL_PTR_INVALID) {
+        /* 退化：无 allocator（只读静态审计）→ 按 SB 认领 */
+        if (RFS_IDP_CTL_IS_DIRECT(ctl)) claim_range(ptr, pieces * 2ULL);
+    }
+
+    /* ② 盘上映射树节点（tree 态；sync 后/重挂载）——数据片已由 ① 覆盖，这里只补节点块 */
+    if (ptr != RFS_IDP_CTL_PTR_INVALID && !RFS_IDP_CTL_IS_DIRECT(ctl)) {
+        std::vector<uint64_t> stack; stack.push_back(ptr);
+        uint64_t guard = 0;
+        const uint64_t PTR52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+        while (!stack.empty()) {
+            if (++guard > (1ull << 26)) break;
+            const uint64_t blk = stack.back(); stack.pop_back();
+            if (blk == PTR52 || blk >= total_blocks) continue;
+            mdata_piece_session s(mdata_piece_mgr, blk);
+            if (s.index_error() || !s) continue;
+            Bptree_meta_t *m = (Bptree_meta_t *)s.data;
+            if (!is_extent_node_kind(m, EXTENT_TREE_INODE)) continue;
+            claim_range(blk, 2);                                   /* 节点恒 2 块 */
+            if (RFS_PP_IS_INNER(m->parent_ptr)) {
+                Bptree_extent_inner_node_t *in = (Bptree_extent_inner_node_t *)s.data;
+                const uint16_t cnt = (uint16_t)RFS_PP_COUNT(in->meta.parent_ptr);
+                for (uint16_t i = cnt; i-- > 0;)
+                    stack.push_back(RFS_PTR_ADDR(in->extents[i].sub_node_ptr));
+            } else {
+                Bptree_extent_leaf_node_t *lf = (Bptree_extent_leaf_node_t *)s.data;
+                const uint16_t cnt = (uint16_t)RFS_PP_COUNT(lf->meta.parent_ptr);
+                for (uint16_t i = 0; i < cnt; i++)
+                    claim_range(RFS_PTR_ADDR(lf->extents[i].block_base), lf->extents[i].length);
+            }
+        }
+    }
+
+    /* ③ fr 扁快照区（1 块对齐；块数 = ceil((hdr + count*16)/4096)） */
+    const uint64_t fptr = RFS_IDP_FR_CTL_PTR(sb.inode_data_fr_ctl);
+    if (fptr != RFS_IDP_FR_CTL_PTR_INVALID) {
+        const uint64_t cnt = RFS_IDP_FR_COUNT(sb.inode_data_fr_count);
+        uint64_t fb = sizeof(inode_data_fr_snapshot_hdr)
+                    + cnt * sizeof(inode_dataplane_coordinate_free_range_t);
+        uint64_t fblks = (fb + 4095) / 4096; if (fblks == 0) fblks = 1;
+        claim_range(fptr, fblks);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * audit_dfs_root — 全盘可达性审计主入口（public）
  *   1. 白名单（尾巴三段 + backup SB 链）
  *   2. 从 root 先序 DFS（重画两张影子图）
@@ -142,10 +219,11 @@ result_code_t RavenFS_juvenile::audit_dfs_root(audit_walk_report_t *rep, FILE *o
 
     /* 影子图尺寸 = 真实位图字节尺寸（便于收口按字节 XOR） */
     ctx.shadow_blk.assign((size_t)bitmap_blocks * 4096, 0);
-    ctx.shadow_ino.assign((size_t)inode_bm_blocks * 4096, 0);
+    ctx.shadow_ino.assign((size_t)((inode_count + 7) / 8), 0);   /* v2.0：按 inode 位数 */
 
-    /* 结构块白名单：尾巴三段 [inode_bm_base, total_blocks) 常亮且无 owner */
-    ctx.meta_lo = inode_bm_base;
+    /* 结构块白名单：v2.0 = block bitmap 尾巴 [bitmap_start, total_blocks) 常亮无 owner
+     * （inode 数据面/低块元数据散布在数据区，v2.0 审计口径待 P4 细化）。 */
+    ctx.meta_lo = bitmap_start;
     ctx.meta_hi = total_blocks;
 
     /* backup SB 块链（只读遍历；不修改任何东西） */
@@ -172,6 +250,9 @@ result_code_t RavenFS_juvenile::audit_dfs_root(audit_walk_report_t *rep, FILE *o
                (unsigned long long)ctx.meta_lo, (unsigned long long)ctx.meta_hi,
                ctx.backup_blocks.size());
 
+    /* v2.0：先认领 inode 数据面结构块（映射树/数据片/fr 区），再 DFS——否则收口误报泄露 */
+    audit_claim_inode_plane(ctx);
+
     /* ── 从 root 先序 DFS（重画两张影子图）── */
     audit_walk_inode(ctx, root_inum, PTR_INVALID);
 
@@ -179,12 +260,29 @@ result_code_t RavenFS_juvenile::audit_dfs_root(audit_walk_report_t *rep, FILE *o
     {
         std::vector<std::pair<uint64_t, uint64_t>> run_unprot, run_leak;
 
-        /* 块：只对 [0, meta_lo) 对账；按字节扫描（干净盘零差异 → 极快） */
+        /* 块：真实态 = 分配器**活值**（树版不原地改 block_bits）——先重建一份活位图，
+         * 再按字节 XOR（干净盘零差异 → 极快）。 */
+        std::vector<uint8_t> live_blk((size_t)bitmap_blocks * 4096, 0xFF);
+        if (allocator) {
+            for (uint32_t si = 0; si < allocator->slice_count(); si++) {
+                mgr_slice_t &s = allocator->blk_.slices[si];
+                fs_run_dlist_t dl;
+                s.slice_lock.lock();
+                s.all_dump(&dl);
+                s.slice_lock.unlock();
+                for (const fs_run_t &r : dl)
+                    for (uint64_t k = 0; k < r.len; k++) {
+                        const uint64_t b = r.base + k;
+                        if (b < live_blk.size() * 8ULL)
+                            live_blk[b >> 3] &= (uint8_t)~(1u << (b & 7));
+                    }
+            }
+        }
         const uint64_t lim = std::min<uint64_t>(ctx.meta_lo, total_blocks);
         auto class_blk = [&](uint64_t blk) {
             if (ctx.is_backup_blk(blk)) return;
             const bool reach = ctx.blk_test(blk);
-            const bool lit   = block_test(blk);
+            const bool lit   = ((live_blk[blk >> 3] >> (blk & 7)) & 1u) != 0;
             if (reach == lit) return;
             if (reach) ctx.rep.unprotected_blk++; else ctx.rep.leaked_blk++;
             auto &runs = reach ? run_unprot : run_leak;
@@ -196,15 +294,17 @@ result_code_t RavenFS_juvenile::audit_dfs_root(audit_walk_report_t *rep, FILE *o
         uint64_t i = 0;
         for (; i + 8 <= lim; i += 8) {
             const uint64_t half = i >> 3;
-            uint8_t x = (uint8_t)(ctx.shadow_blk[half] ^ block_bits[half]);
+            uint8_t x = (uint8_t)(ctx.shadow_blk[half] ^ live_blk[half]);
             while (x) {
                 const int b = __builtin_ctz(x);
                 x &= (uint8_t)(x - 1);
                 class_blk(i + (uint64_t)b);
             }
         }
-        for (; i < lim; i++)
-            if (ctx.blk_test(i) != block_test(i)) class_blk(i);
+        for (; i < lim; i++) {
+            const bool lit = ((live_blk[i >> 3] >> (i & 7)) & 1u) != 0;
+            if (ctx.blk_test(i) != lit) class_blk(i);
+        }
 
         /* inode：全量 [0, inode_count) */
         for (uint64_t inum = 0; inum < inode_count; inum++) {
@@ -289,7 +389,11 @@ void RavenFS_juvenile::audit_walk_inode(audit_walk_ctx_t &ctx, uint64_t inum, ui
     }
 
     raven_Inode_t raw;
-    inode_read(inum, &raw);
+    {
+        InodeSession rs(inode_io, inum);
+        if (!rs) return;   /* 读失败（IO）：按坏 inode 跳过 */
+        raw = *rs.inode;
+    }
     const uint32_t type = RFS_INO1_GET_TYPE(raw.word1);
 
     ctx.path_inum.push_back(inum);
@@ -370,7 +474,11 @@ void RavenFS_juvenile::audit_walk_inode(audit_walk_ctx_t &ctx, uint64_t inum, ui
 void RavenFS_juvenile::audit_walk_dir(audit_walk_ctx_t &ctx, uint64_t inum, uint64_t parent_inum)
 {
     raven_Inode_t raw;
-    inode_read(inum, &raw);
+    {
+        InodeSession rs(inode_io, inum);
+        if (!rs) return;
+        raw = *rs.inode;
+    }
     const raven_dir_Inode_t *d = (const raven_dir_Inode_t *)&raw;
 
     /* 目录名字数据面（v1.3：映射 direct/tree + fr）独立审计 + 全物理块认领。
@@ -408,7 +516,7 @@ void RavenFS_juvenile::audit_walk_dir(audit_walk_ctx_t &ctx, uint64_t inum, uint
         for (uint64_t c : children) {
             if (c >= inode_count) continue;   /* 越界已由 audit_walk_btree 报 bad */
             raven_Inode_t craw;
-            inode_read(c, &craw);
+            { InodeSession cs(inode_io, c); if (!cs) continue; craw = *cs.inode; }
             if (RFS_INO1_GET_TYPE(craw.word1) == INODE_TYPE_DIR) k++;
         }
         const uint64_t expect_lc = k + 2;

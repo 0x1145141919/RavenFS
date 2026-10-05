@@ -22,9 +22,11 @@
  * ═══════════════════════════════════════════════════════════════════ */
 #include "../include/ravenfs/ravenfs_audit.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"
+#include "../include/ravenfs/inode_cache_radix.hpp"   /* InodeSession（2026-10-05 显式化，原经 mdata 传递） */
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "inode_compat.hpp"   /* v2.0 inode 读写兼容壳 */
 
 #include <cstdio>
 #include <cstring>
@@ -68,7 +70,7 @@ static linux_userspace_mount_t make_mount(const char *path, bool selfreliat) {
     return mnt;
 }
 static uint64_t rd_fr_count(RavenFS_juvenile &fs, uint64_t inum) {
-    raven_dir_Inode_t d; fs.inode_read(inum, (raven_Inode_t *)&d);
+    raven_dir_Inode_t d; juv_inode_read(fs, inum, (raven_Inode_t *)&d);
     return RFS_ND_FR_COUNT(d.name_data_free_ranges_count);
 }
 
@@ -76,7 +78,7 @@ struct Iv { uint64_t base; uint16_t len; };
 
 /* 三阶段主流程（cache 模式无关）；返回时 fr 已用尽、Phase C 已复原一批定长区间 */
 static void run_phases(RavenFS_juvenile &fs, uint64_t N, uint64_t seed) {
-    const uint64_t root = fs.sb.root_inode;
+    const uint64_t root = RFS_ROOT_INODE_IDX;
     std::mt19937_64 rng(seed);
 
     /* ── Phase A：随机 len + 随机插入序灌树 ── */
@@ -94,7 +96,7 @@ static void run_phases(RavenFS_juvenile &fs, uint64_t N, uint64_t seed) {
     {
         double t0 = now_s(); uint64_t got = 0; bool ok = true;
         while (true) {
-            raven_dir_Inode_t d; fs.inode_read(root, (raven_Inode_t *)&d);
+            raven_dir_Inode_t d; juv_inode_read(fs, root, (raven_Inode_t *)&d);
             got = RFS_ND_PIECE_COUNT(d.name_data_piece_count);
             if (got >= piece_need) break;
             uint64_t o = 0;
@@ -127,7 +129,7 @@ static void run_phases(RavenFS_juvenile &fs, uint64_t N, uint64_t seed) {
     /* ── Phase B：随机 need 乱序 best-fit 取用，直至用尽 ── */
     printf("  [info] Phase B 乱序用尽\n");
     {
-        InodeSession sess(fs.inode_cache_mgr, root);
+        InodeSession sess(fs.inode_io, root);
         if (!sess) { CHECK(false, "Phase B InodeSession 打开失败"); return; }
         raven_dir_Inode_t *dino = (raven_dir_Inode_t *)sess.inode;
         uint64_t frroot = RFS_ND_FR_CTL_PTR(dino->name_data_free_ranges_ctl);
@@ -248,7 +250,7 @@ int main(int argc, char **argv) {
             run_phases(fs, N, seed);
             if (!SELF) {
                 CHECK(audit_clean(fs, "audit"), "offload 原地 audit 全净");
-                CHECK(fs.name_data_release(fs.sb.root_inode) == RC_OK, "release");
+                CHECK(fs.name_data_release(RFS_ROOT_INODE_IDX) == RC_OK, "release");
                 CHECK(audit_clean(fs, "after-release"), "release 后 audit 全净");
             }
         }   /* fs 析构：selfreliat 脏页回写 */
@@ -264,7 +266,7 @@ int main(int argc, char **argv) {
             CHECK(fs.is_mounted(), "重挂 offload rc=%llu", (unsigned long long)rc);
             if (fs.is_mounted()) {
                 CHECK(audit_clean(fs, "persisted"), "selfreliat 落盘 audit 全净");
-                CHECK(fs.name_data_release(fs.sb.root_inode) == RC_OK, "release");
+                CHECK(fs.name_data_release(RFS_ROOT_INODE_IDX) == RC_OK, "release");
                 CHECK(audit_clean(fs, "after-release"), "release 后 audit 全净");
             }
         }

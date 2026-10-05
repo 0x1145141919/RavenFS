@@ -15,6 +15,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "inode_compat.hpp"   /* v2.0 inode 读写兼容壳 */
 
 #include <cstdio>
 #include <cstring>
@@ -188,7 +189,7 @@ int main(int argc, char **argv) {
                 snprintf(nm, sizeof(nm), "s%04d", i);
                 fs.dir_rm_dentry(sub, nm, false);
             }
-            raven_Inode_t sino; fs.inode_read(sub, &sino);
+            raven_Inode_t sino; juv_inode_read(fs, sub, &sino);
             const uint64_t root_blk = sino.data_root;
             uint64_t dd = 0;
             {

@@ -38,6 +38,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "inode_compat.hpp"   /* v2.0 inode 读写兼容壳 */
 #include "audit_check.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"   /* mdata_piece_session 完整类型 */
 
@@ -131,25 +132,25 @@ static uint64_t file_to_extent_mode(RavenFS_juvenile &fs, uint64_t inum) {
         s.dirty();
     }
     raven_Inode_t ino;
-    fs.inode_read(inum, &ino);
+    juv_inode_read(fs, inum, &ino);
     ino.data_root = root_blk;
     RFS_INO1_SET_DIRECT(ino, 0);   /* extent-tree 模式 */
-    fs.inode_write(inum, &ino);
+    juv_inode_write(fs, inum, &ino);
     return root_blk;
 }
 
 /* ── phase5 提交点模拟：一次 inode 回写，把 live root_blk 收口进 inode ── */
 static void phase5_commit(RavenFS_juvenile &fs, uint64_t inum, uint64_t root_blk) {
     raven_Inode_t ino;
-    fs.inode_read(inum, &ino);
+    juv_inode_read(fs, inum, &ino);
     ino.data_root = root_blk;
-    fs.inode_write(inum, &ino);
+    juv_inode_write(fs, inum, &ino);
 }
 
 /* 读 inode 现 data_root（断言 stale 用） */
 static uint64_t inode_data_root(RavenFS_juvenile &fs, uint64_t inum) {
     raven_Inode_t ino;
-    fs.inode_read(inum, &ino);
+    juv_inode_read(fs, inum, &ino);
     return ino.data_root;
 }
 
@@ -553,7 +554,7 @@ static void run_parallel_group(RavenFS_juvenile &fs, uint32_t workers) {
         {
             /* 从 inode 取回建树期提交的根（phase5 初提交后 data_root == live 根） */
             raven_Inode_t ino;
-            fs.inode_read(inums[w], &ino);
+            juv_inode_read(fs, inums[w], &ino);
             root_blk = ino.data_root;
         }
         args[w].root_blk = root_blk;

@@ -85,6 +85,18 @@ struct Raw {
     void set_bit(uint64_t i) { mem[i >> 3] |= (uint8_t)(1u << (i & 7)); }
 };
 
+/* inode 数据面靶场：单条连续 extent + fr 排除 idx0（本压测只压 block；inode 面静态）。 */
+struct Plane {
+    uint64_t pieces = 2, phys = 4096;
+    std::vector<fs_inode_extent_t> ext;
+    std::vector<inode_dataplane_coordinate_free_range_t> fr;
+    void make(uint64_t p = 2, uint64_t phys_base = 4096) {
+        pieces = p; phys = phys_base; ext.clear(); fr.clear();
+        ext.push_back(fs_inode_extent_t{0, phys, pieces * 2});
+        fr.push_back(inode_dataplane_coordinate_free_range_t{1, pieces * 32 - 1});
+    }
+};
+
 /* ── 原子影子账本：bits 1=占用；claim 命中已占 = 重复交付 ── */
 struct Shadow {
     std::vector<uint8_t> bits;
@@ -126,11 +138,10 @@ extern "C" uint32_t get_processor_id() { return t_cpu; }
 
 static std::chrono::steady_clock::time_point g_deadline;
 
-static void worker(fs_allocator_t *a, uint32_t cpu, Shadow *bs, Shadow *is) {
+static void worker(fs_allocator_t *a, uint32_t cpu, Shadow *bs) {
     t_cpu = cpu;
     std::mt19937_64 rng(0x9E3779B97F4A7C15ULL ^ ((uint64_t)(cpu + 1) * 2654435761u));
     std::vector<rec_t> br;  br.reserve(400);       /* 持有的 block run */
-    std::vector<uint64_t> ir; ir.reserve(200);      /* 持有的 inode */
     uint64_t local_ops = 0;
 
     for (uint64_t it = 0; ; it++) {
@@ -190,29 +201,14 @@ static void worker(fs_allocator_t *a, uint32_t cpu, Shadow *bs, Shadow *is) {
             }
             result_code_t rc = a->block_intervals_free(&fl);
             if (rc != RC_OK) CK(false, "block_intervals_free rc=%d", (int)rc);
-        } else {                                    /* inode + block_test 采样 */
-            if (rng() & 1) (void)a->block_test(rng() % BITS);   /* 只压锁路径 */
-            if (ir.empty() || (rng() & 1)) {
-                uint64_t in = 0;
-                result_code_t rc = a->inode_alloc(in);
-                if (rc == RC_OK) {
-                    is->claim(in, 1, (int)cpu);
-                    ir.push_back(in);
-                } else if (rc != RC_ERR_NO_BLOCK) {
-                    CK(false, "inode_alloc unexpected rc=%d", (int)rc);
-                }
-            } else {
-                uint64_t in = ir.back(); ir.pop_back();
-                is->release(in, 1);
-                a->inode_free(in);
-            }
+        } else {                                    /* block_test 采样（只压锁路径） */
+            (void)a->block_test(rng() % BITS);
         }
         local_ops++;
     }
 
     /* 收束：归还本线程全部持有 */
     for (const rec_t &x : br) { bs->release(x.base, x.cnt); (void)a->block_free(x.base, x.cnt); }
-    for (uint64_t in : ir)    { is->release(in, 1);         a->inode_free(in); }
     g_ops.fetch_add(local_ops);
 }
 
@@ -223,12 +219,13 @@ int main() {
     g_deadline = t0 + std::chrono::seconds(5);      /* 运行 ≥ 数秒 */
 
     Raw blk(BITS, 0x00);        /* block 组：全空闲 */
-    Raw ino(BITS, 0x00);        /* inode 组：全空闲 */
-    ino.set_bit(0);             /* inode 0 = root：源位图亮灯（占用） */
+    Plane p; p.make(2);         /* inode 数据面：2 片（64 inode），fr 排除 root */
 
     slices_cfg_t cfg{};
     cfg.block_bits_raw = blk.mem; cfg.block_bits_count = BITS;
-    cfg.inode_bits_raw = ino.mem; cfg.inode_bits_count = BITS;
+    cfg.inode.pieces = p.pieces;
+    cfg.inode.extents = p.ext.data(); cfg.inode.extent_count = p.ext.size();
+    cfg.inode.fr = p.fr.data();       cfg.inode.fr_count = p.fr.size();
     cfg.logical_processor_count = CPUS;
 
     uint64_t rc = 1;
@@ -239,32 +236,29 @@ int main() {
     CK(a.cpu_slots() == CPUS, "cpu_slots=%llu", (unsigned long long)a.cpu_slots());
     CK(a.block_free_total() == BITS, "init block_free_total=%llu (want %llu)",
        (unsigned long long)a.block_free_total(), (unsigned long long)BITS);
-    CK(a.inode_free_total() == BITS - 1, "init inode_free_total=%llu (want %llu)",
-       (unsigned long long)a.inode_free_total(), (unsigned long long)(BITS - 1));
+    CK(a.inode_free_total() == 2 * 32 - 1, "init inode_free_total=%llu (want 63)",
+       (unsigned long long)a.inode_free_total());
     CK(a.block_test(0) == false, "init block_test(0)==false");
     CK(a.inode_test(0) == true, "init inode_test(0)==true (root)");
 
-    Shadow bs(BITS), is(BITS);
-    is.bits[0] = 1;             /* 影子同步 root */
+    Shadow bs(BITS);            /* 只做 block 影子；inode 面本压测不参与并发放置 */
 
     std::vector<std::thread> th;
-    for (uint32_t t = 0; t < CPUS; t++) th.emplace_back(worker, &a, t, &bs, &is);
+    for (uint32_t t = 0; t < CPUS; t++) th.emplace_back(worker, &a, t, &bs);
     for (auto &x : th) x.join();
 
     /* ── 终局对账 ── */
     CK(bs.live() == 0, "final block shadow live=%llu (want 0)", (unsigned long long)bs.live());
-    /* inode 影子含 root(0) 恒占用：全归还后应恰为 1（root 本身） */
-    CK(is.live() == 1, "final inode shadow live=%llu (want 1 = root only)", (unsigned long long)is.live());
     CK(g_dup.load() == 0, "double-alloc count=%llu (want 0)", (unsigned long long)g_dup.load());
     CK(a.block_free_total() == BITS, "final block_free_total=%llu (want %llu)",
        (unsigned long long)a.block_free_total(), (unsigned long long)BITS);
-    CK(a.inode_free_total() == BITS - 1, "final inode_free_total=%llu (want %llu)",
-       (unsigned long long)a.inode_free_total(), (unsigned long long)(BITS - 1));
+    CK(a.inode_free_total() == 2 * 32 - 1, "final inode_free_total=%llu (want 63)",
+       (unsigned long long)a.inode_free_total());
 
-    /* 静止期抽样：归还后 test 恢复（例外：inode 0 = root 恒占用） */
+    /* 静止期抽样：归还后 test 恢复（inode 面本压测无并发，应全空；root 恒占用） */
     uint64_t blk_bad = 0, ino_bad = 0;
     for (uint64_t b = 0; b < BITS; b += 977) if (a.block_test(b)) blk_bad++;
-    for (uint64_t i = 1; i < BITS; i += 991) if (a.inode_test(i)) ino_bad++;
+    for (uint64_t i = 1; i < 64; i++) if (a.inode_test(i)) ino_bad++;
     CK(blk_bad == 0, "residual block bits=%llu (want 0)", (unsigned long long)blk_bad);
     CK(ino_bad == 0, "residual inode bits=%llu (want 0)", (unsigned long long)ino_bad);
     CK(a.inode_test(0) == true, "root inode still occupied after stress");

@@ -809,7 +809,7 @@ result_code_t RavenFS_juvenile::name_data_fr_release(uint64_t dir_inode_idx,
  * ═══════════════════════════════════════════════════════════════════ */
 result_code_t RavenFS_juvenile::name_data_fr_compact(uint64_t dir_inode_idx)
 {
-    InodeSession ino_sess(inode_cache_mgr, dir_inode_idx);
+    InodeSession ino_sess(inode_io, dir_inode_idx);
     if (!ino_sess) return RC_ERR_IO;
     raven_dir_Inode_t *dino = (raven_dir_Inode_t *)ino_sess.inode;
     if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR) return RC_ERR_STATE;

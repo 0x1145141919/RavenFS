@@ -1,4 +1,5 @@
 #include "mkfs.hpp"
+#include "../include/disk_struct_v1.3.h"   /* v1.1/v1.2/v1.3 盘面头（v2.0 在 mkfs_v20.cpp 单独 include） */
 
 #include <cstdio>
 #include <cstdlib>
@@ -236,7 +237,11 @@ bool check_existing_fs(int fd) {
     uint64_t raven_magic = 0;
     pread(fd, &raven_magic, 8, 0);
     if (raven_magic == SUPERBLOCK_MAGIC) {
-        fprintf(stderr, "RavenFS superblock found — use -f to overwrite\n");
+        fprintf(stderr, "RavenFS superblock found (v1.x \"RAVN\") — use -f to overwrite\n");
+        return true;
+    }
+    if (raven_magic == SUPERBLOCK_MAGIC_V20_W0) {   /* v2.0 magic[0] 前缀 "RAVENFS\0" */
+        fprintf(stderr, "RavenFS superblock found (v2.0 \"RAVENFS\") — use -f to overwrite\n");
         return true;
     }
 
@@ -278,6 +283,9 @@ uint32_t mkfs_fmt_version(MkfsFormat f) {
     case MKFS_FMT_V1_1: return 2u;
     case MKFS_FMT_V1_2: return 3u;
     case MKFS_FMT_V1_3: return 4u;
+    /* v2.0 版本号 = disk_struct_v2.0.h 的 RAVENFS_VERSION；本函数**不服务 v2.0**
+     * （format_fs_v20 直接取盘面头常量），此处仅为 enum 完备性占位。 */
+    case MKFS_FMT_V2_0: return 0u;
     }
     return 3u;   /* 不可达：枚举错误兜底 = v1.2 */
 }
@@ -287,6 +295,7 @@ const char *mkfs_fmt_name(MkfsFormat f) {
     case MKFS_FMT_V1_1: return "v1.1";
     case MKFS_FMT_V1_2: return "v1.2";
     case MKFS_FMT_V1_3: return "v1.3";
+    case MKFS_FMT_V2_0: return "v2.0";
     }
     return "v1.2";
 }

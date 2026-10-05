@@ -25,6 +25,9 @@ static void print_usage(const char *prog) {
         "                     for juvenile god / tests\n"
         "  --v1.2             Write v1.2 disk format (version=3) [default]\n"
         "  --v1.3             Write v1.3 disk format (version=4; DIR name-data double tree)\n"
+        "  --v2.0             Write v2.0 disk format (elastic inode data plane; no fixed\n"
+        "                     inode array/bitmap; initial 256KB direct data plane;\n"
+        "                     root inode idx hardcoded 0). --inode-ratio/--inode-count ignored\n"
         "  -f, --force        Overwrite existing filesystem\n"
         "  -v, --verbose      Print detailed layout info\n"
         "  -h, --help         Show this help\n"
@@ -57,6 +60,7 @@ int main(int argc, char *argv[]) {
         {"v1.1",        no_argument,       0, '1'},
         {"v1.2",        no_argument,       0, '2'},
         {"v1.3",        no_argument,       0, '3'},
+        {"v2.0",        no_argument,       0, '4'},
         {"force",       no_argument,       0, 'f'},
         {"verbose",     no_argument,       0, 'v'},
         {"help",        no_argument,       0, 'h'},
@@ -116,6 +120,9 @@ int main(int argc, char *argv[]) {
             break;
         case '3':
             params.fmt = MKFS_FMT_V1_3;   /* --v1.3：写 v1.3 盘（DIR 名字数据面双树） */
+            break;
+        case '4':
+            params.fmt = MKFS_FMT_V2_0;   /* --v2.0：写 v2.0 盘（弹性 inode 数据面） */
             break;
         case 'f':
             params.force = true;
@@ -198,8 +205,59 @@ int main(int argc, char *argv[]) {
         return 3;
     }
 
-    /* ─── inode count 确定 ─── */
+    /* ─── 生成 UUID（提前：v2.0 的 256-bit magic / backup 散布都依赖 uuid）── */
+    if (uuid_is_null(params.uuid))
+        uuid_generate(params.uuid);
+
     uint64_t total_blocks = dev.bytes / 4096 - 1;
+
+    /* ═══ v2.0 分支：弹性 inode 数据面（无固定 inode 数组 / 无 inode 位图）═══ */
+    if (params.fmt == MKFS_FMT_V2_0) {
+        if (params.inode_count_explicit)
+            fprintf(stderr, "warning: --inode-count/--inode-ratio ignored for v2.0 "
+                            "(elastic inode data plane)\n");
+        V20Geometry g = calc_geometry_v20(total_blocks);
+        if (params.verbose) {
+            fprintf(stderr,
+                "device:          %s\n"
+                "type:            %s\n"
+                "bytes:           %lu\n"
+                "total_blocks:    %lu\n"
+                "backups:         %u\n"
+                "lba_size:        %lu\n"
+                "multiplier:      %lu\n"
+                "world_base_lba:  %lu\n"
+                "\n"
+                "metadata layout (FS_block world, v2.0):\n"
+                "  block bitmap:  [%lu, %lu)  (%lu blocks)\n"
+                "  (inode data plane: 256KB direct, allocated from block allocator)\n",
+                params.device,
+                dev.type == DEV_BLOCK_NVME ? "NVMe" :
+                    dev.type == DEV_BLOCK_ATA ? "ATA" : "file",
+                (unsigned long)dev.bytes,
+                (unsigned long)g.total_blocks,
+                (unsigned)params.backups,
+                (unsigned long)params.lba_size,
+                (unsigned long)params.multiplier,
+                (unsigned long)params.world_base_lba,
+                (unsigned long)g.bitmap_start,
+                (unsigned long)(g.bitmap_start + g.bitmap_blocks),
+                (unsigned long)g.bitmap_blocks);
+        }
+        int rc20 = format_fs_v20(fd, params, g);
+        close(fd);
+        if (rc20 == 0) {
+            char uuid_str[37];
+            uuid_unparse(params.uuid, uuid_str);
+            printf("mkfs.ravenfs: done  device=%s  format=%s  blocks=%lu  "
+                   "backups=%u  uuid=%s\n",
+                   params.device, mkfs_fmt_name(params.fmt),
+                   (unsigned long)g.total_blocks, (unsigned)params.backups, uuid_str);
+        }
+        return rc20;
+    }
+
+    /* ═══ v1.x 分支：固定 inode 数组 + inode 位图 ═══ */
     if (!params.inode_count_explicit) {
         // inode_count = ceil(total_blocks / inode_ratio)，再 16 向上取整
         uint64_t raw = (total_blocks + params.inode_ratio - 1) / params.inode_ratio;
@@ -258,10 +316,6 @@ int main(int argc, char *argv[]) {
             (unsigned long)geo.inode_array_base,
             (unsigned long)geo.inode_bitmap_blocks);
     }
-
-    /* ─── 生成 UUID ─── */
-    if (uuid_is_null(params.uuid))
-        uuid_generate(params.uuid);
 
     /* ─── 执行 ─── */
     int ret = format_fs(fd, params, geo);

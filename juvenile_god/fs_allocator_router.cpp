@@ -166,9 +166,8 @@ uint64_t sum_runs(const fs_run_list_t &runs) {
 fs_allocator_t::fs_allocator_t(const slices_cfg_t &cfg, uint64_t *res_code) {
     if (res_code) *res_code = RC_ERR_STATE;   /* 默认失败态（成员保持零值/空态） */
 
-    if (!cfg.block_bits_raw || !cfg.inode_bits_raw ||
-        cfg.block_bits_count == 0 || cfg.inode_bits_count == 0) {
-        return;   /* 调用方参数缺失：保持空态 */
+    if (!cfg.block_bits_raw || cfg.block_bits_count == 0) {
+        return;   /* block 源缺失：保持空态（inode 数据面虽独立，但 grow 需 block 组取片） */
     }
 
     const uint64_t msb = cfg.min_slice_bits ? cfg.min_slice_bits : 32768;
@@ -176,20 +175,16 @@ fs_allocator_t::fs_allocator_t(const slices_cfg_t &cfg, uint64_t *res_code) {
     /* 2^n 上界（仿 FPA；0 → 由 cpu_slots_ 兜底单槽） */
     uint64_t n = 1;
     while (n < cfg.logical_processor_count && n < (1ULL << 30)) n <<= 1;
-    /* 满片数约束：每片 ≥ msb bit */
+    /* 满片数约束：每片 ≥ msb bit。v2.0 只按 **block 组** 推导——inode 组已成数据面，
+     * 不再参与切片（旧「两组共享 slice_count」的几何来源随 inode 位图一起退役）。 */
     const uint64_t blk_cap = cfg.block_bits_count / msb;
-    const uint64_t ino_cap = cfg.inode_bits_count / msb;
-    uint64_t cap = blk_cap < ino_cap ? blk_cap : ino_cap;
-    if (cap == 0) cap = 1;
+    uint64_t cap = blk_cap ? blk_cap : 1;
     if (n > cap) n = cap;
-    /* 末片非空迭代：per 按 msb 倍数上取整后，两组的末片都必须非空 */
+    /* 末片非空迭代：per 按 msb 倍数上取整后，block 组末片必须非空 */
     for (;;) {
         uint64_t per_b = ((cfg.block_bits_count + n - 1) / n + msb - 1) / msb * msb;
-        uint64_t per_i = ((cfg.inode_bits_count + n - 1) / n + msb - 1) / msb * msb;
         if (per_b == 0) per_b = msb;
-        if (per_i == 0) per_i = msb;
-        if ((n - 1) * per_b < cfg.block_bits_count &&
-            (n - 1) * per_i < cfg.inode_bits_count) break;
+        if ((n - 1) * per_b < cfg.block_bits_count) break;
         if (n == 1) break;
         n >>= 1;
     }
@@ -199,27 +194,25 @@ fs_allocator_t::fs_allocator_t(const slices_cfg_t &cfg, uint64_t *res_code) {
     /* per-CPU preferred：每"CPU"记住上次成功的亲和片（仿 FPA 每 CPU preferred） */
     try {
         blk_.preferred = new uint32_t[cpu_slots_];
-        ino_.preferred = new uint32_t[cpu_slots_];
     } catch (const std::bad_alloc &) {
         teardown_slices(blk_.slices, slice_count_, blk_.preferred);
-        teardown_slices(ino_.slices, slice_count_, ino_.preferred);
+        slice_count_ = 0; cpu_slots_ = 0;
         return;
     }
-    for (uint32_t i = 0; i < cpu_slots_; i++) {
-        blk_.preferred[i] = (uint32_t)(i % slice_count_);   /* 初值：CPU i 亲和片 i%n */
-        ino_.preferred[i] = (uint32_t)(i % slice_count_);
-    }
+    for (uint32_t i = 0; i < cpu_slots_; i++)
+        blk_.preferred[i] = (uint32_t)(i % slice_count_);
 
     if (setup_slices(blk_.slices, blk_.per_slice_bits, slice_count_,
                      cfg.block_bits_raw, cfg.block_bits_count, msb) != RC_OK) {
         teardown_slices(blk_.slices, slice_count_, blk_.preferred);
-        teardown_slices(ino_.slices, slice_count_, ino_.preferred);
+        slice_count_ = 0; cpu_slots_ = 0;
         return;
     }
-    if (setup_slices(ino_.slices, ino_.per_slice_bits, slice_count_,
-                     cfg.inode_bits_raw, cfg.inode_bits_count, msb) != RC_OK) {
+
+    /* inode 数据面装配（无状态；失败即整体失败自清理） */
+    if (inode_plane_.init(cfg.inode, this) != RC_OK) {
         teardown_slices(blk_.slices, slice_count_, blk_.preferred);
-        teardown_slices(ino_.slices, slice_count_, ino_.preferred);
+        slice_count_ = 0; cpu_slots_ = 0;
         return;
     }
 
@@ -227,10 +220,9 @@ fs_allocator_t::fs_allocator_t(const slices_cfg_t &cfg, uint64_t *res_code) {
 }
 
 /* dtor：逐片 shutdown 后 delete[] 自有数组（不在 dtor 里碰任何调用方内存，
- * 因为根本不留全局位图指针——建 tree 时已消费完）。 */
+ * 因为根本不留全局位图指针——建 tree 时已消费完）。inode 数据面自带 dtor。 */
 fs_allocator_t::~fs_allocator_t() {
     teardown_slices(blk_.slices, slice_count_, blk_.preferred);
-    teardown_slices(ino_.slices, slice_count_, ino_.preferred);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -417,58 +409,29 @@ bool fs_allocator_t::block_test(uint64_t blk) const {
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * inode 组
+ * inode 组（v2.0）：薄转发 → inode_data_plane_t
  *
- * inode_alloc(&out)：per-CPU preferred 扫描，逐片 try_lock，片内取**单个空闲位**。
- *   ⚠ 用片内 alloc_hard(0, 1, out) 取单 bit（而非 soft_alloc(0,1,...)）——
- *   理由：inode 分配是**严格单槽、无需多段链**；alloc_hard 对 bitscount=1 的
- *   best-fit 恰好落到「最小空闲区间的尾位」，与 soft_alloc 的碎片优先取
- *   size_.begin() 尾位**同点**（两者对 1-bit 结果一致），但 alloc_hard 直接
- *   返回 base、零 STL 链表构造、原子（不部分分配），更贴合单槽语义。报告已说明。
- *   root inode（0）由源位图亮灯保证不空闲，故无需 set_hint 跳过（见 ctor 注）。
+ * 数据面自带两把读写锁（空间/翻译，锁序见 inode_data_plane_t 头注）；
+ * 本层只做转发，不做 preferred 分片（inode 已非位粒度分片）。
+ *   · inode_alloc  ：fr best-fit；用尽 → grow（空间写→翻译写）；无块 → RC_ERR_NO_BLOCK
+ *   · inode_free   ：fr 插入（自动融合）；幂等；inum==0 拒绝
+ *   · inode_test   ：已分配 = 在 [0,pieces*32) 且不在 fr
+ *   · inode_locate ：翻译物理 8K 片基 + 片内偏移（不做引用计数）
  * ═══════════════════════════════════════════════════════════════ */
 result_code_t fs_allocator_t::inode_alloc(uint64_t &out_inum) {
-    if (!ino_.slices || slice_count_ == 0 || cpu_slots_ == 0 || !ino_.preferred)
-        return RC_ERR_STATE;
-
-    const uint32_t cpu = get_processor_id() % cpu_slots_;
-    for (uint64_t round = 0; round < slice_count_; round++) {
-        const uint64_t idx = (ino_.preferred[cpu] + round) % slice_count_;
-        mgr_slice_t &s = ino_.slices[idx];
-        if (!s.slice_lock.try_lock()) continue;            /* 锁忙换片 */
-        uint64_t out = 0;
-        const result_code_t rc = s.alloc_hard(0, 1, out);  /* 单 bit：对齐 0 */
-        s.slice_lock.unlock();
-        if (rc == RC_OK) {
-            ino_.preferred[cpu] = (uint32_t)idx;
-            out_inum = out;
-            return RC_OK;
-        }
-    }
-    return RC_ERR_NO_BLOCK;                                /* 全片无空闲 inode */
+    return inode_plane_.alloc(out_inum);
 }
 
-/* inode_free：定点对 → 阻塞抢锁；按名义片长定位片后 free_interval(inum,1)。 */
 void fs_allocator_t::inode_free(uint64_t inum) {
-    if (!ino_.slices || slice_count_ == 0 || ino_.per_slice_bits == 0) return;
-    const uint64_t idx = inum / ino_.per_slice_bits;
-    if (idx >= slice_count_) return;
-    mgr_slice_t &s = ino_.slices[idx];
-    s.slice_lock.lock();
-    s.free_interval(inum, 1);
-    s.slice_lock.unlock();
+    inode_plane_.free_inode(inum);
 }
 
-/* inode_test：inum 是否已占用（同 block_test 的 test_interval 口径）。 */
 bool fs_allocator_t::inode_test(uint64_t inum) const {
-    if (!ino_.slices || slice_count_ == 0 || ino_.per_slice_bits == 0) return false;
-    const uint64_t idx = inum / ino_.per_slice_bits;
-    if (idx >= slice_count_) return false;
-    mgr_slice_t &s = ino_.slices[idx];
-    s.slice_lock.lock();
-    const bool occupied = (s.test_interval(true, inum, 1) == RC_OK);
-    s.slice_lock.unlock();
-    return occupied;
+    return inode_plane_.test_inode(inum);
+}
+
+result_code_t fs_allocator_t::inode_locate(uint64_t inum, inode_location_t *result) {
+    return inode_plane_.locate(inum, result);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -490,15 +453,7 @@ uint64_t fs_allocator_t::block_free_total() const {
 }
 
 uint64_t fs_allocator_t::inode_free_total() const {
-    if (!ino_.slices || slice_count_ == 0) return 0;
-    uint64_t sum = 0;
-    for (uint64_t i = 0; i < slice_count_; i++) {
-        mgr_slice_t &s = ino_.slices[i];
-        s.slice_lock.lock();
-        sum += s.get_free_count();
-        s.slice_lock.unlock();
-    }
-    return sum;
+    return inode_plane_.free_total();   /* 数据面空闲 inode 数（fr 读锁内取） */
 }
 
 uint32_t fs_allocator_t::block_preferred_of(uint32_t cpu) const {
@@ -506,36 +461,5 @@ uint32_t fs_allocator_t::block_preferred_of(uint32_t cpu) const {
     return blk_.preferred[cpu];
 }
 
-uint32_t fs_allocator_t::inode_preferred_of(uint32_t cpu) const {
-    if (!ino_.preferred || cpu >= cpu_slots_) return 0;
-    return ino_.preferred[cpu];
-}
-
-/* ═══════════════════════════════════════════════════════════════
- * all_syn — 全量同步磁盘
- *
- * ⚠ **缺口报告（本实现的关键裁断）**：slices_cfg_t **不含任何磁盘几何 / IO
- *   回调**（没有设备 fd、没有块偏移、没有 pwrite/mmap 句柄）；且 cfg 的原始位图
- *   内存只在 ctor 用一次即弃、fs_allocator_t 自身不存（头注释明确「出了构造
- *   函数就可以释放原始位图内存」）。因此**路由层无法自己写盘**——没有任何
- *   落盘目标可寻址。
- *
- * 头文件对该函数的契约写着：「逐片 all_dump 取空闲快照（纯内存）→ 解锁后
- * 落盘（IO 永远在锁外）」。这条契约里「取快照」半段本层可做，「落盘」半段
- * 缺 IO 面，做不了。故本实现取**选项 (b)**：直接返回 RC_ERR_NOT_SUPPORTED +
- * 本注释点明缺口，绝不假装同步成功（返回 RC_OK 会是「谎报已落盘」，比报错更坏）。
- *
- * 未来接线点（供后续补全）：
- *   1. 若在 slices_cfg_t 增加 IO 面（如 device fd + 各组位图落盘块号/长度），
- *      或在 fs_allocator_t 增持一个落盘回调，则本函数应改为：
- *        for 每片 i: { lock(slice_lock); all_dump(&local_dlist); unlock; }
- *                    // local_dlist 按 base 序聚合出「全片空闲区间」→ 逆推成位图字
- *                    // → 在锁外 pwrite 落盘（IO 永远在锁外）
- *   2. 位图是 1=占用/0=空闲；all_dump 给的是**空闲**区间，写盘前需按全片范围
- *      取补集生成位图（这一层换算目前无处可去）。
- * 在此之前，调用方须自行持有位图原始内存并负责写回。
- * ═══════════════════════════════════════════════════════════════ */
-result_code_t fs_allocator_t::all_syn() {
-    /* 无 IO 目标：不静默降级、不谎报成功。缺口见上注释。 */
-    return RC_ERR_NOT_SUPPORTED;
-}
+/* 注：全量刷回 / 落盘属上帝类职责（涉及 I/O），模块不提供 all_syn——
+ * 数据面提供 dump_fr / dump_extents 供上层取一致快照后自行落盘（P3）。 */

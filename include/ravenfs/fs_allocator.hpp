@@ -1,5 +1,6 @@
 #pragma once
 #include "rc.hpp"                    /* result_code_t / RC_* / PTR_INVALID（轻量头，零盘结构依赖） */
+#include "../disk_struct_v2.0.h"     /* inode 数据面 fr 用契约坐标类型 inode_dataplane_coordinate_free_range_t（inode 单位 256B）*/
 #include "../util/lock.h"            /* 锁原语（本头现用 std::mutex；其余原语供实现取用） */
 #include <cstdint>
 #include <cstddef>
@@ -8,6 +9,8 @@
 #include <set>                       /* std::set：主红黑树 = STL 区间序列（base 升序） */
 #include <boost/intrusive/set.hpp>   /* Boost.Intrusive set：从红黑树（侵入式 member_hook） */
 #include <mutex>                     /* std::mutex：分片唯一锁 slice_lock（可睡） */
+#include <shared_mutex>              /* std::shared_mutex：inode 数据面两把读写锁（翻译/空间，可睡） */
+#include <list>                      /* std::list：extent 快照出参（P3 落盘用） */
 
 /* 切片配置（enable_slice 入参）——**建树原始依据**：
  * 只提供「本片空闲状态的源数据 + 其在全局位号系的起点 + 位数」；enable_slice
@@ -43,6 +46,59 @@ using fs_run_list_t = std::forward_list<fs_run_t>;
  * 「交付（多段 run，软分配）」与「快照（全量区间，同步）」是两种用途，
  * 共用一个别名迟早误用。同样归调用方持有，mgr_slice_t 只借指针。 */
 using fs_run_dlist_t = std::list<fs_run_t>;
+
+/* ═══════════════════════════════════════════════════════════════
+ * v2.0 全局 inode 数据面 — 运行时类型
+ *
+ * 盘上是 packed `extent_t`（24B，disk_struct_v2.0.h）；运行时翻译树用下面这个
+ * 独立类型，避免 packed/对齐耦合。
+ *
+ * ★ fr（空闲面）**必须**用契约坐标类型 `inode_dataplane_coordinate_free_range_t`
+ *   （inode 单位，1 inode = 256B）——禁止用 fs_run_t / free_range_t：前者是
+ *   块/位通用 run，后者是名字数据面**字节**坐标；三者同尺寸异坐标系，混用即腐烂。
+ *   该类型直接来自 disk_struct_v2.0.h（本头已 include）。
+ *
+ *   翻译面（extent 树）：key = lblk（逻辑 4K 块），值 = {phys_base, length}；
+ *   空闲面（fr 主从树）：inode_dataplane_coordinate_free_range_t {base, len}。
+ *
+ * 坐标恒等式（disk_layout_v2.0 §4）：
+ *   lblk = inum >> 4 ; 片内偏移 = (inum & 31) * 256 ; 1 片 = 32 inode = 8K = 2 块
+ * ═══════════════════════════════════════════════════════════════ */
+/* inode 数据面 fr 装载条目 —— **必须**用契约坐标类型（inode 单位，1 inode = 256B）。
+ * 禁止用 fs_run_t / free_range_t（前者是块/位通用 run，后者是名字数据面**字节**坐标）；
+ * 三者同尺寸异坐标系，混用即「坐标腐烂」。类型真值 = disk_struct_v2.0.h：
+ *     struct inode_dataplane_coordinate_free_range_t { uint64_t base; uint64_t len; };
+ */
+
+struct fs_inode_extent_t {       /* 运行时翻译树元素（单位 = 4K 块） */
+    uint64_t lblk;               /* 逻辑 4K 块起点（主树序键；偶） */
+    uint64_t phys_base;          /* 物理 FS_block 起点（偶 = 8K 片对齐） */
+    uint64_t length;             /* 逻辑 4K 块数（偶；每 8K 片 = 2） */
+};
+struct inode_extent_less {
+    bool operator()(const fs_inode_extent_t &a, const fs_inode_extent_t &b) const {
+        return a.lblk < b.lblk;  /* 只按逻辑键排序；物理/长度由不变量约束 */
+    }
+};
+using inode_extent_tree_t = std::set<fs_inode_extent_t, inode_extent_less>;
+
+/* inode_locate 出参：物理位置（**不做引用计数**——计数归 mdata_piece_session）。 */
+struct inode_location_t {
+    uint64_t blkbase;        /* 8K 片起始物理 FS_block（偶；mdata_piece blkidx 纪律） */
+    uint16_t inblk_offset;   /* 片内字节偏移 = (inum & 31) × 256，值域 [0,8192) */
+};
+
+/* inode 数据面无状态初始化配置（调用方组装，ctor 一次消费；**零 I/O**）——
+ * 装载读盘（SB + fr 快照 + 映射 B+tree）归上帝类，模块只吃现成数组。
+ * ⚠ 生命周期：数组归调用方，ctor 返回后不再引用（建树即消费）。 */
+struct inode_data_plane_cfg_t {
+    uint64_t pieces = 0;                        /* 8K 片数（= Σ extent.length / 2） */
+    const fs_inode_extent_t     *extents = nullptr; uint64_t extent_count = 0;
+    const inode_dataplane_coordinate_free_range_t *fr = nullptr; uint64_t fr_count = 0;   /* inode 单位 */
+    /* 用尽增长批量（片）：先试 block_alloc_hard(2*batch,1)，失败逐级折半降至 1；
+     * 0/1 = 单片。 */
+    uint32_t grow_batch_pieces = 1;
+};
 
 /* ═══════════════════════════════════════════════════════════════
  * 内部组合：主从红黑树（本后端 = 纯内存、**位粒度**）
@@ -97,6 +153,79 @@ using fs_slave_tree_t = boost::intrusive::set<                          /* 从�
                                   &fs_interval_t::by_size>,
     boost::intrusive::compare<fs_size_less>,
     boost::intrusive::constant_time_size<false>>;
+
+class fs_allocator_t;   /* 前向：inode 数据面 grow 借外层 block 组取片 */
+class RavenFS_juvenile; /* 前向：上帝类友元——同步时直读私有树/位图（all_sycn） */
+
+/* ═══════════════════════════════════════════════════════════════
+ * inode_data_plane_t — 全局 inode 数据面（v2.0 弹性面；fs_allocator_t 的 inode 组）
+ *
+ *   ┌─ 翻译面 extent 树（key=lblk）── 翻译锁 extent_lock_（读/写）
+ *   └─ 空闲面 fr 主从红黑树（inode）── 空间锁 fr_lock_（读/写）
+ *
+ * ★ 全局锁序（硬）：**空间锁(fr) > 翻译锁(extent)**；**空间锁 > block 片锁**（grow
+ *   取片在 fr 写锁内）。**禁止任何路径先持翻译锁再取空间锁**（否则与 grow 的
+ *   空间→翻译 反序死锁）。
+ *   接口分工：locate = 翻译读；alloc 常规 = 空间写、用尽 = 空间写→翻译写；
+ *   free = 空间写；test = 空间读。
+ *
+ * ★ 不变量：
+ *   · append-only：运行期只 grow 追加/扩尾，从不改已有 extent 的映射（故
+ *     locate 返位后到开 mdata_piece 之间无改址风险）；direct→tree、离线压实
+ *     走整树换根（写锁）。
+ *   · 逻辑空间稠密无洞 `[0, pieces*32)`；fr ⊆ 其中、互不重叠、不含 idx 0。
+ *   · extent：lblk 偶、phys_base 偶、length 偶>0，且 `Σlength == pieces*2`。
+ *
+ * 移植注记：同 mgr_slice_t —— 锁为可睡 shared_mutex（临界区含 STL malloc）。
+ * ═══════════════════════════════════════════════════════════════ */
+class inode_data_plane_t {
+public:
+    inode_data_plane_t() = default;
+    ~inode_data_plane_t();
+    inode_data_plane_t(const inode_data_plane_t &) = delete;
+    inode_data_plane_t &operator=(const inode_data_plane_t &) = delete;
+    friend class RavenFS_juvenile;   /* 同步直读私有树（all_sycn） */
+
+    /* 装配：校验 cfg（对齐/稠密/无洞/无重叠/Σ/idx0）+ 建 extent 树 + fr 主从树。
+     * owner = 外层分配器（grow 走 owner->block_alloc_hard / block_free 取/退片）。
+     * 失败返回非 RC_OK（对象已自清理，可弃）。 */
+    result_code_t init(const inode_data_plane_cfg_t &cfg, fs_allocator_t *owner);
+
+    /* 翻译：inum → 物理 8K 片基 + 片内字节偏移。翻译读锁。 */
+    result_code_t locate(uint64_t inum, inode_location_t *out) const;
+    /* 分配一个 inode（best-fit）；用尽 → grow 增片（空间写→翻译写）。 */
+    result_code_t alloc(uint64_t &out_inum);
+    /* 释放一个 inode（fr 插入自动融合）；幂等（重复释放忽略）；inum==0 拒绝。空间写。 */
+    void          free_inode(uint64_t inum);
+    /* 是否已分配（= 在 [0,pieces*32) 且不在 fr）。空间读。 */
+    bool          test_inode(uint64_t inum) const;
+
+    /* 几何/快照（读锁内取一致量；P3 落盘用） */
+    uint64_t pieces() const;
+    uint64_t free_total() const;
+    uint64_t extent_count() const;
+    result_code_t dump_fr(std::list<inode_dataplane_coordinate_free_range_t> *out) const;   /* inode 坐标区间 */
+    result_code_t dump_extents(std::list<fs_inode_extent_t> *out) const; /* 翻译面全量 */
+private:
+    fs_allocator_t *owner_ = nullptr;
+    uint32_t grow_batch_ = 1;
+    uint64_t pieces_ = 0;
+
+    inode_extent_tree_t extents_;                 /* 翻译面（extent_lock_ 保护） */
+    mutable std::shared_mutex extent_lock_;       /* 翻译锁 */
+
+    fs_pos_tree_t   fr_pos_;                      /* 空闲面主树：base 升序 */
+    fs_slave_tree_t fr_size_;                     /* 空闲面从树：len 主 base 辅 */
+    uint64_t fr_free_ = 0;                        /* 空闲 inode 计数（增量） */
+    mutable std::shared_mutex fr_lock_;           /* 空间锁 */
+
+    /* grow：须持 fr_lock_ 写锁；内部再取 extent_lock_ 写锁 + owner_ block 片锁。 */
+    result_code_t grow_locked();
+    /* fr 取一个 inode（best-fit）；须持 fr_lock_ 写锁。 */
+    result_code_t alloc_locked(uint64_t &out_inum);
+    /* fr 是否已含 inum（重复释放/幂等判定）。须持 fr_lock_。 */
+    bool fr_contains(uint64_t inum) const;
+};
 
 class mgr_slice_t {
 private:
@@ -194,8 +323,9 @@ struct slices_cfg_t {
     /* 位图原始内存（已加载/已映射），生命周期归调用方；4K 对齐 */
     uint8_t  *block_bits_raw  = nullptr;
     uint64_t  block_bits_count = 0;    /* block 组位数（= bitmap_blocks×4096×8） */
-    uint8_t  *inode_bits_raw  = nullptr;
-    uint64_t  inode_bits_count = 0;    /* inode 组位数（= inode_bm_blocks×4096×8） */
+    /* v2.0：inode 组**不再是位图源**，改为全局弹性数据面（extent 翻译 + fr 空闲面）。
+     * 装载读盘归上帝类；本 cfg 只吃现成数组，ctor 一次消费即弃（见 inode_data_plane_cfg_t）。 */
+    inode_data_plane_cfg_t inode{};
     /* preferred 槽数 + 2^n 上界推导输入；0 → 退化单槽 */
     uint32_t  logical_processor_count = 1;
     /* 片下限（位数）：1 个位图块 = 32768 bit，4K 对齐切片约束，勿动 */
@@ -210,6 +340,7 @@ public:
     ~fs_allocator_t();
     fs_allocator_t(const slices_cfg_t &) = delete;
     fs_allocator_t &operator=(const slices_cfg_t &) = delete;
+    friend class RavenFS_juvenile;   /* 同步直读 block 片树（位图回写） */
 
     /* ── block 组（FS_block 分配器）── */
     /* 硬分配：require_count 连续 + 起始块号 2^align_log2 对齐；单片内完成
@@ -238,24 +369,25 @@ public:
     result_code_t block_intervals_free(fs_run_list_t *runs);
     bool     block_test(uint64_t blk) const;
 
-    /* ── inode 组（inode 槽分配器；inode 0 = root，片 0 hint 从 1 起）── */
+    /* ── inode 组（v2.0 全局数据面）：薄转发 → inode_data_plane_t ──
+     * inode_locate 只翻译物理位置（不做引用计数——计数归 mdata_piece_session）。 */
     result_code_t inode_alloc(uint64_t &out_inum);
-    void     inode_free(uint64_t inum);
-    bool     inode_test(uint64_t inum) const;
-
+    void          inode_free(uint64_t inum);
+    bool          inode_test(uint64_t inum) const;
+    result_code_t inode_locate(uint64_t inum, inode_location_t *result);
+    /* 数据面探针（审计/测试；几何与快照走 inode_data_plane_t 自身接口） */
+    inode_data_plane_t       &inode_plane()       { return inode_plane_; }
+    const inode_data_plane_t &inode_plane() const { return inode_plane_; }
     /* ── 几何/审计 ── */
     uint64_t slice_count() const        { return slice_count_; }
     uint32_t cpu_slots() const          { return cpu_slots_; }
     uint64_t block_per_slice_bits() const { return blk_.per_slice_bits; }
-    uint64_t inode_per_slice_bits() const { return ino_.per_slice_bits; }
     uint64_t block_free_total() const;   /* 各片 free_count 求和（空闲块总数） */
-    uint64_t inode_free_total() const;
+    uint64_t inode_free_total() const;   /* 数据面空闲 inode 数 */
     uint32_t block_preferred_of(uint32_t cpu) const;  /* dump_info 用 */
-    uint32_t inode_preferred_of(uint32_t cpu) const;
-    /* 全量同步：逐片 all_dump 取空闲快照（纯内存）→ 解锁后落盘（IO 永远在锁外）。 */
-    result_code_t all_syn();//全量同步磁盘
+    //全部刷回实际上涉及到io的事情，实质上是属于上帝类，模块不碰
 private:
-    /* 一组分片的全套状态（block / inode 各一）。
+    /* 一组分片的全套状态（block 组）。
      * ⚠ 树版**不持全局位图描述符**（片自持主从树、无全局坐标回指）；每片的建树源
      *   （slice_config_t）由 ctor 按 **2^n 上界 ∩ 满片数** 推导切好后，一次性喂给
      *   各片 enable_slice，不驻留（enable 返回即可弃）。 */
@@ -264,7 +396,8 @@ private:
         uint64_t per_slice_bits = 0;
         uint32_t *preferred = nullptr;   /* [cpu_slots_]：每 CPU 亲和片游标 */
     };
-    group_t blk_, ino_;
+    group_t blk_;                        /* block 组分片 */
+    inode_data_plane_t inode_plane_;     /* v2.0 全局 inode 数据面（extent 翻译 + fr 空闲） */
     uint32_t slice_count_ = 0;
     uint32_t cpu_slots_ = 0;
 };

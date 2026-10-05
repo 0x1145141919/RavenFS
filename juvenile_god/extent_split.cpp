@@ -37,6 +37,11 @@ void RavenFS_juvenile::extent_node_meta_init(void *node_buf, uint16_t entry_coun
         meta->magics[1] = NAMEDATA_EXTENT_MAGIC2;
         meta->magics[2] = NAMEDATA_EXTENT_MAGIC3;
         meta->magics[3] = NAMEDATA_EXTENT_MAGIC4;
+    } else if (kind == EXTENT_TREE_INODE) {
+        meta->magics[0] = INODE_DATA_EXTENT_MAGIC1;
+        meta->magics[1] = INODE_DATA_EXTENT_MAGIC2;
+        meta->magics[2] = INODE_DATA_EXTENT_MAGIC3;
+        meta->magics[3] = INODE_DATA_EXTENT_MAGIC4;
     } else {
         meta->magics[0] = BPTREE_MAGIC1;
         meta->magics[1] = BPTREE_MAGIC2;

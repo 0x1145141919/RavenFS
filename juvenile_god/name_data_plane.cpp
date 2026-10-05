@@ -164,7 +164,7 @@ result_code_t RavenFS_juvenile::name_data_alloc(uint64_t dir_inode_idx,
 {
     if (!out_offset || tail_len == 0 || tail_len > 512) return RC_ERR_STATE;
 
-    InodeSession ino_sess(inode_cache_mgr, dir_inode_idx);
+    InodeSession ino_sess(inode_io, dir_inode_idx);
     if (!ino_sess) return RC_ERR_IO;
     raven_dir_Inode_t *dino = (raven_dir_Inode_t *)ino_sess.inode;
     if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR) return RC_ERR_STATE;
@@ -211,7 +211,7 @@ result_code_t RavenFS_juvenile::name_data_free(uint64_t dir_inode_idx,
                                                uint64_t offset, uint16_t tail_len)
 {
     if (tail_len == 0) return RC_OK;
-    InodeSession ino_sess(inode_cache_mgr, dir_inode_idx);
+    InodeSession ino_sess(inode_io, dir_inode_idx);
     if (!ino_sess) return RC_ERR_IO;
     raven_dir_Inode_t *dino = (raven_dir_Inode_t *)ino_sess.inode;
     if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR) return RC_ERR_STATE;
@@ -229,7 +229,7 @@ result_code_t RavenFS_juvenile::name_data_read(uint64_t dir_inode_idx, uint64_t 
 {
     if (!out_tail || tail_len == 0 || tail_len > 512) return RC_ERR_STATE;
 
-    InodeSession ino_sess(inode_cache_mgr, dir_inode_idx);
+    InodeSession ino_sess(inode_io, dir_inode_idx);
     if (!ino_sess) return RC_ERR_IO;
     raven_dir_Inode_t *dino = (raven_dir_Inode_t *)ino_sess.inode;
     if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR) return RC_ERR_STATE;
@@ -254,7 +254,7 @@ result_code_t RavenFS_juvenile::name_data_write(uint64_t dir_inode_idx, uint64_t
 {
     if (!tail || tail_len == 0 || tail_len > 512) return RC_ERR_STATE;
 
-    InodeSession ino_sess(inode_cache_mgr, dir_inode_idx);
+    InodeSession ino_sess(inode_io, dir_inode_idx);
     if (!ino_sess) return RC_ERR_IO;
     raven_dir_Inode_t *dino = (raven_dir_Inode_t *)ino_sess.inode;
     if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR) return RC_ERR_STATE;
@@ -287,7 +287,7 @@ result_code_t RavenFS_juvenile::name_data_write(uint64_t dir_inode_idx, uint64_t
  * ═══════════════════════════════════════════════════════════════════ */
 result_code_t RavenFS_juvenile::name_data_release(uint64_t dir_inode_idx)
 {
-    InodeSession ino_sess(inode_cache_mgr, dir_inode_idx);
+    InodeSession ino_sess(inode_io, dir_inode_idx);
     if (!ino_sess) return RC_ERR_IO;
     raven_dir_Inode_t *dino = (raven_dir_Inode_t *)ino_sess.inode;
     if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR) return RC_ERR_STATE;
@@ -383,7 +383,7 @@ void RavenFS_juvenile::name_data_map_reclaim(uint64_t tree_root)
  * ═══════════════════════════════════════════════════════════════════ */
 result_code_t RavenFS_juvenile::name_data_rebuild(uint64_t dir_inode_idx)
 {
-    InodeSession ino_sess(inode_cache_mgr, dir_inode_idx);
+    InodeSession ino_sess(inode_io, dir_inode_idx);
     if (!ino_sess) return RC_ERR_IO;
     raven_dir_Inode_t *dino = (raven_dir_Inode_t *)ino_sess.inode;
     if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR) return RC_ERR_STATE;

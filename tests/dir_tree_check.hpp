@@ -238,7 +238,7 @@ inline uint64_t dir_verify_node(RavenFS_juvenile &fs, uint64_t blk,
  * 同步点 flush_all（脏写回驻留 + 非脏丢弃；offload=msync / nocache=无操作，均无害）。 */
 inline void dir_flush_caches(RavenFS_juvenile &fs)
 {
-    if (fs.inode_cache_mgr) fs.inode_cache_mgr->flush_all();
+    if (fs.mdata_piece_mgr) fs.mdata_piece_mgr->flush_all();
     if (fs.mdata_piece_mgr) fs.mdata_piece_mgr->flush_all();
 }
 

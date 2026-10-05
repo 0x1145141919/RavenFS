@@ -1,5 +1,6 @@
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"   /* mdata_piece_session：8K 元数据节点会话（头里仅前置声明） */
+#include "../include/ravenfs/inode_cache_radix.hpp"    /* InodeSession：inode 访问统一走缓存（2026-10-05 显式化，原经 mdata 传递） */
 #include <cstring>
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -84,7 +85,7 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
         root_sess.dirty();
 
         {
-            InodeSession ino_sess(inode_cache_mgr, new_inum);
+            InodeSession ino_sess(inode_io, new_inum);
             if (!ino_sess) return RC_ERR_IO;   /* guard 自动回滚 */
             raven_dir_Inode_t *dino = (raven_dir_Inode_t*)ino_sess.inode;
             memset(dino, 0, sizeof(raven_dir_Inode_t));
@@ -105,7 +106,7 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
         }
     } else {
         /* REGULAR / SOFT_SYM：内联空 inode（全零 inline_data） */
-        InodeSession ino_sess(inode_cache_mgr, new_inum);
+        InodeSession ino_sess(inode_io, new_inum);
         if (!ino_sess) return RC_ERR_IO;   /* guard 自动回滚 */
         raven_Inode_t *ino = ino_sess.inode;
         memset(ino, 0, sizeof(raven_Inode_t));   /* 全零：inline_data = 内联空文件 */
@@ -189,7 +190,7 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_insert(
      * POSIX 口径（D-12）：link_count = 2 + 直属 DIR 型子 inode 数，与 size 解耦。
      * 非目录条目（REGULAR / SOFT_SYM）只增 size，不影响 link_count。 ── */
     {
-        InodeSession dir_sess(inode_cache_mgr, owner_dir_inode);
+        InodeSession dir_sess(inode_io, owner_dir_inode);
         if (!dir_sess) return RC_ERR_IO;
         dir_sess.inode->size++;
         if (inode_type == INODE_TYPE_DIR)
@@ -255,7 +256,7 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_delete(
     uint64_t dir_tree_root = PTR_INVALID;
     uint8_t tgt_type = 0xFF;   /* 0xFF = 无有效目标（跳过资产维护） */
     if (has_inode) {
-        InodeSession tgt_sess(inode_cache_mgr, inum);
+        InodeSession tgt_sess(inode_io, inum);
         if (!tgt_sess) return RC_ERR_IO;
         tgt_type = RFS_INO1_GET_TYPE(tgt_sess.inode->word1);
         if (tgt_type == INODE_TYPE_DIR) {
@@ -298,7 +299,7 @@ result_code_t RavenFS_juvenile::dentry_leaf_entry_delete(
      * 树删已落盘：此处失败仅上报错误，孤儿/计数偏差由 fsck 修正。 */
     bool need_reclaim = false;   /* REG/SOFT_SYM 归零：延后到 tgt_sess 析构后执行 */
     if (has_inode) {
-        InodeSession tgt_sess(inode_cache_mgr, inum);
+        InodeSession tgt_sess(inode_io, inum);
         if (!tgt_sess) return RC_ERR_IO;
         if (tgt_type == INODE_TYPE_DIR) {
             /* 空目录全量回收（rmdir 语义）：名字数据面 → 树根 2 块 → inode 槽。

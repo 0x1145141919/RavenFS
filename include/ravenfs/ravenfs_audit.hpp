@@ -20,7 +20,7 @@
  * 类型面与实现分离：本头只放数据结构；实现在 juvenile_god/audit.cpp，
  * 入口是 RavenFS_juvenile 的成员方法（复用其位图 + 缓存 + 几何）。
  * ═══════════════════════════════════════════════════════════════════ */
-#include "../disk_struct_v1.3.h"
+#include "../disk_struct_v2.0.h"
 #include <cstdint>
 #include <cstdio>
 #include <string>

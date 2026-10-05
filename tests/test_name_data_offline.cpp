@@ -18,6 +18,7 @@
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
+#include "inode_compat.hpp"   /* v2.0 inode 读写兼容壳 */
 
 #include <cstdio>
 #include <cstring>
@@ -51,7 +52,7 @@ static linux_userspace_mount_t make_mount(const char *path) {
 static void read_dir_ctl(RavenFS_juvenile &fs, uint64_t inum, uint64_t *nd_ctl,
                          uint64_t *pieces, uint64_t *fr_ctl, uint64_t *fr_cnt) {
     raven_dir_Inode_t d;
-    fs.inode_read(inum, (raven_Inode_t *)&d);
+    juv_inode_read(fs, inum, (raven_Inode_t *)&d);
     if (nd_ctl)  *nd_ctl  = d.name_data_ctl;
     if (pieces)  *pieces  = RFS_ND_PIECE_COUNT(d.name_data_piece_count);
     if (fr_ctl)  *fr_ctl  = d.name_data_free_ranges_ctl;
@@ -97,7 +98,7 @@ int main(int argc, char **argv) {
     {
         RavenFS_juvenile fs(mnt, &rc);
         if (!fs.is_mounted()) { printf("mount failed rc=%llu\n", (unsigned long long)rc); return 1; }
-        const uint64_t root = fs.sb.root_inode;
+        const uint64_t root = RFS_ROOT_INODE_IDX;
 
         /* ══ A. name_data_rebuild ══ */
         printf("\n--- A: name_data_rebuild（tree → direct 压实）---\n");
