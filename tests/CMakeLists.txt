@@ -322,3 +322,15 @@ add_executable(ravenfs_header_selfcheck_v13
 add_executable(ravenfs_header_selfcheck_v20
     header_selfcheck_v20.cpp
 )
+
+# v1.3 fr 空闲区间表平台中立 C 模块（⇄ god name_data_freeranges.cpp）宿主单测：
+# 直接编 test_name_data_freeranges.c + ../linux/name_data_freeranges.c
+# （测试内置假宿主块存储 + bump 节点分配器；**不链** god/ko 其它任何东西）。
+add_executable(ravenfs_test_name_data_freeranges
+    test_name_data_freeranges.c
+    ../linux/name_data_freeranges.c
+)
+target_include_directories(ravenfs_test_name_data_freeranges PRIVATE
+    ${CMAKE_SOURCE_DIR}/include/linux
+    ${CMAKE_SOURCE_DIR}/include
+)
