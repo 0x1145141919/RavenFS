@@ -14,7 +14,7 @@
 struct rfs_delinfo {
 	u64	inum;		/* 目标 inode 编号（52 位形态） */
 	u32	name_len;	/* 全名长（RFS_PTR_FREE） */
-	u64	remain;		/* 长名尾段定位；短名 = PTR_INVALID */
+	u64	remain;		/* 长名尾段**逻辑**偏移（名字数据面内）；短名 = PTR_INVALID */
 };
 
 /* ── dentry B+树 写入（dentry_tree.c）：多级 walk + 插入（含分裂/升根） ── */

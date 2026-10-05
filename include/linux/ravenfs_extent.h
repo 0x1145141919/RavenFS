@@ -42,6 +42,11 @@ int ravenfs_extent_count_kind(struct super_block *sb, u32 kind, u64 root,
 int ravenfs_extent_new_root_leaf_kind(struct super_block *sb, u32 kind, u64 ino,
 				      u64 *root_io);
 
+/* 孤儿树释放（kind 参数化）：释放子树**全部节点**（每节点 2 块），
+ * 数据块 phys 零碰（归调用方）。镜像 god extent_orphan_release —— 左叶下钻 +
+ * 子树 DFS；结构异常即弃疗（孤儿留盘 fsck 收）。名字数据面 map_reclaim 复用。 */
+void ravenfs_extent_orphan_release_kind(struct super_block *sb, u32 kind, u64 root);
+
 /* ── M4.3 区段树删除/平衡（extent_write.c）── */
 /* 空根叶（direct→extent 物化 / 空树终态） */
 int ravenfs_extent_new_root_leaf(struct super_block *sb, u64 ino, u64 *root_io);

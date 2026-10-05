@@ -32,14 +32,17 @@ struct rfs_dpath {
 					RFS_PP_IS_ROOT((m)->parent_ptr), RFS_PP_PTR((m)->parent_ptr)); } while (0)
 
 /* ── 底层导出（三分拆分自 static；签名与设计注释随迁原样）── */
-/* 物化 dentry 名字：≤40 内联；>40 从名字堆读尾部（full_char_remain_ptr 给物理位置） */
-int ravenfs_ddentry_name(struct super_block *sb, const struct ddentry_t *e,
+/* 物化 dentry 名字：≤40 内联；>40 从所属目录名字数据面读尾部（owner_dir_inum
+ * 定位目录 inode；e->full_char_remain_offset 为数据面内**逻辑**偏移） */
+int ravenfs_ddentry_name(struct super_block *sb, u64 owner_dir_inum,
+			       const struct ddentry_t *e,
 			       char *out, unsigned int *out_len);
 int rfs_meta_ok(const struct Bptree_meta_t *m, u32 *cnt, u32 *inner, u32 *root, u64 *pptr);
 /* 叶内 GLB：复合序 (hash,name) 的最大下界；无 → GLB_NONE；hit=精确命中 */
-int rfs_leaf_glb(struct super_block *sb, const struct Bptree_ddentry_leaf_node_t *lf,
+int rfs_leaf_glb(struct super_block *sb, u64 owner_dir_inum,
+			const struct Bptree_ddentry_leaf_node_t *lf,
 			u32 cnt, u64 hash, const char *name, u32 nlen, u32 *glb, bool *hit);
-int ravenfs_leaf_lookup(struct super_block *sb,
+int ravenfs_leaf_lookup(struct super_block *sb, u64 owner_dir_inum,
 			       const struct Bptree_ddentry_leaf_node_t *leaf,
 			       u32 cnt, const char *name, u32 nlen, u64 hash, u64 *ino);
 /* 自 child_level 起向上传播（child 子树 max 变为 cur_max）；父 max 未变则短路 */

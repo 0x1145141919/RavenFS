@@ -6,7 +6,7 @@
 #   guest 内构建由 vm/share/install-ravenfs-module.sh 走 `make -C $KDIR M=<src>/linux modules`
 #
 obj-m += ravenfs.o
-ravenfs-y := version.o super.o dentry.o dentry_tree.o dentry_node.o inode_cache.o mdata_cache.o cache_ttl.o allocator_adapter.o name_heap.o iomap.o file.o extent_write.o xattr.o \
+ravenfs-y := version.o super.o dentry.o dentry_tree.o dentry_node.o inode_cache.o mdata_cache.o cache_ttl.o allocator_adapter.o name_data_plane.o name_data_freeranges.o iomap.o file.o extent_write.o xattr.o \
              ravenfs_rbtree_intrusive.o ravenfs_rbtree_owning.o \
              ravenfs_allocator_slice.o ravenfs_allocator_router.o
 

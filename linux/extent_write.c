@@ -1028,6 +1028,54 @@ int ravenfs_extent_new_root_leaf(struct super_block *sb, u64 ino, u64 *root_io)
 	return ravenfs_extent_new_root_leaf_kind(sb, RFS_EXT_KIND_FILE, ino, root_io);
 }
 
+/* ══════════════════════════════════════════════════════════════════
+ * kind 参数化「孤儿树释放」：释放子树全部节点（每节点 2 块），数据 phys 零碰。
+ * 镜像 god extent_orphan_release —— 子树 DFS（深度 ≤64）；结构异常即停，
+ * 余节点留盘由 fsck 收。名字数据面 map_reclaim（name_data_plane.c）复用。
+ * ══════════════════════════════════════════════════════════════════ */
+static int rfs_ext_orphan_free_rec(struct super_block *sb, u32 kind, u64 blk,
+				   u32 depth)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	struct ravenfs_msession *ms;
+	struct Bptree_meta_t *m;
+	u32 cnt, inner, root, i;
+	u64 pptr;
+
+	if (blk == (u64)PTR_INVALID || blk == (u64)RFS_MASK52 ||
+	    depth > RFS_EXT_DEPTH_MAX)
+		return 0;
+	ms = ravenfs_mdata_get(sb, blk);
+	if (IS_ERR(ms))
+		return PTR_ERR(ms);
+	m = ravenfs_msession_node(ms);
+	if (rfs_ext_meta_ok(kind, m, &cnt, &inner, &root, &pptr)) {
+		ravenfs_mdata_put(ms);
+		return -EIO;
+	}
+	if (inner) {
+		struct Bptree_extent_inner_node_t *nd = ravenfs_msession_node(ms);
+
+		for (i = 0; i < cnt; i++) {
+			u64 cb = RFS_PTR_ADDR(nd->extents[i].sub_node_ptr);
+
+			if (cb != (u64)RFS_MASK52 && cb != (u64)PTR_INVALID)
+				(void)rfs_ext_orphan_free_rec(sb, kind, cb, depth + 1);
+		}
+	}
+	ravenfs_mdata_put(ms);
+	ravenfs_mdata_drop(sb, blk);
+	(void)rfs_allocator_block_free(sbi->alloc, blk, 2);
+	return 0;
+}
+
+void ravenfs_extent_orphan_release_kind(struct super_block *sb, u32 kind, u64 root)
+{
+	if (root == (u64)PTR_INVALID || root == (u64)RFS_MASK52 || root == 0)
+		return;
+	(void)rfs_ext_orphan_free_rec(sb, kind, root, 0);
+}
+
 /* 节点 max 变更后沿父链上溯刷新 hint key（短路：key 未变即停） */
 static int rfs_ext_refresh_chain(struct super_block *sb, u32 kind, u64 blk)
 {

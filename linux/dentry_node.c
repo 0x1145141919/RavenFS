@@ -23,6 +23,7 @@
 #include "ravenfs_cache.h"
 #include "ravenfs_mdata_cache.h"
 #include "ravenfs_allocator_top.h"
+#include "ravenfs_name_data_plane.h"
 
 /* ── 8K 节点 / 跨块字节读 ── */
 /* ── 8K 节点读取已移至 mdata_cache.c（走 mdata_piece_cache_mgr + session） ── */
@@ -31,8 +32,10 @@
  * 跨块读任意字节（off 为块内偏移）—— **走 mdata 8K 片缓存**（与写路径同源）。
  * 为什么不直接 sb_bread：写路径改了 mdata 缓存但尚未落盘时，直接读盘会读到旧内容
  * （外置名/堆数据“刚写完读不到”）；统一走缓存保证同源可见。
+ * 注：长名外置已迁至名字数据面（ravenfs_nd_read 自行解析逻辑偏移），本助手
+ * 仅供 mdata 节点内部读用（历史保留）。
  */
-static int ravenfs_read_bytes(struct super_block *sb, u64 fs_blk, u32 off,
+__maybe_unused static int ravenfs_read_bytes(struct super_block *sb, u64 fs_blk, u32 off,
 			      u32 len, void *out)
 {
 	u8 *p = out;
@@ -60,8 +63,10 @@ static int ravenfs_read_bytes(struct super_block *sb, u64 fs_blk, u32 off,
 	return 0;
 }
 
-/* 物化 dentry 名字：≤40 内联；>40 从名字堆读尾部（full_char_remain_ptr 给物理位置） */
-int ravenfs_ddentry_name(struct super_block *sb, const struct ddentry_t *e,
+/* 物化 dentry 名字：≤40 内联；>40 从所属目录名字数据面读尾部
+ * （owner_dir_inum 定位目录 inode；full_char_remain_offset 为数据面内逻辑偏移） */
+int ravenfs_ddentry_name(struct super_block *sb, u64 owner_dir_inum,
+			       const struct ddentry_t *e,
 			       char *out, unsigned int *out_len)
 {
 	u32 nlen = RFS_PTR_FREE(e->inode_ptr);
@@ -71,13 +76,13 @@ int ravenfs_ddentry_name(struct super_block *sb, const struct ddentry_t *e,
 		return -EIO;
 	memcpy(out, e->name, inl);
 	if (nlen > DENTRY_INLINE_NAME_MAX) {
-		u64 ptr = e->full_char_remain_ptr;
+		u64 off = e->full_char_remain_offset;
 		int err;
 
-		if (ptr == (u64)PTR_INVALID)
+		if (off == (u64)PTR_INVALID)
 			return -EIO;
-		err = ravenfs_read_bytes(sb, ptr >> 12, (u32)(ptr & 0xFFF),
-					 nlen - inl, out + inl);
+		err = ravenfs_nd_read(sb, owner_dir_inum, off,
+				      (u16)(nlen - inl), out + inl);
 		if (err)
 			return err;
 	}
@@ -162,7 +167,8 @@ out:
 }
 
 /* 叶内 GLB：复合序 (hash,name) 的最大下界；无 → GLB_NONE；hit=精确命中 */
-int rfs_leaf_glb(struct super_block *sb, const struct Bptree_ddentry_leaf_node_t *lf,
+int rfs_leaf_glb(struct super_block *sb, u64 owner_dir_inum,
+			const struct Bptree_ddentry_leaf_node_t *lf,
 			u32 cnt, u64 hash, const char *name, u32 nlen, u32 *glb, bool *hit)
 {
 	char *nm = kmalloc(RAVENFS_MAX_NAME_LEN, GFP_KERNEL);
@@ -185,7 +191,7 @@ int rfs_leaf_glb(struct super_block *sb, const struct Bptree_ddentry_leaf_node_t
 		}
 		if (e->hash > hash)
 			break;
-		err = ravenfs_ddentry_name(sb, e, nm, &en);
+		err = ravenfs_ddentry_name(sb, owner_dir_inum, e, nm, &en);
 		if (err)
 			goto out;
 		cmplen = min_t(int, en, (int)nlen);
@@ -208,7 +214,7 @@ out:
 	return err;
 }
 
-int ravenfs_leaf_lookup(struct super_block *sb,
+int ravenfs_leaf_lookup(struct super_block *sb, u64 owner_dir_inum,
 			       const struct Bptree_ddentry_leaf_node_t *leaf,
 			       u32 cnt, const char *name, u32 nlen, u64 hash, u64 *ino)
 {
@@ -227,7 +233,7 @@ int ravenfs_leaf_lookup(struct super_block *sb,
 			break;
 		if (e->hash != hash)
 			continue;
-		if (ravenfs_ddentry_name(sb, e, nm, &en)) {
+		if (ravenfs_ddentry_name(sb, owner_dir_inum, e, nm, &en)) {
 			kfree(nm);
 			return -EIO;
 		}

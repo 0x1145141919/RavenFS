@@ -70,7 +70,7 @@ int ravenfs_ddentry_walk(struct super_block *sb, u64 dir_ino, const char *name, 
 		if (!inner) {
 			u32 glb;
 
-			err = rfs_leaf_glb(sb, buf, cnt, hash, name, nlen, &glb, &p->hit);
+			err = rfs_leaf_glb(sb, dir_ino, buf, cnt, hash, name, nlen, &glb, &p->hit);
 			if (err)
 				break;
 			p->cidx[depth] = glb;
@@ -130,7 +130,7 @@ int ravenfs_ddentry_insert(struct super_block *sb, u64 dir_ino, const struct rfs
 		memset(e, 0, sizeof(*e));
 		e->inode_ptr.v = RFS_PTR_PACK(nlen, inum);
 		e->hash = hash;
-		e->full_char_remain_ptr = remain_ptr;
+		e->full_char_remain_offset = remain_ptr;
 		memcpy(e->name, name, min_t(u32, nlen, (u32)DENTRY_INLINE_NAME_MAX));
 		lf->meta.parent_ptr.v = RFS_PP_PACK(c + 1, 0, root, pptr);
 		cnt = c + 1;
@@ -190,7 +190,7 @@ int ravenfs_ddentry_delete(struct super_block *sb, u64 dir_ino, const struct rfs
 	if (info) {
 		info->inum = RFS_PTR_ADDR(lf->entries[idx].inode_ptr);
 		info->name_len = RFS_PTR_FREE(lf->entries[idx].inode_ptr);
-		info->remain = lf->entries[idx].full_char_remain_ptr;
+		info->remain = lf->entries[idx].full_char_remain_offset;
 	}
 	is_last = (idx == cnt - 1);
 	is_root = root != 0;
@@ -252,7 +252,7 @@ int ravenfs_dir_find(struct super_block *sb, u64 dir_ino,
 			break;
 		}
 		if (!inner) {
-			err = ravenfs_leaf_lookup(sb, buf, cnt, name, nlen, hash, ino);
+			err = ravenfs_leaf_lookup(sb, dir_ino, buf, cnt, name, nlen, hash, ino);
 			break;
 		}
 		{

@@ -44,6 +44,7 @@
 #include "ravenfs_mdata_cache.h"
 #include "ravenfs_allocator_top.h"
 #include "ravenfs_allocator_adapter.h"
+#include "ravenfs_extent.h"
 #include "ravenfs_xattr.h"
 
 /* ── 前向声明（ops 表在 read_inode 里被引用） ── */
@@ -335,7 +336,7 @@ static void ravenfs_destroy_inode(struct inode *inode)
 /* 块统计（M2.1）见下方 ravenfs_inode_blocks4k */
 
 /* 块统计（M2.1）：4K 块数。**诚实**：数据块 + 元数据块（8K 节点计 2 块）均计；
- * DIR 含 dentry 树节点 + name_heap（位图+数据面）；xattr 块也计。 */
+ * DIR 含 dentry 树节点 + 名字数据面（映射树数据块/节点 + fr 树节点）；xattr 块也计。 */
 
 static void ravenfs_count_extent(struct super_block *sb, u64 root, u32 depth,
 				 u64 *data, u64 *nodes)
@@ -409,34 +410,81 @@ static void ravenfs_count_ddentry_nodes(struct super_block *sb, u64 blk, u32 dep
 	kfree(buf);
 }
 
+/* 名字数据面 fr 树节点计数（tree 态；8K 节点/个，调用方 ×2） */
+static void ravenfs_count_fr_nodes(struct super_block *sb, u64 blk, u32 depth,
+				   u64 *nodes)
+{
+	const struct Bptree_meta_t *m;
+	void *buf;
+	u32 cnt, i;
+
+	if (depth > 64 || blk == (u64)PTR_INVALID)
+		return;
+	buf = kmalloc(RAVENFS_NODE_BYTES, GFP_KERNEL);
+	if (!buf)
+		return;
+	if (ravenfs_read_node(sb, blk, buf)) {
+		kfree(buf);
+		return;
+	}
+	m = buf;
+	if (m->magics[0] != NAMEDATA_FREERANGES_MAGIC1 ||
+	    m->magics[1] != NAMEDATA_FREERANGES_MAGIC2 ||
+	    m->magics[2] != NAMEDATA_FREERANGES_MAGIC3 ||
+	    m->magics[3] != NAMEDATA_FREERANGES_MAGIC4) {
+		kfree(buf);
+		return;
+	}
+	(*nodes)++;
+	cnt = RFS_PP_COUNT(m->parent_ptr);
+	if (RFS_PP_IS_INNER(m->parent_ptr)) {
+		const struct Bptree_dir_name_data_free_ranges_inner_node_t *nd = buf;
+
+		for (i = 0; i < cnt && i < 338; i++)
+			ravenfs_count_fr_nodes(sb, RFS_PTR_ADDR(nd->hints[i].sub_node_ptr),
+					       depth + 1, nodes);
+	}
+	kfree(buf);
+}
+
 static u64 ravenfs_inode_blocks4k(struct super_block *sb, const struct raven_Inode_t *r, u32 type)
 {
-	u64 blks = 0, i;
+	u64 blks = 0;
 
 	if (RFS_XATTRPTR_GET(r->mode_xattr) != (u64)RFS_XATTR_NONE)
 		blks += 1;				/* xattr 块（1 个 4K） */
 
 	if (type == INODE_TYPE_DIR) {
 		const struct raven_dir_Inode_t *d = (const struct raven_dir_Inode_t *)r;
+		u64 ndctl = d->name_data_ctl;
+		u64 ndptr = RFS_ND_CTL_PTR(ndctl);
 		u64 nodes = 0;
 
 		ravenfs_count_ddentry_nodes(sb, r->data_root, 0, &nodes);
 		blks += nodes * 2;			/* dentry 树节点（8K/个） */
-		for (i = 0; i < RFS_DIR_HEAP_COUNT; i++) {	/* name_heap：位图面 + 数据面 */
-			const struct name_heap_controller_t *h = rfs_dir_heap_c(d, i);
-			u64 bmp, dat;
-			u32 bits, gran;
 
-			if (!h)
-				continue;
-			bmp = RFS_NHC_BITMAP(*h);
-			dat = RFS_NHC_DATA(*h);
-			if (bmp == (u64)RFS_MASK52 && dat == (u64)RFS_MASK52)
-				continue;		/* 未激活 */
-			bits = RFS_NHC_BITS(*h);
-			gran = RFS_NHC_GRAN(*h);
-			blks += (1ULL << bits) / RAVENFS_BITS_PER_BLOCK;
-			blks += 1ULL << (bits + gran - 12);
+		/* 名字数据面：direct = pieces×2；tree = 映射数据块 + 映射树节点 */
+		if (ndptr != RFS_ND_CTL_PTR_INVALID) {
+			if (RFS_ND_CTL_IS_DIRECT(ndctl)) {
+				blks += RFS_ND_PIECE_COUNT(d->name_data_piece_count) * 2;
+			} else {
+				u64 data = 0, mnodes = 0;
+
+				ravenfs_extent_count_kind(sb, RFS_EXT_KIND_NAMEDATA,
+							  ndptr, &data, &mnodes);
+				blks += data + mnodes * 2;
+			}
+		}
+		/* fr 树节点（tree 态）*/
+		if (RFS_ND_FR_CTL_PTR(d->name_data_free_ranges_ctl) !=
+				RFS_ND_FR_CTL_PTR_INVALID &&
+		    !RFS_ND_FR_CTL_IS_INLINE(d->name_data_free_ranges_ctl)) {
+			u64 fnodes = 0;
+
+			ravenfs_count_fr_nodes(sb,
+					RFS_ND_FR_CTL_PTR(d->name_data_free_ranges_ctl),
+					0, &fnodes);
+			blks += fnodes * 2;
 		}
 	} else if (type == INODE_TYPE_REGULAR || type == INODE_TYPE_SOFT_SYM) {
 		if (r->size > 160) {

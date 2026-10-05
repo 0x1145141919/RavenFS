@@ -2,7 +2,7 @@
 /*
  * ravenfs.h —— RavenFS Linux KO 核心头（全模块共享的最小集）
  *
- * 盘面真值：include/disk_struct_v1.2.h（v1.2，C/C++ 双兼容；内置 __KERNEL__ 分支）
+ * 盘面真值：include/disk_struct_v1.3.h（v1.3，C/C++ 双兼容；内置 __KERNEL__ 分支）
  * 规格：Docs/linux/ravenfs-linux-ko-requirements-spec.md
  *
  * 【M1 范围声明（诚实边界，勿当成品）】
@@ -42,8 +42,8 @@
 #include <linux/compiler.h>
 #include <linux/cleanup.h>
 
-/* v1.2 盘面结构（-I$(src)/../include） */
-#include <disk_struct_v1.2.h>
+/* v1.3 盘面结构（-I$(src)/../include） */
+#include <disk_struct_v1.3.h>
 #include <magics.h>	/* SUPERBLOCK_MAGIC */
 
 /* al_ 分配器计数器：字段枚举（show 表对位 + 钩子下标） */
