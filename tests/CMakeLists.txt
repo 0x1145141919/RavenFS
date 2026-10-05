@@ -266,3 +266,11 @@ add_executable(ravenfs_juv_audit_dfs
     ${CPU_ID_STUB}
 )
 target_link_libraries(ravenfs_juv_audit_dfs PRIVATE ravenfs_juvenile)
+
+# disk_struct_v1.3.h 自校验 TU（2026-10-05）：**纯编译期护栏 + IDE 收录**。
+# 让 v1.3 盘面头进入 compile_commands.json（真实 -I include / -std=gnu++20），
+# clangd/VSCode 不再退回带 -D__KERNEL__ 的兜底配置而刷假错；
+# 同时以 static_assert 钉死 v1.3 结构尺寸与关键 offset。无运行时符号。
+add_executable(ravenfs_header_selfcheck_v13
+    header_selfcheck_v13.cpp
+)

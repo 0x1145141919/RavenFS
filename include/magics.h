@@ -22,6 +22,20 @@
 #define DENTRY_MAGIC3  0xD9C792AE76308B5BULL
 #define DENTRY_MAGIC4  0x0586CE7C1EDF3B9CULL
 
+/* ─── 目录名字数据面 · 映射树 (Bptree_dir_name_data_extent_*) ───
+ * meta.magics[0..3]；数据面必须 8K 对齐、无空洞（v1.3） */
+#define NAMEDATA_EXTENT_MAGIC1  0xC372D1FC567D65CFULL
+#define NAMEDATA_EXTENT_MAGIC2  0x6E702B0D21436D8EULL
+#define NAMEDATA_EXTENT_MAGIC3  0x0CCD38A459D96B13ULL
+#define NAMEDATA_EXTENT_MAGIC4  0xD5F8B50F3ED12C4DULL
+
+/* ─── 目录名字数据面 · 空闲区间树 (Bptree_dir_name_data_free_ranges_*) ───
+ * meta.magics[0..3]；inline(≤9) / B+树 二态；记「已映射但内容已释放」区间 */
+#define NAMEDATA_FREERANGES_MAGIC1  0xFFD7291C71147B5EULL
+#define NAMEDATA_FREERANGES_MAGIC2  0xDC68716E675F2409ULL
+#define NAMEDATA_FREERANGES_MAGIC3  0x3994B6520C33B94FULL
+#define NAMEDATA_FREERANGES_MAGIC4  0xC49BE2A5D4F3C1A1ULL
+
 /* ─── Superblock (Primary & Backup) ───
  * RavenSuperblock.magic = "RAVN" = SUPERBLOCK_MAGIC */
 #define SUPERBLOCK_MAGIC  0x5241564EULL
