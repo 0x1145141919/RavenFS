@@ -28,7 +28,7 @@
  * extent_refresh_key_chain 兜底。
  * ═══════════════════════════════════════════════════════════════════ */
 result_code_t RavenFS_juvenile::extent_node_balance(
-    uint64_t parent_blk, uint16_t idx, bool &need_balance)
+    uint64_t parent_blk, uint16_t idx, bool &need_balance, extent_tree_kind_t kind)
 {
     need_balance = false;
     const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
@@ -61,7 +61,7 @@ result_code_t RavenFS_juvenile::extent_node_balance(
             if (c_sess.index_error()) return RC_ERR_STATE;
             if (!c_sess) return RC_ERR_IO;
             Bptree_meta_t *cm = (Bptree_meta_t *)c_sess.data;
-            if (!is_extent_node(cm)) return RC_ERR_STATE;
+            if (!is_extent_node_kind(cm, kind)) return RC_ERR_STATE;
             if (RFS_PP_IS_ROOT(cm->parent_ptr)) return RC_ERR_STATE;
             if (RFS_PP_PTR(cm->parent_ptr) != node_blk) {
                 RFS_PP_SET_PTR(cm->parent_ptr, node_blk);
@@ -76,7 +76,7 @@ result_code_t RavenFS_juvenile::extent_node_balance(
     if (parent_sess.index_error()) return RC_ERR_STATE;
     if (!parent_sess) return RC_ERR_IO;
     Bptree_extent_inner_node_t *parent = (Bptree_extent_inner_node_t *)parent_sess.data;
-    if (!is_extent_node(&parent->meta) || !RFS_PP_IS_INNER(parent->meta.parent_ptr))
+    if (!is_extent_node_kind(&parent->meta, kind) || !RFS_PP_IS_INNER(parent->meta.parent_ptr))
         return RC_ERR_STATE;
     uint16_t parent_count = (uint16_t)RFS_PP_COUNT(parent->meta.parent_ptr);
     if (idx >= parent_count) return RC_ERR_STATE;
@@ -87,7 +87,7 @@ result_code_t RavenFS_juvenile::extent_node_balance(
     if (child_sess.index_error()) return RC_ERR_STATE;
     if (!child_sess) return RC_ERR_IO;
     Bptree_meta_t *child_meta = (Bptree_meta_t *)child_sess.data;
-    if (!is_extent_node(child_meta)) return RC_ERR_STATE;
+    if (!is_extent_node_kind(child_meta, kind)) return RC_ERR_STATE;
     uint16_t child_count = (uint16_t)RFS_PP_COUNT(child_meta->parent_ptr);
     bool is_inner = RFS_PP_IS_INNER(child_meta->parent_ptr);
     if (child_count >= 168) return RC_OK;   /* 已健康 */
@@ -105,7 +105,7 @@ result_code_t RavenFS_juvenile::extent_node_balance(
     if (neighbor_sess.index_error()) return RC_ERR_STATE;
     if (!neighbor_sess) return RC_ERR_IO;
     Bptree_meta_t *neighbor_meta = (Bptree_meta_t *)neighbor_sess.data;
-    if (!is_extent_node(neighbor_meta)) return RC_ERR_STATE;
+    if (!is_extent_node_kind(neighbor_meta, kind)) return RC_ERR_STATE;
     if (RFS_PP_IS_INNER(neighbor_meta->parent_ptr) != is_inner) return RC_ERR_STATE;
     uint16_t neighbor_count = (uint16_t)RFS_PP_COUNT(neighbor_meta->parent_ptr);
     uint16_t total = (uint16_t)(child_count + neighbor_count);
@@ -258,14 +258,15 @@ result_code_t RavenFS_juvenile::extent_node_balance(
  * 叶子清兄弟链（文件树根无 ".." → ptrs 全 INVALID）；释放旧根 2 块。
  * 返回：RC_OK（成功或无需收缩：非内部/entry_count≠1）/ RC_ERR_STATE（非根）。
  * ═══════════════════════════════════════════════════════════════════ */
-result_code_t RavenFS_juvenile::extent_root_shrink(uint64_t &root_blk, uint64_t owner_inode_idx)
+result_code_t RavenFS_juvenile::extent_root_shrink(uint64_t &root_blk, uint64_t owner_inode_idx,
+                                                   extent_tree_kind_t kind)
 {
     const uint64_t old_root = root_blk;   /* 引用入参：收缩前先捕获旧根块号 */
     mdata_piece_session root_sess(mdata_piece_mgr, old_root);
     if (root_sess.index_error()) return RC_ERR_STATE;
     if (!root_sess) return RC_ERR_IO;
     Bptree_extent_inner_node_t *root = (Bptree_extent_inner_node_t *)root_sess.data;
-    if (!is_extent_node(&root->meta)) return RC_ERR_STATE;
+    if (!is_extent_node_kind(&root->meta, kind)) return RC_ERR_STATE;
     if (!RFS_PP_IS_ROOT(root->meta.parent_ptr)) return RC_ERR_STATE;
     if (!RFS_PP_IS_INNER(root->meta.parent_ptr)) return RC_OK;
     uint16_t cnt = (uint16_t)RFS_PP_COUNT(root->meta.parent_ptr);
@@ -276,7 +277,7 @@ result_code_t RavenFS_juvenile::extent_root_shrink(uint64_t &root_blk, uint64_t 
     if (child_sess.index_error()) return RC_ERR_STATE;
     if (!child_sess) return RC_ERR_IO;
     Bptree_meta_t *cm = (Bptree_meta_t *)child_sess.data;
-    if (!is_extent_node(cm)) return RC_ERR_STATE;
+    if (!is_extent_node_kind(cm, kind)) return RC_ERR_STATE;
     if (RFS_PP_IS_ROOT(cm->parent_ptr)) return RC_ERR_STATE;   /* 孩子已是根：结构损坏 */
 
     RFS_PP_SET_IS_ROOT(cm->parent_ptr, 1);
@@ -310,7 +311,7 @@ result_code_t RavenFS_juvenile::extent_root_shrink(uint64_t &root_blk, uint64_t 
  * owner_inode_idx 仅传给收缩侧写 "." 锚。
  * ═══════════════════════════════════════════════════════════════════ */
 result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t owner_inode_idx,
-                                                    uint64_t &root_blk)
+                                                    uint64_t &root_blk, extent_tree_kind_t kind)
 {
     const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
     uint64_t cur = child_blk;
@@ -319,12 +320,12 @@ result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t
         if (cs.index_error()) return RC_ERR_STATE;
         if (!cs) return RC_ERR_IO;
         Bptree_meta_t *cm = (Bptree_meta_t *)cs.data;
-        if (!is_extent_node(cm)) return RC_ERR_STATE;
+        if (!is_extent_node_kind(cm, kind)) return RC_ERR_STATE;
         const uint16_t cnt = (uint16_t)RFS_PP_COUNT(cm->parent_ptr);
 
         if (RFS_PP_IS_ROOT(cm->parent_ptr)) {
             if (RFS_PP_IS_INNER(cm->parent_ptr) && cnt == 1)
-                return extent_root_shrink(root_blk, owner_inode_idx);   /* 合并残留收尾（cur 即根） */
+                return extent_root_shrink(root_blk, owner_inode_idx, kind);   /* 合并残留收尾（cur 即根） */
             return RC_OK;                                    /* 根叶/健康根内：链止 */
         }
         if (cnt >= 168) return RC_OK;                        /* 已健康 */
@@ -336,7 +337,7 @@ result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t
         if (ps.index_error()) return RC_ERR_STATE;
         if (!ps) return RC_ERR_IO;
         Bptree_extent_inner_node_t *parent = (Bptree_extent_inner_node_t *)ps.data;
-        if (!is_extent_node(&parent->meta) || !RFS_PP_IS_INNER(parent->meta.parent_ptr))
+        if (!is_extent_node_kind(&parent->meta, kind) || !RFS_PP_IS_INNER(parent->meta.parent_ptr))
             return RC_ERR_STATE;
         const uint16_t pcnt = (uint16_t)RFS_PP_COUNT(parent->meta.parent_ptr);
         uint16_t idx = 0;
@@ -347,14 +348,14 @@ result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t
         if (!found) return RC_ERR_STATE;
 
         bool need = false;
-        result_code_t rc = extent_node_balance(parent_blk, idx, need);
+        result_code_t rc = extent_node_balance(parent_blk, idx, need, kind);
         if (rc == RC_ERR_STATE) {
             /* 父是根内部且只剩此一孩 → 无邻居可平衡，收缩提升（含空叶升根） */
-            return extent_root_shrink(root_blk, owner_inode_idx);
+            return extent_root_shrink(root_blk, owner_inode_idx, kind);
         }
         if (rc) return rc;
 
-        rc = extent_refresh_key_chain(parent_blk);   /* 平衡后父自身 max 可能变 */
+        rc = extent_refresh_key_chain(parent_blk, kind);   /* 平衡后父自身 max 可能变 */
         if (rc) return rc;
 
         if (!need) {
@@ -365,7 +366,7 @@ result_code_t RavenFS_juvenile::extent_balance_from(uint64_t child_blk, uint64_t
             Bptree_meta_t *rm = (Bptree_meta_t *)rps.data;
             if (RFS_PP_IS_ROOT(rm->parent_ptr) && RFS_PP_IS_INNER(rm->parent_ptr) &&
                 RFS_PP_COUNT(rm->parent_ptr) == 1)
-                return extent_root_shrink(root_blk, owner_inode_idx);
+                return extent_root_shrink(root_blk, owner_inode_idx, kind);
             return RC_OK;
         }
         cur = parent_blk;   /* 父欠载 → 继续上溯 */

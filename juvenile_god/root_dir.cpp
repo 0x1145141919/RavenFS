@@ -8,8 +8,8 @@
  *
  * dir_insert_dentry / dir_rm_dentry / dir_lookup —— 任意目录（inode_idx 指定）
  * root_dir_* —— root 专属薄封装（内部转调 dir_*）
- * 零缓存原则：所有块/inode 访问直接 pread/pwrite，无缓存层（名字堆块经
- * mdata_piece_caches 会话访问，见 name_heap.cpp）。
+ * 零缓存原则：所有块/inode 访问直接 pread/pwrite，无缓存层（名字数据面
+ * 块经 mdata_piece_caches 会话访问，见 name_data_plane.cpp）。
  *
  * v1.1 目录生命周期契约（disk_layout_v1.1.md §10 不变量 11）：
  *   DIR inode 的 data_root **恒 = dentry 树根块号，PTR_INVALID 非法**。
@@ -33,9 +33,10 @@
  * 新建 dir 根叶子细节见 dentry_leaf_entry_insert（与 mkfs build_root_dentry_node
  * 对齐，差异仅 ".."=父目录）；dir inode 初始化要点：
  *   link_count = 2（POSIX：2 + 直属 DIR 型子 inode 数，空目录即 2，§3.3）、
- *   permission=0755、data_root=新建
- *   树根、**10 名字堆描述符显式未激活哨兵** —— memset 0 是雷：0 是合法块号，
- *   dir 关闭时 dir_name_heap_release 会误把 block 0/1（根 dentry 块）当激活堆释放。
+ *   permission=0755、ddentry_Bptree_root=新建
+ *   树根、**名字数据面双树显式空态哨兵（RFS_ND_CTL_INACTIVE / RFS_ND_FR_CTL_INACTIVE）**
+ *   —— memset 0 是雷：0 是合法块号，旧 dir_name_heap_release 曾误把 block 0/1
+ *   （根 dentry 块）当激活堆释放。
  * ═══════════════════════════════════════════════════════════════════ */
 result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char *name, uint8_t inode_type)
 {
@@ -52,14 +53,15 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
         .name = (char*)name,
         .hash = name_hash(name),
         .name_len = (uint16_t)strlen(name),
-        .full_char_remain_ptr = PTR_INVALID
+        .full_char_remain_offset = PTR_INVALID,
+        .owner_dir_inum = inode_idx
     };
 
     uint64_t dentry_root_idx;
     {
         InodeSession ino_sess(inode_cache_mgr, inode_idx);
         if (!ino_sess) return RC_ERR_IO;
-        raven_Inode_t *ino = ino_sess.inode;
+        raven_dir_Inode_t *ino = (raven_dir_Inode_t *)ino_sess.inode;
         if (RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_DIR)
             return RC_ERR_STATE;
 
@@ -67,9 +69,9 @@ result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char
          * 三参数版本**拒绝**空 data_root —— 出现即严重内部磁盘契约违反
          * （dir 从诞生起树根已建：根目录由 mkfs，子目录由本函数急建）。
          * 旧两参版本的"空目录懒建根"在此退役。 */
-        if (ino->data_root == PTR_INVALID)
+        if (ino->ddentry_Bptree_root == PTR_INVALID)
             return RC_ERR_STATE;
-        dentry_root_idx = ino->data_root;
+        dentry_root_idx = ino->ddentry_Bptree_root;
     }
 
     bptree_path_t trace;
@@ -212,19 +214,20 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
         .name = (char*)name,
         .hash = name_hash(name),
         .name_len = (uint16_t)strlen(name),
-        .full_char_remain_ptr = PTR_INVALID
+        .full_char_remain_offset = PTR_INVALID,
+        .owner_dir_inum = inode_idx
     };
 
     uint64_t dentry_root_idx;
     {
         InodeSession ino_sess(inode_cache_mgr, inode_idx);
         if (!ino_sess) return RC_ERR_IO;
-        raven_Inode_t *ino = ino_sess.inode;
+        raven_dir_Inode_t *ino = (raven_dir_Inode_t *)ino_sess.inode;
         if (RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_DIR)
             return RC_ERR_STATE;
-        if (ino->data_root == PTR_INVALID)
+        if (ino->ddentry_Bptree_root == PTR_INVALID)
             return RC_ERR_NOT_FOUND;   /* 空目录，无条目可删 */
-        dentry_root_idx = ino->data_root;
+        dentry_root_idx = ino->ddentry_Bptree_root;
     }
 
     bptree_path_t trace;
@@ -242,7 +245,7 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
 
     /* 名字堆信息必须在删除（memmove）**之前**取 */
     const uint16_t e_name_len = (uint16_t)RFS_PTR_FREE(leaf->entries[idx].inode_ptr);
-    const uint64_t e_remain   = leaf->entries[idx].full_char_remain_ptr;
+    const uint64_t e_remain   = leaf->entries[idx].full_char_remain_offset;
 
     /* 目标 inode 类型也须在删除前读出（D-12）：仅 DIR 型条目才影响 owner
      * 目录 link_count（POSIX：link_count = 2 + 直属 DIR 型子 inode 数）。 */
@@ -366,9 +369,9 @@ result_code_t RavenFS_juvenile::dir_rm_dentry(uint64_t inode_idx, const char *na
         }
     }
 
-    /* 长名：释放名字堆外置存储（树删除已成功；释放失败尽力而为，不覆盖删除结果） */
+    /* 长名：释放名字数据面外置区间（树删除已成功；释放失败尽力而为，不覆盖删除结果） */
     if (e_name_len > DENTRY_INLINE_NAME_MAX)
-        name_heap_free(inode_idx, e_name_len, e_remain);
+        name_data_free(inode_idx, e_remain, (uint16_t)(e_name_len - DENTRY_INLINE_NAME_MAX));
 
     /* 当前目录（owner）条目计数维护：size--（全部条目）；tgt_is_dir 时
      * link_count--（POSIX：link_count = 2 + 直属 DIR 型子 inode 数，§3.3）。
@@ -403,17 +406,18 @@ result_code_t RavenFS_juvenile::dir_lookup(uint64_t inode_idx, const char *name,
         .name = (char*)name,
         .hash = name_hash(name),
         .name_len = (uint16_t)strlen(name),
-        .full_char_remain_ptr = PTR_INVALID
+        .full_char_remain_offset = PTR_INVALID,
+        .owner_dir_inum = inode_idx
     };
 
     uint64_t dentry_root_idx = 0;
     {
         InodeSession ino_sess(inode_cache_mgr, inode_idx);
         if (!ino_sess) return RC_ERR_IO;
-        raven_Inode_t *ino = ino_sess.inode;
+        raven_dir_Inode_t *ino = (raven_dir_Inode_t *)ino_sess.inode;
         if (RFS_INO1_GET_TYPE(ino->word1) != INODE_TYPE_DIR) return RC_ERR_STATE;
-        if (ino->data_root == PTR_INVALID) return RC_ERR_NOT_FOUND;   /* 空目录 */
-        dentry_root_idx = ino->data_root;
+        if (ino->ddentry_Bptree_root == PTR_INVALID) return RC_ERR_NOT_FOUND;   /* 空目录 */
+        dentry_root_idx = ino->ddentry_Bptree_root;
     }
 
     bptree_path_t trace;

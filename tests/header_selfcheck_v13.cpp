@@ -50,7 +50,7 @@ static_assert(offsetof(struct raven_dir_Inode_t, possible_inline_free_ranges) ==
 
 /* ── v1.3 名字数据面双树（映射树 + 空闲区间树）── */
 static_assert(sizeof(struct free_range_t)       == 16, "free_range_t 16B");
-static_assert(sizeof(struct free_ranges_hint_t) == 16, "free_ranges_hint_t 16B");
+static_assert(sizeof(struct free_ranges_hint_t) == 24, "free_ranges_hint_t 24B");
 static_assert(RFS_ND_FREE_INLINE_MAX == 9, "inline free-range max 9");
 /* 空态哨兵：ptr 域全 1 = 无效指针 ⇒ 整字全 0xF */
 static_assert(RFS_ND_CTL_PTR_INVALID == RFS_MASK51, "ctl ptr invalid = 51-bit ones");

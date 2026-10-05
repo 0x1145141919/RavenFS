@@ -294,7 +294,8 @@ result_code_t RavenFS_juvenile::dfprealloc_and_plan(raven_Inode_t *inode, uint64
  * 审计锚 owner_inode_idx）→ ptrs[0..2] = PTR_INVALID（文件树根无链表无 ".."）。
  * root_blk 出参；失败（无块）→ RC_ERR_NO_BLOCK，root_blk 不变。
  * ═══════════════════════════════════════════════════════════════════ */
-result_code_t RavenFS_juvenile::extent_new_root_leaf(uint64_t owner_inode_idx, uint64_t &root_blk)
+result_code_t RavenFS_juvenile::extent_new_root_leaf(uint64_t owner_inode_idx, uint64_t &root_blk,
+                                                     extent_tree_kind_t kind)
 {
     const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
     const uint64_t blk = block_alloc_hard(2, 1);
@@ -305,7 +306,7 @@ result_code_t RavenFS_juvenile::extent_new_root_leaf(uint64_t owner_inode_idx, u
             block_free(blk, 2);
             return RC_ERR_STATE;
         }
-        extent_node_meta_init(s.data, 0, false, true, owner_inode_idx);
+        extent_node_meta_init(s.data, 0, false, true, owner_inode_idx, kind);
         Bptree_meta_t *meta = (Bptree_meta_t *)s.data;
         RFS_PTR_SET_ADDR(meta->ptrs[0], PTR_INVALID_52);
         RFS_PTR_SET_ADDR(meta->ptrs[1], PTR_INVALID_52);
@@ -1002,7 +1003,7 @@ result_code_t RavenFS_juvenile::direct_file_pread(uint64_t inode_idx, uint64_t o
  * （归调用方账本 / 折弃时数据块归旧态仍在）。结构异常即弃疗（孤儿留盘 fsck 收）。
  * 与 direct_file_pwrite 内 free_orphan_extent_tree lambda 同机械。
  * ═══════════════════════════════════════════════════════════════════ */
-void RavenFS_juvenile::extent_orphan_release(uint64_t tree_root)
+void RavenFS_juvenile::extent_orphan_release(uint64_t tree_root, extent_tree_kind_t kind)
 {
     const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
     if (tree_root == PTR_INVALID_52) return;
@@ -1012,7 +1013,7 @@ void RavenFS_juvenile::extent_orphan_release(uint64_t tree_root)
         mdata_piece_session sess(mdata_piece_mgr, cur);
         if (sess.index_error() || !sess) return;
         Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
-        if (!is_extent_node(meta)) return;
+        if (!is_extent_node_kind(meta, kind)) return;
         if (!RFS_PP_IS_INNER(meta->parent_ptr)) {
             if (!RFS_PP_IS_ROOT(meta->parent_ptr)) parents.push_back(RFS_PP_PTR(meta->parent_ptr));
             leaves.push_back(cur);
@@ -1034,7 +1035,7 @@ void RavenFS_juvenile::extent_orphan_release(uint64_t tree_root)
             mdata_piece_session sess(mdata_piece_mgr, b);
             if (sess.index_error() || !sess) return;
             Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
-            if (!is_extent_node(meta) || !RFS_PP_IS_INNER(meta->parent_ptr)) return;
+            if (!is_extent_node_kind(meta, kind) || !RFS_PP_IS_INNER(meta->parent_ptr)) return;
             if (RFS_PP_IS_ROOT(meta->parent_ptr)) saw_root = true;
             else next.push_back(RFS_PP_PTR(meta->parent_ptr));
         }

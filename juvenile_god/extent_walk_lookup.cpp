@@ -42,7 +42,8 @@
  * 路由不变量：target 必然 > 前驱子树最大开边界（严格上界路由保证），
  * 故叶子内无下界（GLB == NONE）时归宿 = 本叶子开头，无需向左兄弟借位。
  * ═══════════════════════════════════════════════════════════════════ */
-result_code_t RavenFS_juvenile::extent_Bptree_walk(uint64_t root_blk_idx, bptree_path_t *trace, uint64_t logical_block_idx)
+result_code_t RavenFS_juvenile::extent_Bptree_walk(uint64_t root_blk_idx, bptree_path_t *trace,
+                                                   uint64_t logical_block_idx, extent_tree_kind_t kind)
 {
     if (!trace) return RC_ERR_STATE;
     trace->depth = 0;
@@ -57,7 +58,7 @@ result_code_t RavenFS_juvenile::extent_Bptree_walk(uint64_t root_blk_idx, bptree
         if (!sess) return RC_ERR_IO;
 
         Bptree_meta_t *meta = (Bptree_meta_t *)sess.data;
-        if (!is_extent_node(meta)) return RC_ERR_STATE;
+        if (!is_extent_node_kind(meta, kind)) return RC_ERR_STATE;
         /* 根校验：第 0 层必须是根，后续层必须非根（树损坏即报） */
         if ((depth == 0) != (bool)RFS_PP_IS_ROOT(meta->parent_ptr))
             return RC_ERR_STATE;

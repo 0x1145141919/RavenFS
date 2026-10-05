@@ -41,9 +41,31 @@ constexpr uint16_t EXTENT_ORDER = 337;
 constexpr uint16_t DENTRY_MINA  = 63;
 constexpr uint16_t EXTENT_MINA  = 168;
 
-/* 名字堆静态几何（与 name_heap.cpp / raven_dir_Inode_t 字段序一致） */
-constexpr uint8_t  HEAP_GRAN[10] = { 3,3,3, 6,6, 7,7, 8,8, 9 };
-constexpr uint8_t  HEAP_BITS[10] = { 16,17,18, 16,17, 16,17, 16,17, 16 };
+/* 名字数据面映射树节点魔数自识别（独立于 God is_extent_node_kind） */
+inline bool nd_node_magic(const Bptree_meta_t *m)
+{
+    return m->magics[0] == NAMEDATA_EXTENT_MAGIC1 &&
+           m->magics[1] == NAMEDATA_EXTENT_MAGIC2 &&
+           m->magics[2] == NAMEDATA_EXTENT_MAGIC3 &&
+           m->magics[3] == NAMEDATA_EXTENT_MAGIC4;
+}
+
+/* 名字数据面空闲区间树（fr）节点魔数自识别 */
+inline bool fr_node_magic(const Bptree_meta_t *m)
+{
+    return m->magics[0] == NAMEDATA_FREERANGES_MAGIC1 &&
+           m->magics[1] == NAMEDATA_FREERANGES_MAGIC2 &&
+           m->magics[2] == NAMEDATA_FREERANGES_MAGIC3 &&
+           m->magics[3] == NAMEDATA_FREERANGES_MAGIC4;
+}
+
+/* fr 复合键 (len 主序, base 副序) 比较：a < b / a > b */
+inline bool fr_key_lt(uint64_t alen, uint64_t abase, uint64_t blen, uint64_t bbase)
+{ return alen < blen || (alen == blen && abase < bbase); }
+inline bool fr_key_gt(uint64_t alen, uint64_t abase, uint64_t blen, uint64_t bbase)
+{ return blen < alen || (blen == alen && bbase < abase); }
+
+constexpr uint16_t FR_ORDER = 337;   /* fr 树阶（数组 338 = 337 階 + 1 瞬时槽） */
 
 constexpr uint32_t XATTR_MAGIC = 0x52465358u;   /* "RFSX"（v1.2 §5.2） */
 
@@ -74,10 +96,10 @@ void bad_inode(audit_walk_ctx_t &ctx, const char *fmt, ...)
     ctx.rep.inode_bad++;
     va_list ap; va_start(ap, fmt); audit_vlog(ctx, "BAD", fmt, ap); va_end(ap);
 }
-void bad_heap(audit_walk_ctx_t &ctx, const char *fmt, ...)
+void bad_name_data(audit_walk_ctx_t &ctx, const char *fmt, ...)
 {
     ctx.rep.heap_bad++;
-    va_list ap; va_start(ap, fmt); audit_vlog(ctx, "BAD_HEAP", fmt, ap); va_end(ap);
+    va_list ap; va_start(ap, fmt); audit_vlog(ctx, "BAD_NAMEDATA", fmt, ap); va_end(ap);
 }
 void bad_xattr(audit_walk_ctx_t &ctx, const char *fmt, ...)
 {
@@ -216,29 +238,12 @@ result_code_t RavenFS_juvenile::audit_dfs_root(audit_walk_report_t *rep, FILE *o
         print_runs("LEAK_BLK",   "疑似泄露（位图亮 ∧ 不可达）", run_leak);
     }
 
-    audit_logf(ctx, "HEAP_SUM",
-               "active=%llu | blocks=%llu (bmp=%llu data=%llu) = %.1f MiB | "
-               "used_bits=%llu/%llu (%.4f%%) | zero_used=%llu(泄露)",
+    audit_logf(ctx, "NAMEDATA_SUM",
+               "active_dirs=%llu | data_blk=%llu tree_node_blk=%llu | pieces=%llu",
                (unsigned long long)ctx.rep.heap_active,
-               (unsigned long long)(ctx.rep.heap_active_bitmap_blk + ctx.rep.heap_active_data_blk),
-               (unsigned long long)ctx.rep.heap_active_bitmap_blk,
                (unsigned long long)ctx.rep.heap_active_data_blk,
-               (double)(ctx.rep.heap_active_bitmap_blk + ctx.rep.heap_active_data_blk) * 4096.0 / 1048576.0,
-               (unsigned long long)ctx.rep.heap_used_bits,
-               (unsigned long long)ctx.rep.heap_total_bits,
-               ctx.rep.heap_total_bits ? 100.0 * (double)ctx.rep.heap_used_bits / (double)ctx.rep.heap_total_bits : 0.0,
-               (unsigned long long)ctx.rep.heap_zero_used);
-    for (int s = 0; s < 10; s++) {
-        if (ctx.rep.heap_slot_active[s] == 0) continue;
-        audit_logf(ctx, "HEAP_SLOT",
-                   "slot=%d gran=%uB active=%llu data_blk=%llu used=%llu/%llu (%.4f%%)",
-                   s, 1u << HEAP_GRAN[s],
-                   (unsigned long long)ctx.rep.heap_slot_active[s],
-                   (unsigned long long)ctx.rep.heap_slot_data_blk[s],
-                   (unsigned long long)ctx.rep.heap_slot_used_bits[s],
-                   (unsigned long long)ctx.rep.heap_slot_total_bits[s],
-                   ctx.rep.heap_slot_total_bits[s] ? 100.0 * (double)ctx.rep.heap_slot_used_bits[s] / (double)ctx.rep.heap_slot_total_bits[s] : 0.0);
-    }
+               (unsigned long long)ctx.rep.heap_active_bitmap_blk,
+               (unsigned long long)ctx.rep.heap_used_bits);
 
     audit_logf(ctx, "SUM",
                "inodes=%llu | nodes=%llu inner=%llu leaves=%llu recs=%llu | "
@@ -368,22 +373,22 @@ void RavenFS_juvenile::audit_walk_dir(audit_walk_ctx_t &ctx, uint64_t inum, uint
     inode_read(inum, &raw);
     const raven_dir_Inode_t *d = (const raven_dir_Inode_t *)&raw;
 
-    uint64_t root = d->data_root;
+    /* 目录名字数据面（v1.3：映射 direct/tree + fr）独立审计 + 全物理块认领。
+     * 先于 ddentry 根校验：即使 dentry 树根损坏也要认领数据面块，避免误报泄露。 */
+    audit_name_data_plane(ctx, inum, d);
+
+    uint64_t root = d->ddentry_Bptree_root;
     if (root == PTR_INVALID || root >= total_blocks || (root & 1)) {
-        bad_inode(ctx, "DIR inode %llu data_root 非法=%#llx", (unsigned long long)inum,
+        bad_inode(ctx, "DIR inode %llu ddentry_Bptree_root 非法=%#llx", (unsigned long long)inum,
                   (unsigned long long)root);
         return;
     }
-
-    /* 名字堆描述符 + 占用率 + 归属区（供长名指针校验；随参数下传） */
-    std::vector<audit_heap_region_t> heaps;
-    audit_name_heaps(ctx, inum, d, heaps);
 
     /* dentry 树 DFS（先序：本目录树先审完，再下钻子目录） */
     std::vector<uint64_t> children;
     audit_walk_tree_t t;
     bool ok = true;
-    audit_walk_btree(ctx, heaps, children, t, root, inum, inum /*root parent=owner*/,
+    audit_walk_btree(ctx, children, t, root, inum, inum /*root parent=owner*/,
                      parent_inum == PTR_INVALID ? root_inum : parent_inum /*'..' 期望*/,
                      true, true, 0, 0, ok);
     audit_leaf_chain(ctx, t, root, true, inum);
@@ -464,11 +469,10 @@ void RavenFS_juvenile::audit_walk_file(audit_walk_ctx_t &ctx, uint64_t inum, con
                       (unsigned long long)inum, (unsigned long long)root);
             return;
         }
-        std::vector<audit_heap_region_t> none;
         std::vector<uint64_t> children;
         audit_walk_tree_t t;
         bool ok = true;
-        audit_walk_btree(ctx, none, children, t, root, inum, inum, inum,
+        audit_walk_btree(ctx, children, t, root, inum, inum, inum,
                          true, false, blocks, 0, ok);
         audit_leaf_chain(ctx, t, root, false, inum);
     }
@@ -480,10 +484,9 @@ void RavenFS_juvenile::audit_walk_file(audit_walk_ctx_t &ctx, uint64_t inum, con
  *   sub_ok = 本节点读+身份校验通过（父层据此做 key==max 比对）。
  * ═══════════════════════════════════════════════════════════════════ */
 uint64_t RavenFS_juvenile::audit_walk_btree(audit_walk_ctx_t &ctx,
-        const std::vector<audit_heap_region_t> &heaps, std::vector<uint64_t> &children,
-        audit_walk_tree_t &t, uint64_t blk, uint64_t owner_inum, uint64_t expect_parent,
-        uint64_t dotdot_expect, bool expect_root, bool is_dentry, uint64_t size_bound,
-        int depth, bool &sub_ok)
+        std::vector<uint64_t> &children, audit_walk_tree_t &t, uint64_t blk,
+        uint64_t owner_inum, uint64_t expect_parent, uint64_t dotdot_expect,
+        bool expect_root, bool is_dentry, uint64_t size_bound, int depth, bool &sub_ok)
 {
     sub_ok = false;
     const char *tree = is_dentry ? "dentry" : "extent";
@@ -613,50 +616,27 @@ uint64_t RavenFS_juvenile::audit_walk_btree(audit_walk_ctx_t &ctx,
                               (unsigned long long)owner_inum, (unsigned long long)blk, i,
                               name_len, (unsigned)RAVENFS_MAX_NAME_LEN);
 
-                /* 名字重建（≤40 内联 / >40 读堆）→ hash 重算 */
+                /* 名字重建（≤40 内联 / >40 经目录名字数据面读）→ hash 重算。
+                 * v1.3 名字堆已退役；完整双树校验由 audit 独立轨实现（TODO）。 */
                 char full[RAVENFS_MAX_NAME_LEN + 1];
                 const uint16_t ncopy = name_len < DENTRY_INLINE_NAME_MAX ? name_len : DENTRY_INLINE_NAME_MAX;
                 std::memcpy(full, e.name, ncopy);
                 bool name_ok = true;
                 if (name_len > DENTRY_INLINE_NAME_MAX) {
-                    if (e.full_char_remain_ptr == PTR_INVALID) {
+                    if (e.full_char_remain_offset == PTR_INVALID) {
                         name_ok = false;
-                        bad_heap(ctx, "tree=dentry inum=%llu blk=%llu entries[%u] 长名但 remain=PTR_INVALID",
+                        bad_name_data(ctx, "tree=dentry inum=%llu blk=%llu entries[%u] 长名但 offset=PTR_INVALID",
                                  (unsigned long long)owner_inum, (unsigned long long)blk, i);
-                    } else {
-                        const uint16_t tail = name_len - DENTRY_INLINE_NAME_MAX;
-                        const uint16_t units = (tail <= 40) ? (uint16_t)((tail + 7) / 8) : 1;
-                        const uint64_t fblk = e.full_char_remain_ptr >> 12;
-                        const uint16_t off  = (uint16_t)(e.full_char_remain_ptr & 0xFFF);
-                        const audit_heap_region_t *hit = nullptr;
-                        for (const auto &r : heaps)
-                            if (fblk >= r.data_lo && fblk < r.data_hi) { hit = &r; break; }
-                        if (!hit) {
-                            name_ok = false;
-                            bad_heap(ctx, "tree=dentry inum=%llu blk=%llu entries[%u] 长名 remain=%#llx 不落本目录任何激活堆数据区",
-                                     (unsigned long long)owner_inum, (unsigned long long)blk, i,
-                                     (unsigned long long)e.full_char_remain_ptr);
-                        } else if (name_heap_read(name_len, e.full_char_remain_ptr,
-                                                  full + DENTRY_INLINE_NAME_MAX) != RC_OK) {
-                            name_ok = false;
-                            bad_heap(ctx, "tree=dentry inum=%llu blk=%llu entries[%u] 长名尾部读取失败",
-                                     (unsigned long long)owner_inum, (unsigned long long)blk, i);
-                        } else {
-                            const uint64_t sbyte = (fblk - hit->data_lo) * 4096 + off;
-                            const uint64_t bit0  = sbyte >> hit->gran_log2;
-                            bool bits_ok = true;
-                            for (uint16_t u = 0; u < units && bits_ok; u++)
-                                if (audit_heap_bit(*hit, bit0 + u) != 1) bits_ok = false;
-                            if (!bits_ok) {
-                                name_ok = false;
-                                bad_heap(ctx, "tree=dentry inum=%llu blk=%llu entries[%u] 长名堆位图未置位 (fblk=%llu off=%u units=%u)",
-                                         (unsigned long long)owner_inum, (unsigned long long)blk, i,
-                                         (unsigned long long)fblk, off, units);
-                            }
-                        }
+                    } else if (name_data_read(owner_inum, e.full_char_remain_offset,
+                                              (uint16_t)(name_len - DENTRY_INLINE_NAME_MAX),
+                                              full + DENTRY_INLINE_NAME_MAX) != RC_OK) {
+                        name_ok = false;
+                        bad_name_data(ctx, "tree=dentry inum=%llu blk=%llu entries[%u] 长名数据面读取失败 offset=%#llx",
+                                 (unsigned long long)owner_inum, (unsigned long long)blk, i,
+                                 (unsigned long long)e.full_char_remain_offset);
                     }
-                } else if (e.full_char_remain_ptr != PTR_INVALID) {
-                    audit_logf(ctx, "WARN", "tree=dentry inum=%llu blk=%llu entries[%u] name_len<=40 但 remain 非 INVALID（软）",
+                } else if (e.full_char_remain_offset != PTR_INVALID) {
+                    audit_logf(ctx, "WARN", "tree=dentry inum=%llu blk=%llu entries[%u] name_len<=40 但 offset 非 INVALID（软）",
                                (unsigned long long)owner_inum, (unsigned long long)blk, i);
                 }
                 if (name_ok) {
@@ -767,7 +747,7 @@ uint64_t RavenFS_juvenile::audit_walk_btree(audit_walk_ctx_t &ctx,
             continue;
         }
         bool cok = false;
-        const uint64_t cmax = audit_walk_btree(ctx, heaps, children, t, child, owner_inum, blk,
+        const uint64_t cmax = audit_walk_btree(ctx, children, t, child, owner_inum, blk,
                                                dotdot_expect, false, is_dentry, size_bound,
                                                depth + 1, cok);
         if (cok && cmax != key)
@@ -869,101 +849,731 @@ void RavenFS_juvenile::audit_leaf_chain(audit_walk_ctx_t &ctx, const audit_walk_
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * audit_name_heaps — 描述符自洽 + 占用率 + 归属区登记（out_heaps）
+ * audit_name_data_plane — 目录名字数据面（v1.3）独立审计
+ *
+ * 契约（仅据 include/disk_struct_v1.3.h 推导；不借 God 实现假设）：
+ *   · name_data_ctl：[0]=direct(1)/tree(0)，[1:52)=指针（51 位）；
+ *       空态 ptr 全 1（RFS_ND_CTL_PTR_INVALID）⇔ piece_count==0。
+ *   · direct：ptr = 单连续物理段基块（8K 对齐），段长 = pieces×2 FS_block，
+ *       逻辑空间 [0, pieces×2) 由 ptr 线性直算。
+ *   · tree  ：ptr = 映射树根块号；节点族魔数 NAMEDATA_EXTENT_MAGIC1..4，
+ *       布局/阶同文件 extent 树；key = 子树最大开边界 fblkbase+length。
+ *       逻辑空间稠密无空洞、8K 对齐；每数据片 = length 2 的 extent。
+ *   · fr（空闲区间树）：name_data_free_ranges_ctl inline(1)/tree(0) + 根块号；
+ *       空态 ptr 全 1 ⇔ fr_count==0。tree 态节点族 NAMEDATA_FREERANGES_MAGIC1..4，
+ *       复合键 (len 主序, base 副序)，hint=子树最大复合键。独立审计+认领。
+ *
+ * 认领：数据面占用的**全部物理块**（direct 段 / tree 各 extent + 映射树节点 +
+ * fr 树节点）在收口 XOR 前登记进 ctx.blk_set；二次认领计 multi_claim_blk。
+ * 所有不变量违例经 bad_name_data → rep.heap_bad。
  * ═══════════════════════════════════════════════════════════════════ */
-void RavenFS_juvenile::audit_name_heaps(audit_walk_ctx_t &ctx, uint64_t inum,
-                                        const raven_dir_Inode_t *d,
-                                        std::vector<audit_heap_region_t> &out_heaps)
+void RavenFS_juvenile::audit_name_data_plane(audit_walk_ctx_t &ctx, uint64_t inum,
+                                             const raven_dir_Inode_t *d)
 {
-    out_heaps.clear();
-    const name_heap_controller_t *arr = (const name_heap_controller_t *)&d->heaps_8B_8k;
-    for (int s = 0; s < 10; s++) {
-        const name_heap_controller_t &c = arr[s];
-        const uint64_t bmpb = RFS_NHC_BITMAP(c);
-        const uint64_t datab = RFS_NHC_DATA(c);
-        const uint8_t gran = (uint8_t)RFS_NHC_GRAN(c);
-        const uint8_t bits = (uint8_t)RFS_NHC_BITS(c);
-        const bool inactive = (bmpb == NAME_HEAP_INACTIVE && datab == NAME_HEAP_INACTIVE);
-        if (inactive) continue;
+    const uint64_t ctl    = d->name_data_ctl;
+    const uint64_t pieces = RFS_ND_PIECE_COUNT(d->name_data_piece_count);
+    const uint64_t ptr    = RFS_ND_CTL_PTR(ctl);
+    const uint64_t target = pieces * 2;   /* 逻辑块数（8K 片 = 2 FS_block） */
 
-        if (bmpb == NAME_HEAP_INACTIVE || datab == NAME_HEAP_INACTIVE) {
-            bad_heap(ctx, "DIR inode %llu heap[%d] 半激活 (bmp=%llu data=%llu)",
-                     (unsigned long long)inum, s, (unsigned long long)bmpb, (unsigned long long)datab);
-            continue;
-        }
-        if (gran != HEAP_GRAN[s] || bits != HEAP_BITS[s])
-            audit_logf(ctx, "WARN", "DIR inode %llu heap[%d] log2 非常规 gran=%u bits=%u (期望 %u/%u)",
-                       (unsigned long long)inum, s, gran, bits, (unsigned)HEAP_GRAN[s], (unsigned)HEAP_BITS[s]);
-        const uint64_t bmp_blks  = 1ULL << (bits - 15);
-        const uint64_t data_blks = 1ULL << (bits + gran - 12);
-        if (bmpb >= total_blocks || (bmpb & 1) || bmpb + bmp_blks > total_blocks ||
-            datab >= total_blocks || (datab & 1) || datab + data_blks > total_blocks) {
-            bad_heap(ctx, "DIR inode %llu heap[%d] 区间越界 bmp[%llu,+%llu) data[%llu,+%llu)",
-                     (unsigned long long)inum, s, (unsigned long long)bmpb, (unsigned long long)bmp_blks,
-                     (unsigned long long)datab, (unsigned long long)data_blks);
-            continue;
-        }
-        for (uint64_t k = 0; k < bmp_blks; k++) {
-            if (!ctx.blk_set(bmpb + k)) { ctx.rep.multi_claim_blk++;
-                audit_logf(ctx, "MULTI_CLAIM", "heap bmp 块 %llu 二次认领 (inode %llu)",
-                           (unsigned long long)(bmpb + k), (unsigned long long)inum); } }
-        for (uint64_t k = 0; k < data_blks; k++) {
-            if (!ctx.blk_set(datab + k)) { ctx.rep.multi_claim_blk++;
-                audit_logf(ctx, "MULTI_CLAIM", "heap data 块 %llu 二次认领 (inode %llu)",
-                           (unsigned long long)(datab + k), (unsigned long long)inum); } }
+    /* fr（空闲区间树）：独立审计 + 节点块认领（先于映射树，防 XOR 误报泄露） */
+    audit_name_data_free_ranges(ctx, inum, d);
 
-        std::vector<uint8_t> bm((size_t)bmp_blks * 4096);
-        if (read_buff(bmpb, bmp_blks, bm.data()) != RC_OK) {
-            bad_heap(ctx, "DIR inode %llu heap[%d] 位图读取失败", (unsigned long long)inum, s);
-            continue;
-        }
-        uint64_t used = 0;
-        for (uint8_t v : bm) used += (uint64_t)__builtin_popcount(v);
-        const uint64_t total_bits = 1ULL << bits;
-        audit_logf(ctx, "HEAP",
-                   "DIR inode %llu heap[%d] gran=%uB bits_log2=%u bmp=[%llu,+%llu) data=[%llu,+%llu) 占用 %llu/%llu (%.1f%%)",
-                   (unsigned long long)inum, s, 1u << gran, bits,
-                   (unsigned long long)bmpb, (unsigned long long)bmp_blks,
-                   (unsigned long long)datab, (unsigned long long)data_blks,
-                   (unsigned long long)used, (unsigned long long)total_bits,
-                   total_bits ? 100.0 * (double)used / (double)total_bits : 0.0);
-
-        /* ── 分区级统计（分档：slot 即 gran 档）── */
-        ctx.rep.heap_active++;
-        ctx.rep.heap_active_bitmap_blk += bmp_blks;
-        ctx.rep.heap_active_data_blk += data_blks;
-        ctx.rep.heap_used_bits += used;
-        ctx.rep.heap_total_bits += total_bits;
-        if (s >= 0 && s < 10) {
-            ctx.rep.heap_slot_active[s]++;
-            ctx.rep.heap_slot_data_blk[s] += data_blks;
-            ctx.rep.heap_slot_used_bits[s] += used;
-            ctx.rep.heap_slot_total_bits[s] += total_bits;
-        }
-        /* 空堆 = 泄露（激活但 0 占用：长名已删/回收未归还） */
-        if (used == 0) {
-            ctx.rep.heap_zero_used++;
-            bad_heap(ctx, "DIR inode %llu heap[%d] 激活但占用=0（空堆泄露）bmp=[%llu,+%llu) data=[%llu,+%llu)",
-                     (unsigned long long)inum, s,
-                     (unsigned long long)bmpb, (unsigned long long)bmp_blks,
-                     (unsigned long long)datab, (unsigned long long)data_blks);
-        }
-
-        audit_heap_region_t r;
-        r.data_lo = datab; r.data_hi = datab + data_blks;
-        r.gran_log2 = gran; r.bmp_base = bmpb; r.total_bits = total_bits;
-        out_heaps.push_back(r);
+    /* ── 空态自洽：ptr==INVALID ⇔ pieces==0 ── */
+    if (ptr == RFS_ND_CTL_PTR_INVALID) {
+        if (pieces != 0)
+            bad_name_data(ctx, "DIR inode %llu 数据面空态（ptr 全 1）但 piece_count=%llu",
+                          (unsigned long long)inum, (unsigned long long)pieces);
+        return;
     }
+    if (pieces == 0) {
+        bad_name_data(ctx, "DIR inode %llu 数据面非空控制字 ptr=%llu 但 piece_count=0",
+                      (unsigned long long)inum, (unsigned long long)ptr);
+        /* 不 early return：继续认领（段/树），避免收口把活块误报 leaked */
+    }
+
+    ctx.rep.heap_active++;
+    ctx.rep.heap_used_bits += pieces;
+
+    /* ── direct 态 ── */
+    if (RFS_ND_CTL_IS_DIRECT(ctl)) {
+        if (ptr & 1)
+            bad_name_data(ctx, "DIR inode %llu 数据面 direct base=%llu 未 8K 对齐",
+                          (unsigned long long)inum, (unsigned long long)ptr);
+        if (ptr >= total_blocks || ptr + target > total_blocks) {
+            bad_name_data(ctx, "DIR inode %llu 数据面 direct 区间越界 base=%llu pieces=%llu total=%llu",
+                          (unsigned long long)inum, (unsigned long long)ptr,
+                          (unsigned long long)pieces, (unsigned long long)total_blocks);
+            return;
+        }
+        for (uint64_t k = 0; k < target; k++) {
+            if (!ctx.blk_set(ptr + k)) {
+                ctx.rep.multi_claim_blk++;
+                audit_logf(ctx, "MULTI_CLAIM", "name_data direct 块 %llu 二次认领 (inode %llu)",
+                           (unsigned long long)(ptr + k), (unsigned long long)inum);
+            }
+        }
+        ctx.rep.heap_active_data_blk += target;
+        if (ctx.verbose)
+            audit_logf(ctx, "NAMEDATA",
+                       "DIR inode %llu direct base=%llu pieces=%llu (%llu blks)",
+                       (unsigned long long)inum, (unsigned long long)ptr,
+                       (unsigned long long)pieces, (unsigned long long)target);
+        return;
+    }
+
+    /* ── tree 态：映射树 DFS ── */
+    if (ptr & 1)
+        bad_name_data(ctx, "DIR inode %llu 数据面 tree 根=%llu 未 8K 对齐",
+                      (unsigned long long)inum, (unsigned long long)ptr);
+
+    audit_name_data_tree_t w;
+    bool sub_ok = false;
+    (void)audit_name_data_tree(ctx, ptr, inum, inum, true, 0, w, sub_ok);
+    (void)sub_ok;
+
+    /* 逻辑域终态：无缝稠密覆盖 [0, pieces*2)（跨叶游标已逐条校验） */
+    if (w.logical_end != target)
+        bad_name_data(ctx, "DIR inode %llu 数据面逻辑覆盖 end=%llu != pieces*2=%llu",
+                      (unsigned long long)inum, (unsigned long long)w.logical_end,
+                      (unsigned long long)target);
+
+    ctx.rep.heap_active_data_blk += w.data_blocks;
+    ctx.rep.heap_active_bitmap_blk += w.tree_blocks;
+
+    /* 叶链双向自洽 + 链序 == DFS 叶序（数据面专用：违例计 heap_bad） */
+    audit_name_data_leaf_chain(ctx, w, ptr, inum);
 }
 
-int RavenFS_juvenile::audit_heap_bit(const audit_heap_region_t &r, uint64_t bit)
+/* ═══════════════════════════════════════════════════════════════════
+ * audit_name_data_tree — 名字数据面映射树 DFS（独立推导）
+ *
+ * 仅自识别 NAMEDATA_EXTENT_MAGIC1..4（不调用 God is_extent_node_kind）。
+ * 校验：节点 magic/角色（根/内部/叶子）、父指针、叶深一致、叶/内欠载、
+ *   hint key 严格递增且 == 子树 max（key=开边界）、每条 extent length≥2 且
+ *   为偶、逻辑域跨叶无缝稠密递增、物理段 8K 对齐且不越界；认领节点块
+ *   （2 块/节点）与各 extent 物理块（二次认领计 multi_claim_blk）。
+ * 返回：本子树最大开边界（叶子末项 end / 内部末 hint key）。
+ * ═══════════════════════════════════════════════════════════════════ */
+uint64_t RavenFS_juvenile::audit_name_data_tree(audit_walk_ctx_t &ctx, uint64_t blk,
+        uint64_t owner_inum, uint64_t expect_parent, bool expect_root, int depth,
+        audit_name_data_tree_t &w, bool &sub_ok)
 {
-    if (bit >= r.total_bits) return -1;
-    const uint64_t byte  = bit >> 3;
-    const uint64_t blk   = r.bmp_base + byte / 4096;
-    const uint64_t inblk = byte % 4096;
-    if (blk >= total_blocks) return -1;
-    alignas(4096) uint8_t buf[4096];
-    if (read_buff(blk, 1, buf) != RC_OK) return -1;
-    return (buf[inblk] >> (bit & 7)) & 1;
+    sub_ok = false;
+    if (depth > ctx.max_depth) {
+        bad_name_data(ctx, "name_data tree inum=%llu depth 超限 %d (blk=%llu)",
+                      (unsigned long long)owner_inum, depth, (unsigned long long)blk);
+        return 0;
+    }
+    if (blk == PTR_INVALID || ptr52_bad(blk) || blk >= total_blocks ||
+        (blk & 1) || blk + 1 >= total_blocks) {
+        bad_name_data(ctx, "name_data tree inum=%llu blk=%llu 非法节点块号",
+                      (unsigned long long)owner_inum, (unsigned long long)blk);
+        return 0;
+    }
+    if (!ctx.blk_set(blk)) {
+        ctx.rep.multi_claim_blk++;
+        audit_logf(ctx, "MULTI_CLAIM",
+                   "name_data tree inum=%llu 节点 blk=%llu 二次认领（环/共享）",
+                   (unsigned long long)owner_inum, (unsigned long long)blk);
+        return 0;
+    }
+    w.tree_blocks += 2;   /* 节点恒 8K = 2 FS_block */
+    if (!ctx.blk_set(blk + 1)) {
+        ctx.rep.multi_claim_blk++;
+        audit_logf(ctx, "MULTI_CLAIM", "name_data tree inum=%llu 节点尾巴 blk+1=%llu 二次认领",
+                   (unsigned long long)owner_inum, (unsigned long long)(blk + 1));
+    }
+
+    void *nb = node_buf_alloc();
+    if (!nb) {
+        bad_name_data(ctx, "name_data tree inum=%llu blk=%llu 节点缓冲分配失败",
+                      (unsigned long long)owner_inum, (unsigned long long)blk);
+        return 0;
+    }
+    if (!audit_node_read(blk, nb)) {
+        bad_name_data(ctx, "name_data tree inum=%llu blk=%llu 节点读取失败",
+                      (unsigned long long)owner_inum, (unsigned long long)blk);
+        node_buf_free(nb);
+        return 0;
+    }
+    Bptree_meta_t *meta = (Bptree_meta_t *)nb;
+    if (!nd_node_magic(meta)) {
+        bad_name_data(ctx, "name_data tree inum=%llu blk=%llu magic 不符（非 NAMEDATA_EXTENT）",
+                      (unsigned long long)owner_inum, (unsigned long long)blk);
+        node_buf_free(nb);
+        return 0;
+    }
+
+    const uint16_t cnt   = (uint16_t)RFS_PP_COUNT(meta->parent_ptr);
+    const uint16_t it    = std::min<uint16_t>(cnt, (uint16_t)(EXTENT_ORDER + 1));
+    const bool     inner = RFS_PP_IS_INNER(meta->parent_ptr);
+
+    if (cnt > EXTENT_ORDER)
+        bad_name_data(ctx, "name_data tree inum=%llu blk=%llu entry_count=%u > 阶 %u",
+                      (unsigned long long)owner_inum, (unsigned long long)blk,
+                      cnt, (unsigned)EXTENT_ORDER);
+    if ((bool)RFS_PP_IS_ROOT(meta->parent_ptr) != expect_root)
+        bad_name_data(ctx, "name_data tree inum=%llu blk=%llu is_root=%d 期望 %d",
+                      (unsigned long long)owner_inum, (unsigned long long)blk,
+                      (int)RFS_PP_IS_ROOT(meta->parent_ptr), (int)expect_root);
+    if (expect_root) {
+        /* 映射树根 parent_ptr.ptr = owner dir inode（"." 审计锚，同文件 extent 树） */
+        if (RFS_PP_PTR(meta->parent_ptr) != owner_inum)
+            bad_name_data(ctx, "name_data tree inum=%llu 根 blk=%llu ptr=%llu != owner %llu",
+                          (unsigned long long)owner_inum, (unsigned long long)blk,
+                          (unsigned long long)RFS_PP_PTR(meta->parent_ptr),
+                          (unsigned long long)owner_inum);
+    } else {
+        if (RFS_PP_PTR(meta->parent_ptr) != expect_parent)
+            bad_name_data(ctx, "name_data tree inum=%llu blk=%llu parent_ptr=%llu != 实际父 %llu",
+                          (unsigned long long)owner_inum, (unsigned long long)blk,
+                          (unsigned long long)RFS_PP_PTR(meta->parent_ptr),
+                          (unsigned long long)expect_parent);
+    }
+
+    /* ══════ 叶子 ══════ */
+    if (!inner) {
+        if (!w.leaf_depth_set) { w.leaf_depth = (uint64_t)depth; w.leaf_depth_set = true; }
+        else if ((uint64_t)depth != w.leaf_depth)
+            bad_name_data(ctx, "name_data tree inum=%llu blk=%llu 叶深度 %d != %llu（不平衡）",
+                          (unsigned long long)owner_inum, (unsigned long long)blk, depth,
+                          (unsigned long long)w.leaf_depth);
+        w.leaves.push_back(blk);
+
+        if (cnt == 0) {
+            if (!expect_root)
+                bad_name_data(ctx, "name_data tree inum=%llu blk=%llu 非根叶空",
+                              (unsigned long long)owner_inum, (unsigned long long)blk);
+            /* 根叶空：pieces 应为 0（覆盖收尾报） */
+        } else if (!expect_root && cnt < EXTENT_MINA) {
+            bad_name_data(ctx, "name_data tree inum=%llu blk=%llu 叶欠载 cnt=%u < %u",
+                          (unsigned long long)owner_inum, (unsigned long long)blk,
+                          cnt, (unsigned)EXTENT_MINA);
+        }
+
+        auto *leaf = (Bptree_extent_leaf_node_t *)nb;
+        uint64_t leaf_max = 0;
+        for (uint16_t i = 0; i < it; i++) {
+            const extent_t &e = leaf->extents[i];
+            const uint64_t beg = e.fblkbase;
+            const uint64_t len = e.length;
+            const uint64_t end = beg + len;
+
+            if (len < 2 || (len & 1))
+                bad_name_data(ctx, "name_data tree inum=%llu blk=%llu extents[%u] length=%llu（须 ≥2 且偶）",
+                              (unsigned long long)owner_inum, (unsigned long long)blk, i,
+                              (unsigned long long)len);
+            if (beg & 1)
+                bad_name_data(ctx, "name_data tree inum=%llu blk=%llu extents[%u] fblkbase=%llu 未 8K 对齐",
+                              (unsigned long long)owner_inum, (unsigned long long)blk, i,
+                              (unsigned long long)beg);
+
+            if (!w.started) {
+                w.started = true;
+                if (beg != 0)
+                    bad_name_data(ctx, "name_data tree inum=%llu 首条 fblkbase=%llu != 0（逻辑域不始于 0）",
+                                  (unsigned long long)owner_inum, (unsigned long long)beg);
+            } else if (beg < w.logical_end) {
+                bad_name_data(ctx, "name_data tree inum=%llu extents[%u] 逻辑重叠 (prev_end=%llu > fblkbase=%llu)",
+                              (unsigned long long)owner_inum, i,
+                              (unsigned long long)w.logical_end, (unsigned long long)beg);
+            } else if (beg > w.logical_end) {
+                bad_name_data(ctx, "name_data tree inum=%llu extents[%u] 逻辑空洞 (prev_end=%llu < fblkbase=%llu)",
+                              (unsigned long long)owner_inum, i,
+                              (unsigned long long)w.logical_end, (unsigned long long)beg);
+            }
+            w.logical_end = end;
+            w.records++;
+
+            const uint64_t pb = RFS_PTR_ADDR(e.block_base);
+            if (pb == PTR52 || pb >= total_blocks || (pb & 1) || pb + len > total_blocks) {
+                bad_name_data(ctx, "name_data tree inum=%llu blk=%llu extents[%u] 物理段非法 base=%llu len=%llu",
+                              (unsigned long long)owner_inum, (unsigned long long)blk, i,
+                              (unsigned long long)pb, (unsigned long long)len);
+            } else {
+                for (uint64_t k = 0; k < len; k++) {
+                    if (!ctx.blk_set(pb + k)) {
+                        ctx.rep.multi_claim_blk++;
+                        audit_logf(ctx, "MULTI_CLAIM", "name_data 数据块 %llu 二次认领 (inode %llu)",
+                                   (unsigned long long)(pb + k), (unsigned long long)owner_inum);
+                    }
+                }
+                w.data_blocks += len;
+            }
+            leaf_max = end;
+        }
+        sub_ok = true;
+        node_buf_free(nb);
+        return leaf_max;
+    }
+
+    /* ══════ 内部节点 ══════ */
+    if (cnt == 0) {
+        bad_name_data(ctx, "name_data tree inum=%llu blk=%llu 内部节点空",
+                      (unsigned long long)owner_inum, (unsigned long long)blk);
+        node_buf_free(nb);
+        return 0;
+    }
+    if (expect_root && cnt == 1)
+        bad_name_data(ctx, "name_data tree inum=%llu blk=%llu 根内部仅 1 孩子（待收缩）",
+                      (unsigned long long)owner_inum, (unsigned long long)blk);
+    if (!expect_root && cnt < EXTENT_MINA)
+        bad_name_data(ctx, "name_data tree inum=%llu blk=%llu 内部欠载 cnt=%u < %u",
+                      (unsigned long long)owner_inum, (unsigned long long)blk,
+                      cnt, (unsigned)EXTENT_MINA);
+
+    sub_ok = true;
+    std::vector<std::pair<uint64_t, uint64_t>> hints(it);   /* (child, key) */
+    for (uint16_t i = 0; i < it; i++) {
+        auto *nd = (Bptree_extent_inner_node_t *)nb;
+        hints[i].first  = RFS_PTR_ADDR(nd->extents[i].sub_node_ptr);
+        hints[i].second = nd->extents[i].key;
+    }
+    node_buf_free(nb);
+
+    uint64_t prev_key = 0, ret = 0;
+    for (uint16_t i = 0; i < it; i++) {
+        const uint64_t child = hints[i].first;
+        const uint64_t key   = hints[i].second;
+        if (i > 0 && key <= prev_key)
+            bad_name_data(ctx, "name_data tree inum=%llu blk=%llu hint[%u] key=%llu 非严格递增",
+                          (unsigned long long)owner_inum, (unsigned long long)blk, i,
+                          (unsigned long long)key);
+        prev_key = key;
+        if (child == PTR52 || child >= total_blocks) {
+            bad_name_data(ctx, "name_data tree inum=%llu blk=%llu hint[%u] child 指针非法=%llu",
+                          (unsigned long long)owner_inum, (unsigned long long)blk, i,
+                          (unsigned long long)child);
+            continue;
+        }
+        bool cok = false;
+        const uint64_t cmax = audit_name_data_tree(ctx, child, owner_inum, blk, false,
+                                                   depth + 1, w, cok);
+        if (cok && cmax != key)
+            bad_name_data(ctx, "name_data tree inum=%llu blk=%llu hint[%u] key=%llu != 子树 max=%llu",
+                          (unsigned long long)owner_inum, (unsigned long long)blk, i,
+                          (unsigned long long)key, (unsigned long long)cmax);
+        ret = cok ? cmax : key;
+    }
+    return ret;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * audit_name_data_leaf_chain — 名字数据面映射树叶链校验
+ *   从根下钻最左叶 → 沿 ptrs[2] 走链，逐节点核对 ptrs[1]/ptrs[2] 双向自洽，
+ *   且链序 == DFS 叶序；单叶则要求 prev/next 皆 INVALID。
+ *   全部违例经 bad_name_data（heap_bad）；节点须为 NAMEDATA_EXTENT 魔数。
+ * ═══════════════════════════════════════════════════════════════════ */
+void RavenFS_juvenile::audit_name_data_leaf_chain(audit_walk_ctx_t &ctx,
+        const audit_name_data_tree_t &w, uint64_t root_blk, uint64_t owner_inum)
+{
+    auto node_ok = [&](uint64_t b) {
+        return !(b == PTR_INVALID || ptr52_bad(b) || b >= total_blocks ||
+                 (b & 1) || b + 1 >= total_blocks);
+    };
+
+    /* 空树（无叶）：无链可校 */
+    if (w.leaves.empty()) return;
+
+    /* 单叶：根叶不应有兄弟 */
+    if (w.leaves.size() == 1) {
+        void *nb = node_buf_alloc();
+        if (!nb) return;
+        if (!audit_node_read(w.leaves[0], nb)) {
+            bad_name_data(ctx, "name_data 单叶 inum=%llu blk=%llu 读取失败",
+                          (unsigned long long)owner_inum, (unsigned long long)w.leaves[0]);
+            node_buf_free(nb);
+            return;
+        }
+        Bptree_meta_t *m = (Bptree_meta_t *)nb;
+        if (!nd_node_magic(m))
+            bad_name_data(ctx, "name_data 单叶 inum=%llu blk=%llu magic 不符",
+                          (unsigned long long)owner_inum, (unsigned long long)w.leaves[0]);
+        const uint64_t pv = RFS_PTR_ADDR(m->ptrs[1]);
+        const uint64_t nx = RFS_PTR_ADDR(m->ptrs[2]);
+        if (pv != PTR52 || nx != PTR52)
+            bad_name_data(ctx, "name_data 单叶 inum=%llu blk=%llu 兄弟指针非 INVALID (prev=%llu next=%llu)",
+                          (unsigned long long)owner_inum, (unsigned long long)w.leaves[0],
+                          (unsigned long long)pv, (unsigned long long)nx);
+        node_buf_free(nb);
+        return;
+    }
+
+    /* 从根下钻最左叶 */
+    uint64_t blk = root_blk;
+    for (int d = 0; d <= ctx.max_depth; d++) {
+        if (!node_ok(blk)) return;
+        void *nb = node_buf_alloc();
+        if (!nb) return;
+        if (!audit_node_read(blk, nb)) {
+            bad_name_data(ctx, "name_data 叶链下钻读取失败 inum=%llu blk=%llu",
+                          (unsigned long long)owner_inum, (unsigned long long)blk);
+            node_buf_free(nb);
+            return;
+        }
+        Bptree_meta_t *m = (Bptree_meta_t *)nb;
+        if (!nd_node_magic(m)) {
+            bad_name_data(ctx, "name_data 叶链下钻 magic 不符 inum=%llu blk=%llu",
+                          (unsigned long long)owner_inum, (unsigned long long)blk);
+            node_buf_free(nb);
+            return;
+        }
+        if (!RFS_PP_IS_INNER(m->parent_ptr)) { node_buf_free(nb); break; }
+        const uint16_t c = (uint16_t)RFS_PP_COUNT(m->parent_ptr);
+        if (c == 0) {
+            bad_name_data(ctx, "name_data 叶链下钻遇空内部节点 inum=%llu blk=%llu",
+                          (unsigned long long)owner_inum, (unsigned long long)blk);
+            node_buf_free(nb);
+            return;
+        }
+        blk = RFS_PTR_ADDR(((Bptree_extent_inner_node_t *)nb)->extents[0].sub_node_ptr);
+        node_buf_free(nb);
+    }
+
+    size_t idx = 0;
+    uint64_t cur = blk;
+    for (int guard = 0; guard < (int)w.leaves.size() + 2; guard++) {
+        if (cur == PTR52) break;
+        if (idx >= w.leaves.size()) {
+            bad_name_data(ctx, "name_data 兄弟链多出叶子 blk=%llu (owner inum=%llu)",
+                          (unsigned long long)cur, (unsigned long long)owner_inum);
+            return;
+        }
+        if (cur != w.leaves[idx])
+            bad_name_data(ctx, "name_data 兄弟链序 != DFS 叶序 (cur=%llu expect=%llu idx=%zu inum=%llu)",
+                          (unsigned long long)cur, (unsigned long long)w.leaves[idx], idx,
+                          (unsigned long long)owner_inum);
+        void *nb = node_buf_alloc();
+        if (!nb) return;
+        if (!audit_node_read(cur, nb)) {
+            bad_name_data(ctx, "name_data 叶链节点读取失败 inum=%llu blk=%llu",
+                          (unsigned long long)owner_inum, (unsigned long long)cur);
+            node_buf_free(nb);
+            return;
+        }
+        Bptree_meta_t *m = (Bptree_meta_t *)nb;
+        if (!nd_node_magic(m)) {
+            bad_name_data(ctx, "name_data 叶链节点 magic 不符 inum=%llu blk=%llu",
+                          (unsigned long long)owner_inum, (unsigned long long)cur);
+            node_buf_free(nb);
+            return;
+        }
+        const uint64_t prev = RFS_PTR_ADDR(m->ptrs[1]);
+        const uint64_t next = RFS_PTR_ADDR(m->ptrs[2]);
+        node_buf_free(nb);
+
+        if (idx == 0 && prev != PTR52)
+            bad_name_data(ctx, "name_data 最左叶 inum=%llu blk=%llu prev=%llu 非 INVALID",
+                          (unsigned long long)owner_inum, (unsigned long long)cur,
+                          (unsigned long long)prev);
+
+        if (prev != PTR52) {
+            if (!node_ok(prev)) {
+                bad_name_data(ctx, "name_data 前驱块非法 inum=%llu blk=%llu prev=%llu",
+                              (unsigned long long)owner_inum, (unsigned long long)cur,
+                              (unsigned long long)prev);
+            } else {
+                void *pb = node_buf_alloc();
+                if (!pb || !audit_node_read(prev, pb)) {
+                    bad_name_data(ctx, "name_data 前驱块读取失败 inum=%llu blk=%llu prev=%llu",
+                                  (unsigned long long)owner_inum, (unsigned long long)cur,
+                                  (unsigned long long)prev);
+                    if (pb) node_buf_free(pb);
+                } else {
+                    Bptree_meta_t *pm = (Bptree_meta_t *)pb;
+                    if (!nd_node_magic(pm) || RFS_PTR_ADDR(pm->ptrs[2]) != cur)
+                        bad_name_data(ctx, "name_data 兄弟链断裂: blk=%llu.prev=%llu 但前驱.next != blk",
+                                      (unsigned long long)cur, (unsigned long long)prev);
+                    node_buf_free(pb);
+                }
+            }
+        }
+        if (next != PTR52) {
+            if (!node_ok(next)) {
+                bad_name_data(ctx, "name_data 后继块非法 inum=%llu blk=%llu next=%llu",
+                              (unsigned long long)owner_inum, (unsigned long long)cur,
+                              (unsigned long long)next);
+            } else {
+                void *nn = node_buf_alloc();
+                if (!nn || !audit_node_read(next, nn)) {
+                    bad_name_data(ctx, "name_data 后继块读取失败 inum=%llu blk=%llu next=%llu",
+                                  (unsigned long long)owner_inum, (unsigned long long)cur,
+                                  (unsigned long long)next);
+                    if (nn) node_buf_free(nn);
+                } else {
+                    Bptree_meta_t *nm = (Bptree_meta_t *)nn;
+                    if (!nd_node_magic(nm) || RFS_PTR_ADDR(nm->ptrs[1]) != cur)
+                        bad_name_data(ctx, "name_data 兄弟链断裂: blk=%llu.next=%llu 但后继.prev != blk",
+                                      (unsigned long long)cur, (unsigned long long)next);
+                    node_buf_free(nn);
+                }
+            }
+        }
+        cur = next;
+        idx++;
+    }
+    if (idx != w.leaves.size())
+        bad_name_data(ctx, "name_data 兄弟链叶子数 %zu != DFS 叶数 %zu (inum=%llu)",
+                      idx, w.leaves.size(), (unsigned long long)owner_inum);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * audit_name_data_free_ranges — 空闲区间树（fr）独立审计（形态分派 + 认领）
+ *
+ * 契约（仅据 disk_struct_v1.3.h）：
+ *   · fr_ctl：[0]=inline(1)/tree(0)；[1:52)=树根块号。空态 ptr 全 1
+ *     （RFS_ND_FR_CTL_INACTIVE）且 fr_count==0。
+ *   · fr_count = 全域空闲区间总数 = fr 树叶条目总数。
+ *   · inline 态表本轮未实现（恒空态）；tree 态优先生效。
+ *   · tree：节点 NAMEDATA_FREERANGES_MAGIC1..4；hint=子树最大复合键。
+ * 认领 fr 树全部节点块（2/节点）；违例经 bad_name_data 计 heap_bad。
+ * ═══════════════════════════════════════════════════════════════════ */
+void RavenFS_juvenile::audit_name_data_free_ranges(audit_walk_ctx_t &ctx, uint64_t inum,
+                                                   const raven_dir_Inode_t *d)
+{
+    const uint64_t fr_ctl = d->name_data_free_ranges_ctl;
+    const uint64_t fr_cnt = RFS_ND_FR_COUNT(d->name_data_free_ranges_count);
+    const uint64_t ptr    = RFS_ND_FR_CTL_PTR(fr_ctl);
+    const uint64_t pieces = RFS_ND_PIECE_COUNT(d->name_data_piece_count);
+    const uint64_t limit  = pieces * 8192;   /* 逻辑空间字节上界 = pieces×8K */
+
+    /* ── 空态：ptr 全 1 ⇔ fr_count==0 ── */
+    if (ptr == RFS_ND_FR_CTL_PTR_INVALID) {
+        if (fr_cnt != 0)
+            bad_name_data(ctx, "DIR inode %llu fr 空态（ptr 全 1）但 fr_count=%llu",
+                          (unsigned long long)inum, (unsigned long long)fr_cnt);
+        return;
+    }
+
+    /* ── inline 态（本轮未实现；如出现做表级校验，无节点认领）── */
+    if (RFS_ND_FR_CTL_IS_INLINE(fr_ctl)) {
+        if (fr_cnt > RFS_ND_FREE_INLINE_MAX)
+            bad_name_data(ctx, "DIR inode %llu fr inline 态 fr_count=%llu > 上限 %u",
+                          (unsigned long long)inum, (unsigned long long)fr_cnt,
+                          (unsigned)RFS_ND_FREE_INLINE_MAX);
+        bool have = false; uint64_t pl = 0, pb = 0;
+        const uint64_t n = (fr_cnt < RFS_ND_FREE_INLINE_MAX) ? fr_cnt : RFS_ND_FREE_INLINE_MAX;
+        for (uint64_t i = 0; i < n; i++) {
+            const free_range_t &e = d->possible_inline_free_ranges[i];
+            if (e.len == 0)
+                bad_name_data(ctx, "DIR inode %llu fr inline[%llu] len==0",
+                              (unsigned long long)inum, (unsigned long long)i);
+            if (e.base > limit || e.len > limit - e.base)
+                bad_name_data(ctx, "DIR inode %llu fr inline[%llu] 越界 base=%llu len=%llu limit=%llu",
+                              (unsigned long long)inum, (unsigned long long)i,
+                              (unsigned long long)e.base, (unsigned long long)e.len,
+                              (unsigned long long)limit);
+            if (have && !fr_key_gt(e.len, e.base, pl, pb))
+                bad_name_data(ctx, "DIR inode %llu fr inline 复合键非严格递增 [%llu]",
+                              (unsigned long long)inum, (unsigned long long)i);
+            pl = e.len; pb = e.base; have = true;
+        }
+        return;
+    }
+
+    /* ── tree 态 ── */
+    if (ptr & 1)
+        bad_name_data(ctx, "DIR inode %llu fr 树根=%llu 未 8K 对齐",
+                      (unsigned long long)inum, (unsigned long long)ptr);
+    if (ptr >= total_blocks || ptr + 1 >= total_blocks) {
+        bad_name_data(ctx, "DIR inode %llu fr 树根=%llu 越界 total=%llu",
+                      (unsigned long long)inum, (unsigned long long)ptr,
+                      (unsigned long long)total_blocks);
+        return;
+    }
+
+    audit_fr_tree_t w;
+    w.limit = limit;
+    bool sub_ok = false;
+    uint64_t mx_len = 0, mx_base = 0;
+    audit_fr_tree(ctx, ptr, inum, inum, true, 0, w, sub_ok, &mx_len, &mx_base);
+    (void)sub_ok; (void)mx_len; (void)mx_base;
+
+    /* 全域空闲区间总数 == 叶条目总数 */
+    if (w.records != fr_cnt)
+        bad_name_data(ctx, "DIR inode %llu fr_count=%llu != fr 树叶条目 Σ=%llu",
+                      (unsigned long long)inum, (unsigned long long)fr_cnt,
+                      (unsigned long long)w.records);
+
+    ctx.rep.heap_active_bitmap_blk += w.node_blocks;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * audit_fr_tree — fr 树 DFS（独立推导）
+ *
+ * 仅自识别 NAMEDATA_FREERANGES_MAGIC1..4。校验：角色/父指针/叶等深、
+ *   count≤337、leaf 复合键 (len,base) 全局严格递增且 len>0、区间
+ *   [base,base+len)⊆[0,limit)、inner hint==子树最大复合键且严格递增。
+ * 认领节点块（2/节点）；违例计 heap_bad，二次认领计 multi_claim_blk。
+ * 不校验最小占用/合并（God 本轮不做）。出参 out_max_{len,base}=本子树最大复合键。
+ * ═══════════════════════════════════════════════════════════════════ */
+void RavenFS_juvenile::audit_fr_tree(audit_walk_ctx_t &ctx, uint64_t blk,
+        uint64_t owner_inum, uint64_t expect_parent, bool expect_root, int depth,
+        audit_fr_tree_t &w, bool &sub_ok, uint64_t *out_max_len, uint64_t *out_max_base)
+{
+    sub_ok = false;
+    if (out_max_len)  *out_max_len = 0;
+    if (out_max_base) *out_max_base = 0;
+
+    if (depth > ctx.max_depth) {
+        bad_name_data(ctx, "fr tree inum=%llu depth 超限 %d (blk=%llu)",
+                      (unsigned long long)owner_inum, depth, (unsigned long long)blk);
+        return;
+    }
+    if (blk == PTR_INVALID || ptr52_bad(blk) || blk >= total_blocks ||
+        (blk & 1) || blk + 1 >= total_blocks) {
+        bad_name_data(ctx, "fr tree inum=%llu blk=%llu 非法节点块号",
+                      (unsigned long long)owner_inum, (unsigned long long)blk);
+        return;
+    }
+    if (!ctx.blk_set(blk)) {
+        ctx.rep.multi_claim_blk++;
+        audit_logf(ctx, "MULTI_CLAIM", "fr 树节点 blk=%llu 二次认领 (inode %llu)",
+                   (unsigned long long)blk, (unsigned long long)owner_inum);
+        return;
+    }
+    w.node_blocks += 2;   /* 节点恒 8K = 2 FS_block */
+    if (!ctx.blk_set(blk + 1)) {
+        ctx.rep.multi_claim_blk++;
+        audit_logf(ctx, "MULTI_CLAIM", "fr 树节点尾巴 blk+1=%llu 二次认领 (inode %llu)",
+                   (unsigned long long)(blk + 1), (unsigned long long)owner_inum);
+    }
+
+    void *nb = node_buf_alloc();
+    if (!nb) {
+        bad_name_data(ctx, "fr tree inum=%llu blk=%llu 节点缓冲分配失败",
+                      (unsigned long long)owner_inum, (unsigned long long)blk);
+        return;
+    }
+    if (!audit_node_read(blk, nb)) {
+        bad_name_data(ctx, "fr tree inum=%llu blk=%llu 节点读取失败",
+                      (unsigned long long)owner_inum, (unsigned long long)blk);
+        node_buf_free(nb);
+        return;
+    }
+    Bptree_meta_t *meta = (Bptree_meta_t *)nb;
+    if (!fr_node_magic(meta)) {
+        bad_name_data(ctx, "fr tree inum=%llu blk=%llu magic 不符（非 NAMEDATA_FREERANGES）",
+                      (unsigned long long)owner_inum, (unsigned long long)blk);
+        node_buf_free(nb);
+        return;
+    }
+
+    const uint16_t cnt   = (uint16_t)RFS_PP_COUNT(meta->parent_ptr);
+    const uint16_t it    = std::min<uint16_t>(cnt, (uint16_t)(FR_ORDER + 1));
+    const bool     inner = RFS_PP_IS_INNER(meta->parent_ptr);
+
+    if (cnt > FR_ORDER)
+        bad_name_data(ctx, "fr tree inum=%llu blk=%llu entry_count=%u > 阶 %u",
+                      (unsigned long long)owner_inum, (unsigned long long)blk,
+                      cnt, (unsigned)FR_ORDER);
+    if ((bool)RFS_PP_IS_ROOT(meta->parent_ptr) != expect_root)
+        bad_name_data(ctx, "fr tree inum=%llu blk=%llu is_root=%d 期望 %d",
+                      (unsigned long long)owner_inum, (unsigned long long)blk,
+                      (int)RFS_PP_IS_ROOT(meta->parent_ptr), (int)expect_root);
+    if (expect_root) {
+        if (RFS_PP_PTR(meta->parent_ptr) != owner_inum)
+            bad_name_data(ctx, "fr tree inum=%llu 根 blk=%llu ptr=%llu != owner %llu",
+                          (unsigned long long)owner_inum, (unsigned long long)blk,
+                          (unsigned long long)RFS_PP_PTR(meta->parent_ptr),
+                          (unsigned long long)owner_inum);
+    } else {
+        if (RFS_PP_PTR(meta->parent_ptr) != expect_parent)
+            bad_name_data(ctx, "fr tree inum=%llu blk=%llu parent_ptr=%llu != 实际父 %llu",
+                          (unsigned long long)owner_inum, (unsigned long long)blk,
+                          (unsigned long long)RFS_PP_PTR(meta->parent_ptr),
+                          (unsigned long long)expect_parent);
+    }
+
+    /* ══════ 叶子 ══════ */
+    if (!inner) {
+        if (!w.leaf_depth_set) { w.leaf_depth = (uint64_t)depth; w.leaf_depth_set = true; }
+        else if ((uint64_t)depth != w.leaf_depth)
+            bad_name_data(ctx, "fr tree inum=%llu blk=%llu 叶深度 %d != %llu（不平衡）",
+                          (unsigned long long)owner_inum, (unsigned long long)blk, depth,
+                          (unsigned long long)w.leaf_depth);
+        w.leaves.push_back(blk);
+
+        const Bptree_dir_name_data_free_ranges_leaf_node_t *leaf =
+            (const Bptree_dir_name_data_free_ranges_leaf_node_t *)nb;
+        uint64_t last_len = 0, last_base = 0;
+        for (uint16_t i = 0; i < it; i++) {
+            const uint64_t elen  = leaf->free_ranges[i].len;
+            const uint64_t ebase = leaf->free_ranges[i].base;
+            if (elen == 0)
+                bad_name_data(ctx, "fr tree inum=%llu blk=%llu free_ranges[%u] len==0",
+                              (unsigned long long)owner_inum, (unsigned long long)blk, i);
+            if (ebase > w.limit || elen > w.limit - ebase)
+                bad_name_data(ctx, "fr tree inum=%llu blk=%llu free_ranges[%u] 越界 base=%llu len=%llu limit=%llu",
+                              (unsigned long long)owner_inum, (unsigned long long)blk, i,
+                              (unsigned long long)ebase, (unsigned long long)elen,
+                              (unsigned long long)w.limit);
+            if (w.have_last && !fr_key_gt(elen, ebase, w.last_len, w.last_base))
+                bad_name_data(ctx, "fr tree inum=%llu blk=%llu free_ranges[%u] 复合键非严格递增 (len=%llu,base=%llu)",
+                              (unsigned long long)owner_inum, (unsigned long long)blk, i,
+                              (unsigned long long)elen, (unsigned long long)ebase);
+            w.last_len = elen; w.last_base = ebase; w.have_last = true;
+            w.records++;
+            last_len = elen; last_base = ebase;
+        }
+        if (out_max_len)  *out_max_len  = last_len;
+        if (out_max_base) *out_max_base = last_base;
+        sub_ok = true;
+        node_buf_free(nb);
+        return;
+    }
+
+    /* ══════ 内部节点 ══════ */
+    if (cnt == 0) {
+        bad_name_data(ctx, "fr tree inum=%llu blk=%llu 内部节点空",
+                      (unsigned long long)owner_inum, (unsigned long long)blk);
+        node_buf_free(nb);
+        return;
+    }
+    sub_ok = true;
+    std::vector<uint64_t> child(it);
+    std::vector<std::pair<uint64_t, uint64_t>> hint(it);   /* (max_len,max_base) */
+    for (uint16_t i = 0; i < it; i++) {
+        const Bptree_dir_name_data_free_ranges_inner_node_t *nd =
+            (const Bptree_dir_name_data_free_ranges_inner_node_t *)nb;
+        child[i]       = RFS_PTR_ADDR(nd->hints[i].sub_node_ptr);
+        hint[i].first  = nd->hints[i].max_len;
+        hint[i].second = nd->hints[i].max_base;
+    }
+    node_buf_free(nb);
+
+    /* hint 严格递增：仅对**非空子树**参与比较。God 本轮不做欠载合并，一个非根叶
+     * 可被 take_fit 逐个取空 → 其父 hint 被刷新为 max_key 空值 (0,0)（合法降级），
+     * 这种「空子树占位」不参与复合键序，否则会误报。空/非空的真伪由下方
+     * 「hint == 子树 max」等值校验兜底。 */
+    bool prev_set = false;
+    uint64_t prev_len = 0, prev_base = 0;
+    for (uint16_t i = 0; i < it; i++) {
+        const bool hint_empty = (hint[i].first == 0 && hint[i].second == 0);
+        if (!hint_empty) {
+            if (prev_set && !fr_key_gt(hint[i].first, hint[i].second, prev_len, prev_base))
+                bad_name_data(ctx, "fr tree inum=%llu blk=%llu hint[%u] 复合键非严格递增 (len=%llu,base=%llu)",
+                              (unsigned long long)owner_inum, (unsigned long long)blk, i,
+                              (unsigned long long)hint[i].first, (unsigned long long)hint[i].second);
+            prev_len = hint[i].first; prev_base = hint[i].second; prev_set = true;
+        }
+
+        const uint64_t c = child[i];
+        if (c == PTR52 || c >= total_blocks) {
+            bad_name_data(ctx, "fr tree inum=%llu blk=%llu hint[%u] child 指针非法=%llu",
+                          (unsigned long long)owner_inum, (unsigned long long)blk, i,
+                          (unsigned long long)c);
+            continue;
+        }
+        bool cok = false;
+        uint64_t clen = 0, cbase = 0;
+        audit_fr_tree(ctx, c, owner_inum, blk, false, depth + 1, w, cok, &clen, &cbase);
+        if (cok && (clen != hint[i].first || cbase != hint[i].second))
+            bad_name_data(ctx, "fr tree inum=%llu blk=%llu hint[%u] key=(%llu,%llu) != 子树 max=(%llu,%llu)",
+                          (unsigned long long)owner_inum, (unsigned long long)blk, i,
+                          (unsigned long long)hint[i].first, (unsigned long long)hint[i].second,
+                          (unsigned long long)clen, (unsigned long long)cbase);
+        if (out_max_len)  *out_max_len  = cok ? clen : hint[i].first;
+        if (out_max_base) *out_max_base = cok ? cbase : hint[i].second;
+    }
 }

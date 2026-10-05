@@ -66,33 +66,12 @@
 #define RFS_MASK57  ((1ULL << 57) - 1)   /* 0x01FF_FFFF_FFFF_FFFF */
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 结果码（全局共享；原居 disk_struct_v1.1.hpp，沿用）
+ * 结果码（全局共享；2026-10-05 实体迁移至 ravenfs/rc.hpp，本盘头仅转引）
+ *   结果码是纯运行时常量，与落盘字节布局无关：独立成轻量头后，缓存/分配器
+ *   等运行时模块可只拿 RC_*，不必连整份 on-disk 结构契约一起拖进来。
+ *   本盘头仍经此 include 保持 RC_* 对全部盘侧代码可见（对外符号集不变）。
  * ═══════════════════════════════════════════════════════════════════════════ */
-typedef uint64_t result_code_t;
-
-enum rfs_rc {
-    RC_OK = 0,
-    RC_ERR_OPEN,            /* 设备打开失败 */
-    RC_ERR_MAGIC,           /* Primary SB magic 不符 */
-    RC_ERR_VERSION,         /* 版本 != RAVENFS_VERSION(v1.2=3) */
-    RC_ERR_CRC,             /* Primary SB crc32 校验失败 */
-    RC_ERR_BITMAP_SELF,     /* bitmap 自描述校验失败（尾巴三段非全 1） */
-    RC_ERR_EXIST,           /* 同名 dentry 已存在 */
-    RC_ERR_NOT_FOUND,       /* dentry 未找到 */
-    RC_ERR_NO_BLOCK,        /* FS_block 无空闲 */
-    RC_ERR_NO_INODE,        /* inode 槽无空闲 */
-    RC_ERR_NAME_LEN,        /* 名字 > RAVENFS_MAX_NAME_LEN */
-    RC_ERR_IO,              /* 块 I/O 失败（v1.2 起：bio 后端，不再是 pread/pwrite） */
-    RC_ERR_STATE,           /* 内部状态异常（根节点角色不符等） */
-    RC_ERR_NOT_EMPTY,       /* 目录非空：dir 型目标删除前置校验失败（rmdir 语义） */
-    RC_ERR_NOT_SUPPORTED,   /* 功能暂不支持：归零全量空间回收未实现哨兵（inode 暂挂孤儿，fsck 可回收） */
-    RC_ERR_OVERLAP,         /* 区间与既有映射/空闲区重叠（防御；正常流程 = 契约违反） */
-    RC_ERR_IS_DIR,          /* dir 型目标：文件数据操作接口不受理（EISDIR 对齐） */
-    RC_ERR_XATTR,           /* v1.2 新增：xattr 块读/校验/超限（>1 FS_block → -E2BIG）失败 */
-    RC_ERR_BUSY,            /* 设备已被 Linux 内核以某 FS 挂载（God 防呆拒挂：防双写者 / 撕裂读） */
-
-    RC_NEED_SPLIT = 0x1000  /* 内部使用：本层分裂，需父层处理 */
-};
+#include "ravenfs/rc.hpp"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 文件类型常量（v1.2：镜像 S_IFMT，值 = S_IFMT >> 12；其余值含 0 非法）
@@ -113,7 +92,7 @@ enum rfs_inode_type {
 #define RAVENFS_VERSION          4u          /* v1.3 = 4（v1.2 = 3，不兼容） */
 #define DENTRY_INLINE_NAME_MAX   40u         /* name 内联上限：≤40 内联，>40 外置 */
 #define RAVENFS_MAX_NAME_LEN     (DENTRY_INLINE_NAME_MAX + 512u)  /* 552B */
-#define PTR_INVALID              (~0ULL)     /* 通用无效指针哨兵 */
+/* PTR_INVALID —— 通用无效指针哨兵，实体已随结果码移至 ravenfs/rc.hpp */
 #define NAME_HEAP_INACTIVE       RFS_MASK52  /* 名字堆未激活（52 位全 1；禁用 0） */
 #define RFS_XATTR_NONE           RFS_MASK52  /* xattr_ptr 无 xattr（52 位全 1；禁用 0） */
 #define RFS_SB_MAGIC             0x5241564EULL  /* "RAVN" */
@@ -319,10 +298,15 @@ RFS_STATIC_ASSERT(sizeof(struct raven_Inode_t) == 256, "raven_Inode_t must be 25
 /* ═══════════════════════════════════════════════════════════════════════════
  * free_range_t —— 空闲区间（名字数据面**内部**语义）
  *
- * 含义（2026-10-05 定）：目录名字数据面（name data plane）**已被映射、但内容
- * 已释放**的字节区间（删长名产生，可落在中间）；半开 [base, base+len)。
- *   区分：映射树（Bptree_dir_name_data_extent_*）描述「逻辑→物理的**稠密**
- *   映射，无空洞」；本类型描述「映射之内、内容为空闲」的区间——两者不冲突。
+ * 含义（2026-10-05 再定，字节粒度）：目录名字数据面（name data plane）逻辑
+ * 空间 [0, pieces×8K) 内**空闲的字节区间**；半开 [base, base+len)。
+ *   · 组成 = 删长名释放的区间 ∪ **尚未分配的前沿尾部**（每新增 8K 片，其
+ *     未用尾部即成为空闲区间）——故空闲区间之并 == 「已映射 ∧ 未分配」，
+ *     分配"用尽"即 fr 中无 len ≥ 需求者。
+ *   · 映射树（Bptree_dir_name_data_extent_*）描述「逻辑→物理的**稠密无洞**
+ *     映射」；本类型描述「映射之内、内容空闲」的区间——两者不冲突。
+ *   · **fr 树 leaf 按 (len 主序, base 副序) 升序**（2026-10-05 定）：分配是
+ *     best-fit（找最小 len ≥ 需求），len 主序天然给出该序；base 仅同 len 内定序。
  *   inline 表与 B+树叶**复用同一 free_range_t**（用户裁定：64 位时代一切皆
  *   可能，不搞 8B 打包特例）。
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -358,9 +342,9 @@ struct raven_dir_Inode_t {
     uint64_t  mtime;
     uint64_t  ctime;
     uint64_t  atime;
-    uint64_t  ddentry_Bptree_root;        /* PTR_INVALID = inline */
-    uint64_t  name_data_ctl;      /* [0]=inline(1)/tree(0)；[1:52)=数据面映射树根块号（8K 对齐，bit0 借位）；[52:64)=保留 */
-    uint64_t  name_data_piece_count;      /* [0:51)=数据片数/2（读 <<1 得实际片数，片=8K）；[51:64)=保留 */
+    uint64_t  ddentry_Bptree_root;        /* PTR_INVALID说明根B+树没有构建 */
+    uint64_t  name_data_ctl;      /* [0]=direct(1)/tree(0)；[1:52)=数据面映射树根块号（8K 对齐，bit0 借位）；[52:64)=保留 */
+    uint64_t  name_data_piece_count;      /* [0:51)=数据片数原值（片=8K）；[51:64)=保留 */
     uint64_t  name_data_free_ranges_ctl;  /* [0]=inline(1)/tree(0)；[1:52)=空闲区间树根块号（8K 对齐，bit0 借位）；[52:64)=保留 */
     uint64_t  name_data_free_ranges_count;/* 全域=空闲区间总数；> RFS_ND_FREE_INLINE_MAX(9) ⇒ 必须 tree 态 */
     struct free_range_t  possible_inline_free_ranges[RFS_ND_FREE_INLINE_MAX];/* inline 态空闲区间表（≤9 条；与 B+树叶 free_range_t 复用同型） */
@@ -371,59 +355,67 @@ RFS_STATIC_ASSERT(sizeof(struct raven_dir_Inode_t) == 256, "raven_dir_Inode_t mu
  * 名字数据面控制字访问器（v1.3 新增；与文件其它落盘字段同风格）
  *
  * 两棵 per-目录数据面 B+ 树的 inode 侧描述：
- *   映射树     name_data_ctl             （inline / B+树二态 + 根块指针）
+ *   映射树     name_data_ctl             （direct / B+树二态 + 根块指针）
  *   空闲区间树 name_data_free_ranges_ctl （inline / B+树二态 + 根块指针）
  *
  * ★「8K 对齐偷 bit0」约定（2026-10-05 确认）：
  *   树根块号恒 2 FS_block（8K）对齐 ⇒ 块号偶数 ⇒ 其 bit0 恒 0；故 bit0 空出来
- *   当「inline(1)/tree(0)」二态标志，块指针实际落在 [1:52)（51 位）。
+ *   当「direct(1)/tree(0)」二态标志，块指针实际落在 [1:52)（51 位）。
  *   写指针 = ptr << 1；读指针 = (word >> 1) & RFS_MASK51；[52:64) 12 位保留。
+ *
+ * name_data_ctl 的 bit0 语义（2026-10-05 定）：
+ *   direct(1) = 数据面为**单连续物理段**，ptr 域 = 该段物理基块号（8K 对齐）；
+ *              非空数据面的 bootstrap 态，无映射树。
+ *   tree(0)   = 数据面有映射树，ptr 域 = 映射树根块号。
+ *   空态（未分配）由 **ptr 域全 1**（RFS_ND_CTL_PTR_INVALID）表示（整字全 0xF），
+ *   此时 bit0 亦为 1，但 ptr==INVALID 优先判空。
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /* ── name_data_ctl ── */
-#define RFS_ND_CTL_INLINE_SHIFT  0
-#define RFS_ND_CTL_INLINE_MASK   0x1ULL
+#define RFS_ND_CTL_DIRECT_SHIFT  0
+#define RFS_ND_CTL_DIRECT_MASK   0x1ULL
 #define RFS_ND_CTL_PTR_SHIFT     1
 #define RFS_ND_CTL_PTR_MASK      RFS_MASK51
 #define RFS_ND_CTL_RSV_SHIFT     52
 #define RFS_ND_CTL_RSV_MASK      RFS_MASK12
 
-#define RFS_ND_CTL_IS_INLINE(x)  ((uint32_t)(((uint64_t)(x) >> RFS_ND_CTL_INLINE_SHIFT) & RFS_ND_CTL_INLINE_MASK))
+#define RFS_ND_CTL_IS_DIRECT(x)  ((uint32_t)(((uint64_t)(x) >> RFS_ND_CTL_DIRECT_SHIFT) & RFS_ND_CTL_DIRECT_MASK))
 #define RFS_ND_CTL_PTR(x)        ((uint64_t)(((uint64_t)(x) >> RFS_ND_CTL_PTR_SHIFT)   & RFS_ND_CTL_PTR_MASK))
 #define RFS_ND_CTL_RSV(x)        ((uint32_t)(((uint64_t)(x) >> RFS_ND_CTL_RSV_SHIFT)   & RFS_ND_CTL_RSV_MASK))
-#define RFS_ND_CTL_PACK(inline_, ptr) \
-    ((uint64_t)((((uint64_t)(inline_) & RFS_ND_CTL_INLINE_MASK) << RFS_ND_CTL_INLINE_SHIFT) | \
+#define RFS_ND_CTL_PACK(direct_, ptr) \
+    ((uint64_t)((((uint64_t)(direct_) & RFS_ND_CTL_DIRECT_MASK) << RFS_ND_CTL_DIRECT_SHIFT) | \
                 (((uint64_t)(ptr)     & RFS_ND_CTL_PTR_MASK)    << RFS_ND_CTL_PTR_SHIFT)))
-#define RFS_ND_CTL_SET_INLINE(x, v) \
-    do { (x) = (((x) & ~(RFS_ND_CTL_INLINE_MASK << RFS_ND_CTL_INLINE_SHIFT)) | \
-               ((((uint64_t)(v)) & RFS_ND_CTL_INLINE_MASK) << RFS_ND_CTL_INLINE_SHIFT)); } while (0)
+#define RFS_ND_CTL_SET_DIRECT(x, v) \
+    do { (x) = (((x) & ~(RFS_ND_CTL_DIRECT_MASK << RFS_ND_CTL_DIRECT_SHIFT)) | \
+               ((((uint64_t)(v)) & RFS_ND_CTL_DIRECT_MASK) << RFS_ND_CTL_DIRECT_SHIFT)); } while (0)
 #define RFS_ND_CTL_SET_PTR(x, v) \
     do { (x) = (((x) & ~(RFS_ND_CTL_PTR_MASK << RFS_ND_CTL_PTR_SHIFT)) | \
                ((((uint64_t)(v)) & RFS_ND_CTL_PTR_MASK) << RFS_ND_CTL_PTR_SHIFT)); } while (0)
 
 /* 无效指针 / 空态哨兵（2026-10-05 定）：指针域 [1:52) 全 1 = **无效指针**
  *   （对齐 NAME_HEAP_INACTIVE / PTR_INVALID 的「全 1 = 无效」惯例）。
- * 空（未激活）态 = inline=1 ∧ ptr 全 1 ∧ rsv 全 1 ⇒ **整字全 0xF**。*/
+ * 空（未分配）态 = direct=? ∧ ptr 全 1 ∧ rsv 全 1 ⇒ **整字全 0xF**。*/
 #define RFS_ND_CTL_PTR_INVALID  RFS_MASK51   /* [1:52) 全 1 = 无效指针 */
-#define RFS_ND_CTL_INACTIVE     (~0ULL)      /* 空态整字：inline=1 ∧ ptr=全1 ∧ rsv=全1 */
+#define RFS_ND_CTL_INACTIVE     (~0ULL)      /* 空态整字：ptr=全1 ∧ rsv=全1 */
 
 /* ── name_data_piece_count ──
- * 存储 = 实际片数 / 2（2026-10-05 确认：读 <<1 得实际片数，片 = 8K）。
- * ⚠ 该编码只能表达**偶数**片数（奇数片数无法表示）——若数据面保证偶数片，
- *   请把它写成不变量；否则此处需要改为存原值。*/
+ * 存储 = **实际数据片数原值**（2026-10-05 定：8K 数据片数目，直接存，不压缩）。
+ *   [0:51) 51 位足够容纳任何现实片数；[51:64) 保留。
+ *   （早前草案的「存 count/2、读 <<1」编码无法表达奇数片数——单片 8K 即奇数，
+ *    已废弃，改为存原值。） */
 #define RFS_ND_PIECE_RAW_SHIFT   0
 #define RFS_ND_PIECE_RAW_MASK    RFS_MASK51
 #define RFS_ND_PIECE_RSV_SHIFT   51
 #define RFS_ND_PIECE_RSV_MASK    RFS_MASK13
 
 #define RFS_ND_PIECE_RAW(x)      ((uint64_t)(((uint64_t)(x) >> RFS_ND_PIECE_RAW_SHIFT) & RFS_ND_PIECE_RAW_MASK))
-#define RFS_ND_PIECE_COUNT(x)    (RFS_ND_PIECE_RAW(x) << 1)   /* 实际数据片数（片 = 8K） */
+#define RFS_ND_PIECE_COUNT(x)    RFS_ND_PIECE_RAW(x)   /* 实际数据片数（片 = 8K） */
 #define RFS_ND_PIECE_RSV(x)      ((uint32_t)(((uint64_t)(x) >> RFS_ND_PIECE_RSV_SHIFT) & RFS_ND_PIECE_RSV_MASK))
-#define RFS_ND_PIECE_PACK(count) ((uint64_t)((((uint64_t)(count) >> 1) & RFS_ND_PIECE_RAW_MASK) << RFS_ND_PIECE_RAW_SHIFT))
+#define RFS_ND_PIECE_PACK(count) ((uint64_t)(((uint64_t)(count) & RFS_ND_PIECE_RAW_MASK) << RFS_ND_PIECE_RAW_SHIFT))
 #define RFS_ND_PIECE_SET_RAW(x, v) \
     do { (x) = (((x) & ~(RFS_ND_PIECE_RAW_MASK << RFS_ND_PIECE_RAW_SHIFT)) | \
                ((((uint64_t)(v)) & RFS_ND_PIECE_RAW_MASK) << RFS_ND_PIECE_RAW_SHIFT)); } while (0)
-#define RFS_ND_PIECE_SET_COUNT(x, c) RFS_ND_PIECE_SET_RAW((x), ((uint64_t)(c) >> 1))
+#define RFS_ND_PIECE_SET_COUNT(x, c) RFS_ND_PIECE_SET_RAW((x), (uint64_t)(c))
 
 /* ── name_data_free_ranges_ctl（位布局同 name_data_ctl）── */
 #define RFS_ND_FR_CTL_INLINE_SHIFT  0
@@ -496,7 +488,7 @@ struct extent_hint_t {
 struct ddentry_t {
     struct ptr_in_idx inode_ptr;        /* free_to_use = name_len（全名长度） */
     uint64_t hash;                      /* 名字 64 位 hash（查找主键；算法 = XXH64(seed=0)，见 disk_layout_v1.1.md §9） */
-    uint64_t full_char_remain_offset;      /* name_len>40: 外置名物理定位；否则 PTR_INVALID */
+    uint64_t full_char_remain_offset;      /* name_len>40: 外置名在目录名字数据面内的**逻辑字节偏移**；否则 PTR_INVALID */
     char     name[DENTRY_INLINE_NAME_MAX];
 };
 
@@ -540,20 +532,29 @@ struct Bptree_dir_name_data_extent_leaf_node_t {
     uint64_t padding[2];
 } RFS_PACKED;
 RFS_STATIC_ASSERT(sizeof(struct Bptree_dir_name_data_extent_leaf_node_t) == 8192, "name_data extent leaf node must be 8192B");
-/* 空闲区间树路由 hint：上界语义（key = 子树内空闲区间上界）；布局同其它 8K 节点 */
+/* 空闲区间树路由 hint：key = 子树内空闲区间的**最大复合键 (max_len, max_base)**
+ * （len 主序 / base 副序；复合键不可只留 len——同 len 跨叶时仅凭 max_len 会落错叶、
+ * 破坏连续分区）。
+ * 路由 = 找第一个 (max_len,max_base) ≥ target 的子树（无则最右击穿）：
+ *   · 分配 best-fit：target = (need, 0)（等价 max_len ≥ need）；
+ *   · 插入定位   ：target = 新键 (len, base)。
+ * 叶内按 (len,base) 升序 lower_bound。24B hint ⇒ 337 階（+1 瞬时槽）+ padding[2]。 */
 struct free_ranges_hint_t{
-    uint64_t upper_limit;
+    uint64_t max_len;
+    uint64_t max_base;
     struct ptr_in_idx sub_node_ptr;
 };
-RFS_STATIC_ASSERT(sizeof(struct free_ranges_hint_t) == 16, "free_ranges_hint_t must be 16B");
+RFS_STATIC_ASSERT(sizeof(struct free_ranges_hint_t) == 24, "free_ranges_hint_t must be 24B");
 struct Bptree_dir_name_data_free_ranges_inner_node_t{
     struct Bptree_meta_t meta;
-    struct free_ranges_hint_t hints[508];   /* 507 阶 + 1 瞬时槽 */
+    struct free_ranges_hint_t hints[338];   /* 337 阶 + 1 瞬时槽 */
+    uint64_t padding[2];
 };
 RFS_STATIC_ASSERT(sizeof(struct Bptree_dir_name_data_free_ranges_inner_node_t) == 8192, "name_data free_ranges inner node must be 8192B");
 struct Bptree_dir_name_data_free_ranges_leaf_node_t{
     struct Bptree_meta_t meta;
-    struct free_range_t free_ranges[508];   /* 507 阶 + 1 瞬时槽 */
+    struct free_range_t free_ranges[338];   /* 337 阶 + 1 瞬时槽 */
+    uint64_t padding[340];
 };
 RFS_STATIC_ASSERT(sizeof(struct Bptree_dir_name_data_free_ranges_leaf_node_t) == 8192, "name_data free_ranges leaf node must be 8192B");
 struct Bptree_ddentry_leaf_node_t {

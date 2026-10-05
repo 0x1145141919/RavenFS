@@ -148,19 +148,10 @@ add_executable(ravenfs_juv_block_occupy
 )
 target_link_libraries(ravenfs_juv_block_occupy PRIVATE ravenfs_juvenile)
 
-# v1.1 名字堆专项测试（长名外置：档位覆盖/完整比较/位图一致性/释放/持久化）
-add_executable(ravenfs_juv_name_heap
-    test_name_heap.cpp
-    ${CPU_ID_STUB}
-)
-target_link_libraries(ravenfs_juv_name_heap PRIVATE ravenfs_juvenile)
-
-# v1.1 名字堆极限压测（全档位灌满/加塞失败/全删/堆回收；--full 大魔王）
-add_executable(ravenfs_juv_name_heap_stress
-    test_name_heap_stress.cpp
-    ${CPU_ID_STUB}
-)
-target_link_libraries(ravenfs_juv_name_heap_stress PRIVATE ravenfs_juvenile)
+# v1.1 名字堆专项/压测 —— **退役**：v1.3 名字堆（10 档 heaps_*）已由目录名字
+# 数据面（映射 direct/tree + fr 树）取代，旧测试断的正是被删字段。新的
+# name-data 专项测试待正式树落地后另立（见 test_name_data_plane*.cpp TODO）。
+# 原 test_name_heap.cpp / test_name_heap_stress.cpp 保留在树内供移植参考，暂不入构建。
 
 # v1.1 Inode 缓存控制器真盘大测（RADIX 模式，按超级块链式推导初始化）
 # 用法: ./benchmark_radix [/dev/nvme1n1]
@@ -266,6 +257,29 @@ add_executable(ravenfs_juv_audit_dfs
     ${CPU_ID_STUB}
 )
 target_link_libraries(ravenfs_juv_audit_dfs PRIVATE ravenfs_juvenile)
+
+# v1.3 目录名字数据面专项：direct 分配 / 物理碎裂 direct→tree 升级 /
+# 映射解析读写回环 / release 全量回收 + audit 全净。
+add_executable(ravenfs_juv_name_data
+    test_name_data_plane.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_name_data PRIVATE ravenfs_juvenile)
+
+# v1.3 fr 空闲区间树专项：337 满叶 / best-fit >255 索引回归 / 叶分裂 + 内节点 /
+# 复合键序 / release。把原先只在临时程序里验证过的 fr 结构路径纳入入库回归。
+add_executable(ravenfs_juv_name_data_fr
+    test_name_data_freeranges.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_name_data_fr PRIVATE ravenfs_juvenile)
+
+# fr 空闲区间树百万级压测（开缓存：offload / selfreliat）。手动运行，不入 ctest 默认。
+add_executable(ravenfs_stress_name_data_fr
+    stress_name_data_fr.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_stress_name_data_fr PRIVATE ravenfs_juvenile)
 
 # disk_struct_v1.3.h 自校验 TU（2026-10-05）：**纯编译期护栏 + IDE 收录**。
 # 让 v1.3 盘面头进入 compile_commands.json（真实 -I include / -std=gnu++20），

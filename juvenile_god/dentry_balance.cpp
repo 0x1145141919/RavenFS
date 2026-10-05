@@ -390,10 +390,10 @@ result_code_t RavenFS_juvenile::dentry_root_shrink(uint64_t root_blk, uint64_t r
     child_sess.dirty();
 
     /* ── 更新 root inode.data_root 与内存根句柄 ── */
-    raven_Inode_t root_inode;
-    inode_read(root_inode_idx, &root_inode);
-    root_inode.data_root = child_blk;
-    inode_write(root_inode_idx, &root_inode);
+    raven_dir_Inode_t root_inode;
+    inode_read(root_inode_idx, (raven_Inode_t *)&root_inode);
+    root_inode.ddentry_Bptree_root = child_blk;
+    inode_write(root_inode_idx, (const raven_Inode_t *)&root_inode);
     root_dentry_blk = child_blk;
 
     /* ── 释放旧根（恒 2 块） ── */

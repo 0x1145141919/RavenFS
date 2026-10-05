@@ -123,14 +123,17 @@ result_code_t RavenFS_juvenile::dentry_Bptree_walk(uint64_t root_blk_idx, bptree
  * 树内条目 e 的完整名字 = e.name[0..min(40,e_len)) +（e_len>40 时）堆外置尾部。
  * 与目标名 memcmp 公共前缀，长度裁决；e_len 取 inode_ptr.free_to_use。
  * 读堆失败保守返回 1（目标 < 条目，不会误判命中）。 */
-int RavenFS_juvenile::dentry_name_cmp(const ddentry_t &e, const char *name, uint16_t name_len)
+int RavenFS_juvenile::dentry_name_cmp(const ddentry_t &e, const char *name, uint16_t name_len,
+                                      uint64_t owner_dir_inum)
 {
     const uint16_t e_len = (uint16_t)RFS_PTR_FREE(e.inode_ptr);
     char e_buf[RAVENFS_MAX_NAME_LEN];
     const uint16_t e_inline = (e_len < DENTRY_INLINE_NAME_MAX) ? e_len : DENTRY_INLINE_NAME_MAX;
     memcpy(e_buf, e.name, e_inline);
     if (e_len > DENTRY_INLINE_NAME_MAX) {
-        if (name_heap_read(e_len, e.full_char_remain_ptr, e_buf + DENTRY_INLINE_NAME_MAX) != RC_OK)
+        if (name_data_read(owner_dir_inum, e.full_char_remain_offset,
+                           (uint16_t)(e_len - DENTRY_INLINE_NAME_MAX),
+                           e_buf + DENTRY_INLINE_NAME_MAX) != RC_OK)
             return 1;   /* 保守：视为大于目标 */
     }
     const uint16_t cmp_len = (e_len < name_len) ? e_len : name_len;
@@ -159,7 +162,7 @@ RavenFS_juvenile::leaf_node_result_t RavenFS_juvenile::dentry_leaf_node_lookup(B
         else if (e.hash > target_hash)
             e_le_target = false;
         else
-            e_le_target = dentry_name_cmp(e, name->name, name->name_len) <= 0;   /* 冲突降级完整名字比较（>40B 读堆） */
+            e_le_target = dentry_name_cmp(e, name->name, name->name_len, name->owner_dir_inum) <= 0;   /* 冲突降级完整名字比较（>40B 读数据面） */
 
         if (e_le_target) {
             glb = mid;      /* 候选下界，继续向右找更大的 */
@@ -172,7 +175,7 @@ RavenFS_juvenile::leaf_node_result_t RavenFS_juvenile::dentry_leaf_node_lookup(B
     res.greates_lower_bound_idx = glb;
     if (glb != DENTRY_LEAF_GLB_NONE) {
         const ddentry_t &e = leaf->entries[glb];
-        if (e.hash == target_hash && dentry_name_cmp(e, name->name, name->name_len) == 0)
+        if (e.hash == target_hash && dentry_name_cmp(e, name->name, name->name_len, name->owner_dir_inum) == 0)
             res.is_idx_hitted = true;
     }
     return res;

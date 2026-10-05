@@ -345,10 +345,10 @@ result_code_t RavenFS_juvenile::dentry_new_root_inner(uint64_t low_blk, uint64_t
 
     root_sess.dirty();
 
-    raven_Inode_t root_inode;
-    inode_read(root_inode_idx, &root_inode);
-    root_inode.data_root = new_root_blk;
-    inode_write(root_inode_idx, &root_inode);
+    raven_dir_Inode_t root_inode;
+    inode_read(root_inode_idx, (raven_Inode_t *)&root_inode);
+    root_inode.ddentry_Bptree_root = new_root_blk;
+    inode_write(root_inode_idx, (const raven_Inode_t *)&root_inode);
     root_dentry_blk = new_root_blk;
     return RC_OK;
 }

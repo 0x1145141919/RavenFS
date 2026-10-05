@@ -17,6 +17,7 @@
  *     已全面淘汰：分片树/行原语直接消费 v2 派生的 inode_cache_rt_t 快照
  * ═══════════════════════════════════════════════════════════════════ */
 #include "ravenfs/inode_cache_radix.hpp"
+#include "disk_struct_v1.3.h"   /* raven_Inode_t 完整定义：InodeSession::inode_slot_of 与各分支实现消费 */
 #include "util/lock.h"   /* cpu_relax（忙等） / rdtsc_timestamp（LRU 时间戳） */
 
 #include <cstring>   /* memset：中间表槽位清零 */
@@ -26,6 +27,13 @@
 #if defined(__linux__) || defined(__unix__)
 #include <sys/mman.h>   /* msync：offload 后端 flush_all 的内核页缓存同步 syscall */
 #endif
+
+/* InodeSession no_cache 槽定位（唯一定义 TU）：
+ * 头文件只前置声明 raven_Inode_t，此处才拿完整定义做指针对齐/取址。
+ * page_buf = 会话自管的 4K 页缓冲（16 inode），idx = 页内槽号（inum & 15）。 */
+raven_Inode_t *InodeSession::inode_slot_of(void *page_buf, uint64_t idx) {
+    return &static_cast<raven_Inode_t *>(page_buf)[idx];
+}
 
 /* ═══════════════════════════════════════════════════════════════════
  * statey 位域策略表（Sparrow 亲笔，从头文件原样迁入）

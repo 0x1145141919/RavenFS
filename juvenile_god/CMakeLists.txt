@@ -40,7 +40,8 @@ add_library(ravenfs_juvenile STATIC
     extent_map_unmap.cpp
     extent_rebuild.cpp
     root_dir.cpp
-    name_heap.cpp
+    name_data_plane.cpp
+    name_data_freeranges.cpp
     inode_cache.cpp
     mdata_piece_cache.cpp
     direct_file_ops.cpp

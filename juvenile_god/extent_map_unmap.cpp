@@ -90,12 +90,12 @@
  * root_blk 指向合法 extent 树根（inline→extent 跃迁归 direct_file_* 层）。
  */
 result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t owner_inode_idx,
-                                                 const extent_t &ext)
+                                                 const extent_t &ext, extent_tree_kind_t kind)
 {
     if (ext.length == 0) return RC_OK;   /* 空映射：无操作 */
 
     bptree_path_t trace;
-    result_code_t rc = extent_Bptree_walk(root_blk, &trace, ext.fblkbase);
+    result_code_t rc = extent_Bptree_walk(root_blk, &trace, ext.fblkbase, kind);
     if (rc) return rc;
     const uint64_t leaf_blk = trace.blocks[trace.depth - 1];
     const uint16_t glb = trace.child_idx[trace.depth - 1];
@@ -116,7 +116,7 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
         if (sess.index_error()) return RC_ERR_STATE;
         if (!sess) return RC_ERR_IO;
         Bptree_extent_leaf_node_t *leaf = (Bptree_extent_leaf_node_t *)sess.data;
-        if (!is_extent_node(&leaf->meta) || RFS_PP_IS_INNER(leaf->meta.parent_ptr))
+        if (!is_extent_node_kind(&leaf->meta, kind) || RFS_PP_IS_INNER(leaf->meta.parent_ptr))
             return RC_ERR_STATE;
         uint16_t count = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr);
 
@@ -214,7 +214,7 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
     if (merge == merge_t::left) {
         /* 左融合收尾：GLB 非叶末 → 叶 max 未变 → 父链零刷新；仅叶末项上溯。 */
         if (left_key_changed) {
-            rc = extent_refresh_key_chain(leaf_blk);
+            rc = extent_refresh_key_chain(leaf_blk, kind);
             if (rc) return rc;
         }
         return RC_OK;
@@ -228,16 +228,16 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
          * （叶 max 不变论证）。根叶恒合法（count≥1）。 */
         if (is_root_leaf) return RC_OK;
         if (underflow)
-            return extent_balance_from(leaf_blk, owner_inode_idx, root_blk);
+            return extent_balance_from(leaf_blk, owner_inode_idx, root_blk, kind);
         return RC_OK;
     }
 
     /* ── none（纯插）收尾：分裂级联 + 父 key 刷新 ── */
     if (need_split)
         rc = extent_split_cascade(leaf_blk, trace, reserve_pool, pool_used,
-                                  owner_inode_idx, root_blk);
+                                  owner_inode_idx, root_blk, kind);
     else
-        rc = extent_refresh_key_chain(leaf_blk);   /* 纯插不裂：叶末插入 max 变时上溯（内部短路） */
+        rc = extent_refresh_key_chain(leaf_blk, kind);   /* 纯插不裂：叶末插入 max 变时上溯（内部短路） */
 
     /* 预算归还（统一收尾）：级联实际消耗 pool_used 个（多数情况只裂一层 → 大部
      * 分预算归还；最坏全链分裂 depth+1 个全部消耗）。错误路径同样在此归还。 */
@@ -264,27 +264,27 @@ result_code_t RavenFS_juvenile::extent_map_range(uint64_t &root_blk, uint64_t ow
 result_code_t RavenFS_juvenile::extent_split_cascade(
     uint64_t leaf_blk, const bptree_path_t &trace,
     std::vector<uint64_t> &reserve_pool, size_t &pool_used,
-    uint64_t owner_inode_idx, uint64_t &root_blk)
+    uint64_t owner_inode_idx, uint64_t &root_blk, extent_tree_kind_t kind)
 {
     const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
     bool did_split = false;
     uint64_t split_high_leaf = 0;
     result_code_t rc;
 
-    split_result_t sr = extent_leaf_split(leaf_blk, reserve_pool[pool_used++]);
+    split_result_t sr = extent_leaf_split(leaf_blk, reserve_pool[pool_used++], kind);
     if (sr.rc != RC_OK) return sr.rc;
     did_split = true;
     split_high_leaf = sr.high_node_blkidx;
     if (trace.depth == 1) {
         rc = extent_new_root_inner(sr.low_node_blkidx, sr.low_node_maxhash,
                                    sr.high_node_blkidx, owner_inode_idx, root_blk,
-                                   reserve_pool[pool_used++]);
+                                   reserve_pool[pool_used++], kind);
         if (rc) return rc;
     } else {
         uint64_t parent_blk = trace.blocks[trace.depth - 2];
         uint16_t child_idx = trace.child_idx[trace.depth - 2];
         bool parent_spilt = false;
-        rc = extent_spilt_parent_apply(parent_blk, child_idx, sr, parent_spilt);
+        rc = extent_spilt_parent_apply(parent_blk, child_idx, sr, parent_spilt, kind);
         if (rc) return rc;
         uint64_t cur_parent = parent_blk;
         int guard = 0;
@@ -294,16 +294,16 @@ result_code_t RavenFS_juvenile::extent_split_cascade(
             if (ps.index_error()) return RC_ERR_STATE;
             if (!ps) return RC_ERR_IO;
             Bptree_extent_inner_node_t *pn = (Bptree_extent_inner_node_t *)ps.data;
-            if (!is_extent_node(&pn->meta) || !RFS_PP_IS_INNER(pn->meta.parent_ptr))
+            if (!is_extent_node_kind(&pn->meta, kind) || !RFS_PP_IS_INNER(pn->meta.parent_ptr))
                 return RC_ERR_STATE;
             const bool parent_is_root = RFS_PP_IS_ROOT(pn->meta.parent_ptr);
             const uint64_t grand_blk = RFS_PP_PTR(pn->meta.parent_ptr);
-            split_result_t isr = extent_inner_split(cur_parent, reserve_pool[pool_used++]);
+            split_result_t isr = extent_inner_split(cur_parent, reserve_pool[pool_used++], kind);
             if (isr.rc != RC_OK) return isr.rc;
             if (parent_is_root) {
                 rc = extent_new_root_inner(isr.low_node_blkidx, isr.low_node_maxhash,
                                            isr.high_node_blkidx, owner_inode_idx,
-                                           root_blk, reserve_pool[pool_used++]);
+                                           root_blk, reserve_pool[pool_used++], kind);
                 if (rc) return rc;
                 break;
             }
@@ -312,7 +312,7 @@ result_code_t RavenFS_juvenile::extent_split_cascade(
             if (gs.index_error()) return RC_ERR_STATE;
             if (!gs) return RC_ERR_IO;
             Bptree_extent_inner_node_t *grand = (Bptree_extent_inner_node_t *)gs.data;
-            if (!is_extent_node(&grand->meta) || !RFS_PP_IS_INNER(grand->meta.parent_ptr))
+            if (!is_extent_node_kind(&grand->meta, kind) || !RFS_PP_IS_INNER(grand->meta.parent_ptr))
                 return RC_ERR_STATE;
             const uint16_t gcnt = (uint16_t)RFS_PP_COUNT(grand->meta.parent_ptr);
             uint16_t grand_idx = 0;
@@ -323,17 +323,17 @@ result_code_t RavenFS_juvenile::extent_split_cascade(
                 }
             }
             if (!found) return RC_ERR_STATE;
-            rc = extent_spilt_parent_apply(grand_blk, grand_idx, isr, parent_spilt);
+            rc = extent_spilt_parent_apply(grand_blk, grand_idx, isr, parent_spilt, kind);
             if (rc) return rc;
             cur_parent = grand_blk;
         }
     }
 
     /* 父 key 刷新：从本叶上溯；分裂后两半叶都刷。 */
-    rc = extent_refresh_key_chain(leaf_blk);
+    rc = extent_refresh_key_chain(leaf_blk, kind);
     if (rc) return rc;
     if (did_split) {
-        rc = extent_refresh_key_chain(split_high_leaf);
+        rc = extent_refresh_key_chain(split_high_leaf, kind);
         if (rc) return rc;
     }
     return RC_OK;

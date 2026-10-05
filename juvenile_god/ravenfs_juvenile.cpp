@@ -41,6 +41,20 @@ bool is_extent_node(Bptree_meta_t *meta)
     meta->magics[2]==BPTREE_MAGIC3&&
     meta->magics[3]==BPTREE_MAGIC4;
 }
+/* 通用 extent 机械的按 kind 魔数校验：同一套算法服务两族树（文件区段树 /
+ * 目录名字数据面映射树），节点布局同构，仅 256-bit 魔数不同。 */
+bool RavenFS_juvenile::is_extent_node_kind(const Bptree_meta_t *meta, extent_tree_kind_t kind)
+{
+    if (kind == EXTENT_TREE_NAMEDATA)
+        return meta->magics[0]==NAMEDATA_EXTENT_MAGIC1 &&
+               meta->magics[1]==NAMEDATA_EXTENT_MAGIC2 &&
+               meta->magics[2]==NAMEDATA_EXTENT_MAGIC3 &&
+               meta->magics[3]==NAMEDATA_EXTENT_MAGIC4;
+    return meta->magics[0]==BPTREE_MAGIC1 &&
+           meta->magics[1]==BPTREE_MAGIC2 &&
+           meta->magics[2]==BPTREE_MAGIC3 &&
+           meta->magics[3]==BPTREE_MAGIC4;
+}
 bool is_dentry_node(Bptree_meta_t *meta)
 {
     return meta->magics[0]==DENTRY_MAGIC1&&

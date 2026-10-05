@@ -28,13 +28,21 @@
 /* ── 新建 extent 节点通用初始化（整块清零 + 256-bit 魔数 + parent 四件套）；
  * ptrs[3] 按角色由调用方填（文件树根无 ".."，调用方按需写 PTR_INVALID）。 ── */
 void RavenFS_juvenile::extent_node_meta_init(void *node_buf, uint16_t entry_count,
-                                  bool is_inner, bool is_root, uint64_t parent_ptr) {
+                                  bool is_inner, bool is_root, uint64_t parent_ptr,
+                                  extent_tree_kind_t kind) {
     memset(node_buf, 0, 8192);
     Bptree_meta_t *meta = (Bptree_meta_t *)node_buf;
-    meta->magics[0] = BPTREE_MAGIC1;
-    meta->magics[1] = BPTREE_MAGIC2;
-    meta->magics[2] = BPTREE_MAGIC3;
-    meta->magics[3] = BPTREE_MAGIC4;
+    if (kind == EXTENT_TREE_NAMEDATA) {
+        meta->magics[0] = NAMEDATA_EXTENT_MAGIC1;
+        meta->magics[1] = NAMEDATA_EXTENT_MAGIC2;
+        meta->magics[2] = NAMEDATA_EXTENT_MAGIC3;
+        meta->magics[3] = NAMEDATA_EXTENT_MAGIC4;
+    } else {
+        meta->magics[0] = BPTREE_MAGIC1;
+        meta->magics[1] = BPTREE_MAGIC2;
+        meta->magics[2] = BPTREE_MAGIC3;
+        meta->magics[3] = BPTREE_MAGIC4;
+    }
     RFS_PP_SET_COUNT(meta->parent_ptr, entry_count);
     RFS_PP_SET_IS_INNER(meta->parent_ptr, is_inner ? 1 : 0);
     RFS_PP_SET_IS_ROOT(meta->parent_ptr, is_root ? 1 : 0);
@@ -62,7 +70,7 @@ uint64_t RavenFS_juvenile::extent_node_max_key(const void *node_buf) {
  * 是父的末孩），继续上溯，直到 key 未变/到根即止。
  * 调用点必须保证 blk 存活（勿在平衡吞并后刷已释放块）。
  * ═══════════════════════════════════════════════════════════════════ */
-result_code_t RavenFS_juvenile::extent_refresh_key_chain(uint64_t blk)
+result_code_t RavenFS_juvenile::extent_refresh_key_chain(uint64_t blk, extent_tree_kind_t kind)
 {
     const uint64_t PTR_INVALID_52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
     uint64_t cur = blk;
@@ -71,7 +79,7 @@ result_code_t RavenFS_juvenile::extent_refresh_key_chain(uint64_t blk)
         if (cs.index_error()) return RC_ERR_STATE;
         if (!cs) return RC_ERR_IO;
         Bptree_meta_t *cm = (Bptree_meta_t *)cs.data;
-        if (!is_extent_node(cm)) return RC_ERR_STATE;
+        if (!is_extent_node_kind(cm, kind)) return RC_ERR_STATE;
         if (RFS_PP_IS_ROOT(cm->parent_ptr)) return RC_OK;   /* 根无父，链止 */
         const uint64_t new_key = extent_node_max_key(cs.data);
         const uint64_t parent_blk = RFS_PP_PTR(cm->parent_ptr);  /* 52 位形态 */
@@ -80,7 +88,7 @@ result_code_t RavenFS_juvenile::extent_refresh_key_chain(uint64_t blk)
         if (ps.index_error()) return RC_ERR_STATE;
         if (!ps) return RC_ERR_IO;
         Bptree_extent_inner_node_t *parent = (Bptree_extent_inner_node_t *)ps.data;
-        if (!is_extent_node(&parent->meta) || !RFS_PP_IS_INNER(parent->meta.parent_ptr))
+        if (!is_extent_node_kind(&parent->meta, kind) || !RFS_PP_IS_INNER(parent->meta.parent_ptr))
             return RC_ERR_STATE;
         const uint16_t pcnt = (uint16_t)RFS_PP_COUNT(parent->meta.parent_ptr);
         uint16_t i = 0;
@@ -107,7 +115,8 @@ result_code_t RavenFS_juvenile::extent_refresh_key_chain(uint64_t blk)
  *   根叶分裂后 victim 转链表成员：无前驱 → ptrs[1]=INVALID。
  * ═══════════════════════════════════════════════════════════════════ */
 RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_leaf_split(uint64_t victim_blk,
-                                                                     uint64_t prealloc_blk)
+                                                                     uint64_t prealloc_blk,
+                                                                     extent_tree_kind_t kind)
 {
     split_result_t res;
     res.rc = RC_OK;
@@ -120,7 +129,7 @@ RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_leaf_split(uint64_t vi
     if (victim_sess.index_error()) { res.rc = RC_ERR_STATE; return res; }
     if (!victim_sess) { res.rc = RC_ERR_IO; return res; }
     Bptree_extent_leaf_node_t *victim = (Bptree_extent_leaf_node_t *)victim_sess.data;
-    if (!is_extent_node(&victim->meta) || RFS_PP_IS_INNER(victim->meta.parent_ptr)) {
+    if (!is_extent_node_kind(&victim->meta, kind) || RFS_PP_IS_INNER(victim->meta.parent_ptr)) {
         res.rc = RC_ERR_STATE; return res;
     }
     uint16_t count = (uint16_t)RFS_PP_COUNT(victim->meta.parent_ptr);
@@ -137,7 +146,7 @@ RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_leaf_split(uint64_t vi
     if (!new_sess) { res.rc = RC_ERR_IO; return res; }
     Bptree_extent_leaf_node_t *new_leaf = (Bptree_extent_leaf_node_t *)new_sess.data;
     extent_node_meta_init(new_sess.data, (uint16_t)(count - 168), false, false,
-                          RFS_PP_PTR(victim->meta.parent_ptr));   /* 同父（暂态：根裂时父值由上层 reparent 修正） */
+                          RFS_PP_PTR(victim->meta.parent_ptr), kind);   /* 同父（暂态：根裂时父值由上层 reparent 修正） */
     RFS_PTR_SET_ADDR(new_leaf->meta.ptrs[0], PTR_INVALID);
     RFS_PTR_SET_ADDR(new_leaf->meta.ptrs[1], victim_blk);                       /* prev = victim */
     RFS_PTR_SET_ADDR(new_leaf->meta.ptrs[2], victim_is_root ? PTR_INVALID : old_next);
@@ -175,7 +184,8 @@ RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_leaf_split(uint64_t vi
  * 2026-09-07：prealloc_blk = 预算池节点块号，本函数不再 alloc（无 ENOSPC 面）。
  * ═══════════════════════════════════════════════════════════════════ */
 RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_inner_split(uint64_t victim_blk,
-                                                                      uint64_t prealloc_blk)
+                                                                      uint64_t prealloc_blk,
+                                                                      extent_tree_kind_t kind)
 {
     split_result_t res;
     res.rc = RC_OK;
@@ -188,7 +198,7 @@ RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_inner_split(uint64_t v
     if (victim_sess.index_error()) { res.rc = RC_ERR_STATE; return res; }
     if (!victim_sess) { res.rc = RC_ERR_IO; return res; }
     Bptree_extent_inner_node_t *victim = (Bptree_extent_inner_node_t *)victim_sess.data;
-    if (!is_extent_node(&victim->meta) || !RFS_PP_IS_INNER(victim->meta.parent_ptr)) {
+    if (!is_extent_node_kind(&victim->meta, kind) || !RFS_PP_IS_INNER(victim->meta.parent_ptr)) {
         res.rc = RC_ERR_STATE; return res;
     }
     uint16_t count = (uint16_t)RFS_PP_COUNT(victim->meta.parent_ptr);
@@ -201,7 +211,7 @@ RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_inner_split(uint64_t v
     if (!new_sess) { res.rc = RC_ERR_IO; return res; }
     Bptree_extent_inner_node_t *new_inner = (Bptree_extent_inner_node_t *)new_sess.data;
     extent_node_meta_init(new_sess.data, (uint16_t)(count - 168), true, false,
-                          RFS_PP_PTR(victim->meta.parent_ptr));   /* 同父 */
+                          RFS_PP_PTR(victim->meta.parent_ptr), kind);   /* 同父 */
     RFS_PTR_SET_ADDR(new_inner->meta.ptrs[0], PTR_INVALID);
     RFS_PTR_SET_ADDR(new_inner->meta.ptrs[1], PTR_INVALID);
     RFS_PTR_SET_ADDR(new_inner->meta.ptrs[2], PTR_INVALID);
@@ -218,7 +228,7 @@ RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_inner_split(uint64_t v
         if (c_sess.index_error()) { res.rc = RC_ERR_STATE; return res; }
         if (!c_sess) { res.rc = RC_ERR_IO; return res; }
         Bptree_meta_t *cmeta = (Bptree_meta_t *)c_sess.data;
-        if (!is_extent_node(cmeta)) { res.rc = RC_ERR_STATE; return res; }
+        if (!is_extent_node_kind(cmeta, kind)) { res.rc = RC_ERR_STATE; return res; }
         if (RFS_PP_IS_ROOT(cmeta->parent_ptr)) { res.rc = RC_ERR_STATE; return res; }
         RFS_PP_SET_PTR(cmeta->parent_ptr, new_blk);
         c_sess.dirty();
@@ -239,7 +249,8 @@ RavenFS_juvenile::split_result_t RavenFS_juvenile::extent_inner_split(uint64_t v
  *   （key 现算）；父 count+1 超 337 → parent_spilt=true（需递归分裂）。
  * ═══════════════════════════════════════════════════════════════════ */
 result_code_t RavenFS_juvenile::extent_spilt_parent_apply(
-    uint64_t parent_blk, uint16_t victim_idx, split_result_t r, bool &parent_spilt)
+    uint64_t parent_blk, uint16_t victim_idx, split_result_t r, bool &parent_spilt,
+    extent_tree_kind_t kind)
 {
     if (r.rc != RC_OK) return r.rc;
     parent_spilt = false;
@@ -248,7 +259,7 @@ result_code_t RavenFS_juvenile::extent_spilt_parent_apply(
     if (parent_sess.index_error()) return RC_ERR_STATE;
     if (!parent_sess) return RC_ERR_IO;
     Bptree_extent_inner_node_t *parent = (Bptree_extent_inner_node_t *)parent_sess.data;
-    if (!is_extent_node(&parent->meta) || !RFS_PP_IS_INNER(parent->meta.parent_ptr))
+    if (!is_extent_node_kind(&parent->meta, kind) || !RFS_PP_IS_INNER(parent->meta.parent_ptr))
         return RC_ERR_STATE;
     uint16_t count = (uint16_t)RFS_PP_COUNT(parent->meta.parent_ptr);
     if (victim_idx >= count) return RC_ERR_STATE;
@@ -258,7 +269,7 @@ result_code_t RavenFS_juvenile::extent_spilt_parent_apply(
     mdata_piece_session child_sess(mdata_piece_mgr, r.high_node_blkidx);
     if (child_sess.index_error()) return RC_ERR_STATE;
     if (!child_sess) return RC_ERR_IO;
-    if (!is_extent_node((Bptree_meta_t *)child_sess.data)) return RC_ERR_STATE;
+    if (!is_extent_node_kind((Bptree_meta_t *)child_sess.data, kind)) return RC_ERR_STATE;
     const uint64_t high_key = extent_node_max_key(child_sess.data);
 
     parent->extents[victim_idx].key = r.low_node_maxhash;   /* 左半 key（分裂不增大左半 max） */
@@ -288,7 +299,8 @@ result_code_t RavenFS_juvenile::extent_new_root_inner(uint64_t low_blk, uint64_t
                                                       uint64_t high_blk,
                                                       uint64_t owner_inode_idx,
                                                       uint64_t &root_blk,
-                                                      uint64_t prealloc_blk)
+                                                      uint64_t prealloc_blk,
+                                                      extent_tree_kind_t kind)
 {
     const uint64_t new_root_blk = prealloc_blk;   /* 预算块：调用方保证已分配 */
 
@@ -296,7 +308,7 @@ result_code_t RavenFS_juvenile::extent_new_root_inner(uint64_t low_blk, uint64_t
     if (root_sess.index_error()) return RC_ERR_STATE;
     if (!root_sess) return RC_ERR_IO;
     Bptree_extent_inner_node_t *new_root = (Bptree_extent_inner_node_t *)root_sess.data;
-    extent_node_meta_init(root_sess.data, 2, true, true, owner_inode_idx);   /* "." 审计锚 */
+    extent_node_meta_init(root_sess.data, 2, true, true, owner_inode_idx, kind);   /* "." 审计锚 */
     RFS_PTR_SET_ADDR(new_root->meta.ptrs[1], PTR_INVALID);   /* 无 ".." */
 
     new_root->extents[0].key = low_key;
@@ -306,7 +318,7 @@ result_code_t RavenFS_juvenile::extent_new_root_inner(uint64_t low_blk, uint64_t
     mdata_piece_session right_sess(mdata_piece_mgr, high_blk);
     if (right_sess.index_error()) return RC_ERR_STATE;
     if (!right_sess) return RC_ERR_IO;
-    if (!is_extent_node((Bptree_meta_t *)right_sess.data)) return RC_ERR_STATE;
+    if (!is_extent_node_kind((Bptree_meta_t *)right_sess.data, kind)) return RC_ERR_STATE;
     new_root->extents[1].key = extent_node_max_key(right_sess.data);
     RFS_PTR_SET_ADDR(new_root->extents[1].sub_node_ptr, high_blk);
     RFS_PTR_SET_FREE(new_root->extents[1].sub_node_ptr, 0);
@@ -316,7 +328,7 @@ result_code_t RavenFS_juvenile::extent_new_root_inner(uint64_t low_blk, uint64_t
     if (left_sess.index_error()) return RC_ERR_STATE;
     if (!left_sess) return RC_ERR_IO;
     Bptree_meta_t *lm = (Bptree_meta_t *)left_sess.data;
-    if (!is_extent_node(lm)) return RC_ERR_STATE;
+    if (!is_extent_node_kind(lm, kind)) return RC_ERR_STATE;
     RFS_PP_SET_PTR(lm->parent_ptr, new_root_blk);
     RFS_PP_SET_IS_ROOT(lm->parent_ptr, 0);
     left_sess.dirty();
