@@ -146,12 +146,29 @@ static const struct rfs_ndfr_ops rfs_nd_ndfr_ops = {
 	.node_free	= nd_node_free,
 };
 
+/* fr 模块 stat 钩子宿主实现：字段下标 → sbi->stats.nd_fr_*（内核 atomic64）。
+ * 纪律同 §7：只累加、无阻塞、可持锁；sb 判空由 RFS_STAT_ADD 兜底。*/
+static void nd_fr_stat_inc(void *ctx, u32 field, u64 delta)
+{
+	struct super_block *sb = ctx;
+
+	switch (field) {
+	case NDFR_FR_INLINE: RFS_STAT_ADD(sb, nd_fr_inline, delta); break;
+	case NDFR_FR_TREE:   RFS_STAT_ADD(sb, nd_fr_tree,   delta); break;
+	case NDFR_FR_SPLIT:  RFS_STAT_ADD(sb, nd_fr_split,  delta); break;
+	case NDFR_FR_RETIRE: RFS_STAT_ADD(sb, nd_fr_retire, delta); break;
+	default: break;
+	}
+}
+
 static void nd_fr_ctx_init(struct rfs_ndfr_ctx *ctx, struct rfs_nd_host *host,
 			   u64 dir_idx)
 {
 	ctx->ops = &rfs_nd_ndfr_ops;
 	ctx->host = host;
 	ctx->dir_inode_idx = dir_idx;
+	ctx->stat.inc = nd_fr_stat_inc;
+	ctx->stat.ctx = host->sb;
 }
 
 /* ══════════════════════ 8K 片字节读写（mdata read-modify-write）══════════════════════ */
@@ -238,6 +255,7 @@ int ravenfs_nd_resolve(struct super_block *sb, struct raven_dir_Inode_t *dino,
 	const u64 ptr = RFS_ND_CTL_PTR(ctl);
 	u64 pieces;
 
+	RFS_STAT_INC(sb, nd_resolve);
 	if (!out_fblk || !out_off)
 		return -EINVAL;
 	if (ptr == RFS_ND_CTL_PTR_INVALID)
@@ -283,6 +301,7 @@ int ravenfs_nd_map_append(struct super_block *sb, u64 dir_idx,
 	struct extent_t nx;
 	u64 root;
 
+	RFS_STAT_INC(sb, nd_map_append);
 	nx.length = 2;			/* 8K = 2 FS_block */
 	nx.fblkbase = pieces * 2;	/* 逻辑尾 */
 	nd_set_addr(&nx.block_base, phys_base);
@@ -339,6 +358,7 @@ static int nd_grow_core(struct super_block *sb, u64 dir_idx,
 	u64 new_base;
 	int rc;
 
+	RFS_STAT_INC(sb, nd_grow);
 	if (RFS_ND_CTL_PTR(ctl) == RFS_ND_CTL_PTR_INVALID)
 		return -EIO;			/* 空态不应增片（先 bootstrap） */
 
@@ -403,6 +423,7 @@ int ravenfs_nd_alloc(struct super_block *sb, u64 dir_idx, u16 tail_len,
 	struct rfs_ndfr_ctx ctx;
 	int rc;
 
+	RFS_STAT_INC(sb, nd_alloc);
 	if (!out_offset || tail_len == 0 || tail_len > 512)
 		return -EINVAL;
 
@@ -479,6 +500,7 @@ int ravenfs_nd_free(struct super_block *sb, u64 dir_idx, u64 offset, u16 tail_le
 	struct rfs_ndfr_ctx ctx;
 	int rc;
 
+	RFS_STAT_INC(sb, nd_free);
 	if (tail_len == 0)
 		return 0;
 
@@ -508,6 +530,7 @@ int ravenfs_nd_read(struct super_block *sb, u64 dir_idx, u64 offset, u16 tail_le
 	u16 off = 0;
 	int rc;
 
+	RFS_STAT_INC(sb, nd_read);
 	if (!out || tail_len == 0 || tail_len > 512)
 		return -EINVAL;
 
@@ -533,6 +556,7 @@ int ravenfs_nd_write(struct super_block *sb, u64 dir_idx, u64 offset, u16 tail_l
 	u16 off = 0;
 	int rc;
 
+	RFS_STAT_INC(sb, nd_write);
 	if (!tail || tail_len == 0 || tail_len > 512)
 		return -EINVAL;
 
@@ -562,6 +586,7 @@ void ravenfs_nd_map_reclaim(struct super_block *sb, u64 tree_root)
 	u64 guard;
 	int d;
 
+	RFS_STAT_INC(sb, nd_reclaim);
 	/* ⚠️ 0 是合法块号（v2.0 契约明令禁用 0 作哨兵）：映射树根可能恰为 block 0，
 	 * 不得当无效早退（否则整棵映射树 + 数据片漏回收）。 */
 	if (tree_root == (u64)PTR_INVALID || tree_root == PTR52)
@@ -638,6 +663,7 @@ int ravenfs_nd_release(struct super_block *sb, u64 dir_idx)
 	struct rfs_ndfr_ctx ctx;
 	u64 ctl, pieces, ptr;
 
+	RFS_STAT_INC(sb, nd_release);
 	ds = ravenfs_session_get(sb, dir_idx);
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);

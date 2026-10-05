@@ -320,6 +320,7 @@ int rfs_ndfr_find_fit(struct rfs_ndfr_ctx *ctx, u64 root, u64 need,
 
 	if (!out_base || !out_len)
 		return -EINVAL;
+	RFS_AL_STAT1(ctx->stat, NDFR_FR_TREE);
 	rc = rfs_ndfr_walk(ctx, root, need, 0, &tr);
 	if (rc)
 		return rc;
@@ -456,6 +457,7 @@ int rfs_ndfr_insert(struct rfs_ndfr_ctx *ctx, struct raven_dir_Inode_t *dino,
 	if (RFS_ND_FR_CTL_PTR(ctl) == RFS_ND_FR_CTL_PTR_INVALID) {
 		fr_t *t = FR_INLINE_TAB(dino);
 
+		RFS_AL_STAT1(ctx->stat, NDFR_FR_INLINE);
 		t[0].base = base;
 		t[0].len = len;
 		dino->name_data_free_ranges_ctl = RFS_ND_FR_CTL_PACK(1, 0);
@@ -467,6 +469,7 @@ int rfs_ndfr_insert(struct rfs_ndfr_ctx *ctx, struct raven_dir_Inode_t *dino,
 	if (RFS_ND_FR_CTL_IS_INLINE(ctl)) {
 		fr_t *t = FR_INLINE_TAB(dino);
 
+		RFS_AL_STAT1(ctx->stat, NDFR_FR_INLINE);
 		cnt = (u16)RFS_ND_FR_COUNT(dino->name_data_free_ranges_count);
 		if (cnt > RFS_ND_FREE_INLINE_MAX)
 			return -EINVAL;
@@ -527,6 +530,7 @@ int rfs_ndfr_insert(struct rfs_ndfr_ctx *ctx, struct raven_dir_Inode_t *dino,
 	}
 
 	/* ── tree 态（root 恒有效）── */
+	RFS_AL_STAT1(ctx->stat, NDFR_FR_TREE);
 	root = RFS_ND_FR_CTL_PTR(ctl);
 	rc = rfs_ndfr_walk(ctx, root, len, base, &trace);
 	if (rc)
@@ -605,6 +609,7 @@ int rfs_ndfr_insert(struct rfs_ndfr_ctx *ctx, struct raven_dir_Inode_t *dino,
 
 	/* 分裂叶 169 / 169 */
 	sr.rc = 0;
+	RFS_AL_STAT1(ctx->stat, NDFR_FR_SPLIT);
 	{
 		bool e2 = false;
 		void *vs = ctx->ops->node_pin(ctx->host, leaf_blk, &e2);
@@ -693,6 +698,7 @@ int rfs_ndfr_insert(struct rfs_ndfr_ctx *ctx, struct raven_dir_Inode_t *dino,
 				grand_blk = RFS_PP_PTR(pn->meta.parent_ptr);
 
 				ir.rc = 0;
+				RFS_AL_STAT1(ctx->stat, NDFR_FR_SPLIT);
 				{
 					void *ns = ctx->ops->node_pin(
 						ctx->host, pool[used], &e3);
@@ -881,6 +887,7 @@ int rfs_ndfr_take_fit(struct rfs_ndfr_ctx *ctx, struct raven_dir_Inode_t *dino,
 			dino->name_data_free_ranges_count);
 		u16 fi;
 
+		RFS_AL_STAT1(ctx->stat, NDFR_FR_INLINE);
 		if (cnt > RFS_ND_FREE_INLINE_MAX)
 			return -EINVAL;
 		fi = fr_inline_find_fit(t, cnt, need);
@@ -904,6 +911,7 @@ int rfs_ndfr_take_fit(struct rfs_ndfr_ctx *ctx, struct raven_dir_Inode_t *dino,
 	}
 
 	/* ── tree 态 ── */
+	RFS_AL_STAT1(ctx->stat, NDFR_FR_TREE);
 	root = ptr;
 	rc = rfs_ndfr_walk(ctx, root, need, 0, &trace);
 	if (rc)
@@ -988,6 +996,7 @@ int rfs_ndfr_retire_empty_leaf(struct rfs_ndfr_ctx *ctx,
 	u64 cur = leaf_blk;
 	int hop;
 
+	RFS_AL_STAT1(ctx->stat, NDFR_FR_RETIRE);
 	for (hop = 0; hop < 64; hop++) {
 		u64 parent_blk = 0, only_child = 0;
 		u16 pcnt_after = 0;

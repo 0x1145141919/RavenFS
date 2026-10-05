@@ -317,6 +317,7 @@ static int ravenfs_inode_plane_load(struct super_block *sb,
 		if (fptr == RFS_IDP_FR_CTL_PTR_INVALID || n == 0)
 			goto done;			/* 空 fr（防御） */
 
+		RFS_AL_INC(sb, al_idp_snap_read);
 		fbytes = sizeof(*h) +
 			 n * sizeof(struct inode_dataplane_coordinate_free_range_t);
 		fblks = DIV_ROUND_UP_ULL(fbytes, RAVENFS_BLOCK_SIZE);
@@ -424,6 +425,7 @@ static int ravenfs_inode_plane_sync(struct super_block *sb)
 		} else {
 			u64 new_root = (u64)PTR_INVALID;
 
+			RFS_AL_INC(sb, al_idp_tree_build);
 			for (i = 0; i < en; i++) {
 				struct extent_t x;
 
@@ -529,6 +531,8 @@ static int ravenfs_inode_plane_sync(struct super_block *sb)
 			sync_dirty_buffer(bh);
 			brelse(bh);
 		}
+		RFS_AL_INC(sb, al_idp_snap_write);
+		RFS_AL_ADD(sb, al_idp_snap_blocks, blks);
 		kfree(buf);
 		kfree(fa);
 		sbi->inode_data_fr_ctl = RFS_IDP_FR_CTL_PACK(new_fr);

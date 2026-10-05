@@ -26,7 +26,8 @@ extern "C" {
 #endif
 
 /* ══════════════════════════ 字段枚举（al_ 组）══════════════════════════
- * 分组：装配/生命周期 · block 顶层 · inode 顶层 · 片内双树/融合 · 路由 · checkpoint · 元素池。
+ * 分组：装配/生命周期 · block 顶层 · inode 顶层 · 片内双树/融合 · 路由 · checkpoint · 元素池 ·
+ *       inode 数据面（H）。
  * **顺序即输出顺序**（super.c 名字表逐一对位）；增删须同改两处。
  */
 enum rfs_al_stat {
@@ -79,6 +80,21 @@ enum rfs_al_stat {
 	AL_CHECKPOINT_BLOCKS,	/* 写回的位图镜像块数 */
 	AL_POOL_ALLOC,		/* 元素池取区间节点次数 */
 	AL_POOL_FAIL,		/* 元素池取节点失败（-ENOMEM 路径）*/
+
+	/* ── H 全局 inode 数据面（11；v2.0 内核）──
+	 * plane 内 op（locate/free/grow/fr_merge）经 owner->stat 钩子累加；
+	 * 盘面装载/落盘（扁 fr 快照 / 映射树 bulk）由 FS 适配层直接打点。*/
+	AL_IDP_LOCATE_OK,	/* inode 数据面翻译命中 */
+	AL_IDP_LOCATE_FAIL,	/* inode 数据面翻译未命中 / 非法 */
+	AL_IDP_FREE,		/* inode 数据面释放一次 */
+	AL_IDP_GROW,		/* inode 数据面增片次数 */
+	AL_IDP_GROW_PIECES,	/* inode 数据面增片累计片数 */
+	AL_IDP_FR_MERGE,	/* inode 数据面 fr 释放与邻接融合次数 */
+	AL_IDP_TREE_DUMP,	/* inode 数据面翻译面 dump_extents 次数 */
+	AL_IDP_TREE_BUILD,	/* 映射树 bulk build 次数 */
+	AL_IDP_SNAP_WRITE,	/* 扁 fr 快照写次数 */
+	AL_IDP_SNAP_READ,	/* 扁 fr 快照读次数 */
+	AL_IDP_SNAP_BLOCKS,	/* 扁 fr 快照写累计块数 */
 
 	AL_STAT_COUNT		/* 哨兵：字段总数（勿作为计数器用）*/
 };

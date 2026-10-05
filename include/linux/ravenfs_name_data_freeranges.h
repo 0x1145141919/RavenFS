@@ -28,6 +28,7 @@
 #define _RAVENFS_NAME_DATA_FREERANGES_H
 
 #include "ravenfs_platform.h"	/* 类型 u8..u64 / bool / errno（唯一平台收口）*/
+#include "ravenfs_allocator_stats.h"	/* struct rfs_stat_hook / RFS_AL_STAT（宿主注入打点）*/
 /* v2.0 原子切换：v1.3/v2.0 盘头定义同名类型，不能同 TU 共存 → 名字数据面类型
  * （free_range_t / 节点族 / 控制字宏 / 魔数）逐字节同构地由 v2.0 头提供。 */
 #include "disk_struct_v2.0.h"	/* free_range_t / 节点族 / 控制字宏 */
@@ -63,13 +64,25 @@ struct rfs_ndfr_ops {
 
 /* ══════════════════════════ 运行上下文 ══════════════════════════ */
 
+/* fr 计数器下标（宿主钩子 field 空间）：模块只按此下标上报，具体累加由宿主决定。
+ * NDFR_STAT_COUNT 为哨兵，勿作为计数器用。*/
+enum rfs_ndfr_stat {
+	NDFR_FR_INLINE,		/* 在 inline 态操作（insert / take_fit 就地）*/
+	NDFR_FR_TREE,		/* 在 tree 态操作（insert / take_fit / find_fit 走树）*/
+	NDFR_FR_SPLIT,		/* 叶 / 内层分裂路径 */
+	NDFR_FR_RETIRE,		/* rfs_ndfr_retire_empty_leaf */
+	NDFR_STAT_COUNT
+};
+
 /* host      —— 注入 ops 的宿主句柄；
  * dir_inode_idx —— 根节点 parent_ptr 指向的 DIR inode 编号（根收缩/新建根用）；
- * ops       —— 见上。*/
+ * ops       —— 见上；
+ * stat      —— 打点钩子（宿主注入；未注入 = no-op）。*/
 struct rfs_ndfr_ctx {
 	const struct rfs_ndfr_ops	*ops;
 	void				*host;
 	u64				 dir_inode_idx;
+	struct rfs_stat_hook		 stat;
 };
 
 /* ══════════════════════════ 寻路轨迹（⇄ god bptree_path_t）══════════════════════════

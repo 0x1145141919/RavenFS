@@ -43,6 +43,16 @@
 	do { (m)->parent_ptr.v = RFS_PP_PACK((u32)(c), RFS_PP_IS_INNER((m)->parent_ptr), \
 				RFS_PP_IS_ROOT((m)->parent_ptr), RFS_PP_PTR((m)->parent_ptr)); } while (0)
 
+/* G 组 kind 分面打点（ext_nd_ops / ext_idp_ops）：每个公有 kind 入口每次调用一次。
+ * FILE（默认）不计。只累加，绝不参与控制流（P1）。*/
+static inline void rfs_ext_kind_stat(struct super_block *sb, u32 kind)
+{
+	if (kind == RFS_EXT_KIND_NAMEDATA)
+		RFS_STAT_INC(sb, ext_nd_ops);
+	else if (kind == RFS_EXT_KIND_INODE)
+		RFS_STAT_INC(sb, ext_idp_ops);
+}
+
 /* 多级路径（叶在 depth-1；cidx[内] = hint idx；cidx[叶] = GLB，NONE=插入最左） */
 struct rfs_epath {
 	u32	depth;
@@ -209,6 +219,7 @@ int ravenfs_extent_lookup_kind(struct super_block *sb, u32 kind, u64 root,
 	int err = -EIO;
 
 	RFS_STAT_INC(sb, ext_lookup);	/* extent 查找次数 */
+	rfs_ext_kind_stat(sb, kind);
 	*next = 0;
 	if (root == (u64)PTR_INVALID)
 		return 1;			/* 空树 → 全洞 */
@@ -350,6 +361,7 @@ static int rfs_ext_count_rec(struct super_block *sb, u32 kind, u64 root, u64 *da
 int ravenfs_extent_count_kind(struct super_block *sb, u32 kind, u64 root,
 			      u64 *data, u64 *nodes)
 {
+	rfs_ext_kind_stat(sb, kind);
 	return rfs_ext_count_rec(sb, kind, root, data, nodes, 0);
 }
 
@@ -785,6 +797,7 @@ int ravenfs_extent_insert_kind(struct super_block *sb, u32 kind, u64 ino, u64 *r
 	int err = 0;
 
 	RFS_STAT_INC(sb, ext_insert);	/* 映射插入次数 */
+	rfs_ext_kind_stat(sb, kind);
 	if (old_root)
 		*old_root = (u64)PTR_INVALID;
 	rsv.n = 0;
@@ -1004,6 +1017,7 @@ int ravenfs_extent_new_root_leaf_kind(struct super_block *sb, u32 kind, u64 ino,
 	int err;
 
 	RFS_STAT_INC(sb, ext_new_root);
+	rfs_ext_kind_stat(sb, kind);
 	if (*root_out != (u64)PTR_INVALID)
 		return 0;			/* 已有树 */
 	blk = rfs_allocator_block_alloc_hard(sbi->alloc, 2, 1);
@@ -1577,6 +1591,7 @@ static int rfs_ext_unmap_loose(struct super_block *sb, u32 kind, u64 ino, u64 *r
 	int err, cut_mode;
 
 	RFS_STAT_INC(sb, ext_unmap);	/* unmap 强度 */
+	rfs_ext_kind_stat(sb, kind);
 	if (old_root)
 		*old_root = (u64)PTR_INVALID;
 	if (ext->length == 0)

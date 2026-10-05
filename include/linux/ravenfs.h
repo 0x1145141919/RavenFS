@@ -115,9 +115,10 @@ struct ravenfs_msession;
  *    `Docs/linux/ravenfs-linux-ko-sb-counters-design.md` §3/§6/§7）──
  * 纯 atomic64 累计量：随 mount 生（kzalloc(sbi) 天然清零 = S3）、随 umount 灭；
  * 打点只做 atomic64_add，**零分配零 I/O，绝不影响控制流**（P1）。
- * 98 字段 = §3 A–K 全清单；派生指标（命中率/写放大/换片率…，§4）**不存**，
- * 由 debugfs stats 文件现算（单一事实来源，P2）。
- * 口径：入口记 attempts、返回点记 outcomes（P5）；CHUNK 专属 9 个在 FULL 后端恒 0。
+ * 93 字段 = A–K + M；B 组重构为会话面 7（v2.0 薄 InodeSession）、G 组 +2（kind 分面）、
+ * 旧 L 组 nh_ 整体退役、新增 M 组 nd_（名字数据面）13。派生指标（命中率/写放大/换片率…，
+ * §4）**不存**，由 debugfs stats 文件现算（单一事实来源，P2）。
+ * 口径：入口记 attempts、返回点记 outcomes（P5）。
  */
 struct ravenfs_sb_stats {
 	/* A. VFS 操作面 op_（26）—— 负载画像 + 行为指纹 */
@@ -148,16 +149,14 @@ struct ravenfs_sb_stats {
 	atomic64_t	op_acl_get;
 	atomic64_t	op_acl_set;
 
-	/* B. inode 行缓存 ic_（9）—— 最核心调试价值 */
-	atomic64_t	ic_hit;
-	atomic64_t	ic_miss;
-	atomic64_t	ic_row_load;
-	atomic64_t	ic_retry;
-	atomic64_t	ic_row_evict;
-	atomic64_t	ic_row_reap;
-	atomic64_t	ic_dirty_mark;
-	atomic64_t	ic_wb_rows;
-	atomic64_t	ic_err;
+	/* B. inode 会话 ic_（7）—— v2.0 薄 InodeSession 操作面（最核心调试价值）*/
+	atomic64_t	ic_get;		/* session_get 成功 */
+	atomic64_t	ic_get_err;	/* session_get 失败（无 sbi/alloc、容量、kzalloc）*/
+	atomic64_t	ic_locate_err;	/* inode-plane translate 失败 */
+	atomic64_t	ic_dirty;	/* mark_dirty */
+	atomic64_t	ic_evict;	/* inode_reclaim */
+	atomic64_t	ic_flush;	/* inode_flush */
+	atomic64_t	ic_err;		/* 其它内部错（如 mdata_get 失败）*/
 
 	/* C. mdata 节点缓存 md_（8） */
 	atomic64_t	md_hit;
@@ -180,13 +179,13 @@ struct ravenfs_sb_stats {
 	atomic64_t	io_write_bytes;
 	atomic64_t	io_flush_ops;
 
-	/* F. 运行时树分配器 al_（36）—— **独立子结构**（见 struct ravenfs_al_stats）。
+	/* F. 运行时树分配器 al_（47）—— **独立子结构**（见 struct ravenfs_al_stats）。
 	 * 旧 `bm_`（位图时代 18 字段）随位图模块退役而**删除**：新分配器是多分片主从红黑树
 	 * （`ravenfs_allocator_top.h`），字段与埋点全变，见 `ravenfs_allocator_stats.h`。
 	 * 单独成块（不进本数组）之理由：其下标须 = `enum rfs_al_stat`，以便注入钩子按
 	 * 下标累加；混入本大数组会引入脆弱的绝对偏移。*/
 
-	/* G. extent 树 ext_（7） */
+	/* G. extent 树 ext_（9）—— 后 2 个按 kind 分面：名字数据面 / inode 数据面 */
 	atomic64_t	ext_lookup;
 	atomic64_t	ext_insert;
 	atomic64_t	ext_split;
@@ -194,6 +193,8 @@ struct ravenfs_sb_stats {
 	atomic64_t	ext_balance;
 	atomic64_t	ext_unmap;
 	atomic64_t	ext_node_reads;
+	atomic64_t	ext_nd_ops;	/* kind==RFS_EXT_KIND_NAMEDATA 的公有入口调用数 */
+	atomic64_t	ext_idp_ops;	/* kind==RFS_EXT_KIND_INODE 的公有入口调用数 */
 
 	/* H. 目录 dir_（3） */
 	atomic64_t	dir_leaf_reads;
@@ -226,19 +227,26 @@ struct ravenfs_sb_stats {
 	atomic64_t	life_iget_new;
 	atomic64_t	life_evict;
 
-	/* L. 名字堆 nh_（6；v0.1.2 新增）—— 大名字/长目录尾部名字存储的名字堆操作。
-	 * 该模块不做直接磁盘 I/O（经 mdata 片，已并入 md_/io_）；本组只记"名字堆"这一层
-	 * 自身的操作面，使「全模块」每模块都有自己的计数器。*/
-	atomic64_t	nh_alloc;		/* 名字堆分配入口次数 */
-	atomic64_t	nh_alloc_fail;		/* 名字堆分配失败（当前粒度档全满 -> -ENOSPC）*/
-	atomic64_t	nh_write;		/* 尾部名字数据写入次数 */
-	atomic64_t	nh_free;		/* 尾部名字存储释放次数 */
-	atomic64_t	nh_activate;		/* 堆激活次数（首个大名字触发的晋升频率）*/
-	atomic64_t	nh_release;		/* 空堆回收次数（目录折构时释放的堆数）*/
+	/* M. 名字数据面 nd_（13）—— 目录名字数据面（v1.3）操作面。
+	 * nd_fr_* 四项由平台中立 fr 模块经注入 stat 钩子（rfs_ndfr_ctx.stat）回填；
+	 * 其余九项为内核侧 name_data_plane.c 直接打点。*/
+	atomic64_t	nd_resolve;	/* name_data_resolve 调用 */
+	atomic64_t	nd_map_append;	/* name_data_map_append 调用 */
+	atomic64_t	nd_grow;	/* 名字数据面增片（nd_grow_core）*/
+	atomic64_t	nd_alloc;	/* name_data_alloc 调用 */
+	atomic64_t	nd_free;	/* name_data_free 调用 */
+	atomic64_t	nd_read;	/* name_data_read 调用 */
+	atomic64_t	nd_write;	/* name_data_write 调用 */
+	atomic64_t	nd_release;	/* name_data_release 调用 */
+	atomic64_t	nd_reclaim;	/* name_data_map_reclaim 调用 */
+	atomic64_t	nd_fr_inline;	/* fr 在 inline 态操作次数 */
+	atomic64_t	nd_fr_tree;	/* fr 在 tree 态操作次数 */
+	atomic64_t	nd_fr_split;	/* fr 叶 / 内层分裂次数 */
+	atomic64_t	nd_fr_retire;	/* fr 空叶退役次数 */
 };
 
 /*
- * ── F 组：运行时树分配器 al_（36，独立子结构）──
+ * ── F 组：运行时树分配器 al_（47，独立子结构）──
  * 字段顺序**必须**与 `enum rfs_al_stat`（ravenfs_allocator_stats.h）逐一对位：
  * 注入钩子按下标累加（`((atomic64_t *)&sbi->al)[field]`），show 表按序打印。
  * 增删字段 → 同改枚举 + show 名表 + BUILD_BUG_ON 三处。
@@ -290,6 +298,19 @@ struct ravenfs_al_stats {
 	atomic64_t	al_checkpoint_blocks;
 	atomic64_t	al_pool_alloc;
 	atomic64_t	al_pool_fail;
+	/* H 全局 inode 数据面（11；v2.0 内核）—— plane 内 op 经 owner->stat 注入，
+	 * 盘面装载/落盘（扁 fr 快照 / 映射树 bulk）由 FS 适配层直接打点。*/
+	atomic64_t	al_idp_locate_ok;
+	atomic64_t	al_idp_locate_fail;
+	atomic64_t	al_idp_free;
+	atomic64_t	al_idp_grow;
+	atomic64_t	al_idp_grow_pieces;
+	atomic64_t	al_idp_fr_merge;
+	atomic64_t	al_idp_tree_dump;
+	atomic64_t	al_idp_tree_build;
+	atomic64_t	al_idp_snap_write;
+	atomic64_t	al_idp_snap_read;
+	atomic64_t	al_idp_snap_blocks;
 };
 
 struct ravenfs_sb_info {

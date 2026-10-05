@@ -278,6 +278,7 @@ int main(void)
 	ctx.ops = &g_ops;
 	ctx.host = &h;
 	ctx.dir_inode_idx = DIR_INO;
+	ctx.stat = RFS_STAT_HOOK_NULL;
 
 	printf("=== ravenfs_name_data_freeranges host tests ===\n");
 

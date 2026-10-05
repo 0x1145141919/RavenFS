@@ -40,23 +40,25 @@ struct ravenfs_session *ravenfs_session_get(struct super_block *sb, u64 inum)
 	int rc;
 
 	if (!sbi || !sbi->alloc) {
-		RFS_STAT_INC(sb, ic_err);
+		RFS_STAT_INC(sb, ic_get_err);
 		return ERR_PTR(-EIO);
 	}
 	if (inum >= rfs_allocator_inode_capacity(sbi->alloc)) {
-		RFS_STAT_INC(sb, ic_err);
+		RFS_STAT_INC(sb, ic_get_err);
 		return ERR_PTR(-EIO);
 	}
 
 	s = kzalloc(sizeof(*s), GFP_KERNEL);
-	if (!s)
+	if (!s) {
+		RFS_STAT_INC(sb, ic_get_err);
 		return ERR_PTR(-ENOMEM);
+	}
 
 	/* inum → 物理 8K 片基（inode 数据面翻译）*/
 	rc = rfs_allocator_inode_locate(sbi->alloc, inum, &blk, &off);
 	if (rc) {
 		kfree(s);
-		RFS_STAT_INC(sb, ic_err);
+		RFS_STAT_INC(sb, ic_locate_err);
 		return ERR_PTR(rc);
 	}
 	ms = ravenfs_mdata_get(sb, blk);
@@ -70,7 +72,7 @@ struct ravenfs_session *ravenfs_session_get(struct super_block *sb, u64 inum)
 	s->row = ms->row;
 	s->piece_data = ravenfs_msession_node(ms);
 	s->inum = inum;
-	RFS_STAT_INC(sb, ic_hit);
+	RFS_STAT_INC(sb, ic_get);
 	return s;
 }
 
@@ -91,6 +93,7 @@ int ravenfs_inode_flush(struct super_block *sb, u64 inum)
 	u32 off = 0;
 	int rc;
 
+	RFS_STAT_INC(sb, ic_flush);
 	if (!sbi || !sbi->alloc || !ravenfs_sb_writable(sb))
 		return 0;
 	rc = rfs_allocator_inode_locate(sbi->alloc, inum, &blk, &off);
@@ -148,7 +151,7 @@ void ravenfs_inode_mark_dirty(struct super_block *sb, u64 inum)
 	if (IS_ERR_OR_NULL(s))
 		return;
 	RFS_ROW_MARK_DIRTY(s->row);
-	RFS_STAT_INC(sb, ic_dirty_mark);
+	RFS_STAT_INC(sb, ic_dirty);
 }
 
 /*
@@ -160,7 +163,7 @@ void ravenfs_inode_reclaim(struct super_block *sb, u64 inum)
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, inum);
 
-	RFS_STAT_INC(sb, ic_row_evict);
+	RFS_STAT_INC(sb, ic_evict);
 	if (!IS_ERR_OR_NULL(s)) {
 		down_write(&s->row->io_lock);
 		memset(ravenfs_session_inode(s), 0, RAVENFS_INODE_SIZE);

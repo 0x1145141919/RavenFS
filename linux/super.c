@@ -86,23 +86,24 @@ static const char *const ravenfs_stat_names[] = {
 	"op_write_bytes", "op_fallocate", "op_fsync", "op_syncfs", "op_getattr",
 	"op_setattr", "op_mmap", "op_listxattr", "op_xattr_get", "op_xattr_set",
 	"op_acl_get", "op_acl_set",
-	/* B ic_ */  "ic_hit", "ic_miss", "ic_row_load", "ic_retry", "ic_row_evict",
-	"ic_row_reap", "ic_dirty_mark", "ic_wb_rows", "ic_err",
+	/* B ic_ */  "ic_get", "ic_get_err", "ic_locate_err", "ic_dirty",
+	"ic_evict", "ic_flush", "ic_err",
 	/* C md_ */  "md_hit", "md_miss", "md_node_load", "md_retry", "md_drop",
 	"md_reap", "md_node_wb", "md_err",
 	/* D ttl_ */ "ttl_rounds", "ttl_round_errs",
 	/* E io_ */  "io_read_ops", "io_read_bytes", "io_write_ops", "io_write_bytes",
 	"io_flush_ops",
 	/* G ext_ */ "ext_lookup", "ext_insert", "ext_split", "ext_new_root",
-	"ext_balance", "ext_unmap", "ext_node_reads",
+	"ext_balance", "ext_unmap", "ext_node_reads", "ext_nd_ops", "ext_idp_ops",
 	/* H dir_ */ "dir_leaf_reads", "dir_emit", "dir_nlink_adjust",
 	/* I xa_ */  "xa_get", "xa_set", "xa_del", "xa_list", "xa_block_load",
 	"xa_block_store", "xa_e2big", "xa_err", "acl_get", "acl_set",
 	/* J err_ */ "err_shutdown_hits", "err_shutdown_trig", "err_meta_io",
 	"err_sb_read", "err_enospc", "err_other",
 	/* K life_ */"life_mount", "life_umount", "life_iget_new", "life_evict",
-	/* L nh_ */  "nh_alloc", "nh_alloc_fail", "nh_write", "nh_free",
-	"nh_activate", "nh_release",
+	/* M nd_ */  "nd_resolve", "nd_map_append", "nd_grow", "nd_alloc",
+	"nd_free", "nd_read", "nd_write", "nd_release", "nd_reclaim",
+	"nd_fr_inline", "nd_fr_tree", "nd_fr_split", "nd_fr_retire",
 };
 
 /*
@@ -127,6 +128,10 @@ static const char *const ravenfs_al_stat_names[] = {
 	"al_route_cross_slice",
 	/* G checkpoint / 元素池 */ "al_checkpoint", "al_checkpoint_fail",
 	"al_checkpoint_blocks", "al_pool_alloc", "al_pool_fail",
+	/* H inode 数据面 */ "al_idp_locate_ok", "al_idp_locate_fail",
+	"al_idp_free", "al_idp_grow", "al_idp_grow_pieces", "al_idp_fr_merge",
+	"al_idp_tree_dump", "al_idp_tree_build", "al_idp_snap_write",
+	"al_idp_snap_read", "al_idp_snap_blocks",
 };
 
 static int ravenfs_stats_show(struct seq_file *m, void *v)

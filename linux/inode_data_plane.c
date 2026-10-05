@@ -195,6 +195,8 @@ static int ip_grow_locked(struct rfs_inode_plane *p)
 		p->fr_free += (u64)k * RFS_IDP_INODES_PER_PIECE;
 	else
 		RFS_LOG("ravenfs: inode plane grow: fr 插入失败（inode 泄漏 k=%u）\n", k);
+	RFS_AL_STAT1(p->owner->stat, AL_IDP_GROW);
+	RFS_AL_STAT(p->owner->stat, AL_IDP_GROW_PIECES, k);
 	return 0;
 }
 
@@ -357,6 +359,10 @@ void rfs_inode_plane_free(struct rfs_inode_plane *p, u64 inum)
 	ml = left && (left->base + left->len == inum);
 	mr = it && (it->base == inum + 1);
 
+	RFS_AL_STAT1(p->owner->stat, AL_IDP_FREE);
+	if (ml || mr)
+		RFS_AL_STAT1(p->owner->stat, AL_IDP_FR_MERGE);
+
 	if (ml && mr) {
 		rfs_rb_erase(&p->fr_size, &left->by_size);
 		rfs_rb_erase(&p->fr_pos, &left->by_pos);
@@ -432,6 +438,10 @@ int rfs_inode_plane_locate(struct rfs_inode_plane *p, u64 inum,
 		}
 	}
 	up_read(&p->extent_lock);
+	if (rc == 0)
+		RFS_AL_STAT1(p->owner->stat, AL_IDP_LOCATE_OK);
+	else
+		RFS_AL_STAT1(p->owner->stat, AL_IDP_LOCATE_FAIL);
 	return rc;
 }
 
@@ -480,6 +490,7 @@ int rfs_inode_plane_dump_extents(struct rfs_inode_plane *p,
 
 	if (!p || !p->active || !out)
 		return -EINVAL;
+	RFS_AL_STAT1(p->owner->stat, AL_IDP_TREE_DUMP);
 	down_read(&p->extent_lock);
 	if (cap < p->ext_n)
 		rc = -ENOSPC;
