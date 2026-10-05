@@ -115,7 +115,7 @@ v1.3：每目录一个**稠密、8K 对齐的逻辑字节空间** = 一棵**映�
 |---|---|---|
 | `ravenfs_juv_name_data` | `tests/test_name_data_plane.cpp` | 字节打包 / free 复用 / 用尽增片 direct→tree / tree 回环 / release+audit |
 | `ravenfs_juv_name_data_fr` | `tests/test_name_data_freeranges.cpp` | 301 满叶 / **>255 索引回归** / 叶裂+内节点 / 复合序 / release |
-| `ravenfs_stress_name_data_fr` | `tests/stress_name_data_fr.cpp` | **百万级**，`mode=offload|selfreliat`（开缓存）|
+| `ravenfs_stress_name_data_fr` | `tests/stress_name_data_fr.cpp` | **百万级 + 随机/乱序**：随机 len、随机插入序灌入 → 随机 need 乱序 best-fit **取用至用尽**（校验 find_fit==take_fit、区间不重叠、fr 清零）→ **定长乱序返还+再分配**（返回恰为返还集、base 升序）；`mode=offload|selfreliat`（开缓存）|
 | `ravenfs_juv_audit_dfs` | `tests/test_audit_dfs.cpp` | 全盘可达性审计（含 fr 认领/校验）|
 
 ```bash
@@ -131,8 +131,10 @@ truncate -s 512M /tmp/big.img && ./mkfs/mkfs.ravenfs --v1.3 -f /tmp/big.img
 ./build/tests/ravenfs_stress_name_data_fr /tmp/big.img 1000000 mode=selfreliat # 6/6
 ```
 
-实测：百万条 fr 记录（fr_count=1,000,001）灌入 ~1.1s(offload)/1.7s(selfreliat)，
-审计/回收全净。
+实测（随机灌入 1,000,000 条、随机插入序）：fr_count=1,000,001；
+Phase B 乱序取用 **1,162,931** 次至 fr 用尽（`mismatch=0 overlap=0 leftover_fr=0`）；
+Phase C 定长乱序返还 1000 条再分配**逐一命中且 base 升序**；
+audit/回收全净（offload 10/10、selfreliat 11/11）。
 
 ---
 

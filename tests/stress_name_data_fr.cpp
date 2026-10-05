@@ -1,20 +1,24 @@
 /* ═══════════════════════════════════════════════════════════════════
- * stress_name_data_fr.cpp — fr 空闲区间树百万级压测（开缓存）
+ * stress_name_data_fr.cpp — fr 空闲区间树压力测试（随机灌入 + 乱序用尽 + 定长返还，开缓存）
  *
- * 目标：把 fr 树推到百万级记录（多层内节点），在**缓存开启**下压测
- *       插入 / best-fit 取用 / 全量审计 / 回收。
+ * 覆盖（对齐"返还-分配"真实路径，非确定性模式）：
+ *   Phase A 随机灌树：生成 N 条**随机 len**（1..512）、互不重叠的逻辑区间，
+ *            **随机顺序**逐条 name_data_free 灌入 fr（压分裂/路由）。
+ *   Phase B 乱序用尽：以**随机 need** 反复 best-fit 取用（take_fit），直到 fr
+ *            无任何区间可满足（用尽）；校验 find_fit 与 take_fit 一致、
+ *            取用区间两两不重叠、fr 清零。
+ *   Phase C 定长乱序返还+分配：分配 K 条定长区间 → 随机挑子集 S、**乱序** free →
+ *            再分配 |S| 次，校验返回恰为 S（且 best-fit = base 升序）。
+ *   末尾：audit（映射树 + fr 树结构）全净；release 全净。
  *
  * 缓存模式（argv mode=）：
- *   offload   （默认）is_device_direct=false → 整盘 mmap + offload 缓存
- *             （inode/mdata 走内核页缓存直映）；可在原地直接 audit。
+ *   offload   （默认）is_device_direct=false → mmap + offload 缓存，原地 audit。
  *   selfreliat is_device_direct=true + 双 self_reliat 用户态缓存（O_DIRECT）；
- *             audit 需 mmap 后端，故压完卸载后**重挂 offload** 审计落盘树。
- *
- * 规模：N 条空闲区间（默认 1,000,000）；len_i = 1 + (i%8)（1..8 交替），base 递增，
- *       max 偏移 ≈ N×4.5B → 数据面约 N×4.5/8K 片（百万级 ~5MB 逻辑面）。
- *       建议镜像 ≥ 256MiB（fr 记录 16B/条 → 叶约 N/337 个，节点 8K/个）。
+ *             audit 需 mmap，故卸载后**重挂 offload** 审计落盘树。
  *
  * 用法：ravenfs_juv_stress_name_data_fr <device> [N=1000000] [mode=offload|selfreliat]
+ * 规模提示：随机 len 均值 ~256B ⇒ N 条约占 N×256B 逻辑面（1e6 ≈ 256MiB）；
+ *           建议镜像 ≥ 1GiB。种子固定打印，可复现。
  * ═══════════════════════════════════════════════════════════════════ */
 #include "../include/ravenfs/ravenfs_audit.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"
@@ -25,6 +29,11 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <random>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -53,7 +62,7 @@ static linux_userspace_mount_t make_mount(const char *path, bool selfreliat) {
     mnt.param = {};
     if (selfreliat) {
         mnt.param.if_will_use_inode_cache = true;
-        mnt.param.if_will_use_mdata_piece_cache = true;   /* self_reliat 双档 */
+        mnt.param.if_will_use_mdata_piece_cache = true;
     }
     mnt.logical_processor_count = 1;
     return mnt;
@@ -63,16 +72,159 @@ static uint64_t rd_fr_count(RavenFS_juvenile &fs, uint64_t inum) {
     return RFS_ND_FR_COUNT(d.name_data_free_ranges_count);
 }
 
-/* 期望：len_i = 1+(i%8)，base 递增 → 首个 len==L 的条目 base */
-static uint64_t first_base_of_len(uint64_t L) {
-    uint64_t base = 0;
-    for (uint64_t i = 0; i + 1 < L; i++) base += 1 + (i % 8);   /* i0 = L-1 */
-    return base;
+struct Iv { uint64_t base; uint16_t len; };
+
+/* 三阶段主流程（cache 模式无关）；返回时 fr 已用尽、Phase C 已复原一批定长区间 */
+static void run_phases(RavenFS_juvenile &fs, uint64_t N, uint64_t seed) {
+    const uint64_t root = fs.sb.root_inode;
+    std::mt19937_64 rng(seed);
+
+    /* ── Phase A：随机 len + 随机插入序灌树 ── */
+    printf("  [info] Phase A 随机灌树 N=%llu seed=%#llx\n",
+           (unsigned long long)N, (unsigned long long)seed);
+    std::vector<Iv> ivs; ivs.reserve((size_t)N);
+    uint64_t cursor = 0;
+    for (uint64_t i = 0; i < N; i++) {
+        uint16_t len = (uint16_t)(1 + (rng() % 512));
+        ivs.push_back({cursor, len});
+        cursor += len;
+    }
+    const uint64_t total = cursor;
+    const uint64_t piece_need = total / 8192 + 8;
+    {
+        double t0 = now_s(); uint64_t got = 0; bool ok = true;
+        while (true) {
+            raven_dir_Inode_t d; fs.inode_read(root, (raven_Inode_t *)&d);
+            got = RFS_ND_PIECE_COUNT(d.name_data_piece_count);
+            if (got >= piece_need) break;
+            uint64_t o = 0;
+            if (fs.name_data_alloc(root, 512, &o) != RC_OK) { ok = false; break; }
+        }
+        CHECK(ok, "建面 %llu 片 (需 %llu, 逻辑 %llu MiB) %.1fs",
+              (unsigned long long)got, (unsigned long long)piece_need,
+              (unsigned long long)(total >> 20), now_s() - t0);
+    }
+    uint64_t fr_before = rd_fr_count(fs, root);
+    std::vector<uint64_t> order((size_t)N);
+    for (uint64_t i = 0; i < N; i++) order[(size_t)i] = i;
+    std::shuffle(order.begin(), order.end(), rng);   /* 随机插入序 */
+    double t0 = now_s();
+    int ins_fail = 0;
+    for (uint64_t k = 0; k < N; k++) {
+        const Iv &v = ivs[(size_t)order[(size_t)k]];
+        if (fs.name_data_free(root, v.base, v.len) != RC_OK) {
+            if (!ins_fail) printf("  [warn] free #%llu 失败\n", (unsigned long long)k);
+            ins_fail++;
+        }
+    }
+    double dt = now_s() - t0;
+    uint64_t fr_after = rd_fr_count(fs, root);
+    CHECK(ins_fail == 0 && fr_after == fr_before + N,
+          "随机灌入 %llu 条 (fr %llu→%llu) %.1fs (%.2f M ops/s)",
+          (unsigned long long)N, (unsigned long long)fr_before,
+          (unsigned long long)fr_after, dt, N / dt / 1e6);
+
+    /* ── Phase B：随机 need 乱序 best-fit 取用，直至用尽 ── */
+    printf("  [info] Phase B 乱序用尽\n");
+    {
+        InodeSession sess(fs.inode_cache_mgr, root);
+        if (!sess) { CHECK(false, "Phase B InodeSession 打开失败"); return; }
+        raven_dir_Inode_t *dino = (raven_dir_Inode_t *)sess.inode;
+        uint64_t frroot = RFS_ND_FR_CTL_PTR(dino->name_data_free_ranges_ctl);
+        std::vector<Iv> taken; taken.reserve((size_t)N);
+        bool take_ok = true, drained = false;
+        int mismatch = 0;
+        double tb = now_s();
+        uint64_t guard = 8ULL * N + 1024;
+        while (taken.size() + 1 < guard) {
+            if (frroot == RFS_ND_FR_CTL_PTR_INVALID) { drained = true; break; }
+            uint64_t need = 1 + (rng() % 512);
+            uint64_t b = 0, l = 0;
+            result_code_t rf = fs.name_data_fr_find_fit(frroot, need, &b, &l);
+            if (rf == RC_ERR_NOT_FOUND) {           /* 该 need 无解：降为 need=1 榨干 */
+                need = 1;
+                rf = fs.name_data_fr_find_fit(frroot, 1, &b, &l);
+                if (rf == RC_ERR_NOT_FOUND) { drained = true; break; }
+            }
+            if (rf != RC_OK) { take_ok = false; break; }
+            uint64_t got = 0;
+            result_code_t rt = fs.name_data_fr_take_fit(root, dino, need, &got);
+            if (rt == RC_ERR_NOT_FOUND) { drained = true; break; }
+            if (rt != RC_OK) { take_ok = false; break; }
+            if (got != b) { mismatch++; if (mismatch <= 3)
+                printf("  [warn] take base=%llu != find_fit base=%llu\n",
+                       (unsigned long long)got, (unsigned long long)b); }
+            taken.push_back({b, (uint16_t)need});
+            frroot = RFS_ND_FR_CTL_PTR(dino->name_data_free_ranges_ctl);
+        }
+        uint64_t leftover = RFS_ND_FR_COUNT(dino->name_data_free_ranges_count);
+        sess.dirty();
+        double dtb = now_s() - tb;
+        std::sort(taken.begin(), taken.end(),
+                  [](const Iv &a, const Iv &b) { return a.base < b.base; });
+        int overlap = 0;
+        for (size_t i = 1; i < taken.size(); i++)
+            if (taken[i-1].base + taken[i-1].len > taken[i].base) overlap++;
+        CHECK(take_ok && drained && mismatch == 0 && overlap == 0 && leftover == 0,
+              "乱序取用用尽: taken=%zu mismatch=%d overlap=%d leftover_fr=%llu %.1fs",
+              taken.size(), mismatch, overlap, (unsigned long long)leftover, dtb);
+    }
+
+    /* ── Phase C：定长乱序返还 + 再分配 ── */
+    printf("  [info] Phase C 定长乱序返还+分配\n");
+    {
+        CHECK(fs.name_data_release(root) == RC_OK, "Phase C 前置 release");
+        const int K = 2000; const uint16_t FL = 64;
+        std::vector<uint64_t> offs((size_t)K);
+        bool ac_ok = true;
+        for (int i = 0; i < K; i++) {
+            if (fs.name_data_alloc(root, FL, &offs[(size_t)i]) != RC_OK) { ac_ok = false; break; }
+        }
+        CHECK(ac_ok, "分配 K=%d 个定长(%uB)区间", K, (unsigned)FL);
+
+        std::vector<int> idx((size_t)K);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::shuffle(idx.begin(), idx.end(), rng);
+        const int S = K / 2;
+        std::vector<uint64_t> freed;
+        int fr_bad = 0;
+        for (int t = 0; t < S; t++) {
+            int i = idx[(size_t)t];
+            if (fs.name_data_free(root, offs[(size_t)i], FL) != RC_OK) fr_bad++;
+            freed.push_back(offs[(size_t)i]);
+        }
+        CHECK(fr_bad == 0, "乱序 free |S|=%d 个 (bad=%d)", S, fr_bad);
+
+        std::sort(freed.begin(), freed.end());   /* 等 len：best-fit = base 升序 */
+        int reuse_bad = 0;
+        for (int t = 0; t < S; t++) {
+            uint64_t o = 0;
+            if (fs.name_data_alloc(root, FL, &o) != RC_OK || o != freed[(size_t)t]) {
+                if (reuse_bad < 3) printf("  [warn] reuse t=%d got=%llu expect=%llu\n",
+                                          t, (unsigned long long)o,
+                                          (unsigned long long)freed[(size_t)t]);
+                reuse_bad++;
+            }
+        }
+        CHECK(reuse_bad == 0, "定长返还→分配：返回恰为 S 且 base 升序 (bad=%d, |S|=%d)",
+              reuse_bad, S);
+        /* 再 free 剩余 live（offs 中未在 S 的），保持盘面整洁 */
+        for (int i = 0; i < K; i++) {
+            bool inS = false;
+            for (int t = 0; t < S; t++) if (idx[(size_t)t] == i) { inS = true; break; }
+            if (!inS) fs.name_data_free(root, offs[(size_t)i], FL);
+        }
+    }
 }
-static uint64_t total_bytes(uint64_t N) {
-    uint64_t s = 0;
-    for (uint64_t i = 0; i < N; i++) s += 1 + (i % 8);
-    return s;
+
+static bool audit_clean(RavenFS_juvenile &fs, const char *tag) {
+    audit_walk_report_t rep;
+    uint64_t a = fs.audit_dfs_root(&rep, stdout);
+    bool ok = (a == RC_OK && rep.total_bad() == 0);
+    printf("  [%s] audit bad=%llu heap=%llu leak=%llu mc=%llu\n", tag,
+           (unsigned long long)rep.total_bad(), (unsigned long long)rep.heap_bad,
+           (unsigned long long)rep.leaked_blk, (unsigned long long)rep.multi_claim_blk);
+    return ok;
 }
 
 int main(int argc, char **argv) {
@@ -80,13 +232,11 @@ int main(int argc, char **argv) {
     uint64_t N = (argc >= 3) ? strtoull(argv[2], nullptr, 10) : 1000000ULL;
     bool SELF = false;
     for (int i = 2; i < argc; i++) if (strstr(argv[i], "selfreliat")) SELF = true;
-    printf("══════════ fr 百万级压测  device=%s  N=%llu  mode=%s ══════════\n",
-           argv[1], (unsigned long long)N, SELF ? "selfreliat" : "offload");
+    const uint64_t seed = 0x9E3779B97F4A7C15ULL;
+    printf("══════════ fr 随机+乱序压测  device=%s N=%llu mode=%s seed=%#llx ══════════\n",
+           argv[1], (unsigned long long)N, SELF ? "selfreliat" : "offload",
+           (unsigned long long)seed);
 
-    const uint64_t total = total_bytes(N);
-    const uint64_t piece_need = total / 8192 + 4;
-
-    /* ── Phase A：建面 + 灌 N 条 + best-fit 抽检（在所选缓存模式）── */
     {
         uint64_t rc = 0;
         linux_userspace_mount_t mnt = make_mount(argv[1], SELF);
@@ -95,100 +245,27 @@ int main(int argc, char **argv) {
             RavenFS_juvenile fs(mnt, &rc);
             if (!fs.is_mounted()) { printf("mount failed rc=%llu (mode=%s)\n",
                 (unsigned long long)rc, SELF ? "selfreliat" : "offload"); return 1; }
-            const uint64_t root = fs.sb.root_inode;
-
-            double t0 = now_s();
-            uint64_t got_pieces = 0;
-            /* 建够片：alloc 512B× 直至 piece 数达标。读 ctl 片数。 */
-            while (true) {
-                raven_dir_Inode_t d; fs.inode_read(root, (raven_Inode_t *)&d);
-                got_pieces = RFS_ND_PIECE_COUNT(d.name_data_piece_count);
-                if (got_pieces >= piece_need) break;
-                uint64_t o = 0;
-                if (fs.name_data_alloc(root, 512, &o) != RC_OK) { CHECK(false, "建面 alloc 失败"); break; }
-            }
-            printf("  [info] 建面 %llu 片 (需 %llu)，耗时 %.1fs\n",
-                   (unsigned long long)got_pieces, (unsigned long long)piece_need, now_s() - t0);
-
-            uint64_t fr_before = rd_fr_count(fs, root);
-            t0 = now_s();
-            uint64_t cursor = 0;
-            int ins_fail = 0;
-            for (uint64_t i = 0; i < N; i++) {
-                uint16_t len = (uint16_t)(1 + (i % 8));
-                result_code_t r = fs.name_data_free(root, cursor, len);
-                if (r != RC_OK) { if (!ins_fail) printf("  [warn] free #%llu rc=%llu\n",
-                                      (unsigned long long)i, (unsigned long long)r); ins_fail++; }
-                cursor += len;
-            }
-            double dt = now_s() - t0;
-            uint64_t fr_after = rd_fr_count(fs, root);
-            CHECK(ins_fail == 0 && fr_after == fr_before + N,
-                  "灌入 %llu 条 (fr %llu→%llu, fail=%d) 耗时 %.1fs (%.2f M ops/s)",
-                  (unsigned long long)N, (unsigned long long)fr_before,
-                  (unsigned long long)fr_after, ins_fail, dt, N / dt / 1e6);
-
-            /* best-fit 抽检：need=L 应命中 len=L、base=first_base_of_len(L) */
-            raven_dir_Inode_t d; fs.inode_read(root, (raven_Inode_t *)&d);
-            const uint64_t fr_root = RFS_ND_FR_CTL_PTR(d.name_data_free_ranges_ctl);
-            bool spot_ok = (fr_root != RFS_ND_FR_CTL_PTR_INVALID);
-            for (uint64_t L = 1; L <= 8 && spot_ok; L++) {
-                uint64_t base = 0, len = 0;
-                if (fs.name_data_fr_find_fit(fr_root, L, &base, &len) != RC_OK ||
-                    len != L || base != first_base_of_len(L)) spot_ok = false;
-            }
-            CHECK(spot_ok, "best-fit 抽检 (need 1..8 → len==need, base 正确)");
-
-            /* 取用若干（best-fit 摘除 + 余段插回） */
-            t0 = now_s();
-            int take_fail = 0;
-            for (int k = 0; k < 10000; k++) {
-                uint64_t o = 0;
-                if (fs.name_data_alloc(root, (uint16_t)(1 + (k % 8)), &o) != RC_OK) take_fail++;
-            }
-            CHECK(take_fail == 0, "取用 10000 次 best-fit 无失败 耗时 %.1fs", now_s() - t0);
-
-            /* offload 模式可在原地 audit（selfreliat 需重挂 offload） */
+            run_phases(fs, N, seed);
             if (!SELF) {
-                audit_walk_report_t rep;
-                uint64_t a = fs.audit_dfs_root(&rep, stdout);
-                CHECK(a == RC_OK && rep.total_bad() == 0,
-                      "百万级 fr 树 audit 全净 (bad=%llu heap=%llu leak=%llu mc=%llu)",
-                      (unsigned long long)rep.total_bad(), (unsigned long long)rep.heap_bad,
-                      (unsigned long long)rep.leaked_blk, (unsigned long long)rep.multi_claim_blk);
-                uint64_t r3 = fs.name_data_release(root);
-                audit_walk_report_t rep2;
-                uint64_t a2 = fs.audit_dfs_root(&rep2, stdout);
-                CHECK(r3 == RC_OK && a2 == RC_OK && rep2.total_bad() == 0,
-                      "release 后 audit 全净 (bad=%llu)", (unsigned long long)rep2.total_bad());
+                CHECK(audit_clean(fs, "audit"), "offload 原地 audit 全净");
+                CHECK(fs.name_data_release(fs.sb.root_inode) == RC_OK, "release");
+                CHECK(audit_clean(fs, "after-release"), "release 后 audit 全净");
             }
-        }   /* fs 析构：selfreliat 脏页写回落盘 */
+        }   /* fs 析构：selfreliat 脏页回写 */
         if (SELF) printf("  [info] selfreliat 卸载（脏页回写）完成\n");
     }
 
-    /* ── Phase B（selfreliat）：重挂 offload（mmap）审计落盘树 ── */
     if (SELF) {
         uint64_t rc = 0;
-        linux_userspace_mount_t mnt = make_mount(argv[1], false);
+        linux_userspace_mount_t mnt = make_mount(argv[1], false);   /* 重挂 offload 审计 */
         if (mnt.dev.fd < 0) { printf("remount open failed\n"); return 2; }
         {
             RavenFS_juvenile fs(mnt, &rc);
             CHECK(fs.is_mounted(), "重挂 offload rc=%llu", (unsigned long long)rc);
             if (fs.is_mounted()) {
-                const uint64_t root = fs.sb.root_inode;
-                uint64_t fr = rd_fr_count(fs, root);
-                printf("  [info] 重挂后 fr_count=%llu（落盘树）\n", (unsigned long long)fr);
-                audit_walk_report_t rep;
-                uint64_t a = fs.audit_dfs_root(&rep, stdout);
-                CHECK(a == RC_OK && rep.total_bad() == 0,
-                      "selfreliat 落盘百万级 fr 树 audit 全净 (bad=%llu heap=%llu leak=%llu mc=%llu)",
-                      (unsigned long long)rep.total_bad(), (unsigned long long)rep.heap_bad,
-                      (unsigned long long)rep.leaked_blk, (unsigned long long)rep.multi_claim_blk);
-                uint64_t r3 = fs.name_data_release(root);
-                audit_walk_report_t rep2;
-                uint64_t a2 = fs.audit_dfs_root(&rep2, stdout);
-                CHECK(r3 == RC_OK && a2 == RC_OK && rep2.total_bad() == 0,
-                      "release 后 audit 全净 (bad=%llu)", (unsigned long long)rep2.total_bad());
+                CHECK(audit_clean(fs, "persisted"), "selfreliat 落盘 audit 全净");
+                CHECK(fs.name_data_release(fs.sb.root_inode) == RC_OK, "release");
+                CHECK(audit_clean(fs, "after-release"), "release 后 audit 全净");
             }
         }
     }
