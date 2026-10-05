@@ -74,3 +74,4 @@ linux/vm/
 tests/bitmap_core_v2/bm_test
 tests/bitmap_core_v2/bm_test_san
 tests/bitmap_core_v2/bm_test_tsan
+build_v20/
