@@ -50,8 +50,10 @@
 
 - **返回**：一律 `result_code_t`（`RC_OK` / `RC_ERR_*`）。枚举类接口用 `int64_t`
   （`>0` 有条目 / `0` 结束 / `<0` 负错误码），与现有 `root_dir_readdir` 同风格。
-- **名字**：`const char*`，长度校验 `name_len_limiter()`（`≤ RAVENFS_MAX_NAME_LEN=552`，
-  不含 NUL）；超限 → `RC_ERR_NAME_LEN`。
+- **名字**：`const char*`。创建路径（`dir_insert_dentry`）用 `name_check_create()`
+  把关：空名 / 含 `/` → `RC_ERR_NAME_INVALID`；`strlen > RAVENFS_MAX_NAME_LEN=552`
+  → `RC_ERR_NAME_LEN`；均在任何 inode/树访问前完成（零副作用）。
+  读路径（`dir_lookup` / `dir_rm_dentry`）沿用 `name_len_limiter()`（仅长度，≤552）。
 - **inode 定位**：全部用 `uint64_t inode_idx`（52 位有效；`PTR_INVALID` 哨兵永不合法）。
   有效性用 `inode_test()` 判定。
 - **"已分配 inode 恒 ≥1 引用"**（不变量 17）：任何接口遇到 `link_count==0` 的已分配
@@ -92,7 +94,7 @@ result_code_t dir_link(uint64_t dir_idx, const char *name, uint64_t target_inum)
 - `target_inum`：**既有**目标 inode（必须已分配）。
 
 ### 前置校验（全部零副作用，按序，任一失败即返回）
-1. `name_len_limiter(name)` → 否 `RC_ERR_NAME_LEN`。
+1. `name_check_create(name)`：空名 / 含 `/` → `RC_ERR_NAME_INVALID`；超长 → `RC_ERR_NAME_LEN`。
 2. `inode_test(dir_idx)` 否 → `RC_ERR_STATE`；读 dir inode，`type!=DIR` → `RC_ERR_STATE`。
 3. `inode_test(target_inum)` 否 → `RC_ERR_NOT_FOUND`。
 4. 读 target inode：`type==DIR` → `RC_ERR_STATE`（**目录禁硬链接**，§3.3 / 不变量 19）

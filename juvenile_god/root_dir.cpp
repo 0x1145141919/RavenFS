@@ -37,11 +37,15 @@
  *   树根、**名字数据面双树显式空态哨兵（RFS_ND_CTL_INACTIVE / RFS_ND_FR_CTL_INACTIVE）**
  *   —— memset 0 是雷：0 是合法块号，旧 dir_name_heap_release 曾误把 block 0/1
  *   （根 dentry 块）当激活堆释放。
+ *
+ * 名字把关（fs 级，2026-10-05 前置）：name_check_create 在**任何** inode/hash/树
+ * 访问之前执行——空名（首字节 NUL）与含 '/' 的名字 → RC_ERR_NAME_INVALID，
+ * > 552B → RC_ERR_NAME_LEN；失败零副作用（不分配 inode/数据面、不碰树）。
  * ═══════════════════════════════════════════════════════════════════ */
 result_code_t RavenFS_juvenile::dir_insert_dentry(uint64_t inode_idx, const char *name, uint8_t inode_type)
 {
-    if (!name_len_limiter(name))
-        return RC_ERR_NAME_LEN;
+    result_code_t nrc = name_check_create(name);
+    if (nrc) return nrc;
     if (!inode_test(inode_idx))
         return RC_ERR_STATE;
     if (inode_type != INODE_TYPE_REGULAR &&

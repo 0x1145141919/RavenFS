@@ -9,15 +9,22 @@
  *   3. 批量删除：正向删（左→右，看右邻居）→ 反向删（右→左，看左邻居）
  *      → 删空收缩回根叶子；树完整性 DFS；audit_dfs_root 全净（offload）。
  *   4. 持久化：析构 flush → 重挂载 → 树内容不变 + 收缩为根叶。
+ *   2S. 大规模长名乱序压测（可选，long_stress_n>0）：1M 级唯一长名（41..552B）
+ *      固定种子乱序全插 → 峰值 audit（中途）→ 重新洗牌全乱序删 → audit。
+ *      需大镜像 + 足量 inode（见 usage 示例）；仅 offload 下做中途 audit。
  *
  * 后端矩阵：offload（默认，mmap）/ nocache（直写+双 no_cache）/
  *           selfreliat（直写+双 self_reliat）。审计仅在 offload 下执行
  *           （audit_dfs_root 前提 is_device_direct=false）。
  * 用法：ravenfs_juv_delete <device> [batch_count=1000] [del_count=0]
- *                              [mode=offload|nocache|selfreliat]
+ *                              [mode=offload|nocache|selfreliat] [long_stress_n=0]
  *   del_count=0 → 全删；>0 → 只删前 del_count 条（二分复播）。
  *   batch_count 默认 1000 适配 64MiB 镜像（≈2048 inode）。
- * ═══════════════════════════════════════════════════════════════════ */
+ *   long_stress_n>0 追加 Phase 2S 长名压测；1M 示例：
+ *     truncate -s 2G /tmp/big.img
+ *     ./mkfs/mkfs.ravenfs --v1.3 -f /tmp/big.img --inode-count 1200000
+ *     ./build/tests/ravenfs_juv_delete /tmp/big.img 0 0 offload 1000000
+ *═══════════════════════════════════════════════════════════════════ */
 #define private public
 #include "../include/ravenfs/ravenfs_v1.1.hpp"
 #undef private
@@ -27,11 +34,14 @@
 #include <cstring>
 #include <cstdlib>
 #include <chrono>
+#include <vector>
+#include <random>
+#include <algorithm>
 
 using Clock = std::chrono::steady_clock;
 
 int main(int argc, char **argv) {
-    if (argc < 2) { printf("usage: %s <device> [batch_count=1000] [del_count=0] [mode=offload|nocache|selfreliat]\n", argv[0]); return 2; }
+    if (argc < 2) { printf("usage: %s <device> [batch_count=1000] [del_count=0] [mode=offload|nocache|selfreliat] [long_stress_n=0]\n", argv[0]); return 2; }
     int batch_n = 1000;
     if (argc >= 3) batch_n = atoi(argv[2]);
     if (batch_n < 1) batch_n = 1;
@@ -47,16 +57,21 @@ int main(int argc, char **argv) {
         mode_direct = true; mode_use_icache = true; mode_use_bcache = true;
     }
     const bool audit_ok = !mode_direct;   /* 审计前提：mmap 后端 */
+    /* Phase 2S：大规模长名乱序压测条数（0 = 跳过）。固定种子，可复现。 */
+    int64_t long_stress_n = 0;
+    if (argc >= 6) long_stress_n = atoll(argv[5]);
+    if (long_stress_n < 0) long_stress_n = 0;
 
     printf("════════════════════════════════════════════════\n"
            " RavenFS v1.3 dir_rm_dentry 专项测试\n"
-           " device: %s   batch: %d   del: %s   mode: %s\n"
+           " device: %s   batch: %d   del: %s   mode: %s   long_stress: %lld\n"
            "════════════════════════════════════════════════\n",
            argv[1], batch_n,
            del_count > 0 ? "bisect（只删前若干条）" : "全部删除",
            mode_direct ? (mode_use_icache ? "selfreliat（直写+双self_reliat）"
                                           : "nocache（直写+双no_cache）")
-                       : "offload（mmap后端）");
+                       : "offload（mmap后端）",
+           (long long)long_stress_n);
 
     uint64_t rc = 0;
     uint64_t inserted = 0;   /* 树内短名条目数（长名 phase 自带记账） */
@@ -259,6 +274,94 @@ int main(int argc, char **argv) {
     {
         result_code_t r = fs.root_dir_rm_dentry("f00000", false);
         CHECK(r == RC_ERR_NOT_FOUND, "rm(\"f00000\") 删空后 → %s (expect NOT_FOUND)", rc_name(r));
+    }
+
+    /* ══ Phase 2S：大规模长名乱序压测（可选；long_stress_n>0） ══
+     * 固定种子乱序全插 N 条唯一长名（41..552B）→ 峰值 audit（中途）→
+     * 重新洗牌全乱序删 → 删空 audit。压名字数据面 fr + dentry 树分裂合并
+     * （D-13 场景）。1M 需 ~2GiB 镜像 + --inode-count≥N；仅 offload 做 audit。 */
+    if (long_stress_n > 0 && (uint64_t)long_stress_n + 1 > fs.inode_count) {
+        printf("\n  ⚠ Phase 2S 跳过：long_stress_n=%lld 超过镜像 inode 容量 %llu（root 占 1）；"
+               "请以 --inode-count≥%lld 重建镜像。\n",
+               (long long)long_stress_n, (unsigned long long)(fs.inode_count - 1),
+               (long long)long_stress_n + 1);
+        long_stress_n = 0;
+    }
+    if (long_stress_n > 0) {
+        const uint64_t N = (uint64_t)long_stress_n;
+        printf("\n--- Phase 2S: 长名乱序压测 %llu 条（41..552B，种子 20261005） ---\n",
+               (unsigned long long)N);
+
+        std::vector<uint32_t> perm(N);
+        for (uint64_t i = 0; i < N; i++) perm[i] = (uint32_t)i;
+        std::mt19937_64 rng(20261005ULL);
+        std::shuffle(perm.begin(), perm.end(), rng);
+
+        char lname[RAVENFS_MAX_NAME_LEN + 1];
+        uint64_t live = 0;
+        bool sok = true;
+        int progress_s = N >= 1000 ? (int)(N / 8) : 1;
+        const auto ts0 = Clock::now();
+        for (uint64_t k = 0; k < N; k++) {
+            dir_make_unique_long_name(lname, perm[k]);
+            result_code_t r = fs.root_dir_insert_dentry(lname, INODE_TYPE_REGULAR);
+            if (r != RC_OK) { sok = false; printf("  压测 insert #%llu(idx %u) 失败: %s\n",
+                                (unsigned long long)k, perm[k], rc_name(r)); break; }
+            live++;
+            if (progress_s >= 1 && (k + 1) % progress_s == 0)
+                printf("  ... insert %llu/%llu（live %llu）\n",
+                       (unsigned long long)(k + 1), (unsigned long long)N, (unsigned long long)live);
+        }
+        const auto ts1 = Clock::now();
+        const double ins_sec = std::chrono::duration<double>(ts1 - ts0).count();
+        CHECK(sok, "压测插入 %llu 全成功", (unsigned long long)N);
+        printf("  ⏱ 压测插入: %.3f s（%.0f ops/s）\n", ins_sec, ins_sec > 0 ? (double)N / ins_sec : 0);
+        dir_verify_tree(fs, live, "压测插入后");
+
+        if (sok) {
+            /* 中途 audit：插入态全盘可达性（仅 mmap 后端）。 */
+            if (audit_ok) CHECK(audit_clean(fs, "longstress-mid") == 0, "audit_dfs_root 全净 (压测中途)");
+            /* 抽样 lookup：验证名字数据面映射树大规模回读（最多 64 点）。 */
+            uint64_t sample_ok = 0, sample_n = 0;
+            const uint64_t step = (N > 64) ? N / 64 : 1;
+            for (uint64_t k = 0; k < N; k += step) {
+                dir_make_unique_long_name(lname, perm[k]);
+                uint64_t inum = 0;
+                sample_n++;
+                if (fs.root_dir_lookup(lname, &inum) == RC_OK) sample_ok++;
+            }
+            CHECK(sample_ok == sample_n, "压测中途抽样 lookup %llu/%llu",
+                  (unsigned long long)sample_ok, (unsigned long long)sample_n);
+            /* 重新洗牌 → 全乱序删。 */
+            std::shuffle(perm.begin(), perm.end(), rng);
+        } else {
+            /* 插入中途失败（容量不足等）：perm[0..live) 即已插入集合（按序），
+             * 直接原序清理，恢复空目录态，避免级联假失败；不再 audit/抽样。 */
+            printf("  ⚠ 插入中途失败：清理已插入 %llu 条以恢复空目录态\n",
+                   (unsigned long long)live);
+        }
+
+        const uint64_t del_total = live;   /* sok=N；!sok=已插入数 */
+        bool dok = true;
+        progress_s = del_total >= 1000 ? (int)(del_total / 8) : 1;
+        const auto td0 = Clock::now();
+        for (uint64_t k = 0; k < del_total; k++) {
+            dir_make_unique_long_name(lname, perm[k]);
+            result_code_t r = fs.root_dir_rm_dentry(lname, false);
+            if (r != RC_OK) { dok = false; printf("  压测 rm #%llu(idx %u) 失败: %s\n",
+                                (unsigned long long)k, perm[k], rc_name(r)); break; }
+            live--;
+            if (progress_s >= 1 && (k + 1) % progress_s == 0)
+                printf("  ... delete %llu/%llu（live %llu）\n",
+                       (unsigned long long)(k + 1), (unsigned long long)del_total, (unsigned long long)live);
+        }
+        const auto td1 = Clock::now();
+        const double del_sec = std::chrono::duration<double>(td1 - td0).count();
+        CHECK(dok, "压测删除 %llu 全成功", (unsigned long long)del_total);
+        printf("  ⏱ 压测删除: %.3f s（%.0f ops/s）\n", del_sec, del_sec > 0 ? (double)del_total / del_sec : 0);
+        dir_verify_tree(fs, live, "压测删空后");
+        CHECK(live == 0, "压测全部删空（剩余 %llu）", (unsigned long long)live);
+        if (audit_ok) CHECK(audit_clean(fs, "longstress-end") == 0, "audit_dfs_root 全净 (压测删空)");
     }
     }   /* ← fs 析构：位图全量写回 */
 

@@ -34,6 +34,15 @@ extern "C" uint32_t get_processor_id();
 bool name_len_limiter(const char*name){
     return strlen(name)<=RAVENFS_MAX_NAME_LEN;
 }
+/* 新条目名字合法性（fs 级）：空名 / 含 '/' 非法，超长另码。见头声明。 */
+result_code_t name_check_create(const char *name){
+    if (!name) return RC_ERR_NAME_INVALID;
+    const size_t n = strlen(name);
+    if (n == 0) return RC_ERR_NAME_INVALID;              /* 空名（首字节 '\0'） */
+    if (n > RAVENFS_MAX_NAME_LEN) return RC_ERR_NAME_LEN;
+    if (strchr(name, '/') != nullptr) return RC_ERR_NAME_INVALID;
+    return RC_OK;
+}
 bool is_extent_node(Bptree_meta_t *meta)
 {
     return meta->magics[0]==BPTREE_MAGIC1&&

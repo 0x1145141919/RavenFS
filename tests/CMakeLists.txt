@@ -285,6 +285,14 @@ add_executable(ravenfs_juv_name_data_fr
 )
 target_link_libraries(ravenfs_juv_name_data_fr PRIVATE ravenfs_juvenile)
 
+# v1.3 名字数据面离线规整（下行迁移）：name_data_rebuild（tree→direct 压实）+
+# name_data_fr_compact（dump+相邻合并，≤9 降级 inline）。供离线工具使用。
+add_executable(ravenfs_juv_name_data_offline
+    test_name_data_offline.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_name_data_offline PRIVATE ravenfs_juvenile)
+
 # fr 空闲区间树百万级压测（开缓存：offload / selfreliat）。手动运行，不入 ctest 默认。
 add_executable(ravenfs_stress_name_data_fr
     stress_name_data_fr.cpp

@@ -3,6 +3,7 @@
 #include "../include/ravenfs/inode_cache_radix.hpp"
 #include <cstring>
 #include <vector>
+#include <algorithm>
 
 /* ═══════════════════════════════════════════════════════════════════
  * name_data_freeranges.cpp — 目录名字数据面「空闲区间树」（v1.3）
@@ -36,6 +37,45 @@ struct fr_split_t {
 /* 复合键比较：a < b ? */
 inline bool fr_key_lt(uint64_t alen, uint64_t abase, uint64_t blen, uint64_t bbase)
 { return alen < blen || (alen == blen && abase < bbase); }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * inline 态空闲区间表（raven_dir_Inode_t::possible_inline_free_ranges[9]）
+ *
+ * 与 B+树叶复用同一 free_range_t，同键序 (len 主序, base 副序) 升序；
+ * count 由 name_data_free_ranges_count 维护（inline 恒 ≤ RFS_ND_FREE_INLINE_MAX）。
+ * inline 态是非空数据面的 bootstrap；区间数 > 9 时由 name_data_fr_insert
+ * 隐式升格为 B+树（一次性把 9 条就地 + 新条合并进新根叶，不回溯）。
+ * ═══════════════════════════════════════════════════════════════════ */
+inline uint16_t fr_inline_lower_bound(const free_range_t *t, uint16_t cnt,
+                                      uint64_t len, uint64_t base)
+{
+    uint16_t pos = 0;
+    while (pos < cnt && fr_key_lt(t[pos].len, t[pos].base, len, base)) pos++;
+    return pos;
+}
+inline void fr_inline_insert_raw(free_range_t *t, uint16_t &cnt, uint64_t base, uint64_t len)
+{
+    uint16_t pos = fr_inline_lower_bound(t, cnt, len, base);
+    if (pos < cnt)
+        memmove(&t[pos + 1], &t[pos], (size_t)(cnt - pos) * sizeof(free_range_t));
+    t[pos].base = base;
+    t[pos].len  = len;
+    cnt++;
+}
+inline void fr_inline_remove_raw(free_range_t *t, uint16_t &cnt, uint16_t idx)
+{
+    if (idx + 1 < cnt)
+        memmove(&t[idx], &t[idx + 1], (size_t)(cnt - idx - 1) * sizeof(free_range_t));
+    memset(&t[cnt - 1], 0, sizeof(free_range_t));
+    cnt--;
+}
+/* best-fit：表按 len 升序 ⇒ 首个 len≥need 即最小 len（同 len 内 base 升序先取最小 base）。 */
+inline uint16_t fr_inline_find_fit(const free_range_t *t, uint16_t cnt, uint64_t need)
+{
+    for (uint16_t i = 0; i < cnt; i++)
+        if (t[i].len >= need) return i;
+    return 0xFFFF;
+}
 }   /* namespace */
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -214,26 +254,66 @@ result_code_t RavenFS_juvenile::name_data_fr_insert(uint64_t dir_inode_idx,
                                                     uint64_t base, uint64_t len)
 {
     if (len == 0) return RC_OK;
-    uint64_t root = RFS_ND_FR_CTL_PTR(dino->name_data_free_ranges_ctl);
+    const uint64_t ctl = dino->name_data_free_ranges_ctl;
 
-    /* 空态：建根叶 */
-    if (root == RFS_ND_FR_CTL_PTR_INVALID) {
-        uint64_t blk = block_alloc_hard(2, 1);
-        if (blk == PTR_INVALID) return RC_ERR_NO_BLOCK;
-        mdata_piece_session s(mdata_piece_mgr, blk);
-        if (s.index_error() || !s) { block_free(blk, 2); return s.index_error() ? RC_ERR_STATE : RC_ERR_IO; }
-        name_data_fr_node_meta_init(s.data, 1, false, true, dir_inode_idx);
-        Bptree_dir_name_data_free_ranges_leaf_node_t *leaf =
-            (Bptree_dir_name_data_free_ranges_leaf_node_t *)s.data;
-        leaf->free_ranges[0].base = base;
-        leaf->free_ranges[0].len  = len;
-        s.dirty();
-        RFS_ND_FR_CTL_SET_INLINE(dino->name_data_free_ranges_ctl, 0);
-        RFS_ND_FR_CTL_SET_PTR(dino->name_data_free_ranges_ctl, blk);
-        RFS_ND_FR_SET_COUNT(dino->name_data_free_ranges_count,
-                            RFS_ND_FR_COUNT(dino->name_data_free_ranges_count) + 1);
+    /* ── 空态 → inline bootstrap（初始 direct+inline 的 inline 半）── */
+    if (RFS_ND_FR_CTL_PTR(ctl) == RFS_ND_FR_CTL_PTR_INVALID) {
+        free_range_t *t = dino->possible_inline_free_ranges;
+        t[0].base = base;
+        t[0].len  = len;
+        /* inline(1)，ptr 域 0（非空；空态才是 ptr 全 1 的 INACTIVE） */
+        dino->name_data_free_ranges_ctl = RFS_ND_FR_CTL_PACK(1, 0);
+        RFS_ND_FR_SET_COUNT(dino->name_data_free_ranges_count, 1);
         return RC_OK;
     }
+
+    /* ── inline 态：就地插入；超 9 条隐式升格 tree ── */
+    if (RFS_ND_FR_CTL_IS_INLINE(ctl)) {
+        uint16_t cnt = (uint16_t)RFS_ND_FR_COUNT(dino->name_data_free_ranges_count);
+        if (cnt > RFS_ND_FREE_INLINE_MAX) return RC_ERR_STATE;   /* 防御：非法 inline 计数 */
+        free_range_t *t = dino->possible_inline_free_ranges;
+        uint16_t pos = fr_inline_lower_bound(t, cnt, len, base);
+        if (pos < cnt && t[pos].len == len && t[pos].base == base)
+            return RC_OK;   /* 精确重复：幂等跳过 */
+        if (cnt < RFS_ND_FREE_INLINE_MAX) {
+            fr_inline_insert_raw(t, cnt, base, len);
+            RFS_ND_FR_SET_COUNT(dino->name_data_free_ranges_count, cnt);
+            return RC_OK;
+        }
+        /* cnt == 9：合计 10 条 → 建根叶承载；分配失败 = 零副作用（inline 原样） */
+        uint64_t blk = block_alloc_hard(2, 1);
+        if (blk == PTR_INVALID) return RC_ERR_NO_BLOCK;
+        free_range_t merged[RFS_ND_FREE_INLINE_MAX + 1];
+        uint16_t m = 0;
+        bool placed = false;
+        for (uint16_t i = 0; i < cnt; i++) {
+            if (!placed && fr_key_lt(len, base, t[i].len, t[i].base)) {
+                merged[m].base = base; merged[m].len = len; m++; placed = true;
+            }
+            merged[m++] = t[i];
+        }
+        if (!placed) { merged[m].base = base; merged[m].len = len; m++; }
+        {
+            mdata_piece_session s(mdata_piece_mgr, blk);
+            if (s.index_error() || !s) {
+                block_free(blk, 2);
+                return s.index_error() ? RC_ERR_STATE : RC_ERR_IO;
+            }
+            name_data_fr_node_meta_init(s.data, m, false, true, dir_inode_idx);
+            Bptree_dir_name_data_free_ranges_leaf_node_t *leaf =
+                (Bptree_dir_name_data_free_ranges_leaf_node_t *)s.data;
+            memcpy(leaf->free_ranges, merged, (size_t)m * sizeof(free_range_t));
+            s.dirty();
+        }
+        RFS_ND_FR_CTL_SET_PTR(dino->name_data_free_ranges_ctl, blk);
+        RFS_ND_FR_CTL_SET_INLINE(dino->name_data_free_ranges_ctl, 0);   /* 转 tree */
+        RFS_ND_FR_SET_COUNT(dino->name_data_free_ranges_count, m);
+        memset(t, 0, sizeof(free_range_t) * RFS_ND_FREE_INLINE_MAX);
+        return RC_OK;
+    }
+
+    /* ── tree 态（root 恒有效：空态已在上面走 inline bootstrap）── */
+    const uint64_t root = RFS_ND_FR_CTL_PTR(ctl);
 
     /* 定位叶（插入目标 = 精确键） */
     bptree_path_t trace;
@@ -477,8 +557,33 @@ result_code_t RavenFS_juvenile::name_data_fr_take_fit(uint64_t dir_inode_idx,
                                                       uint64_t need, uint64_t *out_base)
 {
     if (!out_base || need == 0) return RC_ERR_STATE;
-    uint64_t root = RFS_ND_FR_CTL_PTR(dino->name_data_free_ranges_ctl);
-    if (root == RFS_ND_FR_CTL_PTR_INVALID) return RC_ERR_NOT_FOUND;
+    const uint64_t ctl = dino->name_data_free_ranges_ctl;
+    const uint64_t ptr = RFS_ND_FR_CTL_PTR(ctl);
+    if (ptr == RFS_ND_FR_CTL_PTR_INVALID) return RC_ERR_NOT_FOUND;
+
+    /* ── inline 态：线性 best-fit 摘除；余段回填（净条目数不增 → 恒 ≤9）── */
+    if (RFS_ND_FR_CTL_IS_INLINE(ctl)) {
+        uint16_t cnt = (uint16_t)RFS_ND_FR_COUNT(dino->name_data_free_ranges_count);
+        if (cnt > RFS_ND_FREE_INLINE_MAX) return RC_ERR_STATE;
+        free_range_t *t = dino->possible_inline_free_ranges;
+        uint16_t idx = fr_inline_find_fit(t, cnt, need);
+        if (idx == 0xFFFF) return RC_ERR_NOT_FOUND;
+        const free_range_t e = t[idx];
+        fr_inline_remove_raw(t, cnt, idx);
+        if (e.len > need)
+            fr_inline_insert_raw(t, cnt, e.base + need, e.len - need);
+        if (cnt == 0) {   /* 取空 → 复位空态（ptr 全 1） */
+            dino->name_data_free_ranges_ctl = RFS_ND_FR_CTL_INACTIVE;
+            RFS_ND_FR_SET_COUNT(dino->name_data_free_ranges_count, 0);
+        } else {
+            RFS_ND_FR_SET_COUNT(dino->name_data_free_ranges_count, cnt);
+        }
+        *out_base = e.base;
+        return RC_OK;
+    }
+
+    /* ── tree 态 ── */
+    const uint64_t root = ptr;
 
     bptree_path_t trace;
     result_code_t rc = name_data_fr_walk(root, need, 0, &trace);
@@ -634,19 +739,12 @@ result_code_t RavenFS_juvenile::name_data_fr_retire_empty_leaf(uint64_t dir_inod
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * release — 全量释放 fr 树节点（不碰数据片）：BFS 收集所有层节点，逐块归还
+ * name_data_fr_free_tree — 归还 fr 树全部节点块（BFS；不碰控制字/数据片）
  * ═══════════════════════════════════════════════════════════════════ */
-result_code_t RavenFS_juvenile::name_data_fr_release(uint64_t dir_inode_idx,
-                                                     raven_dir_Inode_t *dino)
+void RavenFS_juvenile::name_data_fr_free_tree(uint64_t root)
 {
-    (void)dir_inode_idx;
-    uint64_t root = RFS_ND_FR_CTL_PTR(dino->name_data_free_ranges_ctl);
-    if (root == RFS_ND_FR_CTL_PTR_INVALID) {
-        dino->name_data_free_ranges_ctl = RFS_ND_FR_CTL_INACTIVE;
-        dino->name_data_free_ranges_count = 0;
-        return RC_OK;
-    }
     const uint64_t PTR52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+    if (root == PTR52 || root == PTR_INVALID) return;
     std::vector<uint64_t> layer{root};
     while (!layer.empty()) {
         std::vector<uint64_t> next;
@@ -668,7 +766,135 @@ result_code_t RavenFS_juvenile::name_data_fr_release(uint64_t dir_inode_idx,
         for (uint64_t b : layer) block_free(b, 2);
         layer.swap(next);
     }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * release — 全量释放 fr（不碰数据片）：inline 态清表复位；tree 态归还全部节点
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::name_data_fr_release(uint64_t dir_inode_idx,
+                                                     raven_dir_Inode_t *dino)
+{
+    (void)dir_inode_idx;
+    const uint64_t ctl = dino->name_data_free_ranges_ctl;
+    const uint64_t ptr = RFS_ND_FR_CTL_PTR(ctl);
+
+    /* 空态 / inline 态：无树节点可归还，复位控制字 + 清 inline 表即可 */
+    if (ptr == RFS_ND_FR_CTL_PTR_INVALID || RFS_ND_FR_CTL_IS_INLINE(ctl)) {
+        memset(dino->possible_inline_free_ranges, 0,
+               sizeof(free_range_t) * RFS_ND_FREE_INLINE_MAX);
+        dino->name_data_free_ranges_ctl = RFS_ND_FR_CTL_INACTIVE;
+        dino->name_data_free_ranges_count = 0;
+        return RC_OK;
+    }
+
+    name_data_fr_free_tree(ptr);
     dino->name_data_free_ranges_ctl = RFS_ND_FR_CTL_INACTIVE;
     dino->name_data_free_ranges_count = 0;
+    return RC_OK;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * name_data_fr_compact — fr 全量相邻合并（离线压缩；可降级 inline）
+ *
+ * 步骤：
+ *   1. dump 全部空闲区间（inline 表 / tree BFS 叶条目），读旧态；
+ *   2. 按 base 升序排序 → 全量相邻合并（含重叠防御，取并集）；
+ *   3. **忘记旧 fr**（清控制字，但**暂不释放**旧树节点）→ 按规范灌回
+ *      （≤9 条自然落 inline = 下行降级；>9 条自然升格 tree）；
+ *   4. 成功 → 释放旧树节点；失败 → 释放半成品新树 + 恢复旧 ctl/count/inline。
+ *
+ * 合并正确性：空闲区间之并 = 「已映射 ∧ 未分配」，相邻合并不改变并集，
+ * 故语义不变（只是 best-fit 视图更整洁、树更小，甚至降级省一棵树）。
+ * 前置：调用方保证无并发（离线工具）。空态 = no-op。
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::name_data_fr_compact(uint64_t dir_inode_idx)
+{
+    InodeSession ino_sess(inode_cache_mgr, dir_inode_idx);
+    if (!ino_sess) return RC_ERR_IO;
+    raven_dir_Inode_t *dino = (raven_dir_Inode_t *)ino_sess.inode;
+    if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR) return RC_ERR_STATE;
+
+    const uint64_t old_ctl = dino->name_data_free_ranges_ctl;
+    const uint64_t old_ptr = RFS_ND_FR_CTL_PTR(old_ctl);
+    const uint64_t old_cnt = RFS_ND_FR_COUNT(dino->name_data_free_ranges_count);
+    if (old_ptr == RFS_ND_FR_CTL_PTR_INVALID) return RC_OK;   /* 空态 */
+
+    /* ── 1. dump ── */
+    std::vector<free_range_t> ranges;
+    if (RFS_ND_FR_CTL_IS_INLINE(old_ctl)) {
+        if (old_cnt > RFS_ND_FREE_INLINE_MAX) return RC_ERR_STATE;
+        for (uint64_t i = 0; i < old_cnt; i++)
+            ranges.push_back(dino->possible_inline_free_ranges[i]);
+    } else {
+        const uint64_t PTR52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+        std::vector<uint64_t> stack{old_ptr};
+        while (!stack.empty()) {
+            uint64_t b = stack.back(); stack.pop_back();
+            mdata_piece_session s(mdata_piece_mgr, b);
+            if (s.index_error() || !s) return RC_ERR_IO;
+            Bptree_meta_t *m = (Bptree_meta_t *)s.data;
+            if (!is_namedata_freeranges_node(m)) return RC_ERR_STATE;
+            if (RFS_PP_IS_INNER(m->parent_ptr)) {
+                const Bptree_dir_name_data_free_ranges_inner_node_t *n =
+                    (const Bptree_dir_name_data_free_ranges_inner_node_t *)s.data;
+                const uint16_t cnt = (uint16_t)RFS_PP_COUNT(n->meta.parent_ptr);
+                for (uint16_t i = 0; i < cnt; i++) {
+                    uint64_t cb = RFS_PTR_ADDR(n->hints[i].sub_node_ptr);
+                    if (cb != PTR52) stack.push_back(cb);
+                }
+            } else {
+                const Bptree_dir_name_data_free_ranges_leaf_node_t *leaf =
+                    (const Bptree_dir_name_data_free_ranges_leaf_node_t *)s.data;
+                const uint16_t cnt = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr);
+                for (uint16_t i = 0; i < cnt; i++) ranges.push_back(leaf->free_ranges[i]);
+            }
+        }
+    }
+
+    /* ── 2. 排序（base 升序）+ 全量相邻合并（含重叠防御）── */
+    std::sort(ranges.begin(), ranges.end(),
+              [](const free_range_t &a, const free_range_t &b) { return a.base < b.base; });
+    std::vector<free_range_t> merged;
+    merged.reserve(ranges.size());
+    for (const free_range_t &r : ranges) {
+        if (r.len == 0) continue;   /* 防御：空区间 */
+        if (!merged.empty() && merged.back().base + merged.back().len >= r.base) {
+            const uint64_t end = merged.back().base + merged.back().len;
+            const uint64_t rend = r.base + r.len;
+            merged.back().len = (end > rend ? end : rend) - merged.back().base;
+        } else {
+            merged.push_back(r);
+        }
+    }
+
+    /* ── 3. 忘记旧 fr（暂不释放），按规范灌回 ── */
+    free_range_t old_inline[RFS_ND_FREE_INLINE_MAX];
+    memcpy(old_inline, dino->possible_inline_free_ranges, sizeof(old_inline));
+
+    dino->name_data_free_ranges_ctl = RFS_ND_FR_CTL_INACTIVE;
+    RFS_ND_FR_SET_COUNT(dino->name_data_free_ranges_count, 0);
+    memset(dino->possible_inline_free_ranges, 0, sizeof(old_inline));
+
+    for (const free_range_t &m : merged) {
+        result_code_t rc = name_data_fr_insert(dir_inode_idx, dino, m.base, m.len);
+        if (rc) {
+            /* 回滚：释放半成品新树（若已升格），恢复旧 ctl/count/inline。
+             * 旧树节点全程未被释放 → 零丢失。 */
+            const uint64_t new_ctl = dino->name_data_free_ranges_ctl;
+            const uint64_t new_ptr = RFS_ND_FR_CTL_PTR(new_ctl);
+            if (new_ptr != RFS_ND_FR_CTL_PTR_INVALID && !RFS_ND_FR_CTL_IS_INLINE(new_ctl))
+                name_data_fr_free_tree(new_ptr);
+            dino->name_data_free_ranges_ctl = old_ctl;
+            dino->name_data_free_ranges_count = old_cnt;
+            memcpy(dino->possible_inline_free_ranges, old_inline, sizeof(old_inline));
+            return rc;
+        }
+    }
+
+    /* ── 4. 成功：释放旧树节点（inline 旧态无节点）── */
+    if (!RFS_ND_FR_CTL_IS_INLINE(old_ctl))
+        name_data_fr_free_tree(old_ptr);
+
+    ino_sess.dirty();
     return RC_OK;
 }

@@ -88,6 +88,9 @@ inline const char *rc_name(result_code_t rc)
     case RC_ERR_NAME_LEN:   return "RC_ERR_NAME_LEN";
     case RC_ERR_IO:         return "RC_ERR_IO";
     case RC_ERR_STATE:      return "RC_ERR_STATE";
+    case RC_ERR_NOT_EMPTY:  return "RC_ERR_NOT_EMPTY";
+    case RC_ERR_NOT_SUPPORTED: return "RC_ERR_NOT_SUPPORTED";
+    case RC_ERR_NAME_INVALID:  return "RC_ERR_NAME_INVALID";
     default:                return "RC_???";
     }
 }
@@ -274,5 +277,21 @@ inline void dir_make_long_name(char *out, int idx)
     static const char seed[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     int len = 41 + (idx * 7) % 512;   /* 41,48,...,552 循环 */
     for (int j = 0; j < len; j++) out[j] = seed[(idx + j * 3) % 62];
+    out[len] = '\0';
+}
+
+/* ── 唯一长名生成器（大规范压测用；idx 全域不碰撞）──
+ * dir_make_long_name 的名字由 (idx mod 62, idx mod 512) 决定，按 CRT 周期
+ * lcm(62,512)=15872 循环——1M 级会撞名（重复插入 → EXIST）。本生成器把 idx
+ * 以 base62 定宽（8 字节）写进名字最前 8B 作为唯一锚，其后用确定 pattern
+ * 填到 len；长度 41..552 循环。熵足够覆盖 >62^8 个 idx，且前缀唯一。
+ * 生成的名字只含 [0-9A-Za-z]，天然不含 '/'。 */
+inline void dir_make_unique_long_name(char *out, uint64_t idx)
+{
+    static const char seed[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const int len = 41 + (int)((idx * 7) % 512);   /* 41..552 */
+    uint64_t v = idx;
+    for (int j = 7; j >= 0; --j) { out[j] = seed[v % 62]; v /= 62; }   /* 唯一锚 */
+    for (int j = 8; j < len; j++) out[j] = seed[(idx + (uint64_t)j * 3) % 62];
     out[len] = '\0';
 }

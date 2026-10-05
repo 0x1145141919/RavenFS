@@ -119,7 +119,8 @@ public:
      *                       急建其 dentry 树根（根叶子 2 块，magic + . / .. 指针）；
      *   REGULAR/SOFT_SYM  : 内联空 inode（0644/link_count=1/data_root=PTR_INVALID）
      * 之后统一插入 dentry 树。name 已存在 → RC_ERR_EXIST；
-     * > RAVENFS_MAX_NAME_LEN → RC_ERR_NAME_LEN；inode_type 非法 → RC_ERR_STATE。 */
+     * > RAVENFS_MAX_NAME_LEN → RC_ERR_NAME_LEN；空名 / 含 '/' → RC_ERR_NAME_INVALID；
+     * 非法字符检查在 inode/hash/树访问前完成（零副作用）；inode_type 非法 → RC_ERR_STATE。 */
     result_code_t root_dir_insert_dentry(const char *name,uint8_t inode_type);
 
     result_code_t root_dir_direct_file_pwrite(const char *name,uint64_t offset,uint64_t len,void*buf);//左闭右开区间
@@ -423,6 +424,25 @@ private:
     result_code_t name_data_write(uint64_t dir_inode_idx, uint64_t offset, uint16_t tail_len, const char *tail);
     /* 目录销毁时全量回收：映射树节点 + 全部数据片 + fr 树节点 + 双控制字复位 */
     result_code_t name_data_release(uint64_t dir_inode_idx);
+    /* ══════════════════════════════════════════════════════════════
+     * 离线工具专用：下行迁移 / 规整（运行态不用；长名低频、灾难处理）
+     * ══════════════════════════════════════════════════════════════ */
+    /* 数据面重建：tree 态碎片映射 → 单连续 direct 段（压实）。
+     * 步骤：block_alloc_hard(pieces×2, 8K 对齐) → 逐 8K 片 resolve 旧物理并迁数
+     * → **提交** ctl=direct/ptr=新基址 → 释放旧映射树节点 + 旧数据片。
+     * direct / 空态 = no-op RC_OK；失败（无连续块 / IO）零副作用（新段回滚，旧态完好）。
+     * 成功后 fr 不变（逻辑偏移语义与物理无关）。 */
+    result_code_t name_data_rebuild(uint64_t dir_inode_idx);
+    /* 归还一棵名字数据面映射树的**全部数据片 + 树节点**（左叶下钻 → 叶链遍历
+     * 逐段 block_free(phys,len) → extent_orphan_release 释放节点）。不碰 inode
+     * 控制字；供 release / rebuild 复用。叶链用 while（不设 64 深度上限——链长
+     * 可远超树高）。 */
+    void name_data_map_reclaim(uint64_t tree_root);
+    /* fr 全量相邻合并（离线压缩）：dump 全部空闲区间（inline/tree 通吃）→
+     * 按 base 升序全量相邻合并（含重叠防御）→ 忘记旧 fr（暂不释放节点）→
+     * 按规范灌回：合并后 ≤9 条**降级 inline**，>9 条自然升格 tree → 释放旧树节点。
+     * 空态 = no-op RC_OK；中途失败回滚（释放半成品，恢复旧 fr，零丢失）。 */
+    result_code_t name_data_fr_compact(uint64_t dir_inode_idx);
     /* 名字数据面内部机械（见 name_data_plane.cpp）：
      *   resolve    —— 逻辑偏移 → 物理块+块内偏移（direct 直算 / tree 走映射树）
      *   map_append —— 追加一个 8K 数据片到逻辑尾（direct→tree 物化 / tree 尾插），
@@ -431,11 +451,13 @@ private:
                                     uint64_t *out_fblk, uint16_t *out_off);
     result_code_t name_data_map_append(uint64_t dir_inode_idx, raven_dir_Inode_t *dino,
                                        uint64_t phys_base);
-    /* ── fr 空闲区间树内部机械（见 name_data_freeranges.cpp；字节粒度）──
-     * 节点族 Bptree_dir_name_data_free_ranges_*，魔数 NAMEDATA_FREERANGES_MAGIC1..4；
+    /* ── fr 空闲区间表内部机械（见 name_data_freeranges.cpp；字节粒度）──
+     * 两态：inline（possible_inline_free_ranges[9]，bootstrap；键序同叶） /
+     * B+树（节点族 Bptree_dir_name_data_free_ranges_*，魔数 NAMEDATA_FREERANGES_MAGIC1..4；
      * leaf 按 (len,base) 升序，inner hint = 子树最大复合键 (max_len,max_base)；
-     * 统一 337 階。best-fit 取用（最小 len ≥ need）；本轮不做相邻合并、欠载不
-     * 合并（结构仍为合法搜索树），空洞靠 best-fit 复用。 */
+     * 统一 337 階）。初始直接进 inline；插入第 10 条时**隐式升格** tree（不回溯）。
+     * best-fit 取用（最小 len ≥ need）；本轮不做相邻合并、欠载不合并
+     * （结构仍为合法搜索树），空洞靠 best-fit 复用。 */
     static bool is_namedata_freeranges_node(const Bptree_meta_t *m);
     static void name_data_fr_node_meta_init(void *buf, uint16_t count,
                                             bool is_inner, bool is_root, uint64_t parent_ptr);
@@ -444,10 +466,12 @@ private:
     result_code_t name_data_fr_walk(uint64_t root_blk, uint64_t need_len, uint64_t need_base,
                                     bptree_path_t *trace);
     result_code_t name_data_fr_refresh_key_chain(uint64_t blk);
-    /* best-fit：找最小 len ≥ need 的空闲区间（无 → RC_ERR_NOT_FOUND）。 */
+    /* best-fit：找最小 len ≥ need 的空闲区间（无 → RC_ERR_NOT_FOUND）。
+     * 仅 tree 态（传树根块号）；inline 态由 take_fit 内部线性扫描，不经此。 */
     result_code_t name_data_fr_find_fit(uint64_t root_blk, uint64_t need,
                                         uint64_t *out_base, uint64_t *out_len);
-    /* 插入一条空闲区间；空态自建根叶，split 级联建新根。 */
+    /* 插入一条空闲区间：空态建 inline（≤9 条）；第 10 条隐式升格 tree（建根叶，
+     * 后续 split 级联建新根）。 */
     result_code_t name_data_fr_insert(uint64_t dir_inode_idx, raven_dir_Inode_t *dino,
                                       uint64_t base, uint64_t len);
     /* best-fit 取用：定位最小 len ≥ need 的区间，摘除（len>need 时把余段
@@ -459,8 +483,11 @@ private:
      * 二分路由错位）。 */
     result_code_t name_data_fr_retire_empty_leaf(uint64_t dir_inode_idx, raven_dir_Inode_t *dino,
                                                  uint64_t leaf_blk);
-    /* 全量释放 fr 树节点（不碰数据片）。 */
+    /* 全量释放 fr（不碰数据片）：inline 态清表复位；tree 态归还全部节点。 */
     result_code_t name_data_fr_release(uint64_t dir_inode_idx, raven_dir_Inode_t *dino);
+    /* 归还一棵 fr 树的**全部节点块**（BFS；不碰 inode 控制字/数据片）。
+     * 供 release / compact 复用；root 非法或不认则安全跳过。 */
+    void name_data_fr_free_tree(uint64_t root);
     /* 数据面增长一个 8K 片（direct 物理尾 soft_occupy，失败 hard_alloc+映射树注入）。 */
     result_code_t name_data_grow(uint64_t dir_inode_idx, raven_dir_Inode_t *dino);
     /* 名字数据面分配回滚守卫（insert 流程 RAII：分配成功后的任何失败返回
@@ -742,6 +769,13 @@ bool is_dentry_node(Bptree_meta_t*meta);
 bool is_extent_node(Bptree_meta_t*meta);
 /* 名字长度把关：strlen ≤ RAVENFS_MAX_NAME_LEN */
 bool name_len_limiter(const char*name);
+/* 新条目名字合法性把关（fs 级；仅创建路径 dir_insert_dentry 调用）：
+ *   · 非空（拒绝空名 / 首字节 NUL）
+ *   · strlen ≤ RAVENFS_MAX_NAME_LEN(552B)
+ *   · 不含 '/'（路径分隔符；单条目名字非法；God 原生 API 无 VFS 拆路径兜底）
+ * 返回 RC_OK / RC_ERR_NAME_LEN / RC_ERR_NAME_INVALID。
+ * 注：C 字符串无法承载内嵌 NUL，嵌入即截断——"含 NUL" 在本 API 上等价于空名。 */
+result_code_t name_check_create(const char *name);
 /* 节点最大 hash：叶子末项 entry.hash / 内部末项 hint.hash_max */
 uint64_t node_max_hash(const void *node_buf);
 

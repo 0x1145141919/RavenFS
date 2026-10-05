@@ -7,6 +7,7 @@
  *       单叶 >256 条才暴露）。
  *
  * 覆盖：
+ *   0. fr inline bootstrap（≤9 条）与第 10 条**隐式升格 tree** 的状态断言
  *   1. 造 337 条 distinct-len 空闲区间（单根叶、count==337）
  *   2. best-fit 命中 index>255 的条目（截断回归）：find_fit(300)→len=300
  *   3. take_fit 精确取用（整取）+ 计数回退
@@ -81,9 +82,39 @@ int main(int argc, char **argv) {
         /* 释放 [i*512, i*512+i)：互不重叠（i<512），len = i ∈ [1,300]。
          * 另加 alloc 段尾遗留的一条空闲区间（~4K），合计 301 条 < 337 → 单根叶；
          * 叶内 len=300 的下标为 299 (>255)，正是 child_idx 截断 bug 的暴露点。 */
+        uint64_t start_frc = rd_fr_count(fs, root);
+        CHECK(start_frc == 1, "建面后 fr 遗留 1 条空闲区间（inline bootstrap）got=%llu",
+              (unsigned long long)start_frc);
         for (uint64_t i = 1; i <= 300; i++) {
             uint64_t r = fs.name_data_free(root, i * SLOT, (uint16_t)i);
             if (r != RC_OK) { CHECK(false, "free #%llu rc=%llu", (unsigned long long)i, (unsigned long long)r); break; }
+            /* 隐含升级回归：1（遗留）+8 条 = 9 条仍 inline；第 10 条升格 tree。 */
+            if (i == 8) {
+                raven_dir_Inode_t d; fs.inode_read(root, (raven_Inode_t *)&d);
+                CHECK(RFS_ND_FR_CTL_IS_INLINE(d.name_data_free_ranges_ctl) == 1 &&
+                      RFS_ND_FR_COUNT(d.name_data_free_ranges_count) == 9 &&
+                      RFS_ND_FR_CTL_PTR(d.name_data_free_ranges_ctl) != RFS_ND_FR_CTL_PTR_INVALID,
+                      "累计 9 条仍 inline（inline=%u count=%llu）",
+                      (unsigned)RFS_ND_FR_CTL_IS_INLINE(d.name_data_free_ranges_ctl),
+                      (unsigned long long)RFS_ND_FR_COUNT(d.name_data_free_ranges_count));
+            }
+            if (i == 9) {
+                raven_dir_Inode_t d; fs.inode_read(root, (raven_Inode_t *)&d);
+                CHECK(RFS_ND_FR_CTL_IS_INLINE(d.name_data_free_ranges_ctl) == 0 &&
+                      RFS_ND_FR_COUNT(d.name_data_free_ranges_count) == 10 &&
+                      RFS_ND_FR_CTL_PTR(d.name_data_free_ranges_ctl) != RFS_ND_FR_CTL_PTR_INVALID,
+                      "第 10 条隐式升格 tree（inline=%u count=%llu root=%llu）",
+                      (unsigned)RFS_ND_FR_CTL_IS_INLINE(d.name_data_free_ranges_ctl),
+                      (unsigned long long)RFS_ND_FR_COUNT(d.name_data_free_ranges_count),
+                      (unsigned long long)RFS_ND_FR_CTL_PTR(d.name_data_free_ranges_ctl));
+                /* 升格后树立即可用：best-fit 命中 len=9 */
+                uint64_t base = 0, len = 0;
+                uint64_t rf = fs.name_data_fr_find_fit(
+                    RFS_ND_FR_CTL_PTR(d.name_data_free_ranges_ctl), 9, &base, &len);
+                CHECK(rf == RC_OK && len == 9 && base == 9 * SLOT,
+                      "升格后 find_fit(9) → len=%llu base=%llu", (unsigned long long)len,
+                      (unsigned long long)base);
+            }
         }
         uint64_t frc = rd_fr_count(fs, root);
         CHECK(frc == 301, "fr_count==301（单根叶未裂；含段尾遗留 1 条）got=%llu", (unsigned long long)frc);

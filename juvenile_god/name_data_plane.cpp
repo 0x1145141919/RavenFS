@@ -11,7 +11,7 @@
  *   每目录一个**稠密、无空洞、8K 对齐**的逻辑字节空间：
  *     · 映射     name_data_ctl              direct(1)/tree(0) + 指针（51 位）
  *     · 片数     name_data_piece_count      实际 8K 数据片数原值
- *     · 空闲区间 name_data_free_ranges_ctl   fr B+树（inline 表尚未实现，恒 tree 态）
+ *     · 空闲区间 name_data_free_ranges_ctl   fr 空闲区间表（inline(≤9 条) / B+树二态）
  *   长名（>40B）tail（≤512B）由本层分配逻辑区间；ddentry 存逻辑偏移
  *   full_char_remain_offset，经映射解析到物理。
  *
@@ -19,8 +19,9 @@
  *   逻辑空间 [0, pieces×8K) 内按**字节**分配：空闲区间 = 删长名释放 ∪ 新片未
  *   分配尾部，分配取 best-fit（最小 len ≥ 需求，见 name_data_freeranges.cpp）。
  *   一个 8K 数据片可容纳多个 tail（片内字节打包）；fr 无 len ≥ 需求才
- *   name_data_grow 增片。可能的优化：inline 空闲表
- *   （possible_inline_free_ranges[9]）当前未实现，小目录恒走 fr 树。
+ *   name_data_grow 增片。潜在的优化：inline 空闲表
+ *   （possible_inline_free_ranges[9]）已落地——初始 direct+inline，区间数 > 9
+ *   才隐式升格 fr 树（见 name_data_freeranges.cpp）。
  *
  * ── 映射（复用通用 extent 树机械，kind = EXTENT_TREE_NAMEDATA）──
  *   direct(1) = 单连续物理段：物理块 = base + 逻辑块；逻辑块 = 偏移>>12。
@@ -306,29 +307,8 @@ result_code_t RavenFS_juvenile::name_data_release(uint64_t dir_inode_idx)
     if (RFS_ND_CTL_IS_DIRECT(ctl)) {
         block_free(ptr, pieces * 2);
     } else {
-        /* tree：叶链遍历逐段归还物理数据片 */
-        const uint64_t PTR52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
-        std::vector<extent_t> recs;
-        uint64_t cur = ptr;
-        for (int d = 0; d < 64 && cur != PTR52; d++) {
-            mdata_piece_session s(mdata_piece_mgr, cur);
-            if (s.index_error() || !s) break;
-            Bptree_meta_t *m = (Bptree_meta_t *)s.data;
-            if (!is_extent_node_kind(m, EXTENT_TREE_NAMEDATA)) break;
-            if (!RFS_PP_IS_INNER(m->parent_ptr)) {
-                const Bptree_extent_leaf_node_t *leaf = (const Bptree_extent_leaf_node_t *)s.data;
-                const uint16_t cnt = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr);
-                for (uint16_t i = 0; i < cnt; i++) recs.push_back(leaf->extents[i]);
-                cur = RFS_PTR_ADDR(leaf->meta.ptrs[2]);
-                continue;
-            }
-            const Bptree_extent_inner_node_t *inner = (const Bptree_extent_inner_node_t *)s.data;
-            if (RFS_PP_COUNT(inner->meta.parent_ptr) == 0) break;
-            cur = RFS_PTR_ADDR(inner->extents[0].sub_node_ptr);
-        }
-        for (const extent_t &e : recs)
-            block_free(RFS_PTR_ADDR(e.block_base), e.length);
-        extent_orphan_release(ptr, EXTENT_TREE_NAMEDATA);
+        /* tree：归还全部数据片 + 映射树节点（共享机械） */
+        name_data_map_reclaim(ptr);
     }
 
     /* 复位名字数据面控制字（空态） */
@@ -338,5 +318,107 @@ result_code_t RavenFS_juvenile::name_data_release(uint64_t dir_inode_idx)
     dino->name_data_free_ranges_count = 0;
     memset(dino->possible_inline_free_ranges, 0, sizeof(dino->possible_inline_free_ranges));
     ino_sess.dirty();
+    return RC_OK;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * name_data_map_reclaim — 归还一棵名字数据面映射树的数据片 + 节点
+ *
+ * 左叶下钻（inner extents[0]）→ 叶链 while 遍历（ptrs[2] 后继，**不设
+ * 64 深度上限**：叶链长度 = 逻辑片数/叶容量，可远超树高）→ 逐条 extent
+ * block_free(phys,len) → extent_orphan_release 释放全部节点。
+ * 结构异常即停（余块泄漏由 fsck 收）；不碰 inode 控制字。
+ * ═══════════════════════════════════════════════════════════════════ */
+void RavenFS_juvenile::name_data_map_reclaim(uint64_t tree_root)
+{
+    const uint64_t PTR52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
+    if (tree_root == PTR52 || tree_root == PTR_INVALID) return;
+
+    /* 1. 下钻到最左叶（深度受限，防环） */
+    uint64_t cur = tree_root;
+    for (int d = 0; d < 64; d++) {
+        mdata_piece_session s(mdata_piece_mgr, cur);
+        if (s.index_error() || !s) return;
+        Bptree_meta_t *m = (Bptree_meta_t *)s.data;
+        if (!is_extent_node_kind(m, EXTENT_TREE_NAMEDATA)) return;
+        if (!RFS_PP_IS_INNER(m->parent_ptr)) break;
+        const Bptree_extent_inner_node_t *inner = (const Bptree_extent_inner_node_t *)s.data;
+        if (RFS_PP_COUNT(inner->meta.parent_ptr) == 0) return;
+        cur = RFS_PTR_ADDR(inner->extents[0].sub_node_ptr);
+    }
+
+    /* 2. 叶链遍历收集物理段（while，链长无上限） */
+    std::vector<extent_t> recs;
+    while (cur != PTR52) {
+        mdata_piece_session s(mdata_piece_mgr, cur);
+        if (s.index_error() || !s) break;
+        Bptree_meta_t *m = (Bptree_meta_t *)s.data;
+        if (!is_extent_node_kind(m, EXTENT_TREE_NAMEDATA)) break;
+        if (RFS_PP_IS_INNER(m->parent_ptr)) break;   /* 结构异常：非叶 */
+        const Bptree_extent_leaf_node_t *leaf = (const Bptree_extent_leaf_node_t *)s.data;
+        const uint16_t cnt = (uint16_t)RFS_PP_COUNT(leaf->meta.parent_ptr);
+        for (uint16_t i = 0; i < cnt; i++) recs.push_back(leaf->extents[i]);
+        cur = RFS_PTR_ADDR(leaf->meta.ptrs[2]);
+    }
+
+    /* 3. 逐段归还数据片 → 释放全部树节点（只放节点 2 块/个，不碰数据 phys） */
+    for (const extent_t &e : recs)
+        block_free(RFS_PTR_ADDR(e.block_base), e.length);
+    extent_orphan_release(tree_root, EXTENT_TREE_NAMEDATA);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * name_data_rebuild — 数据面重建（离线压实）：tree 态碎片映射 → 单连续 direct
+ *
+ * 语义：把逻辑空间 [0, pieces×8K) 的物理承载从「映射树描述的离散段」整体
+ * 搬迁到一段**新分配的、连续且 8K 对齐**的物理段（pieces×2 个 FS_block），
+ * 然后切换 name_data_ctl 为 direct，最后回收旧映射树 + 旧数据片。
+ *
+ * 写序（崩溃安全）：先把新段数据全部写好 → **提交点**（ctl=direct）→ 才回收
+ * 旧资产。任何中断点：提交前崩溃 = 旧态完好（新段孤儿，位图亮，fsck 可收）；
+ * 提交后崩溃 = 新态一致（旧段/旧树孤儿，fsck 可收）。绝不出现「ctl 指向未写数据的段」。
+ *
+ * 前置：调用方保证无并发（离线工具）。direct / 空态 = no-op。
+ * fr 不受影响（空闲区间是逻辑偏移，与物理搬迁无关）。
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::name_data_rebuild(uint64_t dir_inode_idx)
+{
+    InodeSession ino_sess(inode_cache_mgr, dir_inode_idx);
+    if (!ino_sess) return RC_ERR_IO;
+    raven_dir_Inode_t *dino = (raven_dir_Inode_t *)ino_sess.inode;
+    if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR) return RC_ERR_STATE;
+
+    const uint64_t pieces = nd_pieces(dino);
+    if (nd_is_empty(dino) || pieces == 0) return RC_OK;            /* 空态 */
+    if (RFS_ND_CTL_IS_DIRECT(dino->name_data_ctl)) return RC_OK;   /* 已连续 */
+
+    const uint64_t tree_root = RFS_ND_CTL_PTR(dino->name_data_ctl);
+    const uint64_t need_blk  = pieces * 2;   /* 8K 片 = 2 FS_block */
+
+    /* 1. 新连续段（8K 对齐；失败零副作用） */
+    uint64_t new_base = block_alloc_hard(need_blk, 1);
+    if (new_base == PTR_INVALID) return RC_ERR_NO_BLOCK;
+
+    /* 2. 逐 8K 片搬迁（resolve 旧 phys → 读 → 写新 phys）。缓冲 8K 对齐
+     *    （O_DIRECT 前提）。任一 IO 失败 = 回滚新段，旧态完好。 */
+    void *buf = node_buf_alloc();
+    if (!buf) { block_free(new_base, need_blk); return RC_ERR_IO; }
+    for (uint64_t i = 0; i < pieces; i++) {
+        uint64_t old_blk = 0; uint16_t off = 0;
+        result_code_t rc = name_data_resolve(dino, i * 8192, &old_blk, &off);
+        if (rc == RC_OK && off != 0) rc = RC_ERR_STATE;   /* 片必 8K 对齐 */
+        if (rc == RC_OK) rc = read_buff(old_blk, 2, buf);
+        if (rc == RC_OK) rc = write_buff(new_base + i * 2, 2, buf);
+        if (rc) { node_buf_free(buf); block_free(new_base, need_blk); return rc; }
+    }
+    node_buf_free(buf);
+
+    /* 3. 提交点：ctl → direct（先提交后回收；旧资产回收失败仅泄漏，可 fsck） */
+    RFS_ND_CTL_SET_PTR(dino->name_data_ctl, new_base);
+    RFS_ND_CTL_SET_DIRECT(dino->name_data_ctl, 1);
+    ino_sess.dirty();
+
+    /* 4. 回收旧映射树 + 旧数据片（尽力而为） */
+    name_data_map_reclaim(tree_root);
     return RC_OK;
 }

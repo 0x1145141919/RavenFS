@@ -1324,7 +1324,8 @@ void RavenFS_juvenile::audit_name_data_leaf_chain(audit_walk_ctx_t &ctx,
  *   · fr_ctl：[0]=inline(1)/tree(0)；[1:52)=树根块号。空态 ptr 全 1
  *     （RFS_ND_FR_CTL_INACTIVE）且 fr_count==0。
  *   · fr_count = 全域空闲区间总数 = fr 树叶条目总数。
- *   · inline 态表本轮未实现（恒空态）；tree 态优先生效。
+ *   · inline 态：possible_inline_free_ranges[9]（键序同叶），fr_count ≤ 9；
+ *     区间数 > 9 ⇒ 必须 tree 态（隐式升格）。
  *   · tree：节点 NAMEDATA_FREERANGES_MAGIC1..4；hint=子树最大复合键。
  * 认领 fr 树全部节点块（2/节点）；违例经 bad_name_data 计 heap_bad。
  * ═══════════════════════════════════════════════════════════════════ */

@@ -43,13 +43,17 @@ v1.3：每目录一个**稠密、8K 对齐的逻辑字节空间** = 一棵**映�
 - **不变量**：逻辑空间 `[0, pieces×8K)` **稠密无洞**；每条 extent `length` 为偶数块
   （每 8K 数据片 = `length 2`）；物理段 8K 对齐。
 
-### 1.3 空闲区间树 fr（`Bptree_dir_name_data_free_ranges_{leaf,inner}_node_t`）
+### 1.3 空闲区间表 fr（inline 表 / `Bptree_dir_name_data_free_ranges_{leaf,inner}_node_t`）
 
-- 魔数 `NAMEDATA_FREERANGES_MAGIC1..4`；**统一 337 阶**（`free_ranges[338]` /
-  `hints[338]` + padding）。
+- **两态**（`name_data_free_ranges_ctl` bit0）：`inline(1)` = 内联表
+  `possible_inline_free_ranges[9]`；`tree(0)` = B+树。空态 = ptr 全 1（`INACTIVE`）。
+  - `inline`：键序与叶同 `(len 主序, base 副序)`，`fr_count ≤ 9`；初始（bootstrap）
+    态；插入第 10 条时**隐式升格** tree（把 9 条 + 新条合并进新根叶，不回溯）。
+  - `tree`：魔数 `NAMEDATA_FREERANGES_MAGIC1..4`；**统一 337 阶**
+    （`free_ranges[338]` / `hints[338]` + padding）。
 - `free_range_t{ base, len }`（16B）：**空闲 = 删长名释放 ∪ 新片未分配尾部**
-  （故无需"已用前沿"字段；分配用尽 ⇔ fr 内无 `len ≥ need`）。
-- 叶子按 **复合键 `(len 主序, base 副序)`** 升序。
+  （故无需"已用前沿"字段；分配用尽 ⇔ fr 内无 `len ≥ need`）。inline 表与叶复用同型。
+- 叶按 **复合键 `(len 主序, base 副序)`** 升序。
 - 内部 hint = 子树**最大复合键 `(max_len, max_base)`**；路由 = 第一个
   `(max_len,max_base) ≥ target` 的子树，无则最右击穿。
   - 分配 best-fit：target=`(need, 0)`（等价 `max_len ≥ need`）；
@@ -69,11 +73,25 @@ v1.3：每目录一个**稠密、8K 对齐的逻辑字节空间** = 一棵**映�
 - `name_data_read/write(dir, off, len, buf)`：`name_data_resolve` 解析物理（含逻辑上界校验）。
 - `name_data_release(dir)`：数据片 + 映射树节点 + fr 树节点全量回收 + 双控制字复位。
 - `name_data_resolve` / `name_data_map_append`：映射解析 / 映射尾插。
+- `name_data_map_reclaim(tree_root)`：归还一棵映射树的数据片 + 节点（左叶下钻 →
+  叶链 **while** 遍历逐段 `block_free(phys,len)` → `extent_orphan_release`）。
+  供 release / rebuild 复用；叶链无 64 深度上限。
+- **`name_data_rebuild(dir)`（离线压实）**：tree 碎片映射 → 单连续 direct。
+  `block_alloc_hard(pieces×2, 8K 对齐)` → 逐片 `resolve` 旧物理迁数 →
+  **提交** ctl=direct → `name_data_map_reclaim` 回收旧树+旧片。direct/空态 = no-op；
+  失败零副作用（新段回滚）。写序保证：提交前崩溃旧态完好，提交后崩溃旧资产孤儿可 fsck。
 
-### 2.2 `juvenile_god/name_data_freeranges.cpp`（fr B+ 树）
-- `name_data_fr_walk` / `find_fit` / `insert`（预算池 + 169/169 分裂级联 + 建新根）/
-  `take_fit`（best-fit 摘除 + 余段回填）/ `retire_empty_leaf` / `refresh_key_chain` /
-  `node_meta_init` / `max_key` / `release`。
+### 2.2 `juvenile_god/name_data_freeranges.cpp`（fr 两态）
+- **inline 态**（`possible_inline_free_ranges[9]`）：`insert`/`take_fit`/`release`
+  在入口按 `RFS_ND_FR_CTL_IS_INLINE` 分派；线性 lower_bound/best-fit；
+  `insert` 第 10 条 → `block_alloc_hard` 建根叶并合并升格 tree（失败零副作用）。
+- **tree 态**：`name_data_fr_walk` / `find_fit` / `insert`（预算池 + 169/169 分裂级联
+  + 建新根）/ `take_fit`（best-fit 摘除 + 余段回填）/ `retire_empty_leaf` /
+  `refresh_key_chain` / `node_meta_init` / `max_key` / `release` / `free_tree`。
+- **`name_data_fr_compact(dir)`（离线压缩）**：dump 全部区间（inline/tree 通吃）→
+  按 base 升序**全量相邻合并**（含重叠防御）→ 忘记旧 fr（暂不释放）→ 按规范灌回
+  （**≤9 条降级 inline**，>9 条升格 tree）→ 释放旧树节点。中途失败回滚（释放半成品 +
+  恢复旧 ctl/count/inline，零丢失）。合并不改变空闲并集，best-fit 语义不变。
 
 ### 2.3 通用 extent 机械 kind 泛化（复用）
 - `ravenfs_v1.1.hpp`：`enum extent_tree_kind_t { EXTENT_TREE_FILE, EXTENT_TREE_NAMEDATA }`。
@@ -86,6 +104,8 @@ v1.3：每目录一个**稠密、8K 对齐的逻辑字节空间** = 一棵**映�
 ### 2.4 顶层 / dentry 侧
 - `root_dir.cpp`：`dir_*` 用 `raven_dir_Inode_t*` + `ddentry_Bptree_root`；
   `name_cmlpx_t` 填 `owner_dir_inum`；长名释放走 `name_data_free`。
+  创建路径前置 `name_check_create`（fs 级名字把关：空名 / 含 `/` → `RC_ERR_NAME_INVALID`，
+  超 552B → `RC_ERR_NAME_LEN`；在 inode/hash/树访问前完成，零副作用）。
 - `dentry_walk_lookup.cpp`：`dentry_name_cmp(e, name, len, owner_dir_inum)`。
 - `dentry_insert_delete.cpp`：dir 初始化双树空态；长名 `name_data_alloc/write` +
   `name_data_guard_t`；rmdir 走 `name_data_release`。
@@ -102,7 +122,8 @@ v1.3：每目录一个**稠密、8K 对齐的逻辑字节空间** = 一棵**映�
 
 - 逻辑空间 `[0, pieces×8K)` 稠密无洞、8K 对齐；每片 = `length 2` 的 extent。
 - `name_data_ctl` 空态 ⇔ `piece_count==0`；非空必为 direct 或 tree。
-- fr 区间互不重叠、落 `[0, pieces×8K)`；`fr_count == Σ 叶条目`。
+- fr 两态：`inline` ⇔ `fr_count ≤ 9`（ptr 域非全 1）；`tree` ⇔ `fr_count > 9`。
+  区间互不重叠、落 `[0, pieces×8K)`；`fr_count == Σ 空闲区间`（inline 条目数 / 叶条目 Σ）。
 - fr 叶复合键 `(len,base)` **全局严格递增**；hint = 子树最大复合键。
 - **树内无 `count==0` 的叶**（空叶 hint=(0,0) 会破坏 hint 单调性 → 二分路由错位）；
   根内部不得只剩 1 孩（收缩提升）。
@@ -114,10 +135,11 @@ v1.3：每目录一个**稠密、8K 对齐的逻辑字节空间** = 一棵**映�
 | 目标 | 文件 | 覆盖 |
 |---|---|---|
 | `ravenfs_juv_name_data` | `tests/test_name_data_plane.cpp` | 字节打包 / free 复用 / 用尽增片 direct→tree / tree 回环 / release+audit |
-| `ravenfs_juv_name_data_fr` | `tests/test_name_data_freeranges.cpp` | 301 满叶 / **>255 索引回归** / 叶裂+内节点 / 复合序 / release |
+| `ravenfs_juv_name_data_fr` | `tests/test_name_data_freeranges.cpp` | **inline bootstrap + 第10条隐式升格 tree 断言** / 301 满叶 / **>255 索引回归** / 叶裂+内节点 / 复合序 / release |
+| `ravenfs_juv_name_data_offline` | `tests/test_name_data_offline.cpp` | **离线下行迁移**：`name_data_rebuild`（tree→direct 压实 / 数据回读 / 幂等）/ `name_data_fr_compact`（相邻合并 / ≥10 保持 tree、≤9 **降级 inline** / best-fit 不变）|
 | `ravenfs_stress_name_data_fr` | `tests/stress_name_data_fr.cpp` | **百万级 + 随机/乱序**：随机 len、随机插入序灌入 → 随机 need 乱序 best-fit **取用至用尽**（校验 find_fit==take_fit、区间不重叠、fr 清零）→ **定长乱序返还+再分配**（返回恰为返还集、base 升序）；`mode=offload|selfreliat`（开缓存）|
 | `ravenfs_juv_insert` | `tests/test_root_dir_insert.cpp` | 插入边界（空/40/41/552/553B 等）/ 批量叶·根分裂 / **长名插入+即时 lookup+重复 EXIST** / 树 DFS / 审计 / 重挂载长名回读 |
-| `ravenfs_juv_delete` | `tests/test_root_dir_delete.cpp` | 删除边界 / **长名 140 条 split→全删 merge+收缩→fr best-fit 复用** / 正反向批量删+删空收缩 / 树 DFS / 审计 / 重挂载；`mode=offload\|nocache\|selfreliat` |
+| `ravenfs_juv_delete` | `tests/test_root_dir_delete.cpp` | 删除边界 / **长名 140 条 split→全删 merge+收缩→fr best-fit 复用** / 正反向批量删+删空收缩 / 树 DFS / 审计 / 重挂载；**Phase 2S 大规模长名乱序压测（1M 级）**；`mode=offload\|nocache\|selfreliat` |
 | `ravenfs_juv_audit_dfs` | `tests/test_audit_dfs.cpp` | 全盘可达性审计（含 fr 认领/校验）|
 
 > 顶层三接口（`dir_insert_dentry` / `dir_lookup` / `dir_rm_dentry`）共用测试装置
@@ -125,16 +147,21 @@ v1.3：每目录一个**稠密、8K 对齐的逻辑字节空间** = 一棵**映�
 
 ```bash
 cmake --build build --target ravenfs_juvenile ravenfs_juv_audit_dfs ravenfs_juv_name_data \
-                              ravenfs_juv_name_data_fr ravenfs_stress_name_data_fr \
+                              ravenfs_juv_name_data_fr ravenfs_juv_name_data_offline \
+                              ravenfs_stress_name_data_fr \
                               ravenfs_juv_insert ravenfs_juv_delete
 truncate -s 64M /tmp/x.img && ./mkfs/mkfs.ravenfs --v1.3 -f /tmp/x.img
 ./build/tests/ravenfs_juv_audit_dfs        /tmp/x.img   # 14/14
 ./build/tests/ravenfs_juv_name_data        /tmp/x.img   # 33/33
-./build/tests/ravenfs_juv_name_data_fr     /tmp/x.img   # 10/10
+./build/tests/ravenfs_juv_name_data_fr     /tmp/x.img   # 14/14（含 inline/升格断言）
+./build/tests/ravenfs_juv_name_data_offline /tmp/x.img  # 20/20（rebuild + fr_compact）
 ./build/tests/ravenfs_juv_insert           /tmp/x.img   # 34/34（batch=1000）
 ./build/tests/ravenfs_juv_delete           /tmp/x.img   # 74/74（batch=1000，offload）
 ./build/tests/ravenfs_juv_delete           /tmp/x.img 1000 0 nocache    # 72/72
 ./build/tests/ravenfs_juv_delete           /tmp/x.img 1000 0 selfreliat # 72/72
+# Phase 2S：1M 级长名（41..552B）乱序插删 + 中途 audit（需大镜像 + 足量 inode）
+truncate -s 2G /tmp/big2.img && ./mkfs/mkfs.ravenfs --v1.3 -f /tmp/big2.img --inode-count 1200000
+./build/tests/ravenfs_juv_delete /tmp/big2.img 0 0 offload 1000000    # 84/84
 # 百万级（建议 ≥512MiB 镜像）
 truncate -s 512M /tmp/big.img && ./mkfs/mkfs.ravenfs --v1.3 -f /tmp/big.img
 ./build/tests/ravenfs_stress_name_data_fr /tmp/big.img 1000000 mode=offload    # 5/5
@@ -145,6 +172,12 @@ truncate -s 512M /tmp/big.img && ./mkfs/mkfs.ravenfs --v1.3 -f /tmp/big.img
 Phase B 乱序取用 **1,162,931** 次至 fr 用尽（`mismatch=0 overlap=0 leftover_fr=0`）；
 Phase C 定长乱序返还 1000 条再分配**逐一命中且 base 升序**；
 audit/回收全净（offload 10/10、selfreliat 11/11）。
+
+dir 顶层 1M 实测（`ravenfs_juv_delete /tmp/big2.img 0 0 offload 1000000`，固定种子 20261005）：
+唯一长名 41..552B 乱序全插 **1,000,000/1,000,000 RC_OK**（≈282k ops/s）→ 中途
+`audit_dfs_root` 全净（inodes=1,000,001 nodes=11,688 recs=1,000,000）→ 重新洗牌
+全乱序删 **1,000,000/1,000,000 RC_OK**（≈190k ops/s）→ 删空 audit 全净；整测 84/84，
+10.5s（256MiB 镜像 200k 规模 1.7s）。
 
 ---
 
@@ -161,9 +194,12 @@ audit/回收全净（offload 10/10、selfreliat 11/11）。
 
 ## 6. 已知限制 / TODO（按优先级）
 
-1. **`possible_inline_free_ranges[9]` inline 空闲表未实现**（当前 fr 恒 tree 态）：
-   小目录可省一棵树；需实现 inline↔tree 边界条件（用户明示「fr_tree 稳定后再加」）。
-2. **fr 不做相邻/欠载合并**：长期 churn 会碎片（best-fit 仍可用）；如需回收度可选。
+1. **`possible_inline_free_ranges[9]` inline 空闲表已落地**（2026-10-05）：初始
+   direct+inline；插入第 10 条**隐式升格** tree（不回溯/不降级）。name_data 侧
+   direct + soft 尾延展失败才升格 extent（映射树），同属隐式升级路径。
+2. **运行态 fr 不做相邻/欠载合并**：长期 churn 会碎片（best-fit 仍可用）。合并/降级
+   由离线函数 `name_data_fr_compact` 提供（见 §2.2）；映射碎片压实由 `name_data_rebuild`
+   （§2.1）。两者尚未接入 CLI 工具（离线工具下一战役）。
 3. **审计未强制 fr 非根叶 min-occupancy**（当前只查「合法搜索树」）；可加「非根叶 count≥1」
    以让此类错误被 audit 直接逮住（而非只靠压测）。
 4. **`name_data_resolve` direct 路径**已有逻辑上界校验；tree 路径靠 extent 覆盖校验。

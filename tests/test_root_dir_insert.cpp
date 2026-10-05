@@ -4,6 +4,7 @@
  * 覆盖（root_dir_insert_dentry / dir_insert_dentry）：
  *   1. 边界/异常输入：空名、39/40/41/552/553B、重复插入、大小写、
  *      空格、UTF-8、斜杠、控制字符。
+ *      —— 空名 / 含斜杠 = fs 级非法名 → RC_ERR_NAME_INVALID（2026-10-05）。
  *   2. 批量插入：覆盖叶分裂 → 根分裂（建新根）。
  *   3. 长名批量（41..552B）：插入即 lookup（名字数据面映射树回读），
  *      重复长名 → EXIST（dentry_name_cmp 尾部比较）。
@@ -70,7 +71,7 @@ int main(int argc, char **argv) {
     static const char ctrl[] = { 0x01, 0x02, 0x03, 0 };
 
     const Case cases[] = {
-        { "",            RC_OK,            "空名（长度 0，合法边界）" },
+        { "",            RC_ERR_NAME_INVALID, "空名（fs 级非法：首字节 NUL）" },
         { long40,        RC_OK,            "40B 边界（全内联上限，无外置）" },
         { long41,        RC_OK,            "41B 长名（字节粒度外置 1B）" },
         { "a",           RC_OK,            "正常单字符" },
@@ -82,7 +83,7 @@ int main(int argc, char **argv) {
         { long553,       RC_ERR_NAME_LEN,  "553B 超限（RAVENFS_MAX_NAME_LEN=552）" },
         { "foo bar",     RC_OK,            "含空格" },
         { "中文目录项",    RC_OK,            "UTF-8 多字节" },
-        { "dir/sub",     RC_OK,            "含斜杠（根目录无路径语义，纯字符）" },
+        { "dir/sub",     RC_ERR_NAME_INVALID, "含斜杠（fs 级非法字符）" },
         { ctrl,          RC_OK,            "控制字符 0x01-0x03" },
     };
     for (const auto &c : cases) {
@@ -94,11 +95,11 @@ int main(int argc, char **argv) {
         ok ? g_pass++ : g_fail++;
     }
 
-    /* 空名再插一次：hash 相同 → EXIST */
+    /* 空名再插一次：fs 级非法，在任何分配/树访问前拒绝（幂等，无副作用） */
     {
         result_code_t r = fs.root_dir_insert_dentry("", INODE_TYPE_REGULAR);
-        bool ok = (r == RC_ERR_EXIST);
-        printf("  [%s] insert(\"\") 再次 → %s（expect RC_ERR_EXIST）\n",
+        bool ok = (r == RC_ERR_NAME_INVALID);
+        printf("  [%s] insert(\"\") 再次 → %s（expect RC_ERR_NAME_INVALID）\n",
                ok ? "PASS" : "FAIL", rc_name(r));
         ok ? g_pass++ : g_fail++;
     }
