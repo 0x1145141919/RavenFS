@@ -117,11 +117,41 @@ static u64 rfs_ext_resv_take(struct super_block *sb, struct rfs_ext_resv *r)
 
 /* ══ 节点 / meta 基建 ══ */
 
-static int rfs_ext_meta_ok_x(const struct Bptree_meta_t *m, u32 *cnt, u32 *inner,
-			     u32 *root, u64 *pptr, u32 maxc)
+/* 三族 extent 树的 256-bit 节点魔数：节点布局逐字节同构，kind 仅决定认哪套魔数。
+ * 依据 include/magics.h + god is_extent_node_kind（ravenfs_juvenile.cpp:56）。 */
+static void rfs_ext_magic_of(u32 kind, u64 out[4])
 {
-	if (m->magics[0] != BPTREE_MAGIC1 || m->magics[1] != BPTREE_MAGIC2 ||
-	    m->magics[2] != BPTREE_MAGIC3 || m->magics[3] != BPTREE_MAGIC4)
+	if (kind == RFS_EXT_KIND_NAMEDATA) {
+		out[0] = NAMEDATA_EXTENT_MAGIC1;
+		out[1] = NAMEDATA_EXTENT_MAGIC2;
+		out[2] = NAMEDATA_EXTENT_MAGIC3;
+		out[3] = NAMEDATA_EXTENT_MAGIC4;
+	} else if (kind == RFS_EXT_KIND_INODE) {
+		out[0] = INODE_DATA_EXTENT_MAGIC1;
+		out[1] = INODE_DATA_EXTENT_MAGIC2;
+		out[2] = INODE_DATA_EXTENT_MAGIC3;
+		out[3] = INODE_DATA_EXTENT_MAGIC4;
+	} else {
+		out[0] = BPTREE_MAGIC1;
+		out[1] = BPTREE_MAGIC2;
+		out[2] = BPTREE_MAGIC3;
+		out[3] = BPTREE_MAGIC4;
+	}
+}
+
+static bool rfs_ext_magic_is(u32 kind, const struct Bptree_meta_t *m)
+{
+	u64 want[4];
+
+	rfs_ext_magic_of(kind, want);
+	return m->magics[0] == want[0] && m->magics[1] == want[1] &&
+	       m->magics[2] == want[2] && m->magics[3] == want[3];
+}
+
+static int rfs_ext_meta_ok_x(u32 kind, const struct Bptree_meta_t *m, u32 *cnt,
+			     u32 *inner, u32 *root, u64 *pptr, u32 maxc)
+{
+	if (!rfs_ext_magic_is(kind, m))
 		return -EIO;
 	*cnt = RFS_PP_COUNT(m->parent_ptr);
 	*inner = RFS_PP_IS_INNER(m->parent_ptr);
@@ -132,10 +162,10 @@ static int rfs_ext_meta_ok_x(const struct Bptree_meta_t *m, u32 *cnt, u32 *inner
 	return 0;
 }
 
-static int rfs_ext_meta_ok(const struct Bptree_meta_t *m, u32 *cnt, u32 *inner,
-			   u32 *root, u64 *pptr)
+static int rfs_ext_meta_ok(u32 kind, const struct Bptree_meta_t *m, u32 *cnt,
+			   u32 *inner, u32 *root, u64 *pptr)
 {
-	return rfs_ext_meta_ok_x(m, cnt, inner, root, pptr, RFS_EXT_MAX_SLOTS);
+	return rfs_ext_meta_ok_x(kind, m, cnt, inner, root, pptr, RFS_EXT_MAX_SLOTS);
 }
 
 /* 节点子树最大开边界（叶取末项 fblkbase+length；内取末 hint key）；空 → 0 */
@@ -151,15 +181,12 @@ static u64 rfs_ext_node_max(const void *node, u32 inner, u32 cnt)
 	       ((const struct Bptree_extent_leaf_node_t *)m)->extents[cnt - 1].length;
 }
 
-static void rfs_ext_node_init(void *node, u32 count, u32 inner, u32 root, u64 ptr)
+static void rfs_ext_node_init(u32 kind, void *node, u32 count, u32 inner, u32 root, u64 ptr)
 {
 	struct Bptree_meta_t *m = node;
 
 	memset(node, 0, RAVENFS_NODE_BYTES);
-	m->magics[0] = BPTREE_MAGIC1;
-	m->magics[1] = BPTREE_MAGIC2;
-	m->magics[2] = BPTREE_MAGIC3;
-	m->magics[3] = BPTREE_MAGIC4;
+	rfs_ext_magic_of(kind, m->magics);
 	m->parent_ptr.v = RFS_PP_PACK(count, inner, root, ptr);
 	m->ptrs[0].v = RFS_EXT_PTR_INV;
 	m->ptrs[1].v = RFS_EXT_PTR_INV;
@@ -173,8 +200,8 @@ static inline void rfs_ext_set_addr(struct ptr_in_idx *p, u64 addr)
 
 /* ══ 查询：严格上界路由 + 叶内 GLB ══
  * 返回：0 = 命中（*out）；1 = 未命中（洞，*next=下一 extent 起点块号，0=无）；<0 = 错误。 */
-int ravenfs_extent_lookup(struct super_block *sb, u64 root, u64 target,
-			  struct extent_t *out, u64 *next)
+int ravenfs_extent_lookup_kind(struct super_block *sb, u32 kind, u64 root,
+			       u64 target, struct extent_t *out, u64 *next)
 {
 	u64 blk = root;
 	u32 depth = 0;
@@ -204,7 +231,7 @@ int ravenfs_extent_lookup(struct super_block *sb, u64 root, u64 target,
 			break;
 		RFS_STAT_INC(sb, ext_node_reads);	/* 走树步数 */
 		meta = buf;
-		err = rfs_ext_meta_ok(meta, &cnt, &inner, &rootf, &pptr);
+		err = rfs_ext_meta_ok(kind, meta, &cnt, &inner, &rootf, &pptr);
 		if (err)
 			break;
 
@@ -269,13 +296,20 @@ int ravenfs_extent_lookup(struct super_block *sb, u64 root, u64 target,
 	return err;
 }
 
+/* FILE 版（历史签名）：等价 lookup_kind(..., RFS_EXT_KIND_FILE, ...) */
+int ravenfs_extent_lookup(struct super_block *sb, u64 root, u64 target,
+			  struct extent_t *out, u64 *next)
+{
+	return ravenfs_extent_lookup_kind(sb, RFS_EXT_KIND_FILE, root, target, out, next);
+}
+
 /*
  * 计数（i_blocks 诚实化用）：递归遍历，累加数据块（叶 length 之和）与节点数（每节点 8K=2 块）。
  * 失败/超深时按已知部分返回（不致命）。
  */
 /* 计数递归（depth 护栏防成环） */
-static int rfs_ext_count_rec(struct super_block *sb, u64 root, u64 *data, u64 *nodes,
-			     u32 depth)
+static int rfs_ext_count_rec(struct super_block *sb, u32 kind, u64 root, u64 *data,
+			     u64 *nodes, u32 depth)
 {
 	const struct Bptree_meta_t *m;
 	void *buf;
@@ -291,7 +325,7 @@ static int rfs_ext_count_rec(struct super_block *sb, u64 root, u64 *data, u64 *n
 		return 0;
 	}
 	m = buf;
-	if (rfs_ext_meta_ok(m, &cnt, &inner, &(u32){0}, &(u64){0})) {
+	if (rfs_ext_meta_ok(kind, m, &cnt, &inner, &(u32){0}, &(u64){0})) {
 		kfree(buf);
 		return 0;
 	}
@@ -300,7 +334,7 @@ static int rfs_ext_count_rec(struct super_block *sb, u64 root, u64 *data, u64 *n
 		const struct Bptree_extent_inner_node_t *nd = buf;
 
 		for (i = 0; i < cnt; i++)
-			rfs_ext_count_rec(sb, RFS_PTR_ADDR(nd->extents[i].sub_node_ptr),
+			rfs_ext_count_rec(sb, kind, RFS_PTR_ADDR(nd->extents[i].sub_node_ptr),
 					  data, nodes, depth + 1);
 	} else {
 		const struct Bptree_extent_leaf_node_t *lf = buf;
@@ -313,13 +347,21 @@ static int rfs_ext_count_rec(struct super_block *sb, u64 root, u64 *data, u64 *n
 }
 
 /* 节点/数据块计数（i_blocks 诚实化用） */
+int ravenfs_extent_count_kind(struct super_block *sb, u32 kind, u64 root,
+			      u64 *data, u64 *nodes)
+{
+	return rfs_ext_count_rec(sb, kind, root, data, nodes, 0);
+}
+
+/* FILE 版（历史签名） */
 int ravenfs_extent_count(struct super_block *sb, u64 root, u64 *data, u64 *nodes)
 {
-	return rfs_ext_count_rec(sb, root, data, nodes, 0);
+	return ravenfs_extent_count_kind(sb, RFS_EXT_KIND_FILE, root, data, nodes);
 }
 
 /* ══ 多级 walk：填 path（blk/cidx）、hit、插入位 ══ */
-static int rfs_ext_walk(struct super_block *sb, u64 root, u64 target, struct rfs_epath *p)
+static int rfs_ext_walk(struct super_block *sb, u32 kind, u64 root, u64 target,
+			struct rfs_epath *p)
 {
 	void *buf;
 	u64 blk = root;
@@ -339,7 +381,7 @@ static int rfs_ext_walk(struct super_block *sb, u64 root, u64 target, struct rfs
 		if (err)
 			break;
 		RFS_STAT_INC(sb, ext_node_reads);	/* 走树步数 */
-		err = rfs_ext_meta_ok(buf, &cnt, &inner, &rootf, &pptr);
+		err = rfs_ext_meta_ok(kind, buf, &cnt, &inner, &rootf, &pptr);
 		if (err)
 			break;
 		if ((depth == 0) != (rootf != 0)) { err = -EIO; break; }	/* 第 0 层必须 root */
@@ -395,7 +437,7 @@ static int rfs_ext_walk(struct super_block *sb, u64 root, u64 target, struct rfs
 }
 
 /* 自 child_level 起向上传播 max（父 hint key 变更）；父 max 未变则短路 */
-static int rfs_ext_propagate(struct super_block *sb, const struct rfs_epath *p,
+static int rfs_ext_propagate(struct super_block *sb, u32 kind, const struct rfs_epath *p,
 			     u32 child_level, u64 cur_max)
 {
 	int lvl;
@@ -409,7 +451,7 @@ static int rfs_ext_propagate(struct super_block *sb, const struct rfs_epath *p,
 			return PTR_ERR(ms);
 		nd = ravenfs_msession_node(ms);
 		if (!RFS_PP_IS_INNER(nd->meta.parent_ptr) ||
-		    rfs_ext_meta_ok(&nd->meta, &cnt, &(u32){0}, &(u32){0}, &(u64){0}) ||
+		    rfs_ext_meta_ok(kind, &nd->meta, &cnt, &(u32){0}, &(u32){0}, &(u64){0}) ||
 		    idx >= cnt) {
 			ravenfs_mdata_put(ms);
 			return -EIO;
@@ -430,7 +472,7 @@ static int rfs_ext_propagate(struct super_block *sb, const struct rfs_epath *p,
  *
  * rsv：分裂预算池（D-5b）。非 NULL 时新叶块从池取（池空则现分配）；NULL = 旧口径
  *      （现分配，unmap 路径沿用）。*/
-static int rfs_ext_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
+static int rfs_ext_leaf_split(struct super_block *sb, u32 kind, u64 victim_blk, u64 *out_new,
 			      u64 *out_low, u64 *out_high, bool *out_was_root,
 			      struct rfs_ext_resv *rsv)
 {
@@ -448,7 +490,7 @@ static int rfs_ext_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_n
 	if (IS_ERR(vms))
 		return PTR_ERR(vms);
 	vl = ravenfs_msession_node(vms);
-	err = rfs_ext_meta_ok_x(&vl->meta, &cnt, &inner, &root, &pptr, RFS_EXT_MAX_SLOTS);
+	err = rfs_ext_meta_ok_x(kind, &vl->meta, &cnt, &inner, &root, &pptr, RFS_EXT_MAX_SLOTS);
 	if (err || inner || cnt != RFS_EXT_MAX_SLOTS) {
 		ravenfs_mdata_put(vms);
 		return err ? err : -EIO;
@@ -476,7 +518,7 @@ static int rfs_ext_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_n
 	vl = ravenfs_msession_node(vms);
 	nl = ravenfs_msession_node(nms);
 
-	rfs_ext_node_init(nl, right, 0, 0, parent);
+	rfs_ext_node_init(kind, nl, right, 0, 0, parent);
 	memcpy(&nl->extents[0], &vl->extents[RFS_EXT_SPLIT],
 	       (size_t)right * sizeof(struct extent_t));
 	rfs_ext_set_addr(&nl->meta.ptrs[1], victim_blk);			/* prev */
@@ -512,7 +554,7 @@ static int rfs_ext_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_n
 /* 内裂：victim(count=338) → 左 168 / 右 170；右半孩子 reparent → 新内块
  *
  * rsv：分裂预算池（D-5b，语义同 rfs_ext_leaf_split）。*/
-static int rfs_ext_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
+static int rfs_ext_inner_split(struct super_block *sb, u32 kind, u64 victim_blk, u64 *out_new,
 			       u64 *out_low, u64 *out_high, struct rfs_ext_resv *rsv)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
@@ -528,7 +570,7 @@ static int rfs_ext_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_
 	if (IS_ERR(vms))
 		return PTR_ERR(vms);
 	vi = ravenfs_msession_node(vms);
-	err = rfs_ext_meta_ok_x(&vi->meta, &cnt, &inner, &root, &pptr, RFS_EXT_MAX_SLOTS);
+	err = rfs_ext_meta_ok_x(kind, &vi->meta, &cnt, &inner, &root, &pptr, RFS_EXT_MAX_SLOTS);
 	if (err || !inner || cnt != RFS_EXT_MAX_SLOTS) {
 		ravenfs_mdata_put(vms);
 		return err ? err : -EIO;
@@ -554,7 +596,7 @@ static int rfs_ext_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_
 	vi = ravenfs_msession_node(vms);
 	ni = ravenfs_msession_node(nms);
 
-	rfs_ext_node_init(ni, right, 1, 0, parent);
+	rfs_ext_node_init(kind, ni, right, 1, 0, parent);
 	memcpy(&ni->extents[0], &vi->extents[RFS_EXT_SPLIT],
 	       (size_t)right * sizeof(struct extent_hint_t));
 	vi->meta.parent_ptr.v = RFS_PP_PACK(RFS_EXT_SPLIT, 1, root, parent);
@@ -584,7 +626,7 @@ static int rfs_ext_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_
 		if (IS_ERR(cms))
 			return PTR_ERR(cms);
 		cm = ravenfs_msession_node(cms);
-		err = rfs_ext_meta_ok(cm, &cc, &ci, &cr, &cp);
+		err = rfs_ext_meta_ok(kind, cm, &cc, &ci, &cr, &cp);
 		if (err) {
 			ravenfs_mdata_put(cms);
 			return err;
@@ -600,8 +642,8 @@ static int rfs_ext_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_
 /* 新建根内（根升长）；显式写 ptrs[]（文件树 ".." = PTR_INVALID）
  *
  * rsv：分裂预算池（D-5b）；非 NULL 时新根块从池取。*/
-static int rfs_ext_new_root_inner(struct super_block *sb, u64 ino, u64 left_blk, u64 left_max,
-				  u64 right_blk, u64 right_max, u64 *root_out,
+static int rfs_ext_new_root_inner(struct super_block *sb, u32 kind, u64 ino, u64 left_blk,
+				  u64 left_max, u64 right_blk, u64 right_max, u64 *root_out,
 				  struct rfs_ext_resv *rsv)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
@@ -622,7 +664,7 @@ static int rfs_ext_new_root_inner(struct super_block *sb, u64 ino, u64 left_blk,
 		return err;
 	}
 	ri = ravenfs_msession_node(rms);
-	rfs_ext_node_init(ri, 2, 1, 1, ino);
+	rfs_ext_node_init(kind, ri, 2, 1, 1, ino);
 	rfs_ext_set_addr(&ri->meta.ptrs[1], RFS_MASK52);	/* 文件树无 ".." */
 	rfs_ext_set_addr(&ri->extents[0].sub_node_ptr, left_blk);
 	ri->extents[0].key = left_max;
@@ -642,7 +684,7 @@ static int rfs_ext_new_root_inner(struct super_block *sb, u64 ino, u64 left_blk,
 		if (IS_ERR(kms))
 			return PTR_ERR(kms);
 		km = ravenfs_msession_node(kms);
-		err = rfs_ext_meta_ok(km, &cc, &ci, &cr, &cp);
+		err = rfs_ext_meta_ok(kind, km, &cc, &ci, &cr, &cp);
 		if (err) {
 			ravenfs_mdata_put(kms);
 			return err;
@@ -656,7 +698,7 @@ static int rfs_ext_new_root_inner(struct super_block *sb, u64 ino, u64 left_blk,
 }
 
 /* 父层应用（+ 内裂上溯 + 升根）。cur_victim = 父层里被替换/插入的旧子块号 */
-static int rfs_ext_apply_up(struct super_block *sb, u64 ino, const struct rfs_epath *p,
+static int rfs_ext_apply_up(struct super_block *sb, u32 kind, u64 ino, const struct rfs_epath *p,
 			    u32 level, u32 child_idx, u64 cur_victim, u64 low_max,
 			    u64 new_blk, u64 high_max, u64 *root_io, struct rfs_ext_resv *rsv)
 {
@@ -669,7 +711,7 @@ static int rfs_ext_apply_up(struct super_block *sb, u64 ino, const struct rfs_ep
 		if (IS_ERR(ms))
 			return PTR_ERR(ms);
 		nd = ravenfs_msession_node(ms);
-		if (rfs_ext_meta_ok(&nd->meta, &pcnt, &(u32){0}, &(u32){0}, &(u64){0}) ||
+		if (rfs_ext_meta_ok(kind, &nd->meta, &pcnt, &(u32){0}, &(u32){0}, &(u64){0}) ||
 		    !RFS_PP_IS_INNER(nd->meta.parent_ptr) ||
 		    idx >= pcnt || pcnt > RFS_EXT_ORDER ||
 		    RFS_PTR_ADDR(nd->extents[idx].sub_node_ptr) != cur_victim) {
@@ -689,18 +731,18 @@ static int rfs_ext_apply_up(struct super_block *sb, u64 ino, const struct rfs_ep
 
 		if (new_cnt <= RFS_EXT_ORDER) {
 			if (idx + 1 == new_cnt - 1)	/* 新 hint 是末位 → 父 max 变 */
-				return rfs_ext_propagate(sb, p, level, high_max);
+				return rfs_ext_propagate(sb, kind, p, level, high_max);
 			return 0;
 		}
 		/* 父溢出 → 内裂 */
 		{
 			u64 rblk, lmx, hmx;
 
-			err = rfs_ext_inner_split(sb, p->blk[level], &rblk, &lmx, &hmx, rsv);
+			err = rfs_ext_inner_split(sb, kind, p->blk[level], &rblk, &lmx, &hmx, rsv);
 			if (err)
 				return err;
 			if (is_root)
-				return rfs_ext_new_root_inner(sb, ino, p->blk[level], lmx,
+				return rfs_ext_new_root_inner(sb, kind, ino, p->blk[level], lmx,
 							      rblk, hmx, root_io, rsv);
 			if (level == 0)
 				return -EIO;
@@ -715,7 +757,7 @@ static int rfs_ext_apply_up(struct super_block *sb, u64 ino, const struct rfs_ep
 }
 
 /* 欠载链修复（M4.3 定义于本文件后段；D-5a 双融合吞右邻致欠载时前向调用） */
-static int rfs_ext_balance_from(struct super_block *sb, u64 ino, u64 child_blk,
+static int rfs_ext_balance_from(struct super_block *sb, u32 kind, u64 ino, u64 child_blk,
 				u64 *root_io, u64 *old_root);
 
 /* ══ 插入一条 extent（walk 定位后调用）；叶内四形态融合 + 前瞻预算 + 叶裂 + 升根 + 父 key 上溯 ══
@@ -729,8 +771,8 @@ static int rfs_ext_balance_from(struct super_block *sb, u64 ino, u64 child_blk,
  * P10：根更迭（both 致欠载 → 平衡链 → 根收缩）**旧根不就地 free**，经 *old_root 外抛，
  *       由调用方在 inode.data_root 提交**之后**统一 free。
  */
-int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
-			  const struct extent_t *ext, u64 *old_root)
+int ravenfs_extent_insert_kind(struct super_block *sb, u32 kind, u64 ino, u64 *root_io,
+			       const struct extent_t *ext, u64 *old_root)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct rfs_epath p;
@@ -763,14 +805,14 @@ int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
 			(void)rfs_allocator_block_free(sbi->alloc, rblk, 2);
 			return err;
 		}
-		rfs_ext_node_init(ravenfs_msession_node(rms), 0, 0, 1, ino);
+		rfs_ext_node_init(kind, ravenfs_msession_node(rms), 0, 0, 1, ino);
 		NODE_DIRTY(rms);
 		ravenfs_mdata_put(rms);
 		root = rblk;
 		*root_io = root;
 	}
 
-	err = rfs_ext_walk(sb, root, ext->fblkbase, &p);
+	err = rfs_ext_walk(sb, kind, root, ext->fblkbase, &p);
 	if (err)
 		return err;
 
@@ -786,7 +828,7 @@ int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
 		if (IS_ERR(ms))
 			return PTR_ERR(ms);
 		lf = ravenfs_msession_node(ms);
-		if (rfs_ext_meta_ok(&lf->meta, &c, &inner, &rootf, &pptr) || inner) {
+		if (rfs_ext_meta_ok(kind, &lf->meta, &c, &inner, &rootf, &pptr) || inner) {
 			ravenfs_mdata_put(ms);
 			return -EIO;
 		}
@@ -904,12 +946,12 @@ int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
 		 * —— P10）。*/
 		if (leaf_is_root || cnt2 >= RFS_EXT_MIN)
 			return 0;
-		return rfs_ext_balance_from(sb, ino, leaf_blk, root_io, old_root);
+		return rfs_ext_balance_from(sb, kind, ino, leaf_blk, root_io, old_root);
 	}
 
 	if (cnt2 <= RFS_EXT_ORDER) {
 		if (new_max != old_max)
-			return rfs_ext_propagate(sb, &p, p.depth - 1, new_max);
+			return rfs_ext_propagate(sb, kind, &p, p.depth - 1, new_max);
 		return 0;
 	}
 	/* 叶溢出 → 分裂（D-5b：预算池已前置备好 → 级联零分配失败面） */
@@ -917,14 +959,14 @@ int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
 		u64 nblk, low_max, high_max;
 		bool was_root;
 
-		err = rfs_ext_leaf_split(sb, leaf_blk, &nblk, &low_max, &high_max,
+		err = rfs_ext_leaf_split(sb, kind, leaf_blk, &nblk, &low_max, &high_max,
 					 &was_root, &rsv);
 		if (!err) {
 			if (p.depth == 1) {	/* 叶即根 → 升根 */
-				err = rfs_ext_new_root_inner(sb, ino, leaf_blk, low_max,
+				err = rfs_ext_new_root_inner(sb, kind, ino, leaf_blk, low_max,
 							     nblk, high_max, root_io, &rsv);
 			} else {
-				err = rfs_ext_apply_up(sb, ino, &p, p.depth - 2,
+				err = rfs_ext_apply_up(sb, kind, ino, &p, p.depth - 2,
 						       p.cidx[p.depth - 2], leaf_blk,
 						       low_max, nblk, high_max, root_io, &rsv);
 			}
@@ -932,6 +974,13 @@ int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
 		rfs_ext_resv_release(sb, &rsv);	/* 归还未消耗预算（含错误路径） */
 		return err;
 	}
+}
+
+/* FILE 版（历史签名）：等价 insert_kind(..., RFS_EXT_KIND_FILE, ...) */
+int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
+			  const struct extent_t *ext, u64 *old_root)
+{
+	return ravenfs_extent_insert_kind(sb, RFS_EXT_KIND_FILE, ino, root_io, ext, old_root);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -946,7 +995,8 @@ int ravenfs_extent_insert(struct super_block *sb, u64 ino, u64 *root_io,
  * ══════════════════════════════════════════════════════════════════ */
 
 /* 空根叶：direct→extent 物化 / 整文件打洞的空树终态（size>160 时合法） */
-int ravenfs_extent_new_root_leaf(struct super_block *sb, u64 ino, u64 *root_out)
+int ravenfs_extent_new_root_leaf_kind(struct super_block *sb, u32 kind, u64 ino,
+				      u64 *root_out)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_msession *ms;
@@ -965,15 +1015,21 @@ int ravenfs_extent_new_root_leaf(struct super_block *sb, u64 ino, u64 *root_out)
 		(void)rfs_allocator_block_free(sbi->alloc, blk, 2);
 		return err;
 	}
-	rfs_ext_node_init(ravenfs_msession_node(ms), 0, 0, 1, ino);
+	rfs_ext_node_init(kind, ravenfs_msession_node(ms), 0, 0, 1, ino);
 	NODE_DIRTY(ms);
 	ravenfs_mdata_put(ms);
 	*root_out = blk;
 	return 0;
 }
 
+/* FILE 版（历史签名） */
+int ravenfs_extent_new_root_leaf(struct super_block *sb, u64 ino, u64 *root_io)
+{
+	return ravenfs_extent_new_root_leaf_kind(sb, RFS_EXT_KIND_FILE, ino, root_io);
+}
+
 /* 节点 max 变更后沿父链上溯刷新 hint key（短路：key 未变即停） */
-static int rfs_ext_refresh_chain(struct super_block *sb, u64 blk)
+static int rfs_ext_refresh_chain(struct super_block *sb, u32 kind, u64 blk)
 {
 	u64 cur = blk;
 	u32 hop;
@@ -989,7 +1045,7 @@ static int rfs_ext_refresh_chain(struct super_block *sb, u64 blk)
 		if (IS_ERR(ms))
 			return PTR_ERR(ms);
 		m = ravenfs_msession_node(ms);
-		if (rfs_ext_meta_ok(m, &cnt, &inner, &root, &pptr)) {
+		if (rfs_ext_meta_ok(kind, m, &cnt, &inner, &root, &pptr)) {
 			ravenfs_mdata_put(ms);
 			return -EIO;
 		}
@@ -1005,7 +1061,7 @@ static int rfs_ext_refresh_chain(struct super_block *sb, u64 blk)
 		if (IS_ERR(ps))
 			return PTR_ERR(ps);
 		pn = ravenfs_msession_node(ps);
-		if (rfs_ext_meta_ok(&pn->meta, &pcnt, &pin, &proot, &(u64){0}) || !pin) {
+		if (rfs_ext_meta_ok(kind, &pn->meta, &pcnt, &pin, &proot, &(u64){0}) || !pin) {
 			ravenfs_mdata_put(ps);
 			return -EIO;
 		}
@@ -1032,7 +1088,7 @@ static int rfs_ext_refresh_chain(struct super_block *sb, u64 blk)
 }
 
 /* 内层节点并入后：把孩子指针 parent_ptr 统一改指 node_blk（含从邻居搬来的） */
-static int rfs_ext_reparent(struct super_block *sb, struct ravenfs_msession *node_ms,
+static int rfs_ext_reparent(struct super_block *sb, u32 kind, struct ravenfs_msession *node_ms,
 			    u64 node_blk, u32 cnt)
 {
 	struct Bptree_extent_inner_node_t *nd = ravenfs_msession_node(node_ms);
@@ -1052,7 +1108,7 @@ static int rfs_ext_reparent(struct super_block *sb, struct ravenfs_msession *nod
 		if (IS_ERR(cms))
 			return PTR_ERR(cms);
 		cm = ravenfs_msession_node(cms);
-		err = rfs_ext_meta_ok(cm, &cc, &ci, &cr, &cp);
+		err = rfs_ext_meta_ok(kind, cm, &cc, &ci, &cr, &cp);
 		if (err || cr) {
 			ravenfs_mdata_put(cms);
 			return err ? err : -EIO;
@@ -1071,7 +1127,8 @@ static int rfs_ext_reparent(struct super_block *sb, struct ravenfs_msession *nod
  * 返回 0（*need=父欠载需上溯）/ 1（父为根单孩 → 交 root_shrink）/ <0 错误。
  * 邻居方向：idx==0 向右（idx+1）；idx>0 向左（idx-1）。child 恒存活并吸收邻居。
  */
-static int rfs_ext_node_balance(struct super_block *sb, u64 parent_blk, u32 idx, bool *need)
+static int rfs_ext_node_balance(struct super_block *sb, u32 kind, u64 parent_blk, u32 idx,
+				bool *need)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct ravenfs_msession *pms, *cms = NULL, *nms = NULL;
@@ -1088,7 +1145,7 @@ static int rfs_ext_node_balance(struct super_block *sb, u64 parent_blk, u32 idx,
 	if (IS_ERR(pms))
 		return PTR_ERR(pms);
 	pi = ravenfs_msession_node(pms);
-	ret = rfs_ext_meta_ok(&pi->meta, &pcnt, &pin, &proot, &pptr);
+	ret = rfs_ext_meta_ok(kind, &pi->meta, &pcnt, &pin, &proot, &pptr);
 	if (ret || !pin || idx >= pcnt) {
 		ret = ret ? ret : -EIO;
 		goto out;
@@ -1101,7 +1158,7 @@ static int rfs_ext_node_balance(struct super_block *sb, u64 parent_blk, u32 idx,
 		goto out;
 	}
 	cm = ravenfs_msession_node(cms);
-	ret = rfs_ext_meta_ok(cm, &cc, &ci, &cr, &cp);
+	ret = rfs_ext_meta_ok(kind, cm, &cc, &ci, &cr, &cp);
 	if (ret)
 		goto out;
 	is_inner = ci != 0;
@@ -1125,7 +1182,7 @@ static int rfs_ext_node_balance(struct super_block *sb, u64 parent_blk, u32 idx,
 		goto out;
 	}
 	nm = ravenfs_msession_node(nms);
-	ret = rfs_ext_meta_ok(nm, &nc, &ni, &nr, &np);
+	ret = rfs_ext_meta_ok(kind, nm, &nc, &ni, &nr, &np);
 	if (ret)
 		goto out;
 	if ((ni != 0) != is_inner) {	/* 邻居不同层 → 结构异常 */
@@ -1152,7 +1209,7 @@ static int rfs_ext_node_balance(struct super_block *sb, u64 parent_blk, u32 idx,
 			}
 			RFS_EXT_SET_COUNT(&cnd->meta, total);
 			NODE_DIRTY(cms);
-			ret = rfs_ext_reparent(sb, cms, child_blk, (u32)total);
+			ret = rfs_ext_reparent(sb, kind, cms, child_blk, (u32)total);
 			if (ret)
 				goto out;
 		} else {
@@ -1258,10 +1315,10 @@ static int rfs_ext_node_balance(struct super_block *sb, u64 parent_blk, u32 idx,
 			memset(&r->extents[right], 0, (RFS_EXT_MAX_SLOTS - right) * sizeof(struct extent_hint_t));
 			NODE_DIRTY(lms);
 			NODE_DIRTY(rms);
-			ret = rfs_ext_reparent(sb, lms, lblk, left);
+			ret = rfs_ext_reparent(sb, kind, lms, lblk, left);
 			if (ret)
 				goto out;
-			ret = rfs_ext_reparent(sb, rms, rblk, right);
+			ret = rfs_ext_reparent(sb, kind, rms, rblk, right);
 			if (ret)
 				goto out;
 		} else {
@@ -1310,7 +1367,8 @@ out:
  * 根收缩：根（内）只剩 1 孩 → 提升该孩为新根。
  * **旧根不 free**，经 *old_root 上抛（P10 延迟 free；调用方在 inode 提交后 free）。
  */
-static int rfs_ext_root_shrink(struct super_block *sb, u64 ino, u64 *root_io, u64 *old_root)
+static int rfs_ext_root_shrink(struct super_block *sb, u32 kind, u64 ino, u64 *root_io,
+			       u64 *old_root)
 {
 	struct ravenfs_msession *rms, *cms = NULL;
 	struct Bptree_meta_t *rm, *cm;
@@ -1328,7 +1386,7 @@ static int rfs_ext_root_shrink(struct super_block *sb, u64 ino, u64 *root_io, u6
 	if (IS_ERR(rms))
 		return PTR_ERR(rms);
 	rm = ravenfs_msession_node(rms);
-	err = rfs_ext_meta_ok(rm, &rc, &rin, &rrt, &rp);
+	err = rfs_ext_meta_ok(kind, rm, &rc, &rin, &rrt, &rp);
 	if (err)
 		goto out;
 	if (!rin || rc != 1)		/* 根叶 / 根内非单孩 → 无需收缩 */
@@ -1342,7 +1400,7 @@ static int rfs_ext_root_shrink(struct super_block *sb, u64 ino, u64 *root_io, u6
 		goto out;
 	}
 	cm = ravenfs_msession_node(cms);
-	err = rfs_ext_meta_ok(cm, &cc, &ci, &crr, &cp);
+	err = rfs_ext_meta_ok(kind, cm, &cc, &ci, &crr, &cp);
 	if (err || crr) {
 		err = err ? err : -EIO;
 		goto out;
@@ -1365,7 +1423,7 @@ out:
 }
 
 /* 欠载链修复（自下而上，父指针驱动）；收尾根收缩 */
-static int rfs_ext_balance_from(struct super_block *sb, u64 ino, u64 child_blk,
+static int rfs_ext_balance_from(struct super_block *sb, u32 kind, u64 ino, u64 child_blk,
 				u64 *root_io, u64 *old_root)
 {
 	u64 cur = child_blk;
@@ -1385,14 +1443,14 @@ static int rfs_ext_balance_from(struct super_block *sb, u64 ino, u64 child_blk,
 		if (IS_ERR(ms))
 			return PTR_ERR(ms);
 		m = ravenfs_msession_node(ms);
-		if (rfs_ext_meta_ok(m, &cnt, &inner, &root, &pptr)) {
+		if (rfs_ext_meta_ok(kind, m, &cnt, &inner, &root, &pptr)) {
 			ravenfs_mdata_put(ms);
 			return -EIO;
 		}
 		if (root) {
 			ravenfs_mdata_put(ms);
 			if (inner && cnt == 1)
-				return rfs_ext_root_shrink(sb, ino, root_io, old_root);
+				return rfs_ext_root_shrink(sb, kind, ino, root_io, old_root);
 			return 0;
 		}
 		if (cnt >= RFS_EXT_MIN) {	/* 已健康，链止 */
@@ -1406,7 +1464,7 @@ static int rfs_ext_balance_from(struct super_block *sb, u64 ino, u64 child_blk,
 		if (IS_ERR(ps))
 			return PTR_ERR(ps);
 		pn = ravenfs_msession_node(ps);
-		if (rfs_ext_meta_ok(&pn->meta, &pcnt, &pin, &proot, &(u64){0}) || !pin) {
+		if (rfs_ext_meta_ok(kind, &pn->meta, &pcnt, &pin, &proot, &(u64){0}) || !pin) {
 			ravenfs_mdata_put(ps);
 			return -EIO;
 		}
@@ -1420,12 +1478,12 @@ static int rfs_ext_balance_from(struct super_block *sb, u64 ino, u64 child_blk,
 		if (idx == ~0u)
 			return -EIO;
 
-		r = rfs_ext_node_balance(sb, parent, idx, &need);
+		r = rfs_ext_node_balance(sb, kind, parent, idx, &need);
 		if (r < 0)
 			return r;
 		if (r == 1)			/* 父为根单孩 */
-			return rfs_ext_root_shrink(sb, ino, root_io, old_root);
-		if (rfs_ext_refresh_chain(sb, parent))
+			return rfs_ext_root_shrink(sb, kind, ino, root_io, old_root);
+		if (rfs_ext_refresh_chain(sb, kind, parent))
 			return -EIO;
 		if (!need) {
 			/* 合并可能使根内残留 count==1 → 收尾收缩 */
@@ -1435,10 +1493,10 @@ static int rfs_ext_balance_from(struct super_block *sb, u64 ino, u64 child_blk,
 				struct Bptree_meta_t *rmm = ravenfs_msession_node(rs);
 				u32 rc, rin, rrt;
 
-				if (!rfs_ext_meta_ok(rmm, &rc, &rin, &rrt, &(u64){0}) &&
+				if (!rfs_ext_meta_ok(kind, rmm, &rc, &rin, &rrt, &(u64){0}) &&
 				    rrt && rin && rc == 1) {
 					ravenfs_mdata_put(rs);
-					return rfs_ext_root_shrink(sb, ino, root_io, old_root);
+					return rfs_ext_root_shrink(sb, kind, ino, root_io, old_root);
 				}
 				ravenfs_mdata_put(rs);
 			}
@@ -1455,7 +1513,7 @@ static int rfs_ext_balance_from(struct super_block *sb, u64 ino, u64 child_blk,
  * 根更迭由 root_shrink 上抛旧根（*old_root，延迟 free）。
  * 返回 0 / -ENOENT（起点空洞）/ -EIO（越记录 / phys 不自洽）/ -ENOSPC。
  */
-int ravenfs_extent_unmap_loose(struct super_block *sb, u64 ino, u64 *root_io,
+static int rfs_ext_unmap_loose(struct super_block *sb, u32 kind, u64 ino, u64 *root_io,
 			       const struct extent_t *ext, u64 *old_root)
 {
 	struct rfs_epath p;
@@ -1464,7 +1522,7 @@ int ravenfs_extent_unmap_loose(struct super_block *sb, u64 ino, u64 *root_io,
 	struct Bptree_extent_leaf_node_t *lf;
 	u32 cnt, inner, rootf, glb;
 	u64 pptr, off, rec_len, rec_fb, rec_addr, cut;
-	int err, kind;
+	int err, cut_mode;
 
 	RFS_STAT_INC(sb, ext_unmap);	/* unmap 强度 */
 	if (old_root)
@@ -1474,7 +1532,7 @@ int ravenfs_extent_unmap_loose(struct super_block *sb, u64 ino, u64 *root_io,
 	if (root == (u64)PTR_INVALID)
 		return -ENOENT;
 
-	err = rfs_ext_walk(sb, root, ext->fblkbase, &p);
+	err = rfs_ext_walk(sb, kind, root, ext->fblkbase, &p);
 	if (err)
 		return err;
 	if (!p.hit)
@@ -1486,7 +1544,7 @@ int ravenfs_extent_unmap_loose(struct super_block *sb, u64 ino, u64 *root_io,
 	if (IS_ERR(ms))
 		return PTR_ERR(ms);
 	lf = ravenfs_msession_node(ms);
-	err = rfs_ext_meta_ok(&lf->meta, &cnt, &inner, &rootf, &pptr);
+	err = rfs_ext_meta_ok(kind, &lf->meta, &cnt, &inner, &rootf, &pptr);
 	if (err || inner || glb >= cnt) {
 		ravenfs_mdata_put(ms);
 		return err ? err : -EIO;
@@ -1507,15 +1565,15 @@ int ravenfs_extent_unmap_loose(struct super_block *sb, u64 ino, u64 *root_io,
 	}
 
 	if (cut == rec_len)
-		kind = 0;			/* full 整删 */
+		cut_mode = 0;			/* full 整删 */
 	else if (off == 0)
-		kind = 1;			/* head 贴头挖 */
+		cut_mode = 1;			/* head 贴头挖 */
 	else if (cut == rec_len - off)
-		kind = 2;			/* tail 贴尾挖 */
+		cut_mode = 2;			/* tail 贴尾挖 */
 	else
-		kind = 3;			/* mid 拆两端 */
+		cut_mode = 3;			/* mid 拆两端 */
 
-	switch (kind) {
+	switch (cut_mode) {
 	case 0:	/* full */
 		if (glb < cnt - 1)
 			memmove(&lf->extents[glb], &lf->extents[glb + 1],
@@ -1528,8 +1586,8 @@ int ravenfs_extent_unmap_loose(struct super_block *sb, u64 ino, u64 *root_io,
 		if (rootf)
 			return 0;		/* 根叶可空（空树合法） */
 		if (cnt < RFS_EXT_MIN)
-			return rfs_ext_balance_from(sb, ino, leaf_blk, root_io, old_root);
-		return rfs_ext_refresh_chain(sb, leaf_blk);
+			return rfs_ext_balance_from(sb, kind, ino, leaf_blk, root_io, old_root);
+		return rfs_ext_refresh_chain(sb, kind, leaf_blk);
 
 	case 1:	/* head：贴头挖，终点不变 → 零刷新 */
 		lf->extents[glb].fblkbase = rec_fb + cut;
@@ -1544,7 +1602,7 @@ int ravenfs_extent_unmap_loose(struct super_block *sb, u64 ino, u64 *root_io,
 		NODE_DIRTY(ms);
 		ravenfs_mdata_put(ms);
 		if (!rootf && glb == cnt - 1)	/* 末项 → 叶 max 变 */
-			return rfs_ext_refresh_chain(sb, leaf_blk);
+			return rfs_ext_refresh_chain(sb, kind, leaf_blk);
 		return 0;
 
 	default: /* mid：拆两端（左留原槽缩尾 + 右段新插 glb+1） */
@@ -1568,14 +1626,14 @@ int ravenfs_extent_unmap_loose(struct super_block *sb, u64 ino, u64 *root_io,
 			bool was_root;
 
 			/* unmap 路径不预判预算（rsv=NULL → 现分配，旧口径）*/
-			err = rfs_ext_leaf_split(sb, leaf_blk, &nblk, &low_max,
+			err = rfs_ext_leaf_split(sb, kind, leaf_blk, &nblk, &low_max,
 						 &high_max, &was_root, NULL);
 			if (err)
 				return err;
 			if (p.depth == 1)
-				return rfs_ext_new_root_inner(sb, ino, leaf_blk, low_max,
+				return rfs_ext_new_root_inner(sb, kind, ino, leaf_blk, low_max,
 							      nblk, high_max, root_io, NULL);
-			return rfs_ext_apply_up(sb, ino, &p, p.depth - 2,
+			return rfs_ext_apply_up(sb, kind, ino, &p, p.depth - 2,
 						p.cidx[p.depth - 2], leaf_blk, low_max,
 						nblk, high_max, root_io, NULL);
 		}
@@ -1583,4 +1641,11 @@ int ravenfs_extent_unmap_loose(struct super_block *sb, u64 ino, u64 *root_io,
 		return 0;
 	}
 	}
+}
+
+/* FILE 版（历史签名）：等价 unmap_loose(..., RFS_EXT_KIND_FILE, ...) */
+int ravenfs_extent_unmap_loose(struct super_block *sb, u64 ino, u64 *root_io,
+			       const struct extent_t *ext, u64 *old_root)
+{
+	return rfs_ext_unmap_loose(sb, RFS_EXT_KIND_FILE, ino, root_io, ext, old_root);
 }
