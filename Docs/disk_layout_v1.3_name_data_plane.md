@@ -116,15 +116,25 @@ v1.3：每目录一个**稠密、8K 对齐的逻辑字节空间** = 一棵**映�
 | `ravenfs_juv_name_data` | `tests/test_name_data_plane.cpp` | 字节打包 / free 复用 / 用尽增片 direct→tree / tree 回环 / release+audit |
 | `ravenfs_juv_name_data_fr` | `tests/test_name_data_freeranges.cpp` | 301 满叶 / **>255 索引回归** / 叶裂+内节点 / 复合序 / release |
 | `ravenfs_stress_name_data_fr` | `tests/stress_name_data_fr.cpp` | **百万级 + 随机/乱序**：随机 len、随机插入序灌入 → 随机 need 乱序 best-fit **取用至用尽**（校验 find_fit==take_fit、区间不重叠、fr 清零）→ **定长乱序返还+再分配**（返回恰为返还集、base 升序）；`mode=offload|selfreliat`（开缓存）|
+| `ravenfs_juv_insert` | `tests/test_root_dir_insert.cpp` | 插入边界（空/40/41/552/553B 等）/ 批量叶·根分裂 / **长名插入+即时 lookup+重复 EXIST** / 树 DFS / 审计 / 重挂载长名回读 |
+| `ravenfs_juv_delete` | `tests/test_root_dir_delete.cpp` | 删除边界 / **长名 140 条 split→全删 merge+收缩→fr best-fit 复用** / 正反向批量删+删空收缩 / 树 DFS / 审计 / 重挂载；`mode=offload\|nocache\|selfreliat` |
 | `ravenfs_juv_audit_dfs` | `tests/test_audit_dfs.cpp` | 全盘可达性审计（含 fr 认领/校验）|
+
+> 顶层三接口（`dir_insert_dentry` / `dir_lookup` / `dir_rm_dentry`）共用测试装置
+> `tests/dir_tree_check.hpp`（树 DFS 校验器 + fixture；v1.3 掩码访问器）。
 
 ```bash
 cmake --build build --target ravenfs_juvenile ravenfs_juv_audit_dfs ravenfs_juv_name_data \
-                              ravenfs_juv_name_data_fr ravenfs_stress_name_data_fr
+                              ravenfs_juv_name_data_fr ravenfs_stress_name_data_fr \
+                              ravenfs_juv_insert ravenfs_juv_delete
 truncate -s 64M /tmp/x.img && ./mkfs/mkfs.ravenfs --v1.3 -f /tmp/x.img
 ./build/tests/ravenfs_juv_audit_dfs        /tmp/x.img   # 14/14
 ./build/tests/ravenfs_juv_name_data        /tmp/x.img   # 33/33
 ./build/tests/ravenfs_juv_name_data_fr     /tmp/x.img   # 10/10
+./build/tests/ravenfs_juv_insert           /tmp/x.img   # 34/34（batch=1000）
+./build/tests/ravenfs_juv_delete           /tmp/x.img   # 74/74（batch=1000，offload）
+./build/tests/ravenfs_juv_delete           /tmp/x.img 1000 0 nocache    # 72/72
+./build/tests/ravenfs_juv_delete           /tmp/x.img 1000 0 selfreliat # 72/72
 # 百万级（建议 ≥512MiB 镜像）
 truncate -s 512M /tmp/big.img && ./mkfs/mkfs.ravenfs --v1.3 -f /tmp/big.img
 ./build/tests/ravenfs_stress_name_data_fr /tmp/big.img 1000000 mode=offload    # 5/5
@@ -158,9 +168,12 @@ audit/回收全净（offload 10/10、selfreliat 11/11）。
    以让此类错误被 audit 直接逮住（而非只靠压测）。
 4. **`name_data_resolve` direct 路径**已有逻辑上界校验；tree 路径靠 extent 覆盖校验。
 5. **readdir（`root_dir_readdir`/`dir_readdir_interval`）历史未实现**（与本次无关）。
-6. **旧测试 stale**：`test_root_dir_{insert,delete}`、`test_pwrite_*`、`test_extent_*`、
-   `test_name_heap*` 等仍按 v1.1 位域 API 编写，在 v1.2 掩码迁移时即已编不过；
-   `test_name_heap*` 测的是已退役名字堆，已从构建移除。
+6. **旧测试 stale**：`test_root_dir_{insert,delete}` 已于 2026-10-05 迁移至 v1.3
+   （新增 `tests/dir_tree_check.hpp` 共享校验器 + 长名回环，`ninja` 恢复可编）。
+   其余 `test_pwrite_{smoke,phase1,big}`、`test_pread_smoke`、`test_punch_truncate_smoke`、
+   `test_extent_{walk,fusion,loose_stress,unmap_loose}`、`benchmark_{radix,session_vs_nvme}`
+   仍按 v1.1 位域 API 编写，在 v1.2 掩码迁移时即已编不过 —— `ninja all` 仍卡在这些
+   TU（`test_extent_ops` 不受影响）；`test_name_heap*` 测的是已退役名字堆，已从构建移除。
 7. **mkfs 空目录**：`--v1.3` 写双树空态（`name_data_ctl=RFS_ND_CTL_INACTIVE` 等），已就绪。
 
 ---
@@ -174,5 +187,6 @@ audit/回收全净（offload 10/10、selfreliat 11/11）。
 - 实现：`juvenile_god/name_data_plane.cpp`、`name_data_freeranges.cpp`、`audit.cpp`；
   通用树：`extent_{walk_lookup,split,balance,map_unmap}.cpp`、`direct_file_ops.cpp`。
 - 测试：`tests/test_name_data_plane.cpp`、`test_name_data_freeranges.cpp`、
-  `stress_name_data_fr.cpp`、`test_audit_dfs.cpp`。
+  `stress_name_data_fr.cpp`、`test_audit_dfs.cpp`、`test_root_dir_insert.cpp`、
+  `test_root_dir_delete.cpp`；共享装置 `tests/dir_tree_check.hpp`。
 - 退役：`juvenile_god/name_heap.cpp`（已删）。
