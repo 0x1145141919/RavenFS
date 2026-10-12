@@ -11,3 +11,4 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_subdirectory(mkfs)
 add_subdirectory(tests)
 add_subdirectory(juvenile_god)
+add_subdirectory(audit_leakscan)  # audit/ 的 fork：漏块 8K 单元魔数扫描（目标 modified_audit）
