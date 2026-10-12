@@ -53,6 +53,17 @@ static void ko_free(void *ctx, void *p)
 static const struct rfs_mem_alloc ko_mem_alloc = { ko_alloc, ko_free, NULL };
 static const struct rfs_run_alloc ko_run_alloc = { ko_alloc, ko_free, NULL };
 
+/*
+ * 测试钩子（默认关；生产路径无副作用）：强制挂载期 inode 面压实走「无连续段」回退
+ * 分支，用于验证回退语义（挂载不失败 / 保持 tree / 计数 / 数据完整），无需真把盘填到
+ * 碎片化到无 pieces×2 连续段。置 1 → compact 跳过 block_alloc_hard、按 ENOSPC 处理。
+ * 经 `/sys/module/ravenfs/parameters/idp_compact_force_fail` 或 insmod 参数设置。
+ */
+static bool idp_compact_force_fail;
+module_param_named(idp_compact_force_fail, idp_compact_force_fail, bool, 0644);
+MODULE_PARM_DESC(idp_compact_force_fail,
+	"test-only: force mount-time inode-plane compaction to the no-contiguous-run fallback");
+
 /* ═══════════════════════ al_ 计数器钩子（树分配器 → sbi->al）══════════════════════ */
 static void ko_al_stat_inc(void *ctx, u32 field, u64 delta)
 {
@@ -70,7 +81,6 @@ static void ko_al_stat_inc(void *ctx, u32 field, u64 delta)
 
 struct ravenfs_alloc_mgr {
 	struct rfs_allocator alloc;	/* 运行期真值（首成员；sbi->alloc 直指此处）*/
-	struct super_block *sb;
 	u8		*blk_words;	/* block 位图镜像（checkpoint 底座 + 落盘载体）*/
 	u64		 blk_nbits;
 };
@@ -321,8 +331,6 @@ static int ravenfs_inode_plane_load(struct super_block *sb,
 		fbytes = sizeof(*h) +
 			 n * sizeof(struct inode_dataplane_coordinate_free_range_t);
 		fblks = DIV_ROUND_UP_ULL(fbytes, RAVENFS_BLOCK_SIZE);
-		if (fblks == 0)
-			fblks = 1;
 		buf = kzalloc((size_t)fblks * RAVENFS_BLOCK_SIZE, GFP_KERNEL);
 		if (!buf) {
 			kfree(ea);
@@ -418,10 +426,12 @@ static int ravenfs_inode_plane_sync(struct super_block *sb)
 		direct_single = (en == 1 && ea[0].lblk == 0 &&
 				 ea[0].length == pieces * 2ULL);
 		if (direct_single) {
+			/* 先发布新 ctl，再释放旧树：避免「ctl 仍指旧树而旧树已释放」的
+			 * 内存窗口（旧树释放不可逆）。 */
+			sbi->inode_data_ctl = RFS_IDP_CTL_PACK(1, ea[0].phys_base);
 			if (old_is_tree)
 				ravenfs_extent_orphan_release_kind(sb,
 						RFS_EXT_KIND_INODE, old_ptr);
-			sbi->inode_data_ctl = RFS_IDP_CTL_PACK(1, ea[0].phys_base);
 		} else {
 			u64 new_root = (u64)PTR_INVALID;
 
@@ -447,24 +457,34 @@ static int ravenfs_inode_plane_sync(struct super_block *sb)
 					return rc;
 				}
 			}
+			/* 先发布新 ctl，再释放旧树（同上；new_root 已构建完成）。 */
+			sbi->inode_data_ctl = RFS_IDP_CTL_PACK(0, new_root);
 			if (old_is_tree)
 				ravenfs_extent_orphan_release_kind(sb,
 						RFS_EXT_KIND_INODE, old_ptr);
-			sbi->inode_data_ctl = RFS_IDP_CTL_PACK(0, new_root);
 		}
 		kfree(ea);
 	}
 	RFS_IDP_PIECE_SET_COUNT(sbi->inode_data_plane_pieces_count, pieces);
 	sbi->ra_inode_count = pieces * RFS_IDP_INODES_PER_PIECE;
 
-	/* ── ①b fr：释放旧扁区 → hard_alloc 新区（1 块对齐）→ 整段写 ── */
+	/* ── ①b fr：hard_alloc 新区 → 整段写（逐块 sync 落盘）→ 发布新 ctl → 释放旧扁区 ──
+	 * 加固：旧 fr 改为**最后**释放。原顺序「先释放旧 → 分配/写新」在 alloc 失败
+	 * （-ENOSPC/-ENOMEM/-EIO）时已把旧 fr 释放，而 sbi->inode_data_fr_ctl 仍指旧
+	 * → on-disk SB 指向已释放块。新顺序保证任何早退路径旧 fr 仍然完好。 */
 	{
 		u64 fn = rfs_inode_plane_fr_count(p);
 		struct inode_dataplane_coordinate_free_range_t *fa = NULL;
 		u64 bytes, blks, new_fr, b;
+		u64 ofr = RFS_IDP_FR_CTL_PTR(sbi->inode_data_fr_ctl);
+		u64 ofn = RFS_IDP_FR_COUNT(sbi->inode_data_fr_count);
+		u64 obl = 0;
 		u8 *buf;
 		struct inode_data_fr_snapshot_hdr *h;
 
+		if (ofr != RFS_IDP_FR_CTL_PTR_INVALID)
+			obl = DIV_ROUND_UP_ULL(sizeof(*h) + ofn * sizeof(*fa),
+					       RAVENFS_BLOCK_SIZE);
 		if (fn) {
 			fa = kmalloc((size_t)fn * sizeof(*fa), GFP_KERNEL);
 			if (!fa)
@@ -474,23 +494,8 @@ static int ravenfs_inode_plane_sync(struct super_block *sb)
 				return -EIO;
 			}
 		}
-		{
-			u64 ofr = RFS_IDP_FR_CTL_PTR(sbi->inode_data_fr_ctl);
-			u64 ofn = RFS_IDP_FR_COUNT(sbi->inode_data_fr_count);
-
-			if (ofr != RFS_IDP_FR_CTL_PTR_INVALID) {
-				u64 ob = sizeof(*h) + ofn * sizeof(*fa);
-				u64 obl = DIV_ROUND_UP_ULL(ob, RAVENFS_BLOCK_SIZE);
-
-				if (obl == 0)
-					obl = 1;
-				(void)rfs_allocator_block_free(a, ofr, obl);
-			}
-		}
 		bytes = sizeof(*h) + fn * sizeof(*fa);
 		blks = DIV_ROUND_UP_ULL(bytes, RAVENFS_BLOCK_SIZE);
-		if (blks == 0)
-			blks = 1;
 		new_fr = rfs_allocator_block_alloc_hard(a, blks, 0);
 		if (new_fr == RFS_IV_NO_HIT) {
 			kfree(fa);
@@ -537,7 +542,218 @@ static int ravenfs_inode_plane_sync(struct super_block *sb)
 		kfree(fa);
 		sbi->inode_data_fr_ctl = RFS_IDP_FR_CTL_PACK(new_fr);
 		sbi->inode_data_fr_count = fn;
+		/* 新 fr 已逐块 sync 落盘且 ctl 已切换 → 此时才回收旧扁区 */
+		if (ofr != RFS_IDP_FR_CTL_PTR_INVALID)
+			(void)rfs_allocator_block_free(a, ofr, obl);
 	}
+	return 0;
+}
+
+/* ═══════════════════ inode 数据面：挂载期压实（tree → direct）═══════════════════════
+ *
+ * 目标：挂载时若全局 inode 数据面处于 tree 态，把逻辑空间 [0, pieces×8K) 的物理承载
+ * 整体搬迁到一段**新分配的、连续且 8K 对齐**的物理段（pieces×2 个 FS_block），随后把
+ * SB 的 `inode_data_ctl` 切成 direct(ptr=新段基)。此后 inode 访问由「映射树查表 +
+ * 物理块计算」降为「基块 + 逻辑块」直算（挂载后 inode 访问更快）。旧映射树 + 旧数据片
+ * 回收。本特性 ⇄ god `name_data_rebuild`（juvenile_god/name_data_plane.cpp）在名字面
+ * 的同形操作，此处抬升到**全局 inode 面**。
+ *
+ * 崩溃安全硬不变量（勿改！）——**盘上块位图任何时刻都不得把 SB/元数据仍引用的块标成
+ * 空闲**（= 未保护 = 后续复用 = 损坏）。故写序只能是：
+ *   ① 内存分配器取新连续段（新段亮灯）；
+ *   ② 逐 8K 片拷贝旧数据 → 新段并落盘 + flush（提交前新段内容完整）；
+ *   ③ 位图落盘：此刻新段**已亮**、旧树/旧片**仍亮**（保守；绝不先放旧）；
+ *   ④ 写 SB：inode_data_ctl = direct(新段) —— **提交点**；
+ *   ⑤ 提交成功后才在内存分配器释放旧树节点 + 旧数据片，再次位图落盘。
+ * 崩溃点：
+ *   · ④ 前崩 → SB 仍 = tree 指旧树；旧树/旧片在盘在位图亮（引用与被引用都在）→ 完好，
+ *     新段虽亮无人引用 = 孤儿（fsck 收，无害）；
+ *   · ④ 与 ⑤ 之间崩 → SB = direct 指新段（新段在、位图亮）→ 完好；旧树/旧片仍亮 = 孤儿；
+ *   · 绝不出现「SB = direct 且新段位图暗」= 未保护（= 后续被复用 = 损坏）。
+ * 注：此处**不复用** §17.4 `ravenfs_inode_plane_sync` 的顺序——那条为运行期增量同步设计
+ * （先翻内存 ctl 再回收旧树），本压实是挂载期一次性搬迁，必须先把新段持久化再翻 SB。
+ *
+ * 前置：rw 挂载、单线程（fill_super 内、root iget 之前）。已 direct / 空态 / pieces==0
+ * = no-op（幂等）。fr 快照（`inode_data_fr_ctl` 区）**不变**：fr 坐标 = inode 逻辑量，
+ * 与物理搬迁无关。返回 0 = 成功或无需压实；负 errno = 压实失败（调用方忽略，照常挂载）。
+ */
+
+/* 逐 8K 片把旧物理承载抄入新连续段（旧段由 ea 的稠密 extent 描述；片恒 8K 对齐）。 */
+static int ip_compact_copy_pieces(struct super_block *sb,
+				  const struct rfs_inode_extent *ea, u64 en,
+				  u64 new_base, u64 pieces)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	const u32 npb = RAVENFS_MDATA_BLK_PER_NODE;	/* 每 8K 片 = 2 个 4K 块 */
+	u8 *buf;
+	u64 j = 0, i;
+	int rc = 0;
+
+	buf = kmalloc(RAVENFS_MDATA_NODE_BYTES, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	for (i = 0; i < pieces && !rc; i++) {
+		u64 lblk = i * 2ULL;			/* 片逻辑起点（4K 块） */
+		u64 old_blk = 0;
+		u32 b;
+
+		while (j < en && ea[j].lblk + ea[j].length <= lblk)
+			j++;
+		if (j >= en || lblk < ea[j].lblk ||
+		    lblk >= ea[j].lblk + ea[j].length) {
+			rc = -EIO;			/* 逻辑空间应稠密无洞 */
+			break;
+		}
+		old_blk = ea[j].phys_base + (lblk - ea[j].lblk);
+		for (b = 0; b < npb && !rc; b++) {	/* 读旧片 2 块 */
+			struct buffer_head *bh = sb_bread(sb,
+					ravenfs_dev_blk(sbi, old_blk + b));
+
+			if (!bh) {
+				rc = -EIO;
+				break;
+			}
+			memcpy(buf + ((u64)b << 12), bh->b_data, RAVENFS_BLOCK_SIZE);
+			brelse(bh);
+			RFS_STAT_INC(sb, io_read_ops);
+			RFS_STAT_ADD(sb, io_read_bytes, RAVENFS_BLOCK_SIZE);
+		}
+		for (b = 0; b < npb && !rc; b++) {	/* 写新片 2 块（同步落盘） */
+			struct buffer_head *bh = sb_bread(sb,
+					ravenfs_dev_blk(sbi, new_base + i * 2ULL + b));
+
+			if (!bh) {
+				rc = -EIO;
+				break;
+			}
+			memcpy(bh->b_data, buf + ((u64)b << 12), RAVENFS_BLOCK_SIZE);
+			mark_buffer_dirty(bh);
+			sync_dirty_buffer(bh);
+			brelse(bh);
+			RFS_STAT_INC(sb, io_write_ops);
+			RFS_STAT_ADD(sb, io_write_bytes, RAVENFS_BLOCK_SIZE);
+		}
+	}
+	kfree(buf);
+	return rc;
+}
+
+int ravenfs_inode_plane_compact(struct super_block *sb)
+{
+	struct ravenfs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+	struct rfs_allocator *a;
+	struct ravenfs_alloc_mgr *m;
+	struct rfs_inode_plane *p;
+	struct rfs_inode_extent *ea = NULL;
+	u64 en, pieces, old_ctl, old_ptr, need, new_base, i;
+	bool moved = false;
+	int rc;
+
+	if (!sbi || !sbi->alloc)
+		return 0;
+	if (!ravenfs_sb_writable(sb))		/* ro 挂载：不写盘、不改面 */
+		return 0;
+	a = sbi->alloc;
+	if (!a->ino_plane.active)
+		return 0;
+	p = &a->ino_plane;
+	m = container_of(a, struct ravenfs_alloc_mgr, alloc);
+
+	old_ctl = sbi->inode_data_ctl;
+	old_ptr = RFS_IDP_CTL_PTR(old_ctl);
+	if (RFS_IDP_CTL_IS_DIRECT(old_ctl) || old_ptr == RFS_IDP_CTL_PTR_INVALID)
+		return 0;			/* 已 direct / 空态：幂等 no-op */
+
+	pieces = rfs_inode_plane_pieces(p);
+	en = rfs_inode_plane_extent_count(p);
+	if (pieces == 0 || en == 0)
+		return 0;
+
+	/* 翻译面快照（旧映射）。提交前不改内存面 → 早退路径可无损回退。 */
+	ea = kmalloc((size_t)en * sizeof(*ea), GFP_KERNEL);
+	if (!ea)
+		return -ENOMEM;
+	if (rfs_inode_plane_dump_extents(p, ea, en)) {
+		kfree(ea);
+		return -EIO;
+	}
+
+	/* 内存翻译面已单连续段（tree 仅为历史盘面）→ 无需搬迁数据，直接提交。 */
+	if (en == 1 && ea[0].lblk == 0 && ea[0].length == pieces * 2ULL) {
+		new_base = ea[0].phys_base;
+	} else {
+		need = pieces * 2ULL;
+		/* align_log2=1 → 2 块（8K）对齐，与片语义一致。 */
+		new_base = idp_compact_force_fail ? (u64)RFS_IV_NO_HIT
+			: rfs_allocator_block_alloc_hard(a, need, 1);
+		if (new_base == (u64)RFS_IV_NO_HIT) {
+			RFS_AL_INC(sb, al_idp_compact_fail);
+			pr_warn("ravenfs: inode plane compact: no contiguous run (%llu blocks) — stay tree\n",
+				(unsigned long long)need);
+			kfree(ea);
+			return -ENOSPC;
+		}
+		rc = ip_compact_copy_pieces(sb, ea, en, new_base, pieces);
+		if (rc) {
+			(void)rfs_allocator_block_free(a, new_base, need);
+			RFS_AL_INC(sb, al_idp_compact_fail);
+			pr_warn("ravenfs: inode plane compact: piece copy failed (%d) — stay tree\n",
+				rc);
+			kfree(ea);
+			return rc;
+		}
+		(void)ravenfs_issue_flush(sb);	/* 新段数据先持久（提交前） */
+		moved = true;
+	}
+
+	/* ③ 位图落盘：新段已亮、旧树/旧片仍亮（保守）。失败 = 不可提交 → 回退。 */
+	rc = checkpoint_block(m);
+	if (!rc)
+		rc = bm_image_save(sb, m->blk_words, sbi->bitmap_blocks,
+				   sbi->bitmap_start);
+	if (rc) {
+		if (moved)
+			(void)rfs_allocator_block_free(a, new_base, pieces * 2ULL);
+		RFS_AL_INC(sb, al_idp_compact_fail);
+		pr_warn("ravenfs: inode plane compact: bitmap persist failed (%d) — stay tree\n",
+			rc);
+		kfree(ea);
+		return rc;
+	}
+
+	/* ④ 提交点：内存翻译面换向 + SB 写 direct（先新段持久、后翻 SB）。 */
+	rfs_inode_plane_set_direct(p, new_base, pieces);
+	sbi->inode_data_ctl = RFS_IDP_CTL_PACK(1, new_base);
+	rc = ravenfs_sb_write_sync(sb);
+	if (rc) {
+		/* SB 写失败：**不释放新段**（盘上 SB 可能已 = direct 指它），保持 direct
+		 * 内存态防 umount 误回收旧树 → 仅泄漏，绝不损坏。 */
+		RFS_AL_INC(sb, al_idp_compact_fail);
+		pr_err("ravenfs: inode plane compact: SB commit failed (%d) — direct left in memory, old leaked\n",
+		       rc);
+		kfree(ea);
+		return rc;
+	}
+
+	/* ⑤ 提交成功：回收旧映射树 + 旧数据片（尽力而为），再次位图落盘。 */
+	ravenfs_extent_orphan_release_kind(sb, RFS_EXT_KIND_INODE, old_ptr);
+	if (moved) {
+		for (i = 0; i < en; i++) {
+			(void)rfs_allocator_block_free(a, ea[i].phys_base,
+						       ea[i].length);
+			ravenfs_mdata_drop(sb, ea[i].phys_base);
+		}
+	}
+	(void)checkpoint_block(m);
+	(void)bm_image_save(sb, m->blk_words, sbi->bitmap_blocks,
+			    sbi->bitmap_start);
+	kfree(ea);
+
+	RFS_AL_INC(sb, al_idp_compact_ok);
+	RFS_AL_ADD(sb, al_idp_compact_pieces, pieces);
+	pr_info("ravenfs: inode plane compact: tree→direct ok base=%llu pieces=%llu (old_tree=%llu old_extents=%llu)\n",
+		(unsigned long long)new_base, (unsigned long long)pieces,
+		(unsigned long long)old_ptr, (unsigned long long)en);
 	return 0;
 }
 
@@ -566,7 +782,6 @@ int ravenfs_allocator_create(struct super_block *sb)
 	m = kzalloc(sizeof(*m), GFP_KERNEL);
 	if (!m)
 		return -ENOMEM;
-	m->sb = sb;
 	m->blk_nbits = bn;
 	m->blk_words = vzalloc(bn >> 3);
 	if (!m->blk_words) {

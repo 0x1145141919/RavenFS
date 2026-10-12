@@ -135,7 +135,7 @@ static bool ip_contains_locked(struct rfs_inode_plane *p, u64 inum)
  * （物理尾邻接则扩尾）→ 新片 32k 个 inode 入 fr。失败回滚退片。 */
 static int ip_grow_locked(struct rfs_inode_plane *p)
 {
-	u32 k = p->grow_batch ? p->grow_batch : 1;
+	u32 k = p->grow_batch;	/* init 保证 ≥1 */
 	u64 blk = (u64)PTR_INVALID;
 	u64 new_lblk, old_pieces;
 	bool merged = false;
@@ -149,9 +149,7 @@ static int ip_grow_locked(struct rfs_inode_plane *p)
 		}
 		if (k <= 1)
 			break;
-		k >>= 1;
-		if (k == 0)
-			k = 1;
+		k >>= 1;	/* k ≥ 2 进入 → 右移后必 ≥ 1 */
 	}
 	if (blk == (u64)PTR_INVALID)
 		return -ENOSPC;
@@ -545,4 +543,24 @@ int rfs_inode_plane_dump_fr(struct rfs_inode_plane *p,
 out:
 	up_read(&p->fr_lock);
 	return rc;
+}
+
+/* ══════════════════════ 挂载期压实提交 ══════════════════════
+ * 把翻译面整体替换为**单连续 direct 段** [0, pieces×2) → phys_base。逻辑空间、
+ * 片数、fr 空闲面均不变（fr 坐标 = inode，是逻辑量，与物理搬迁无关）。
+ *
+ * 调用方（allocator_adapter.c 的 ravenfs_inode_plane_compact）负责：数据已抄入
+ * phys_base 段并落盘 flush、旧映射树/旧数据片已由提交后流程处置。本函数只做
+ * 「翻译面一次性换向」，翻译写锁内原子替换（ext_cap 恒 ≥ 1：init 拒绝空 extents）。
+ * 幂等：已是单段同 phys_base 时无副作用（仍安全重写）。 */
+void rfs_inode_plane_set_direct(struct rfs_inode_plane *p, u64 phys_base, u64 pieces)
+{
+	if (!p || !p->active)
+		return;
+	down_write(&p->extent_lock);
+	p->ext[0].lblk = 0;
+	p->ext[0].phys_base = phys_base;
+	p->ext[0].length = pieces * 2ULL;
+	p->ext_n = 1;
+	up_write(&p->extent_lock);
 }

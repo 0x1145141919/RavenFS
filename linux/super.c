@@ -53,7 +53,6 @@ static const struct inode_operations ravenfs_file_inode_operations;
 static const struct file_operations ravenfs_dir_operations;
 static const struct file_operations ravenfs_file_operations;
 static const struct fs_context_operations ravenfs_context_ops;
-static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc);
 static int ravenfs_sb_write_timestamp(struct super_block *sb, bool is_mount);
 static int ravenfs_sync_fs(struct super_block *sb, int wait);
 static int ravenfs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
@@ -107,7 +106,7 @@ static const char *const ravenfs_stat_names[] = {
 };
 
 /*
- * F 组：运行时树分配器 al_（36）—— **独立子结构 `sbi->al`**，
+ * F 组：运行时树分配器 al_（50）—— **独立子结构 `sbi->al`**，
  * 下标空间 = `enum rfs_al_stat`（ravenfs_allocator_stats.h），与下面名字表逐一对位。
  * BUILD_BUG_ON 同时守「子结构是纯 atomic64 无填充」与「名字表数目 == 字段数」。
  */
@@ -131,7 +130,8 @@ static const char *const ravenfs_al_stat_names[] = {
 	/* H inode 数据面 */ "al_idp_locate_ok", "al_idp_locate_fail",
 	"al_idp_free", "al_idp_grow", "al_idp_grow_pieces", "al_idp_fr_merge",
 	"al_idp_tree_dump", "al_idp_tree_build", "al_idp_snap_write",
-	"al_idp_snap_read", "al_idp_snap_blocks",
+	"al_idp_snap_read", "al_idp_snap_blocks", "al_idp_compact_ok",
+	"al_idp_compact_fail", "al_idp_compact_pieces",
 };
 
 static int ravenfs_stats_show(struct seq_file *m, void *v)
@@ -337,8 +337,6 @@ static void ravenfs_destroy_inode(struct inode *inode)
 /* ═══════════════════════════════════════════════════════════════════
  * 盘 inode → 内存 inode（R-LM-02 读侧）
  * ═══════════════════════════════════════════════════════════════════ */
-
-/* 块统计（M2.1）见下方 ravenfs_inode_blocks4k */
 
 /* 块统计（M2.1）：4K 块数。**诚实**：数据块 + 元数据块（8K 节点计 2 块）均计；
  * DIR 含 dentry 树节点 + 名字数据面（映射树数据块/节点 + fr 树节点）；xattr 块也计。 */
@@ -701,14 +699,17 @@ static int ravenfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 struct ravenfs_fs_context {
 	unsigned int	row_size;	/* 0 = 默认 4K；mount option `row_size=` */
+	bool		idp_compact;	/* 挂载期 inode 数据面压实（tree→direct）；默认开 */
 };
 
 enum ravenfs_param {
 	Opt_row_size,
+	Opt_idp_compact,
 };
 
 static const struct fs_parameter_spec ravenfs_fs_parameters[] = {
 	fsparam_string("row_size", Opt_row_size),
+	fsparam_bool("idp_compact", Opt_idp_compact),
 	{}
 };
 
@@ -752,6 +753,9 @@ static int ravenfs_parse_param(struct fs_context *fc, struct fs_parameter *param
 			return -EINVAL;
 		}
 		ctx->row_size = sz;
+		return 0;
+	case Opt_idp_compact:
+		ctx->idp_compact = result.boolean;
 		return 0;
 	}
 	return -EINVAL;
@@ -1388,6 +1392,11 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_flags |= SB_POSIXACL;
 
 	sbi = sb->s_fs_info;
+	/* 挂载期 inode 数据面压实（tree → direct；§12/§17.5；默认开启、`idp_compact=0`
+	 * 关闭）。失败仅回退（保持 tree），**不挡挂载**；须在 root iget 之前——root inode
+	 * 经该数据面定位，压实后当场生效（ro 挂载由 compact 内闸 no-op）。 */
+	if (ctx && ctx->idp_compact)
+		(void)ravenfs_inode_plane_compact(sb);
 	/* v2.0：根 inode 索引 = 契约级硬编码 RFS_ROOT_INODE_IDX(=0) */
 	root = ravenfs_iget(sb, RFS_ROOT_INODE_IDX);
 	if (IS_ERR(root))
@@ -1461,6 +1470,7 @@ static int ravenfs_init_fs_context(struct fs_context *fc)
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
 		return -ENOMEM;
+	ctx->idp_compact = true;	/* 默认开启；`idp_compact=0` 关闭 */
 	fc->fs_private = ctx;
 	fc->ops = &ravenfs_context_ops;
 	return 0;
@@ -1469,7 +1479,6 @@ static int ravenfs_init_fs_context(struct fs_context *fc)
 static void ravenfs_fc_free(struct fs_context *fc)
 {
 	kfree(fc->fs_private);
-	fc->fs_private = NULL;
 }
 
 static const struct fs_context_operations ravenfs_context_ops = {

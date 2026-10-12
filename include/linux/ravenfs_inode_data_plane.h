@@ -118,6 +118,12 @@ int	rfs_inode_plane_dump_fr(struct rfs_inode_plane *p,
 				struct inode_dataplane_coordinate_free_range_t *out,
 				u64 cap);
 
+/* 挂载期压实提交：把翻译面整体替换为单连续 direct 段 [0, pieces*2) → phys_base。
+ * 逻辑空间/片数/fr 均不变（fr 坐标 = inode，与物理搬迁无关）。翻译写锁内一次性替换
+ * （ext_cap 恒 ≥ 1；调用方保证数据已就位、旧树/旧片已由挂载压实流程处置）。幂等。 */
+void	rfs_inode_plane_set_direct(struct rfs_inode_plane *p, u64 phys_base,
+				   u64 pieces);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

@@ -81,7 +81,7 @@ enum rfs_al_stat {
 	AL_POOL_ALLOC,		/* 元素池取区间节点次数 */
 	AL_POOL_FAIL,		/* 元素池取节点失败（-ENOMEM 路径）*/
 
-	/* ── H 全局 inode 数据面（11；v2.0 内核）──
+	/* ── H 全局 inode 数据面（14；v2.0 内核）──
 	 * plane 内 op（locate/free/grow/fr_merge）经 owner->stat 钩子累加；
 	 * 盘面装载/落盘（扁 fr 快照 / 映射树 bulk）由 FS 适配层直接打点。*/
 	AL_IDP_LOCATE_OK,	/* inode 数据面翻译命中 */
@@ -95,6 +95,9 @@ enum rfs_al_stat {
 	AL_IDP_SNAP_WRITE,	/* 扁 fr 快照写次数 */
 	AL_IDP_SNAP_READ,	/* 扁 fr 快照读次数 */
 	AL_IDP_SNAP_BLOCKS,	/* 扁 fr 快照写累计块数 */
+	AL_IDP_COMPACT_OK,	/* 挂载期压实 tree→direct 成功次数（挂载加速）*/
+	AL_IDP_COMPACT_FAIL,	/* 挂载期压实无连续段回退（保持 tree）次数 */
+	AL_IDP_COMPACT_PIECES,	/* 挂载期压实搬移的累计 8K 片数 */
 
 	AL_STAT_COUNT		/* 哨兵：字段总数（勿作为计数器用）*/
 };

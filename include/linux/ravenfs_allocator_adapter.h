@@ -35,6 +35,13 @@ struct super_block;			/* 前向声明；定义属内核 <linux/fs.h> */
  * 幂等（已建则 0）；几何非法 / IO 失败 / 建树失败 → 负 -errno → 挂载失败。*/
 int	ravenfs_allocator_create(struct super_block *sb);
 
+/* 挂载期 inode 数据面压实（tree → direct；§12/§17.5；默认开启、`idp_compact=0` 关）。
+ * 若全局 inode 数据面为 tree 态：分配单连续 pieces×2 块（8K 对齐）→ 逐片搬迁 →
+ * **先持久新段** → 翻 SB `inode_data_ctl=direct`（提交点）→ 回收旧树 + 旧数据片。
+ * 无连续段 → 保持 tree（返回负 errno；调用方忽略，照常挂载）。幂等（已 direct no-op）。
+ * ro 挂载 no-op。返回 0 = 成功/无需压实；负 = 压实失败（**不挡挂载**）。*/
+int	ravenfs_inode_plane_compact(struct super_block *sb);
+
 /* 同步：逐片 dump 树 → 补集写回 words → **words 写回设备**（确定性，返回即落盘）。
  * 无管理器 → 0；ro 挂载只做内存 checkpoint、不写盘。TTL / sync_fs / fsync / put_super 共用。*/
 int	ravenfs_allocator_flush(struct super_block *sb);

@@ -60,7 +60,6 @@
 
 #define RAVENFS_BLOCK_SIZE		4096
 #define RAVENFS_BITS_PER_BLOCK		32768ULL	/* 4096 B × 8 */
-#define RAVENFS_INODES_PER_BLOCK	16ULL		/* 4096 / 256 */
 #define RAVENFS_INODE_SIZE		256ULL
 
 /* E6：s_maxbytes = 1<<52（字节）≤ MAX_LFS_FILESIZE */
@@ -97,9 +96,6 @@
 
 /* ─────────────── 前向声明（定义在各 ravenfs_*.h） ─────────────── */
 
-struct ravenfs_cache;		/* inode_cache.c：磁盘 inode 行缓存（§4.11.1） */
-struct ravenfs_row;
-struct ravenfs_shard;
 struct ravenfs_session;
 struct ravenfs_ttl;		/* cache_ttl.c：自写 TTL 淘汰器，不透明句柄 */
 struct rfs_allocator;	/* include/linux/ravenfs_allocator_top.h：运行时多分片主从红黑树分配器 */
@@ -246,7 +242,7 @@ struct ravenfs_sb_stats {
 };
 
 /*
- * ── F 组：运行时树分配器 al_（47，独立子结构）──
+ * ── F 组：运行时树分配器 al_（50，独立子结构）──
  * 字段顺序**必须**与 `enum rfs_al_stat`（ravenfs_allocator_stats.h）逐一对位：
  * 注入钩子按下标累加（`((atomic64_t *)&sbi->al)[field]`），show 表按序打印。
  * 增删字段 → 同改枚举 + show 名表 + BUILD_BUG_ON 三处。
@@ -298,7 +294,7 @@ struct ravenfs_al_stats {
 	atomic64_t	al_checkpoint_blocks;
 	atomic64_t	al_pool_alloc;
 	atomic64_t	al_pool_fail;
-	/* H 全局 inode 数据面（11；v2.0 内核）—— plane 内 op 经 owner->stat 注入，
+	/* H 全局 inode 数据面（14；v2.0 内核）—— plane 内 op 经 owner->stat 注入，
 	 * 盘面装载/落盘（扁 fr 快照 / 映射树 bulk）由 FS 适配层直接打点。*/
 	atomic64_t	al_idp_locate_ok;
 	atomic64_t	al_idp_locate_fail;
@@ -311,6 +307,9 @@ struct ravenfs_al_stats {
 	atomic64_t	al_idp_snap_write;
 	atomic64_t	al_idp_snap_read;
 	atomic64_t	al_idp_snap_blocks;
+	atomic64_t	al_idp_compact_ok;	/* 挂载期 tree→direct 压实成功次数 */
+	atomic64_t	al_idp_compact_fail;	/* 挂载期压实回退（保持 tree）次数 */
+	atomic64_t	al_idp_compact_pieces;	/* 挂载期压实搬移的累计片数 */
 };
 
 struct ravenfs_sb_info {
@@ -329,7 +328,6 @@ struct ravenfs_sb_info {
 	/* FS_block[i] 在设备上的字节偏移 = blk0_off + i*4096；blk0_off 恒 4096 */
 	u64	blk0_off;
 
-	struct ravenfs_cache *icache;	/* disk_inode_cache_mgr（§4.11.1） */
 	struct ravenfs_mdata_cache *mcache;	/* mdata_piece_cache_mgr（8K 节点） */
 	struct ravenfs_ttl *ttl;	/* 自写 TTL 淘汰器（cache_ttl.c） */
 	struct rfs_allocator *alloc;	/* 运行时树分配器（挂载必建、无回退）；定义在 allocator_adapter.c */
