@@ -230,8 +230,7 @@ int ravenfs_extent_lookup_kind(struct super_block *sb, u32 kind, u64 root,
 
 	for (;;) {
 		const struct Bptree_meta_t *meta;
-		u32 cnt, inner, rootf, i;
-		u64 pptr;
+		u32 cnt, inner, i;
 
 		if (++depth > RFS_EXT_DEPTH_MAX || blk == (u64)PTR_INVALID) {
 			err = -EIO;
@@ -242,7 +241,7 @@ int ravenfs_extent_lookup_kind(struct super_block *sb, u32 kind, u64 root,
 			break;
 		RFS_STAT_INC(sb, ext_node_reads);	/* 走树步数 */
 		meta = buf;
-		err = rfs_ext_meta_ok(kind, meta, &cnt, &inner, &rootf, &pptr);
+		err = rfs_ext_meta_ok(kind, meta, &cnt, &inner, &(u32){0}, &(u64){0});
 		if (err)
 			break;
 
@@ -538,8 +537,6 @@ static int rfs_ext_leaf_split(struct super_block *sb, u32 kind, u64 victim_blk, 
 
 	vl->meta.parent_ptr.v = RFS_PP_PACK(RFS_EXT_SPLIT, 0, root, parent);	/* 左 168 */
 	rfs_ext_set_addr(&vl->meta.ptrs[2], new_blk);				/* next = new */
-	if (was_root)
-		vl->meta.ptrs[1].v = RFS_EXT_PTR_INV;				/* 根叶无 prev */
 
 	NODE_DIRTY(vms);
 	NODE_DIRTY(nms);
@@ -553,8 +550,22 @@ static int rfs_ext_leaf_split(struct super_block *sb, u32 kind, u64 victim_blk, 
 	if (!was_root && old_next != (u64)RFS_MASK52) {
 		struct ravenfs_msession *oms = ravenfs_mdata_get(sb, old_next);
 
-		if (IS_ERR(oms))
-			return PTR_ERR(oms);
+		if (IS_ERR(oms)) {
+			int rc = PTR_ERR(oms);
+			struct ravenfs_msession *v2;
+
+			/* 分裂尚未挂入父层 → new_blk 本调用自有且未发布：
+			 * best-effort 复原 victim->next = old_next，再释放 new_blk。 */
+			v2 = ravenfs_mdata_get(sb, victim_blk);
+			if (!IS_ERR(v2)) {
+				rfs_ext_set_addr(&((struct Bptree_meta_t *)ravenfs_msession_node(v2))->ptrs[2], old_next);
+				NODE_DIRTY(v2);
+				ravenfs_mdata_put(v2);
+			}
+			ravenfs_mdata_drop(sb, new_blk);
+			(void)rfs_allocator_block_free(sbi->alloc, new_blk, 2);
+			return rc;
+		}
 		rfs_ext_set_addr(&((struct Bptree_meta_t *)ravenfs_msession_node(oms))->ptrs[1], new_blk);
 		NODE_DIRTY(oms);
 		ravenfs_mdata_put(oms);
@@ -628,20 +639,24 @@ static int rfs_ext_inner_split(struct super_block *sb, u32 kind, u64 victim_blk,
 		u32 cc, ci, cr;
 		u64 cp, child;
 
-		if (IS_ERR(xms))
-			return PTR_ERR(xms);
+		if (IS_ERR(xms)) {
+			err = PTR_ERR(xms);
+			goto out_free_new;
+		}
 		xin = ravenfs_msession_node(xms);
 		child = RFS_PTR_ADDR(xin->extents[i].sub_node_ptr);
 		ravenfs_mdata_put(xms);
 
 		cms = ravenfs_mdata_get(sb, child);
-		if (IS_ERR(cms))
-			return PTR_ERR(cms);
+		if (IS_ERR(cms)) {
+			err = PTR_ERR(cms);
+			goto out_free_new;
+		}
 		cm = ravenfs_msession_node(cms);
 		err = rfs_ext_meta_ok(kind, cm, &cc, &ci, &cr, &cp);
 		if (err) {
 			ravenfs_mdata_put(cms);
-			return err;
+			goto out_free_new;
 		}
 		cm->parent_ptr.v = RFS_PP_PACK(cc, ci, 0, new_blk);
 		NODE_DIRTY(cms);
@@ -649,6 +664,14 @@ static int rfs_ext_inner_split(struct super_block *sb, u32 kind, u64 victim_blk,
 	}
 	*out_new = new_blk;
 	return 0;
+
+out_free_new:
+	/* new_blk（右半）尚未挂入祖父层（apply_up / new_root_inner 才链接）→ 本调用
+	 * 自有且未发布 → 释放防漏。注：已 reparent 到它的孩子随本次失败成孤儿（树已被
+	 * 半分裂破坏，交 fsck）——但绝不释放任何**已发布/未校验**的块。 */
+	ravenfs_mdata_drop(sb, new_blk);
+	(void)rfs_allocator_block_free(sbi->alloc, new_blk, 2);
+	return err;
 }
 
 /* 新建根内（根升长）；显式写 ptrs[]（文件树 ".." = PTR_INVALID）
@@ -677,7 +700,6 @@ static int rfs_ext_new_root_inner(struct super_block *sb, u32 kind, u64 ino, u64
 	}
 	ri = ravenfs_msession_node(rms);
 	rfs_ext_node_init(kind, ri, 2, 1, 1, ino);
-	rfs_ext_set_addr(&ri->meta.ptrs[1], RFS_MASK52);	/* 文件树无 ".." */
 	rfs_ext_set_addr(&ri->extents[0].sub_node_ptr, left_blk);
 	ri->extents[0].key = left_max;
 	rfs_ext_set_addr(&ri->extents[1].sub_node_ptr, right_blk);
@@ -687,26 +709,44 @@ static int rfs_ext_new_root_inner(struct super_block *sb, u32 kind, u64 ino, u64
 
 	kids[0] = left_blk;
 	kids[1] = right_blk;
-	for (k = 0; k < 2; k++) {
-		struct ravenfs_msession *kms = ravenfs_mdata_get(sb, kids[k]);
-		struct Bptree_meta_t *km;
-		u32 cc, ci, cr;
+	{
+		/* 先校验**两**孩子（不改任何状态）→ 再统一 reparent：任一失败时两孩子
+		 * 保持原样，新根 root_blk 未被发布（*root_out 未写）→ 可安全释放。 */
+		struct ravenfs_msession *kms[2] = { NULL, NULL };
+		struct Bptree_meta_t *km[2];
+		u32 cc[2], ci[2], cr[2];
 		u64 cp;
 
-		if (IS_ERR(kms))
-			return PTR_ERR(kms);
-		km = ravenfs_msession_node(kms);
-		err = rfs_ext_meta_ok(kind, km, &cc, &ci, &cr, &cp);
-		if (err) {
-			ravenfs_mdata_put(kms);
-			return err;
+		for (k = 0; k < 2; k++) {
+			kms[k] = ravenfs_mdata_get(sb, kids[k]);
+			if (IS_ERR(kms[k])) {
+				err = PTR_ERR(kms[k]);
+				kms[k] = NULL;
+				goto out_free_root;
+			}
+			km[k] = ravenfs_msession_node(kms[k]);
+			err = rfs_ext_meta_ok(kind, km[k], &cc[k], &ci[k], &cr[k], &cp);
+			if (err)
+				goto out_free_root;
 		}
-		km->parent_ptr.v = RFS_PP_PACK(cc, ci, 0, root_blk);
-		NODE_DIRTY(kms);
-		ravenfs_mdata_put(kms);
+		for (k = 0; k < 2; k++) {
+			km[k]->parent_ptr.v = RFS_PP_PACK(cc[k], ci[k], 0, root_blk);
+			NODE_DIRTY(kms[k]);
+			ravenfs_mdata_put(kms[k]);
+			kms[k] = NULL;
+		}
+		*root_out = root_blk;
+		return 0;
+
+out_free_root:
+		for (k = 0; k < 2; k++)
+			if (kms[k])
+				ravenfs_mdata_put(kms[k]);
+		/* 新根未发布（*root_out 未写）；两孩子未被改动 → root_blk 本调用自有 → 释放 */
+		ravenfs_mdata_drop(sb, root_blk);
+		(void)rfs_allocator_block_free(sbi->alloc, root_blk, 2);
+		return err;
 	}
-	*root_out = root_blk;
-	return 0;
 }
 
 /* 父层应用（+ 内裂上溯 + 升根）。cur_victim = 父层里被替换/插入的旧子块号 */
@@ -714,21 +754,27 @@ static int rfs_ext_apply_up(struct super_block *sb, u32 kind, u64 ino, const str
 			    u32 level, u32 child_idx, u64 cur_victim, u64 low_max,
 			    u64 new_blk, u64 high_max, u64 *root_io, struct rfs_ext_resv *rsv)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	int err = 0;
+	struct ravenfs_msession *ms;
+
 	for (;;) {
-		struct ravenfs_msession *ms = ravenfs_mdata_get(sb, p->blk[level]);
 		struct Bptree_extent_inner_node_t *nd;
 		u32 pcnt, idx = child_idx, new_cnt, is_root;
-		int err = 0;
 
-		if (IS_ERR(ms))
-			return PTR_ERR(ms);
+		ms = ravenfs_mdata_get(sb, p->blk[level]);
+		if (IS_ERR(ms)) {
+			err = PTR_ERR(ms);
+			goto out_free_newblk;	/* new_blk 尚未挂入本层 → 未发布 */
+		}
 		nd = ravenfs_msession_node(ms);
 		if (rfs_ext_meta_ok(kind, &nd->meta, &pcnt, &(u32){0}, &(u32){0}, &(u64){0}) ||
 		    !RFS_PP_IS_INNER(nd->meta.parent_ptr) ||
 		    idx >= pcnt || pcnt > RFS_EXT_ORDER ||
 		    RFS_PTR_ADDR(nd->extents[idx].sub_node_ptr) != cur_victim) {
 			ravenfs_mdata_put(ms);
-			return -EIO;
+			err = -EIO;
+			goto out_free_newblk;	/* new_blk 尚未挂入本层 → 未发布 */
 		}
 		nd->extents[idx].key = low_max;
 		memmove(&nd->extents[idx + 2], &nd->extents[idx + 1],
@@ -752,12 +798,23 @@ static int rfs_ext_apply_up(struct super_block *sb, u32 kind, u64 ino, const str
 
 			err = rfs_ext_inner_split(sb, kind, p->blk[level], &rblk, &lmx, &hmx, rsv);
 			if (err)
+				return err;	/* new_blk 已挂入本层（活）→ 不释放 */
+			if (is_root) {
+				err = rfs_ext_new_root_inner(sb, kind, ino, p->blk[level], lmx,
+							     rblk, hmx, root_io, rsv);
+				if (err) {
+					/* rblk 由 inner_split 新建、尚未挂入任何层 → 自有未发布 */
+					ravenfs_mdata_drop(sb, rblk);
+					(void)rfs_allocator_block_free(sbi->alloc, rblk, 2);
+				}
 				return err;
-			if (is_root)
-				return rfs_ext_new_root_inner(sb, kind, ino, p->blk[level], lmx,
-							      rblk, hmx, root_io, rsv);
-			if (level == 0)
+			}
+			if (level == 0) {
+				/* 结构异常：rblk 未发布 → 释放 */
+				ravenfs_mdata_drop(sb, rblk);
+				(void)rfs_allocator_block_free(sbi->alloc, rblk, 2);
 				return -EIO;
+			}
 			cur_victim = p->blk[level];
 			low_max = lmx;
 			new_blk = rblk;
@@ -766,6 +823,12 @@ static int rfs_ext_apply_up(struct super_block *sb, u32 kind, u64 ino, const str
 			level--;
 		}
 	}
+out_free_newblk:
+	/* 本层链接**之前**失败：当前 new_blk（首层=调用方新叶，递归层=上轮 rblk）
+	 * 尚未挂入任何活父层 → 自有未发布 → 释放防漏。 */
+	ravenfs_mdata_drop(sb, new_blk);
+	(void)rfs_allocator_block_free(sbi->alloc, new_blk, 2);
+	return err;
 }
 
 /* 欠载链修复（M4.3 定义于本文件后段；D-5a 双融合吞右邻致欠载时前向调用） */
@@ -978,7 +1041,15 @@ int ravenfs_extent_insert_kind(struct super_block *sb, u32 kind, u64 ino, u64 *r
 			if (p.depth == 1) {	/* 叶即根 → 升根 */
 				err = rfs_ext_new_root_inner(sb, kind, ino, leaf_blk, low_max,
 							     nblk, high_max, root_io, &rsv);
+				if (err) {
+					/* 叶即根：nblk 无父链接（victim->next=INV）→ 未发布
+					 * → 自有 → 释放防漏。 */
+					ravenfs_mdata_drop(sb, nblk);
+					(void)rfs_allocator_block_free(sbi->alloc, nblk, 2);
+				}
 			} else {
+				/* depth>1：nblk 由 apply_up 负责——挂入活父层前失败时其内释放；
+				 * 挂入后失败则 nblk 已发布（活）不可释放，留 fsck。 */
 				err = rfs_ext_apply_up(sb, kind, ino, &p, p.depth - 2,
 						       p.cidx[p.depth - 2], leaf_blk,
 						       low_max, nblk, high_max, root_io, &rsv);
@@ -1055,6 +1126,7 @@ static int rfs_ext_orphan_free_rec(struct super_block *sb, u32 kind, u64 blk,
 	struct Bptree_meta_t *m;
 	u32 cnt, inner, root, i;
 	u64 pptr;
+	int nerr = 0;
 
 	if (blk == (u64)PTR_INVALID || blk == (u64)RFS_MASK52 ||
 	    depth > RFS_EXT_DEPTH_MAX)
@@ -1064,6 +1136,9 @@ static int rfs_ext_orphan_free_rec(struct super_block *sb, u32 kind, u64 blk,
 		return PTR_ERR(ms);
 	m = ravenfs_msession_node(ms);
 	if (rfs_ext_meta_ok(kind, m, &cnt, &inner, &root, &pptr)) {
+		/* 头坏 → 块不可信（可能是活块）→ **不释放**，留盘交 fsck。
+		 * 这是 SAFE-OWNERSHIP 政策要求的保守：本函数无法区分「孤儿树里的坏
+		 * 节点」与「指针撞上的活节点」，宁漏勿毁。 */
 		ravenfs_mdata_put(ms);
 		return -EIO;
 	}
@@ -1072,26 +1147,36 @@ static int rfs_ext_orphan_free_rec(struct super_block *sb, u32 kind, u64 blk,
 
 		for (i = 0; i < cnt; i++) {
 			u64 cb = RFS_PTR_ADDR(nd->extents[i].sub_node_ptr);
+			int rc;
 
-			if (cb != (u64)RFS_MASK52 && cb != (u64)PTR_INVALID)
-				(void)rfs_ext_orphan_free_rec(sb, kind, cb, depth + 1);
+			if (cb == (u64)RFS_MASK52 || cb == (u64)PTR_INVALID)
+				continue;
+			rc = rfs_ext_orphan_free_rec(sb, kind, cb, depth + 1);
+			if (rc)		/* 子失败不弃兄弟：累计后继续 */
+				nerr++;
 		}
 	}
 	ravenfs_mdata_put(ms);
+	/* 本节点已成功读出且校验通过 → 本调用自有 → drop + free */
 	ravenfs_mdata_drop(sb, blk);
 	(void)rfs_allocator_block_free(sbi->alloc, blk, 2);
-	return 0;
+	return nerr;
 }
 
 void ravenfs_extent_orphan_release_kind(struct super_block *sb, u32 kind, u64 root)
 {
+	int nerr;
+
 	/* ⚠️ v2.0：0 是合法块号（盘面契约明令禁用 0 作哨兵）——旧树根可能恰为
 	 * block 0（根 dentry 块被 dentry 树释放后经分配器复用为映射树节点）。此处
 	 * **不得**把 0 当无效，否则整棵旧映射树漏释放（audit: LEAK_BLK [0,2)）。
 	 * 仅 PTR_INVALID / ptr 域全 1 为无效。 */
 	if (root == (u64)PTR_INVALID || root == (u64)RFS_MASK52)
 		return;
-	(void)rfs_ext_orphan_free_rec(sb, kind, root, 0);
+	nerr = rfs_ext_orphan_free_rec(sb, kind, root, 0);
+	if (nerr)
+		pr_warn_ratelimited("ravenfs: 孤儿树释放不完整 kind=%u root=%llu nerr=%d（异常子树留盘交 fsck）\n",
+				    kind, (unsigned long long)root, nerr);
 }
 
 /* 节点 max 变更后沿父链上溯刷新 hint key（短路：key 未变即停） */

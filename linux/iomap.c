@@ -226,9 +226,6 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 	u8 *buf;
 	int err;
 
-	if (!end_blk)
-		end_blk = 1;
-
 	/* ── D-6a：先试 direct（整域连续分配 → 零树节点最优路径）── */
 	err = ravenfs_migrate_inline_direct(sb, r, ses, pos, end, end_blk, iomap);
 	if (err != RFS_MIGRATE_INLINE_DEGRADE)
@@ -266,8 +263,14 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 		e0.block_base.v = RFS_PTR_PACK(0, run);
 		tmp = root;
 		err = ravenfs_extent_insert(sb, RFS_INO_TO_IDX(inode->i_ino), &tmp, &e0, NULL);
-		if (err)
-			return err;		/* 孤儿块（inode 未动，§8） */
+		if (err) {
+			/* inode 未提交（仍 inline）→ 刚建的树与数据 run 均自有：
+			 * 释放树节点（不碰数据）+ 释放 run，防「分配未释放」漏。 */
+			if (tmp != (u64)PTR_INVALID)
+				ravenfs_extent_orphan_release_kind(sb, RFS_EXT_KIND_FILE, tmp);
+			(void)rfs_allocator_block_free(sbi->alloc, run, end_blk);
+			return err;
+		}
 		root = tmp;
 		iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
 		iomap->type = IOMAP_MAPPED;
@@ -287,6 +290,7 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 			}
 			memset(buf, 0, RAVENFS_BLOCK_SIZE);
 			memcpy(buf, r->inline_data, min_t(u64, old_size, RAVENFS_INLINE_BYTES));
+			tmp = root;			/* 空树入口：PTR_INVALID */
 			err = rfs_store_block(sb, run0, buf);
 			if (!err) {
 				struct extent_t e0;
@@ -294,11 +298,13 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 				e0.length = 1;
 				e0.fblkbase = 0;
 				e0.block_base.v = RFS_PTR_PACK(0, run0);
-				tmp = root;
 				err = ravenfs_extent_insert(sb, RFS_INO_TO_IDX(inode->i_ino), &tmp, &e0, NULL);
 				root = tmp;
 			}
 			if (err) {
+				/* inode 未提交 → 刚建的树（若插入已建根）与 run0 均自有：释放防漏。 */
+				if (tmp != (u64)PTR_INVALID)
+					ravenfs_extent_orphan_release_kind(sb, RFS_EXT_KIND_FILE, tmp);
 				(void)rfs_allocator_block_free(sbi->alloc, run0, 1);
 				kfree(buf);
 				return err;
@@ -314,6 +320,10 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 		e1.block_base.v = RFS_PTR_PACK(0, run);
 		err = ravenfs_extent_insert(sb, RFS_INO_TO_IDX(inode->i_ino), &root, &e1, NULL);
 		if (err) {
+			/* inode 未提交 → 刚建的整棵树（root 及其插入产生的节点）自有：
+			 * 释放树节点（数据 phys 零碰）+ 释放新数据 run。 */
+			if (root != (u64)PTR_INVALID)
+				ravenfs_extent_orphan_release_kind(sb, RFS_EXT_KIND_FILE, root);
 			(void)rfs_allocator_block_free(sbi->alloc, run, cnt);
 			return err;
 		}
@@ -382,16 +392,27 @@ static int ravenfs_write_migrate_direct(struct super_block *sb, struct inode *in
 	e0.block_base.v = RFS_PTR_PACK(0, old_base);
 	tmp = root;
 	err = ravenfs_extent_insert(sb, RFS_INO_TO_IDX(inode->i_ino), &tmp, &e0, NULL);
-	if (err)
+	if (err) {
+		/* inode 仍 direct（未提交）→ 刚建的树 + 新增长 run 均自有：释放防漏。 */
+		if (tmp != (u64)PTR_INVALID)
+			ravenfs_extent_orphan_release_kind(sb, RFS_EXT_KIND_FILE, tmp);
+		(void)rfs_allocator_block_free(sbi->alloc, run, grow);
 		return err;
+	}
 	root = tmp;
 
 	e1.length = grow;
 	e1.fblkbase = old_ceil;
 	e1.block_base.v = RFS_PTR_PACK(0, run);
 	err = ravenfs_extent_insert(sb, RFS_INO_TO_IDX(inode->i_ino), &root, &e1, NULL);
-	if (err)
+	if (err) {
+		/* 同上：整棵刚建的树（root 及各插入产生的节点）自有 → 释放树节点
+		 * （旧 direct 数据 phys 零碰）+ 释放新增长 run。 */
+		if (root != (u64)PTR_INVALID)
+			ravenfs_extent_orphan_release_kind(sb, RFS_EXT_KIND_FILE, root);
+		(void)rfs_allocator_block_free(sbi->alloc, run, grow);
 		return err;
+	}
 
 	/* 提交记录：direct=0；data_root=root（size 不变，仍 >160 → extent 解码） */
 	RFS_INO1_SET_DIRECT(*r, 0);

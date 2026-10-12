@@ -325,7 +325,17 @@ static void rfs_fl_free(struct super_block *sb, struct rfs_run_list *fl)
 	}
 }
 
-/* 释放一棵区段树的全部节点块 + 收集数据块（commit 之后调用） */
+/* 释放一棵区段树的全部节点块 + 收集数据块（commit 之后调用）。
+ *
+ * best-effort 聚合口径（加固）：
+ *   · **成功读到且通过校验**的节点：本调用自有 → 遍历（尽可能）所有可读孩子后
+ *     无条件 drop + block_free(blk,2)；某一孩子失败**不**放弃兄弟节点。
+ *   · **读失败 / 魔数坏 / cnt 越界**的节点：头不可信，可能是活块 → **不释放**，
+ *     交 fsck（SAFE-OWNERSHIP 政策：绝不释放未通过校验的块）。OOM 同理。
+ *   · 读失败先**有界重试**（瞬时 I/O 抖动恢复）：重试只决定「能否读到」，
+ *     仍须读到且校验通过才释放，故绝不降低上面的安全性；持久故障照样留盘。
+ *   · 返回**聚合错误计数**（0 = 全清）；调用方记录但不改控制流。
+ * 注：RFS_PTR_ADDR 会把全 1 掩成 RFS_MASK52，故无效判定必须用 RFS_MASK52。 */
 static int rfs_release_tree_rec(struct super_block *sb, u64 root, struct rfs_run_list *fl,
 				u32 depth)
 {
@@ -333,36 +343,45 @@ static int rfs_release_tree_rec(struct super_block *sb, u64 root, struct rfs_run
 	struct Bptree_meta_t *m;
 	u8 *buf;
 	u32 cnt, inner, i;
-	int err;
+	int err, nerr = 0, tries;
 
-	if (root == (u64)PTR_INVALID || depth > RFS_EXT_DEPTH_MAX_PUB)
+	if (root == (u64)PTR_INVALID || root == (u64)RFS_MASK52 ||
+	    depth > RFS_EXT_DEPTH_MAX_PUB)
 		return 0;
 	buf = kmalloc(RAVENFS_NODE_BYTES, GFP_KERNEL);
 	if (!buf)
-		return -ENOMEM;
-	err = ravenfs_read_node(sb, root, buf);
+		return -ENOMEM;		/* OOM：头未读 → 不释放，交 fsck */
+	for (tries = 0; tries < 3; tries++) {
+		err = ravenfs_read_node(sb, root, buf);
+		if (!err)
+			break;
+	}
 	if (err) {
 		kfree(buf);
-		return 0;			/* 读不到 → 交给 fsck */
+		return 1;		/* 重试后仍读不到 → 块不可信，保留交 fsck */
 	}
 	m = (void *)buf;
 	if (m->magics[0] != BPTREE_MAGIC1 || m->magics[1] != BPTREE_MAGIC2 ||
 	    m->magics[2] != BPTREE_MAGIC3 || m->magics[3] != BPTREE_MAGIC4) {
 		kfree(buf);
-		return 0;
+		return 1;		/* 魔数坏 → 保留交 fsck */
 	}
 	cnt = RFS_PP_COUNT(m->parent_ptr);
 	inner = RFS_PP_IS_INNER(m->parent_ptr);
 	if (cnt > 338) {
 		kfree(buf);
-		return 0;
+		return 1;		/* cnt 越界 → 保留交 fsck */
 	}
 	if (inner) {
 		struct Bptree_extent_inner_node_t *nd = (void *)buf;
 
-		for (i = 0; i < cnt; i++)
-			rfs_release_tree_rec(sb, RFS_PTR_ADDR(nd->extents[i].sub_node_ptr),
-					     fl, depth + 1);
+		for (i = 0; i < cnt; i++) {
+			u64 cb = RFS_PTR_ADDR(nd->extents[i].sub_node_ptr);
+
+			if (cb == (u64)PTR_INVALID || cb == (u64)RFS_MASK52)
+				continue;
+			nerr += rfs_release_tree_rec(sb, cb, fl, depth + 1);
+		}
 	} else {
 		struct Bptree_extent_leaf_node_t *lf = (void *)buf;
 
@@ -371,9 +390,10 @@ static int rfs_release_tree_rec(struct super_block *sb, u64 root, struct rfs_run
 				   lf->extents[i].length);
 	}
 	kfree(buf);
+	/* 本节点已成功读出且校验通过 → 确定自有：兄弟失败后仍释放 */
 	ravenfs_mdata_drop(sb, root);
 	(void)rfs_allocator_block_free(sbi->alloc, root, 2);
-	return 0;
+	return nerr;
 }
 
 /*
@@ -399,7 +419,13 @@ void ravenfs_release_inode_data(struct super_block *sb, u64 data_root, u64 size,
 	fl = rfs_fl_new();
 	if (!fl)
 		return;		/* OOM：交 fsck 回收，绝不反向破坏「先 inode 后 free」 */
-	rfs_release_tree_rec(sb, data_root, fl, 0);
+	{
+		int nerr = rfs_release_tree_rec(sb, data_root, fl, 0);
+
+		if (nerr)
+			pr_warn_ratelimited("ravenfs: inode 数据树释放不完整 root=%llu depth0 nerr=%d（异常子树留盘交 fsck）\n",
+					    (unsigned long long)data_root, nerr);
+	}
 	rfs_fl_free(sb, fl);
 	rfs_fl_put(fl);
 }
@@ -511,9 +537,67 @@ static int rfs_zero_mapped_bytes(struct inode *inode, u64 off, u64 end)
 	return 0;
 }
 
-/* ── 区段树：删除逻辑块域 [fb0, fb1)（逐记录 loose）；返回可能更迭的新根 ── */
+/* 根更迭旧根动态收集表（S7 加固）：删除/收缩期间根可能反复更迭，旧根**必须**在
+ * inode.data_root 提交之后统一 free。旧的定长 roots[64] 会静默丢弃第 65+ 个旧根
+ * （成功路径即漏；大文件一次性截断极易超过 64 次收缩）→ 改为按需增长。
+ * 纪律：本表只登记；**释放**由调用方在 commit 之后执行；错误路径（未提交）不得释放。 */
+struct rfs_root_list {
+	u64	*v;
+	int	n;
+	int	cap;
+};
+
+static void rfs_rl_init(struct rfs_root_list *rl)
+{
+	rl->v = NULL;
+	rl->n = 0;
+	rl->cap = 0;
+}
+
+/* 登记一个旧根；OOM 则告警丢弃（旧根仍被 inode 链可达 → 非泄漏，交 fsck 收尾）。 */
+static void rfs_rl_add(struct rfs_root_list *rl, u64 blk)
+{
+	if (rl->n == rl->cap) {
+		int ncap = rl->cap ? rl->cap * 2 : 16;
+		u64 *nv = krealloc(rl->v, (size_t)ncap * sizeof(u64), GFP_KERNEL);
+
+		if (!nv) {
+			pr_warn_ratelimited("ravenfs: 旧根收集表扩容失败（丢弃 old_root=%llu）\n",
+					    (unsigned long long)blk);
+			return;
+		}
+		rl->v = nv;
+		rl->cap = ncap;
+	}
+	rl->v[rl->n++] = blk;
+}
+
+/* 释放表内全部旧根块（**仅**在 inode.data_root 已提交指向新根之后调用）。 */
+static void rfs_rl_free_blocks(struct super_block *sb, struct rfs_root_list *rl)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	int i;
+
+	for (i = 0; i < rl->n; i++) {
+		ravenfs_mdata_drop(sb, rl->v[i]);
+		(void)rfs_allocator_block_free(sbi->alloc, rl->v[i], 2);
+	}
+}
+
+/* 仅回收表内存（不碰盘块）；错误/未提交路径用。 */
+static void rfs_rl_put(struct rfs_root_list *rl)
+{
+	kfree(rl->v);
+	rl->v = NULL;
+	rl->n = 0;
+	rl->cap = 0;
+}
+
+/* ── 区段树：删除逻辑块域 [fb0, fb1)（逐记录 loose）；返回可能更迭的新根 ──
+ * 加固：数据块仅在 unmap_loose **确认删记录成功后**才入 fl（此前顺序为「先入 fl
+ * 再删」，一旦删记录硬失败会把仍被引用的数据块记入待释放集 → 错误路径释放 = 释放活块）。 */
 static int rfs_unmap_range(struct inode *inode, u64 *root_io, u64 fb0, u64 fb1,
-			   struct rfs_run_list *fl, u64 *roots, int *nroots)
+			   struct rfs_run_list *fl, struct rfs_root_list *rl)
 {
 	struct super_block *sb = inode->i_sb;
 	u64 root = *root_io, b = fb0;
@@ -538,12 +622,13 @@ static int rfs_unmap_range(struct inode *inode, u64 *root_io, u64 fb0, u64 fb1,
 		cut.length = e - s;
 		cut.fblkbase = s;
 		cut.block_base.v = RFS_PTR_PACK(0, phys);
-		rfs_fl_add(fl, phys, e - s);
 		err = ravenfs_extent_unmap_loose(sb, RFS_INO_TO_IDX(inode->i_ino), &root, &cut, &old_root);
 		if (err && err != -ENOENT)
-			return err;
-		if (old_root != (u64)PTR_INVALID && *nroots < 64)
-			roots[(*nroots)++] = old_root;
+			return err;	/* 未删记录 → 数据块仍活，**不**入 fl */
+		/* 记录已删（含幂等 -ENOENT 口径）→ 数据块确定死 → 收集待释放 */
+		rfs_fl_add(fl, phys, e - s);
+		if (old_root != (u64)PTR_INVALID)
+			rfs_rl_add(rl, old_root);
 		b = e;
 	}
 	*root_io = root;
@@ -683,7 +768,13 @@ static int rfs_punch_hole(struct inode *inode, loff_t off, loff_t len)
 		return 0;
 
 out_free_tree:
-		rfs_release_tree_rec(sb, root, fl, 0);
+		{
+			int nerr = rfs_release_tree_rec(sb, root, fl, 0);
+
+			if (nerr)
+				pr_warn_ratelimited("ravenfs: punch 回滚释放不完整 root=%llu nerr=%d（异常子树留盘交 fsck）\n",
+						    (unsigned long long)root, nerr);
+		}
 		rfs_fl_free(sb, fl);
 		rfs_fl_put(fl);
 		filemap_invalidate_unlock(inode->i_mapping);
@@ -707,11 +798,12 @@ out_free_fl:
 
 	/* extent：逐记录 loose 整块域 + 残块清零 */
 	{
-		u64 root, roots[64];
-		int nroots = 0, i;
+		u64 root;
+		struct rfs_root_list rl;
 		struct ravenfs_session *s2;
 		struct rfs_run_list *fl = rfs_fl_new();
 
+		rfs_rl_init(&rl);
 		if (!fl) {
 			filemap_invalidate_unlock(inode->i_mapping);
 			return -ENOMEM;
@@ -732,26 +824,38 @@ out_free_fl:
 		if (err)
 			goto out_inval;
 		if (db_start < db_end) {
-			err = rfs_unmap_range(inode, &root, db_start, db_end, fl, roots, &nroots);
+			err = rfs_unmap_range(inode, &root, db_start, db_end, fl, &rl);
 			if (err)
 				goto out_inval;
 		}
 		truncate_pagecache_range(inode, off, clamp_end - 1);
 		err = rfs_commit_inode(inode, size, root, 0, NULL);
 		if (err) {
+			/* 提交失败：inode 仍指向旧根（rl 内旧根**不可**释放，否则悬挂）；
+			 * 但 fl 内数据块记录已在树中删除 → 真死 → 可释放（防数据漏）。 */
+			if (rl.n)
+				pr_warn_ratelimited("ravenfs: punch 提交失败，%d 个旧根保留（inode 仍引用）err=%d\n",
+						    rl.n, err);
+			rfs_fl_free(sb, fl);
+			rfs_rl_put(&rl);
 			rfs_fl_put(fl);
 			filemap_invalidate_unlock(inode->i_mapping);
 			return err;
 		}
-		for (i = 0; i < nroots; i++) {
-			ravenfs_mdata_drop(sb, roots[i]);
-			(void)rfs_allocator_block_free(sbi->alloc, roots[i], 2);
-		}
+		rfs_rl_free_blocks(sb, &rl);
 		rfs_fl_free(sb, fl);
+		rfs_rl_put(&rl);
 		rfs_fl_put(fl);
 		filemap_invalidate_unlock(inode->i_mapping);
 		return 0;
 out_inval:
+		/* 未提交：inode.data_root 未更新 → rl 内旧根可能仍被引用，**不释放**（交 fsck）。
+		 * fl 内数据块均已确删（rfs_unmap_range 已前置校验）→ 释放防漏。 */
+		if (rl.n)
+			pr_warn_ratelimited("ravenfs: punch 错误退出，%d 个旧根保留（未提交，inode 仍引用）err=%d\n",
+					    rl.n, err);
+		rfs_fl_free(sb, fl);
+		rfs_rl_put(&rl);
 		rfs_fl_put(fl);
 		filemap_invalidate_unlock(inode->i_mapping);
 		return err;
@@ -815,7 +919,11 @@ static int rfs_truncate(struct inode *inode, loff_t new_size){
 				struct rfs_run_list *fl = rfs_fl_new();
 
 				if (fl) {
-					rfs_release_tree_rec(sb, data_root, fl, 0);
+					int nerr = rfs_release_tree_rec(sb, data_root, fl, 0);
+
+					if (nerr)
+						pr_warn_ratelimited("ravenfs: inline 坍缩释放不完整 root=%llu nerr=%d（异常子树留盘交 fsck）\n",
+								    (unsigned long long)data_root, nerr);
 					rfs_fl_free(sb, fl);
 					rfs_fl_put(fl);
 				}
@@ -852,17 +960,19 @@ static int rfs_truncate(struct inode *inode, loff_t new_size){
 
 		/* 出口 3：extent 尾 loose + 出口坍缩判定 */
 		{
-			u64 root = r->data_root, roots[64], base = 0;
-			int nroots = 0, i, collapse;
+			u64 root = r->data_root, base = 0;
+			int collapse;
+			struct rfs_root_list rl;
 			struct rfs_run_list *fl = rfs_fl_new();
 
+			rfs_rl_init(&rl);
 			RFS_SES_PUT(ses);
 			if (!fl)
 				return -ENOMEM;
 			filemap_invalidate_lock(inode->i_mapping);
 			if (oldceil > newceil) {
 				err = rfs_unmap_range(inode, &root, newceil, oldceil,
-						      fl, roots, &nroots);
+						      fl, &rl);
 				if (err)
 					goto out_inval;
 			}
@@ -879,24 +989,34 @@ static int rfs_truncate(struct inode *inode, loff_t new_size){
 					       collapse ? base : root,
 					       collapse ? 1 : 0, NULL);
 			if (err) {
+				/* 提交失败：inode 未更新 → 旧根（含 rl 内）仍被引用，**不释放**；
+				 * fl 内数据块记录已删 → 真死 → 释放防漏。 */
+				if (rl.n)
+					pr_warn_ratelimited("ravenfs: truncate 提交失败，%d 个旧根保留（inode 仍引用）err=%d\n",
+							    rl.n, err);
+				rfs_fl_free(sb, fl);
+				rfs_rl_put(&rl);
 				rfs_fl_put(fl);
 				filemap_invalidate_unlock(inode->i_mapping);
 				return err;
 			}
-			/* 后置 free：坍缩旧根 + 收缩产生的旧根 + 被删数据块 */
+			/* 后置 free（commit 之后）：坍缩旧根 + 收缩产生的旧根 + 被删数据块 */
 			if (collapse) {
 				ravenfs_mdata_drop(sb, root);
 				(void)rfs_allocator_block_free(sbi->alloc, root, 2);
 			}
-			for (i = 0; i < nroots; i++) {
-				ravenfs_mdata_drop(sb, roots[i]);
-				(void)rfs_allocator_block_free(sbi->alloc, roots[i], 2);
-			}
+			rfs_rl_free_blocks(sb, &rl);
 			rfs_fl_free(sb, fl);
+			rfs_rl_put(&rl);
 			rfs_fl_put(fl);
 			filemap_invalidate_unlock(inode->i_mapping);
 			return 0;
 out_inval:
+			if (rl.n)
+				pr_warn_ratelimited("ravenfs: truncate 错误退出，%d 个旧根保留（未提交，inode 仍引用）err=%d\n",
+						    rl.n, err);
+			rfs_fl_free(sb, fl);
+			rfs_rl_put(&rl);
 			rfs_fl_put(fl);
 			filemap_invalidate_unlock(inode->i_mapping);
 			return err;
