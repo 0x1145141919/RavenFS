@@ -557,9 +557,7 @@ static int block_free_range(struct rfs_allocator *self, u64 blkbase, u64 count)
 		slice_end = (idx + 1) * self->blk_.per_slice_bits;
 		n = count;
 		if (blkbase + n > slice_end)
-			n = slice_end - blkbase;	/* 本片内可释放量 */
-		if (n == 0)
-			return -EINVAL;		/* 防御：理论上不达 */
+			n = slice_end - blkbase;	/* 本片内可释放量（idx<slice_count ⇒ n>0） */
 
 		s = &self->blk_.slices[idx];
 		RFS_MUTEX_LOCK(&s->lock);	/* 释放不可丢：阻塞抢 */

@@ -26,8 +26,6 @@
 /* mount option `row_size=` 支持表（v2.0：inode 缓存不再按行装载，选项被接受但忽略；
  * 保留宏以维持 super.c 参数解析面）。 */
 #define RAVENFS_ROW_DEFAULT	4096u
-#define RAVENFS_ROW_SIZE_OK(sz)	((sz) == 4096u || (sz) == 8192u || (sz) == 16384u || \
-				 (sz) == 32768u || (sz) == 65536u)
 
 /* 行缓冲伙伴系统 order = log2(8K/4K)=1（mdata 节点 / inode 片恒 8K）*/
 #define RAVENFS_ORDER_OF(bytes)	ilog2((bytes) >> PAGE_SHIFT)
@@ -55,7 +53,6 @@
  * `piece_data` 为片缓冲直地址（ravenfs_session_inode 用它，不依赖 mrow 完整定义）。
  */
 struct ravenfs_session {
-	struct ravenfs_sb_info	*sbi;
 	struct ravenfs_msession	*ms;		/* 物理 8K 片 mdata 会话（引用计数归它）*/
 	struct ravenfs_mrow	*row;		/* == ms->row；外部标脏宏用 */
 	void			*piece_data;	/* 片缓冲（8K）直地址 */
@@ -82,8 +79,6 @@ DEFINE_FREE(ravenfs_session, struct ravenfs_session *,
 	    if (!IS_ERR_OR_NULL(_T)) ravenfs_session_put(_T))
 
 /* 用法： struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, ino); */
-#define RAVENFS_SESSION(sb, inum, var)	\
-	struct ravenfs_session *var __free(ravenfs_session) = ravenfs_session_get((sb), (inum))
 
 static inline struct raven_Inode_t *ravenfs_session_inode(struct ravenfs_session *s)
 {
@@ -95,7 +90,6 @@ static inline struct raven_Inode_t *ravenfs_session_inode(struct ravenfs_session
 /* ── 架构无关回刷 driver（缓存后端：inode 片 / mdata 节点）──
  * v2.0：inode 记录随 8K 片落 mdata → inode 后端退化为 no-op；mdata 后端实效。 */
 struct ravenfs_wb_ops {
-	const char	*name;
 	int		(*wb_dirty)(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age);
 	long		(*reap)(struct super_block *sb, u64 cutoff_ns);
 };

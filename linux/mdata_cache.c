@@ -42,8 +42,6 @@ static void ravenfs_mgeo_init(struct ravenfs_mdata_cache *c, u64 total_blocks)
 	c->bits_len = bits;			/* 以块为单位 */
 	c->w0 = (bits <= RAVENFS_SHARD_SEL_BITS) ? 0 : RAVENFS_SHARD_SEL_BITS;
 	c->shard_bits = bits - c->w0;		/* 每片容纳块数 = 2^shard_bits（≥1 节点） */
-	if (c->shard_bits < 1)
-		c->shard_bits = 1;
 	c->node_mask = (c->shard_bits >= BITS_PER_LONG) ? ~0UL
 							: ((1UL << c->shard_bits) - 1);
 	c->n_slices = 1u << c->w0;
@@ -252,10 +250,8 @@ retry:
 		}
 		RFS_STAT_INC(sb, md_miss);	/* 走 mrow_load = miss */
 	}
-	s->sbi = sbi;
 	s->shard = sh;
 	s->row = row;
-	s->node_idx = node_idx;
 	return s;
 }
 
@@ -514,7 +510,6 @@ void ravenfs_mdata_cache_destroy(struct super_block *sb)
 
 /* 架构无关回刷 driver 的 mdata 后端 */
 const struct ravenfs_wb_ops ravenfs_wb_mdata_ops = {
-	.name     = "mdata",
 	.wb_dirty = ravenfs_mdata_wb_dirty,
 	.reap     = ravenfs_mdata_reap_expired,
 };

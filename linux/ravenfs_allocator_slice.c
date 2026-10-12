@@ -415,11 +415,7 @@ int rfs_slice_soft_occupy(struct rfs_slice *self, u64 base, u64 len,
 	if (claimed > real)
 		claimed = real;			/* 额度上限夹断 */
 	if (base + claimed > slice_end)
-		claimed = slice_end - base;	/* 片尾夹断（严格永不越片）*/
-	if (claimed == 0) {			/* 防御（正常不可达）*/
-		*rest_bits = len;
-		return -ENOSPC;
-	}
+		claimed = slice_end - base;	/* 片尾夹断（严格永不越片；base<slice_end ⇒ claimed≥1）*/
 
 	left_base = iv->base;			/* 残余左段 [iv.base, base) */
 	left_len = base - left_base;
@@ -482,18 +478,19 @@ int rfs_slice_alloc_hard(struct rfs_slice *self, u8 align_log2, u64 bitscount,
 		u64 s, left_len, right_base, right_len;
 		int rc;
 
-		if (iv_len < bitscount)		/* 防御：升序，不应发生 */
-			break;
+		/* 树按 (len,base) 升序，lower_bound 起 len 恒 ≥ bitscount */
 
-		/* 尾部下挖起点（尽量贴尾 + 对齐）；落不到区间内 → 本区间容不下 */
-		s = (iv_end - bitscount) & ~align_mask;
-		if (s < iv_base)
+		/* 头部上挖起点（尽量贴头 + 对齐）；越出区间右沿 → 本区间容不下。
+		 * D-14：头挖（非尾挖）→ 连续分配物理**升序**，令锚定（取左邻
+		 * 上沿，iomap.c）与叶内四形态融合（升序相邻，extent_write.c）成立。*/
+		s = (iv_base + align_mask) & ~align_mask;
+		if (s + bitscount > iv_end)
 			continue;
 
 		iv_erase_both(self, iv);	/* 先删（从树先主树后）*/
 
-		left_len = s - iv_base;		/* 余段 [iv.base, s)：base 不变 */
-		right_base = s + bitscount;	/* 尾余（仅对齐贴不到尾时存在）*/
+		left_len = s - iv_base;		/* 头余（仅对齐留白）*/
+		right_base = s + bitscount;	/* 右余 [s+bitscount, iv.end) */
 		right_len = iv_end - right_base;
 		if (left_len > 0) {
 			rc = iv_insert_both(self, iv_base, left_len);
@@ -548,25 +545,21 @@ int rfs_slice_soft_alloc(struct rfs_slice *self, u8 align_log2, u64 bitscount,
 		u64 t, s, left_len, right_base, right_len;
 		int rc;
 
-		t = (iv_len < remain) ? iv_len : remain;	/* 整段优先 */
-		s = (iv_end - t) & ~align_mask;			/* 尽量贴尾 + 对齐 */
-		if (s < iv_base) {
-			/* 贴尾对齐落到区间头之下 → 自区间头向上对齐兜底 */
-			s = (iv_base + align_mask) & ~align_mask;
-			if (s >= iv_end) {			/* 本段无可占 → 跳过 */
-				n = rfs_rb_next(n);
-				continue;
-			}
-			{
-				u64 avail = iv_end - s;
+		/* D-14：头挖（尽量贴头 + 对齐），与 alloc_hard 同向 → 连续分配升序。*/
+		s = (iv_base + align_mask) & ~align_mask;
+		if (s >= iv_end) {			/* 本段无可占 → 跳过 */
+			n = rfs_rb_next(n);
+			continue;
+		}
+		{
+			u64 avail = iv_end - s;
 
-				t = (avail < remain) ? avail : remain;
-			}
+			t = (avail < remain) ? avail : remain;
 		}
 
 		iv_erase_both(self, iv);	/* 先删（从树先主树后）*/
-		left_len = s - iv_base;		/* 余段 [iv.base, s)：base 不变 */
-		right_base = s + t;		/* 尾余（贴尾时为空）*/
+		left_len = s - iv_base;		/* 头余（仅对齐留白）*/
+		right_base = s + t;		/* 右余 [s+t, iv.end) */
 		right_len = iv_end - right_base;
 		if (left_len > 0) {
 			rc = iv_insert_both(self, iv_base, left_len);

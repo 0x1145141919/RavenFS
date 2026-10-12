@@ -161,7 +161,7 @@ int rfs_ndfr_walk(struct rfs_ndfr_ctx *ctx, u64 root, u64 need_len,
 {
 	u64 cur = root;
 	int depth;
-	bool err = false;
+	bool err;
 	void *buf = NULL;
 	meta_t *m;
 	u16 cnt;

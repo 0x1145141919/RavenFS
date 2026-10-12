@@ -10,7 +10,6 @@
  *         + 接待层 emit 直取 ddentry_name（跨层向下只读工具，方案声明例外）。
  * 验收与移植要点总纲见 dentry_tree.c 文件头（原 dentry_write.c banner 原样保留）。
  * 规格：Docs/linux/ravenfs-linux-ko-handover.md §4；god 参考 juvenile_god/dentry_*。
- * 注：rfs_read_max 为历史 __maybe_unused 死代码（全仓零调用），随迁保持原状。
  */
 
 #include <linux/fs.h>
@@ -27,41 +26,6 @@
 
 /* ── 8K 节点 / 跨块字节读 ── */
 /* ── 8K 节点读取已移至 mdata_cache.c（走 mdata_piece_cache_mgr + session） ── */
-
-/*
- * 跨块读任意字节（off 为块内偏移）—— **走 mdata 8K 片缓存**（与写路径同源）。
- * 为什么不直接 sb_bread：写路径改了 mdata 缓存但尚未落盘时，直接读盘会读到旧内容
- * （外置名/堆数据“刚写完读不到”）；统一走缓存保证同源可见。
- * 注：长名外置已迁至名字数据面（ravenfs_nd_read 自行解析逻辑偏移），本助手
- * 仅供 mdata 节点内部读用（历史保留）。
- */
-__maybe_unused static int ravenfs_read_bytes(struct super_block *sb, u64 fs_blk, u32 off,
-			      u32 len, void *out)
-{
-	u8 *p = out;
-
-	while (len) {
-		u64 piece = fs_blk & ~1ULL;
-		u32 in_piece = (u32)((fs_blk - piece) * RAVENFS_BLOCK_SIZE + off);
-		u32 n;
-		struct ravenfs_msession *ms __free(ravenfs_msession) =
-			ravenfs_mdata_get(sb, piece);
-
-		if (IS_ERR(ms))
-			return PTR_ERR(ms);
-		n = min_t(u32, len, RAVENFS_MDATA_NODE_BYTES - in_piece);
-		memcpy(p, (char *)ravenfs_msession_node(ms) + in_piece, n);
-		p += n;
-		len -= n;
-		if (in_piece + n >= RAVENFS_MDATA_NODE_BYTES) {
-			fs_blk = piece + 2;
-			off = 0;
-		} else {
-			off = in_piece + n;
-		}
-	}
-	return 0;
-}
 
 /* 物化 dentry 名字：≤40 内联；>40 从所属目录名字数据面读尾部
  * （owner_dir_inum 定位目录 inode；full_char_remain_offset 为数据面内逻辑偏移） */
@@ -140,30 +104,6 @@ static u64 rfs_node_max(const void *node, u32 inner, u32 count)
 	if (inner)
 		return ((const struct Bptree_ddentry_inner_node_t *)m)->hints[count - 1].hash_max;
 	return ((const struct Bptree_ddentry_leaf_node_t *)m)->entries[count - 1].hash;
-}
-
-/* 读节点（拷贝）取 max */
-__maybe_unused static int rfs_read_max(struct super_block *sb, u64 blk, u32 *inner_out, u32 *count_out, u64 *max_out)
-{
-	void *buf = kmalloc(RAVENFS_NODE_BYTES, GFP_KERNEL);
-	u32 cnt, inner, root;
-	u64 pptr;
-	int err;
-
-	if (!buf)
-		return -ENOMEM;
-	err = ravenfs_read_node(sb, blk, buf);
-	if (err)
-		goto out;
-	err = rfs_meta_ok(buf, &cnt, &inner, &root, &pptr);
-	if (err)
-		goto out;
-	*inner_out = inner;
-	*count_out = cnt;
-	*max_out = rfs_node_max(buf, inner, cnt);
-out:
-	kfree(buf);
-	return err;
 }
 
 /* 叶内 GLB：复合序 (hash,name) 的最大下界；无 → GLB_NONE；hit=精确命中 */
@@ -505,9 +445,6 @@ int rfs_new_root_inner(struct super_block *sb, u64 dir_ino, u64 left_blk, u64 le
 				return err;
 			}
 			km->parent_ptr.v = RFS_PP_PACK(cc, ci, 0, root_blk);
-			if (!ci) {			/* 叶：左叶 ptrs[1] 已是 INV；确保 */
-				/* 左叶在分裂里已置 INV；右叶 ptrs[1]=victim，保留 */
-			}
 			NODE_DIRTY(kms);
 			ravenfs_mdata_put(kms);
 		}
@@ -752,7 +689,7 @@ static int rfs_node_balance(struct super_block *sb, u64 parent_blk, u32 idx, boo
 		{
 			u32 del_idx = (idx == 0) ? 1 : (idx - 1);
 			u32 kept_before = (idx == 0) ? 0 : (idx - 1);
-			u32 kept_after = kept_before - (del_idx < kept_before ? 1u : 0u);
+			u32 kept_after = kept_before;	/* 恒等：del_idx 从不 < kept_before */
 
 			if (del_idx < pcnt - 1)
 				memmove(&pi->hints[del_idx], &pi->hints[del_idx + 1],

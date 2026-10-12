@@ -44,10 +44,8 @@ struct ravenfs_mdata_cache {
 };
 
 struct ravenfs_msession {
-	struct ravenfs_sb_info		*sbi;
 	struct ravenfs_mdata_shard	*shard;
 	struct ravenfs_mrow		*row;
-	u64				node_idx;
 };
 
 /* ── mdata 缓存主体 API（mdata_cache.c） ── */
@@ -67,9 +65,6 @@ void ravenfs_mdata_drop(struct super_block *sb, u64 blk);
 
 DEFINE_FREE(ravenfs_msession, struct ravenfs_msession *,
 	    if (!IS_ERR_OR_NULL(_T)) ravenfs_mdata_put(_T))
-
-#define RAVENFS_MSESSION(sb, blk, var)	\
-	struct ravenfs_msession *var __free(ravenfs_msession) = ravenfs_mdata_get((sb), (blk))
 
 static inline void *ravenfs_msession_node(struct ravenfs_msession *s)
 {

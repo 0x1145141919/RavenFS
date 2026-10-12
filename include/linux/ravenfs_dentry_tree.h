@@ -12,7 +12,6 @@
 
 /* 删除一个条目（含 balance/合并/抹匀/根收缩）；info 回传被删条目的下游资产信息 */
 struct rfs_delinfo {
-	u64	inum;		/* 目标 inode 编号（52 位形态） */
 	u32	name_len;	/* 全名长（RFS_PTR_FREE） */
 	u64	remain;		/* 长名尾段**逻辑**偏移（名字数据面内）；短名 = PTR_INVALID */
 };

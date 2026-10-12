@@ -42,7 +42,6 @@
 #include "ravenfs_xattr.h"
 
 #define RFS_XATTR_NAME_MAX	255
-#define RFS_XATTR_SIZE_MAX	65536
 
 /* ═══════════════════════════════════════════════════════════════════
  * 小块读写（4K，与装载侧同源 sb_bread + sync_dirty_buffer；不绕 mdata 缓存）
@@ -294,7 +293,7 @@ static int rfs_xattr_set_core(struct super_block *sb, u64 inum, int name_index,
 	if (name_len > RFS_XATTR_NAME_MAX)
 		return -ERANGE;
 	/* 定调：值 > 1 FS_block → 干净拒绝（不发明分片） */
-	if (value_len > RFS_XATTR_BLOCK_SIZE || value_len > RFS_XATTR_SIZE_MAX) {
+	if (value_len > RFS_XATTR_BLOCK_SIZE) {
 		RFS_STAT_INC(sb, xa_e2big);	/* 单块上限被撞的频率 */
 		return -E2BIG;
 	}

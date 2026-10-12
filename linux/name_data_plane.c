@@ -478,11 +478,10 @@ int ravenfs_nd_alloc(struct super_block *sb, u64 dir_idx, u16 tail_len,
 		rc = nd_grow_core(sb, dir_idx, dino);
 		if (rc)
 			goto out;
-		if (8192 > tail_len) {
-			rc = rfs_ndfr_insert(&ctx, dino, L + tail_len, 8192 - tail_len);
-			if (rc)
-				goto out;	/* 已增长片：上报（记账偏差，不悬挂） */
-		}
+		/* tail_len 已由入口钳制 ≤512 < 8192，余段恒存在 */
+		rc = rfs_ndfr_insert(&ctx, dino, L + tail_len, 8192 - tail_len);
+		if (rc)
+			goto out;	/* 已增长片：上报（记账偏差，不悬挂） */
 		RFS_ROW_MARK_DIRTY(ds->row);
 		*out_offset = L;
 	}

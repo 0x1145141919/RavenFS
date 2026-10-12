@@ -1187,7 +1187,6 @@ struct dentry *ravenfs_lookup(struct inode *dir, struct dentry *dentry,
  *   ⇒ 每次调用 O(log n) 定位 + O(本次产出)，与目录规模解耦。
  * cookie 编码（loff_t）：0/1 = `.`/`..`（VFS 合成），2 = 起点，≥3 = 3 + ((叶块号<<8)|槽)。
  */
-#define RFS_COOKIE_START 2
 
 static inline u64 ravenfs_cookie(u64 blk, u32 slot)
 {

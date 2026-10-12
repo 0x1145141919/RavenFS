@@ -188,7 +188,6 @@ int ravenfs_ddentry_delete(struct super_block *sb, u64 dir_ino, const struct rfs
 		return err ? err : -EIO;
 	}
 	if (info) {
-		info->inum = RFS_PTR_ADDR(lf->entries[idx].inode_ptr);
 		info->name_len = RFS_PTR_FREE(lf->entries[idx].inode_ptr);
 		info->remain = lf->entries[idx].full_char_remain_offset;
 	}

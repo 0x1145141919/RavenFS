@@ -67,7 +67,6 @@ struct ravenfs_session *ravenfs_session_get(struct super_block *sb, u64 inum)
 		RFS_STAT_INC(sb, ic_err);
 		return ERR_PTR(PTR_ERR(ms));
 	}
-	s->sbi = sbi;
 	s->ms = ms;
 	s->row = ms->row;
 	s->piece_data = ravenfs_msession_node(ms);
@@ -218,7 +217,6 @@ void ravenfs_cache_destroy(struct super_block *sb)
 
 /* 架构无关回刷 driver 的 inode 后端（v2.0：no-op；实效在 mdata 后端） */
 const struct ravenfs_wb_ops ravenfs_wb_inode_ops = {
-	.name     = "inode",
 	.wb_dirty = ravenfs_cache_wb_dirty,
 	.reap     = ravenfs_cache_reap_expired,
 };

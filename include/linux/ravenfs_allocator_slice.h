@@ -112,7 +112,7 @@ int	rfs_slice_shutdown(struct rfs_slice *self);
 /* free_count：读空闲位数（唯一免锁接口）。*/
 u64	rfs_slice_free_count(const struct rfs_slice *self);
 
-/* alloc_hard：best-fit（从树 len≥bitscount 最小者）+ 尾部下挖，不部分分配。*/
+/* alloc_hard：best-fit（从树 len≥bitscount 最小者）+ 头部上挖，不部分分配。*/
 int	rfs_slice_alloc_hard(struct rfs_slice *self, u8 align_log2, u64 bitscount,
 			     u64 *out_base_idx);
 
