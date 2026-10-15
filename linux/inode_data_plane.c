@@ -7,15 +7,16 @@
  * 盘上装载 / 落盘（映射 B+tree / 扁 fr 快照 / SB 四字段）归 FS 适配层
  * （allocator_adapter.c）；本文件零块 I/O。
  *
+ * 平台中立：只 include platform / rbtree / inode_data_plane.h（无内核头）；锁经
+ *   `rfs_rwsem_t`（内核 rw_semaphore / 用户态 pthread_rwlock）；内存经注入
+ *   `cfg.mem`（内核 kmem / 用户态 malloc / 测试计数与故障注入）——**轮子内零直接分配**。
+ *
  * 锁序（硬，见头注）：fr 写锁 > 翻译写锁 > block 片锁；禁止翻译→空间。
  *   · locate        = 翻译读
  *   · alloc         = 空间写（用尽 → grow：空间写内取翻译写 + block 片锁）
  *   · free / test   = 空间写 / 空间读
- * 分配节点走 kzalloc(GFP_NOFS)：临界区在可睡 rw_semaphore 内，无自旋内存分配。
  */
 #include "ravenfs_allocator_top.h"	/* struct rfs_allocator + block_alloc_hard/free 声明 */
-#include <linux/slab.h>
-#include <linux/string.h>
 
 /* ══════════════════════════ 比较器（不对外暴露）══════════════════════════ */
 
@@ -75,7 +76,8 @@ static int ip_link_both(struct rfs_inode_plane *p, struct rfs_ip_interval *iv)
 /* 取一个新区间节点挂双树（取节点 + link；失败还节点）。 */
 static int ip_insert_both(struct rfs_inode_plane *p, u64 base, u64 len)
 {
-	struct rfs_ip_interval *iv = kzalloc(sizeof(*iv), GFP_NOFS);
+	struct rfs_ip_interval *iv =
+		(struct rfs_ip_interval *)p->mem.alloc(p->mem.ctx, (u64)sizeof(*iv));
 	int rc;
 
 	if (!iv)
@@ -84,7 +86,7 @@ static int ip_insert_both(struct rfs_inode_plane *p, u64 base, u64 len)
 	iv->len = len;
 	rc = ip_link_both(p, iv);
 	if (rc)
-		kfree(iv);
+		p->mem.free(p->mem.ctx, iv);
 	return rc;
 }
 
@@ -93,7 +95,7 @@ static void ip_erase_both(struct rfs_inode_plane *p, struct rfs_ip_interval *iv)
 {
 	rfs_rb_erase(&p->fr_size, &iv->by_size);
 	rfs_rb_erase(&p->fr_pos, &iv->by_pos);
-	kfree(iv);
+	p->mem.free(p->mem.ctx, iv);
 }
 
 /* 拆空双树并归还全部节点。 */
@@ -155,17 +157,21 @@ static int ip_grow_locked(struct rfs_inode_plane *p)
 		return -ENOSPC;
 
 	new_lblk = p->pieces * 2ULL;
-	down_write(&p->extent_lock);
+	RFS_RWSEM_DOWN_WRITE(&p->extent_lock);
 	if (p->ext_n == p->ext_cap) {
 		u64 ncap = p->ext_cap ? p->ext_cap * 2ULL : 8ULL;
 		struct rfs_inode_extent *ne =
-			krealloc(p->ext, (size_t)ncap * sizeof(*ne), GFP_NOFS);
+			(struct rfs_inode_extent *)p->mem.alloc(p->mem.ctx,
+					ncap * (u64)sizeof(*ne));
 
 		if (!ne) {
-			up_write(&p->extent_lock);
+			RFS_RWSEM_UP_WRITE(&p->extent_lock);
 			(void)rfs_allocator_block_free(p->owner, blk, (u64)k * 2ULL);
 			return -ENOMEM;
 		}
+		if (p->ext_n)
+			memcpy(ne, p->ext, (size_t)p->ext_n * sizeof(*ne));
+		p->mem.free(p->mem.ctx, p->ext);
 		p->ext = ne;
 		p->ext_cap = ncap;
 	}
@@ -186,7 +192,7 @@ static int ip_grow_locked(struct rfs_inode_plane *p)
 	}
 	old_pieces = p->pieces;
 	p->pieces += k;
-	up_write(&p->extent_lock);
+	RFS_RWSEM_UP_WRITE(&p->extent_lock);
 
 	if (ip_insert_both(p, old_pieces * RFS_IDP_INODES_PER_PIECE,
 			   (u64)k * RFS_IDP_INODES_PER_PIECE) == 0)
@@ -208,21 +214,26 @@ int rfs_inode_plane_init(struct rfs_inode_plane *p,
 
 	if (!p || !cfg || !owner)
 		return -EINVAL;
+	if (!cfg->mem.alloc || !cfg->mem.free)
+		return -EINVAL;		/* 轮子内零直接分配：元素池必填 */
 	memset(p, 0, sizeof(*p));
-	init_rwsem(&p->extent_lock);
-	init_rwsem(&p->fr_lock);
+	RFS_RWSEM_INIT(&p->extent_lock);
+	RFS_RWSEM_INIT(&p->fr_lock);
 	rfs_rb_init(&p->fr_pos);
 	rfs_rb_init(&p->fr_size);
 	p->owner = owner;
+	p->mem = cfg->mem;
 	p->grow_batch = cfg->grow_batch_pieces ? cfg->grow_batch_pieces : 1;
 
 	if (cfg->pieces == 0 || !cfg->extents || cfg->extent_count == 0)
 		return -EINVAL;
 
 	/* ── 翻译面：稠密无洞无重叠 + 2 对齐 + Σ == pieces×2 ── */
-	p->ext = kcalloc((size_t)cfg->extent_count, sizeof(*p->ext), GFP_KERNEL);
+	p->ext = (struct rfs_inode_extent *)p->mem.alloc(p->mem.ctx,
+			cfg->extent_count * (u64)sizeof(*p->ext));
 	if (!p->ext)
 		return -ENOMEM;
+	memset(p->ext, 0, (size_t)cfg->extent_count * sizeof(*p->ext));
 	p->ext_cap = cfg->extent_count;
 	for (i = 0; i < cfg->extent_count; i++) {
 		const struct rfs_inode_extent *e = &cfg->extents[i];
@@ -281,7 +292,8 @@ void rfs_inode_plane_fini(struct rfs_inode_plane *p)
 	ip_free_all(p);
 	rfs_rb_init(&p->fr_pos);
 	rfs_rb_init(&p->fr_size);
-	kfree(p->ext);
+	if (p->ext && p->mem.free)
+		p->mem.free(p->mem.ctx, p->ext);
 	p->ext = NULL;
 	p->ext_n = 0;
 	p->ext_cap = 0;
@@ -300,18 +312,18 @@ int rfs_inode_plane_alloc(struct rfs_inode_plane *p, u64 *out_inum)
 
 	if (!p || !p->active || !out_inum)
 		return -EINVAL;
-	down_write(&p->fr_lock);
+	RFS_RWSEM_DOWN_WRITE(&p->fr_lock);
 	if (rfs_rb_empty(&p->fr_size)) {
 		int rc = ip_grow_locked(p);
 
 		if (rc) {
-			up_write(&p->fr_lock);
+			RFS_RWSEM_UP_WRITE(&p->fr_lock);
 			return rc;
 		}
 	}
 	n = rfs_rb_first(&p->fr_size);
 	if (!n) {
-		up_write(&p->fr_lock);
+		RFS_RWSEM_UP_WRITE(&p->fr_lock);
 		return -ENOSPC;
 	}
 	iv = container_of(n, struct rfs_ip_interval, by_size);
@@ -322,13 +334,13 @@ int rfs_inode_plane_alloc(struct rfs_inode_plane *p, u64 *out_inum)
 		iv->base = b + 1;
 		iv->len -= 1;
 		if (ip_link_both(p, iv))
-			kfree(iv);		/* 极端：余段丢失 */
+			p->mem.free(p->mem.ctx, iv);	/* 极端：余段丢失 */
 	} else {
-		kfree(iv);
+		p->mem.free(p->mem.ctx, iv);
 	}
 	p->fr_free -= 1;
 	*out_inum = b;
-	up_write(&p->fr_lock);
+	RFS_RWSEM_UP_WRITE(&p->fr_lock);
 	return 0;
 }
 
@@ -341,13 +353,13 @@ void rfs_inode_plane_free(struct rfs_inode_plane *p, u64 inum)
 
 	if (!p || !p->active || inum == 0)	/* root 永不释放 */
 		return;
-	down_write(&p->fr_lock);
+	RFS_RWSEM_DOWN_WRITE(&p->fr_lock);
 	if (inum >= p->pieces * RFS_IDP_INODES_PER_PIECE) {
-		up_write(&p->fr_lock);
+		RFS_RWSEM_UP_WRITE(&p->fr_lock);
 		return;
 	}
 	if (ip_contains_locked(p, inum)) {	/* 幂等：重复释放忽略 */
-		up_write(&p->fr_lock);
+		RFS_RWSEM_UP_WRITE(&p->fr_lock);
 		return;
 	}
 
@@ -367,27 +379,27 @@ void rfs_inode_plane_free(struct rfs_inode_plane *p, u64 inum)
 		rfs_rb_erase(&p->fr_size, &it->by_size);
 		rfs_rb_erase(&p->fr_pos, &it->by_pos);
 		left->len = (it->base + it->len) - left->base;
-		kfree(it);
+		p->mem.free(p->mem.ctx, it);
 		if (ip_link_both(p, left))
-			kfree(left);
+			p->mem.free(p->mem.ctx, left);
 	} else if (ml) {
 		rfs_rb_erase(&p->fr_size, &left->by_size);
 		rfs_rb_erase(&p->fr_pos, &left->by_pos);
 		left->len += 1;
 		if (ip_link_both(p, left))
-			kfree(left);
+			p->mem.free(p->mem.ctx, left);
 	} else if (mr) {
 		rfs_rb_erase(&p->fr_size, &it->by_size);
 		rfs_rb_erase(&p->fr_pos, &it->by_pos);
 		it->base = inum;
 		it->len += 1;
 		if (ip_link_both(p, it))
-			kfree(it);
+			p->mem.free(p->mem.ctx, it);
 	} else {
 		(void)ip_insert_both(p, inum, 1);
 	}
 	p->fr_free += 1;
-	up_write(&p->fr_lock);
+	RFS_RWSEM_UP_WRITE(&p->fr_lock);
 }
 
 bool rfs_inode_plane_test(struct rfs_inode_plane *p, u64 inum)
@@ -396,10 +408,10 @@ bool rfs_inode_plane_test(struct rfs_inode_plane *p, u64 inum)
 
 	if (!p || !p->active)
 		return false;
-	down_read(&p->fr_lock);
+	RFS_RWSEM_DOWN_READ(&p->fr_lock);
 	alloc = inum < p->pieces * RFS_IDP_INODES_PER_PIECE &&
 		!ip_contains_locked(p, inum);
-	up_read(&p->fr_lock);
+	RFS_RWSEM_UP_READ(&p->fr_lock);
 	return alloc;
 }
 
@@ -414,7 +426,7 @@ int rfs_inode_plane_locate(struct rfs_inode_plane *p, u64 inum,
 	if (!p || !p->active || !blkbase || !blkoff)
 		return -EINVAL;
 	lblk = inum >> RFS_IDP_SHIFT_INODE_BLOCK;
-	down_read(&p->extent_lock);
+	RFS_RWSEM_DOWN_READ(&p->extent_lock);
 	lo = 0;
 	hi = p->ext_n;
 	while (lo < hi) {			/* 首个 lblk > target */
@@ -435,7 +447,7 @@ int rfs_inode_plane_locate(struct rfs_inode_plane *p, u64 inum,
 			rc = 0;
 		}
 	}
-	up_read(&p->extent_lock);
+	RFS_RWSEM_UP_READ(&p->extent_lock);
 	if (rc == 0)
 		RFS_AL_STAT1(p->owner->stat, AL_IDP_LOCATE_OK);
 	else
@@ -451,9 +463,9 @@ u64 rfs_inode_plane_free_total(struct rfs_inode_plane *p)
 
 	if (!p || !p->active)
 		return 0;
-	down_read(&p->fr_lock);
+	RFS_RWSEM_DOWN_READ(&p->fr_lock);
 	v = p->fr_free;
-	up_read(&p->fr_lock);
+	RFS_RWSEM_UP_READ(&p->fr_lock);
 	return v;
 }
 
@@ -463,9 +475,9 @@ u64 rfs_inode_plane_pieces(struct rfs_inode_plane *p)
 
 	if (!p || !p->active)
 		return 0;
-	down_read(&p->fr_lock);
+	RFS_RWSEM_DOWN_READ(&p->fr_lock);
 	v = p->pieces;
-	up_read(&p->fr_lock);
+	RFS_RWSEM_UP_READ(&p->fr_lock);
 	return v;
 }
 
@@ -475,9 +487,9 @@ u64 rfs_inode_plane_extent_count(struct rfs_inode_plane *p)
 
 	if (!p || !p->active)
 		return 0;
-	down_read(&p->extent_lock);
+	RFS_RWSEM_DOWN_READ(&p->extent_lock);
 	v = p->ext_n;
-	up_read(&p->extent_lock);
+	RFS_RWSEM_UP_READ(&p->extent_lock);
 	return v;
 }
 
@@ -489,12 +501,12 @@ int rfs_inode_plane_dump_extents(struct rfs_inode_plane *p,
 	if (!p || !p->active || !out)
 		return -EINVAL;
 	RFS_AL_STAT1(p->owner->stat, AL_IDP_TREE_DUMP);
-	down_read(&p->extent_lock);
+	RFS_RWSEM_DOWN_READ(&p->extent_lock);
 	if (cap < p->ext_n)
 		rc = -ENOSPC;
 	else
 		memcpy(out, p->ext, (size_t)p->ext_n * sizeof(*out));
-	up_read(&p->extent_lock);
+	RFS_RWSEM_UP_READ(&p->extent_lock);
 	return rc;
 }
 
@@ -504,14 +516,14 @@ u64 rfs_inode_plane_fr_count(struct rfs_inode_plane *p)
 
 	if (!p || !p->active)
 		return 0;
-	down_read(&p->fr_lock);
+	RFS_RWSEM_DOWN_READ(&p->fr_lock);
 	{
 		struct rfs_rb_node *n2;
 
 		for (n2 = rfs_rb_first(&p->fr_pos); n2; n2 = rfs_rb_next(n2))
 			n++;
 	}
-	up_read(&p->fr_lock);
+	RFS_RWSEM_UP_READ(&p->fr_lock);
 	return n;
 }
 
@@ -525,7 +537,7 @@ int rfs_inode_plane_dump_fr(struct rfs_inode_plane *p,
 
 	if (!p || !p->active || !out)
 		return -EINVAL;
-	down_read(&p->fr_lock);
+	RFS_RWSEM_DOWN_READ(&p->fr_lock);
 	for (n2 = rfs_rb_first(&p->fr_pos); n2; n2 = rfs_rb_next(n2))
 		cnt++;
 	if (cap < cnt) {
@@ -541,7 +553,7 @@ int rfs_inode_plane_dump_fr(struct rfs_inode_plane *p,
 		i++;
 	}
 out:
-	up_read(&p->fr_lock);
+	RFS_RWSEM_UP_READ(&p->fr_lock);
 	return rc;
 }
 
@@ -557,10 +569,10 @@ void rfs_inode_plane_set_direct(struct rfs_inode_plane *p, u64 phys_base, u64 pi
 {
 	if (!p || !p->active)
 		return;
-	down_write(&p->extent_lock);
+	RFS_RWSEM_DOWN_WRITE(&p->extent_lock);
 	p->ext[0].lblk = 0;
 	p->ext[0].phys_base = phys_base;
 	p->ext[0].length = pieces * 2ULL;
 	p->ext_n = 1;
-	up_write(&p->extent_lock);
+	RFS_RWSEM_UP_WRITE(&p->extent_lock);
 }

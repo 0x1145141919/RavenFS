@@ -49,14 +49,7 @@
 #include "ravenfs_platform.h"	/* 类型 / 内存 / 锁 / RAII 守卫（唯一平台收口） */
 #include "ravenfs_run_list.h"	/* run 三型 + 「STL 式自造链轮子」（容器拥有节点 + 绑定分配器）*/
 #include "ravenfs_allocator_stats.h"	/* al_ 计数器钩子（注入式；模块保持平台中立）*/
-
-/* v2.0：inode 组由「位图分片」换成**全局 inode 数据面**（内核专用：rw_semaphore +
- * block 组 grow）。**仅内核**下可见；用户态差分测试仍走旧位图分片 inode 组
- * （见 struct rfs_slices_cfg.inode 与 struct rfs_allocator.ino_plane 的条件编译），
- * 从而 tests/ 下的差分测试无需改动即可继续编 router.c / slice.c。 */
-#ifdef __KERNEL__
-#include "ravenfs_inode_data_plane.h"
-#endif
+#include "ravenfs_inode_data_plane.h"	/* 全局 inode 数据面（v2.0 唯一 inode 面；平台中立）*/
 
 #ifdef __cplusplus
 extern "C" {
@@ -89,7 +82,8 @@ extern "C" {
  *   随之另立的还有 `struct rfs_slice_cfg`（⇄ slice_config_t）与树/区间类型（D2）。
  *
  * 本头（顶层 = fs_allocator_t 翻译）只按**指针**引用片数组（`rfs_alloc_group.slices`），
- * 前向声明足够。分工：路由管几何推导 / 双组装配 / 跨片路由 / 审计；片管自己那一段
+ * 前向声明足够。分工：路由管几何推导 / block 组装配 + inode 数据面 / 跨片路由 / 审计；
+ * 片管自己那一段
  * `[in_global_base_idx, +slice_bitscount)` 的主从树与原子性。
  * 不变量（片头必须守）：**从 ⊆ 主**；主树 base 升序且相邻区间严格不重叠。*/
 struct rfs_slice;
@@ -103,21 +97,17 @@ struct rfs_alloc_group {
 	u32		*preferred;	/* [cpu_slots]：每 CPU 亲和片游标（原子 relaxed 提示位）*/
 };
 
-/* ⇄ `fs_allocator_t`：顶层路由（几何推导 + 双组装配 + 路由 + 审计）。
- * 禁止拷贝（C 无拷贝构造，按约定：只按指针传；勿 memcpy 本结构）。*/
+/* ⇄ `fs_allocator_t`：顶层路由（几何推导 + block 组装配 + 路由 + 审计 +
+ * 全局 inode 数据面）。禁止拷贝（C 无拷贝构造，按约定：只按指针传；勿 memcpy）。*/
 struct rfs_allocator {
 	struct rfs_alloc_group blk_;	/* block 组 */
-	struct rfs_alloc_group ino_;	/* inode 组（v2.0 内核下停用；用户态差分测试沿用旧位图分片）*/
 	u32 slice_count;
 	u32 cpu_slots;
 
-#ifdef __KERNEL__
-	/* v2.0（内核）：全局 inode 数据面（映射 interval + fr 主从树）。
-	 * ino_plane.active 时 inode_alloc/free/test/locate 全部转发到它；ino_ 位图分片
-	 * 不再装配（slices/preferred 恒 NULL）。 */
+	/* 全局 inode 数据面（映射 interval + fr 主从树）—— v2.0 唯一 inode 面。
+	 * inode_alloc/free/test/locate/capacity/free_total 全部转发到它。
+	 * 平台中立（用户态可链接独立测试），不再是 `__KERNEL__` 专属。 */
 	struct rfs_inode_plane ino_plane;
-#endif
-
 	/* ── 生命周期「关闸 + 在途排空」双字段（C 无 private，语义在此写死）────────────
 	 * 合起来实现「打烊」：把「fini 之后 / fini 期间」到达的调用从「对已释放内存
 	 * 的 UB」变成「干净错误 + 有界等待」。⇄ 片 `rfs_slice.is_workable`；
@@ -156,22 +146,18 @@ struct rfs_allocator {
 	struct rfs_stat_hook stat;
 };
 
-/* 顶层装配配置（⇄ `slices_cfg_t`）。两段位图原始内存**生命周期归调用方**、4K 对齐；
- * **出了 init 即可释放**（god：ctor 用一次即弃）。
+/* 顶层装配配置（⇄ `slices_cfg_t`）。block 组位图原始内存**生命周期归调用方**、4K 对齐；
+ * inode 数据面配置随 `inode` 传入（见 `rfs_inode_plane_cfg`）。**出了 init 即可释放 / 弃**。
  *
  * ⚠ F6 待裁（装载粒度）：god ctor 一次吃**全量**位图（峰值高）；ko 建议逐片喂。
- *   F5（落盘面）已裁决 
+ *   F5（落盘面）已裁决
  *   —— 落盘归 FS 适配层，本模块不吃 IO/几何，故此处**不填 IO 面**。*/
 struct rfs_slices_cfg {
 	u8	*block_bits_raw;	/* 块组位图原始内存（已加载，4K 对齐）*/
 	u64	 block_bits_count;	/* 块组位数（= bitmap_blocks × 4096 × 8）*/
-	u8	*inode_bits_raw;	/* inode 组位图（**仅用户态差分测试 / 旧位图分片**；
-					 * v2.0 内核挂载不再提供 → inode.pieces 走数据面）*/
-	u64	 inode_bits_count;	/* inode 组位数 */
-#ifdef __KERNEL__
-	/* v2.0 全局 inode 数据面（内核）。pieces==0 → 回退旧位图分片（防御；内核挂载恒 >0）。*/
+	/* 全局 inode 数据面（v2.0 唯一 inode 面）。pieces==0 → 无 inode 面（inode 类接口拒绝）。
+	 * 内存来源 `inode.mem` 由调用方填（router 下传 `alloc`）。*/
 	struct rfs_inode_plane_cfg inode;
-#endif
 	u32	 logical_processor_count;	/* preferred 槽数 + 2^n 上界推导；0 → 退化单槽 */
 	u64	 min_slice_bits;	/* 片下限（位数）；0 → RFS_IV_SLICE_MIN_BITS */
 	/* 装配与元素池的内存来源（router 取 slices/preferred 数组 + 下传各片元素池）。
@@ -195,8 +181,8 @@ struct rfs_slices_cfg {
 
 /* ══════════════════════════ 生命周期 ══════════════════════════ */
 
-/* ⇄ `fs_allocator_t(cfg, &rc)`：ctor 即装配（推导 slice_count → 双组 enable_slice →
- * preferred 初始化）。失败自清理（成员归空/未分配态），返回负 errno。
+/* ⇄ `fs_allocator_t(cfg, &rc)`：ctor 即装配（推导 slice_count → block 组 enable_slice
+ * + inode 数据面 init → preferred 初始化）。失败自清理（成员归空/未分配态），返回负 errno。
  * 位图原始内存**不取所有权**（cfg 只读消费）。*/
 int	rfs_allocator_init(struct rfs_allocator *self, const struct rfs_slices_cfg *cfg);
 
@@ -266,11 +252,9 @@ int	rfs_allocator_inode_locate(struct rfs_allocator *self, u64 inum,
 u32	rfs_allocator_slice_count(const struct rfs_allocator *self);
 u32	rfs_allocator_cpu_slots(const struct rfs_allocator *self);
 u64	rfs_allocator_block_per_slice_bits(const struct rfs_allocator *self);
-u64	rfs_allocator_inode_per_slice_bits(const struct rfs_allocator *self);
 u64	rfs_allocator_block_free_total(const struct rfs_allocator *self);	/* 各片 free_count 求和 */
 u64	rfs_allocator_inode_free_total(const struct rfs_allocator *self);
 u32	rfs_allocator_block_preferred_of(const struct rfs_allocator *self, u32 cpu);
-u32	rfs_allocator_inode_preferred_of(const struct rfs_allocator *self, u32 cpu);
 
 /* ── 持久化出口（**裁决**：落盘归 FS 适配层，本模块只出**纯快照**）────────────
  * `all_syn` 是给 TTL 线程同步位图用的，但**其归属不属本模块**：
@@ -279,11 +263,10 @@ u32	rfs_allocator_inode_preferred_of(const struct rfs_allocator *self, u32 cpu);
  *     见 `ravenfs_bitmap_*.h`）——否则会把 IO/几何拖进纯算法模块，破坏平台中立与
  *     用户态压测，且与位图几何成两份真值（几何双源）。
  * 故本头**不提供** `all_syn`；改提供纯内存**逐片快照**，供 FS 适配层组合：
- *   · `ino=false` 取 block 组、`ino=true` 取 inode 组；`slice` 为片下标；
- *   · 纯内存遍历（不碰 IO），把该片全部空闲区间按 base 升序 dump 进 `out`。
+ *   · `slice` 为 block 组片下标；纯内存遍历（不碰 IO），把该片空闲区间按 base 升序 dump。
  * FS 适配层（TTL 线程调用点）据此：逐片 dump → 按全片范围取补集生成位图字 → 锁外写回。
- * （与 god 的差异：god `all_syn` 因 cfg 无 IO 面而 stub；本裁决把 IO 明确划给 FS 层。）*/
-int	rfs_allocator_dump_slice(struct rfs_allocator *self, bool ino, u32 slice,
+ * （inode 面不再有位图分片：走 `rfs_inode_plane_dump_extents`/`dump_fr`。）*/
+int	rfs_allocator_dump_slice(struct rfs_allocator *self, u32 slice,
 				 struct rfs_run_dlist *out);
 
 /* block 片脏标志（D-15 按脏写回）：取并清片 `slice` 的「空闲区间集自上次落盘已变」

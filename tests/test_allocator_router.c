@@ -94,16 +94,59 @@ static void raw_clear(struct raw *r, u64 start, u64 n)
 		r->mem[(start + k) >> 3] &= (u8)~(1u << ((start + k) & 7));
 }
 
+/* ══════════════════════════ inode 数据面靶（由 i 位图派生）══════════════════════════
+ * v2.0 唯一 inode 面 = 全局 inode 数据面（无 inode 位图分片）。为复用既有「按位图摆放
+ * 空闲」的测试意图，这里把 `i` 位图的**空闲 run** 派生成 fr（free 区间，inode 单位），
+ * 片数 = nbits/32（1 片 = 32 inode），翻译面用单 direct extent。idx0 恒占用（root）。*/
+#define MAX_FR 1024
+static struct inode_dataplane_coordinate_free_range_t g_fr[MAX_FR];
+static struct rfs_inode_extent g_iext[1];
+
+static u64 derive_fr(const struct raw *i, u64 cap)
+{
+	u64 k = 0, n = 0;
+
+	while (k < i->nbits) {
+		u64 start;
+
+		if ((i->mem[k >> 3] >> (k & 7)) & 1u) {
+			k++;
+			continue;
+		}
+		start = k;
+		while (k < i->nbits &&
+		       (((i->mem[k >> 3] >> (k & 7)) & 1u) == 0))
+			k++;
+		if (n < cap) {
+			g_fr[n].base = start;
+			g_fr[n].len = k - start;
+		}
+		n++;
+	}
+	return n > cap ? cap : n;	/* 溢出即截断（测试靶足够）*/
+}
+
 static void make_cfg(struct rfs_slices_cfg *cfg, struct raw *b, struct raw *i,
 		     u32 cpus)
 {
+	u64 pieces = i->nbits / RFS_IDP_INODES_PER_PIECE;
+
 	memset(cfg, 0, sizeof(*cfg));
 	cfg->block_bits_raw = b->mem;
 	cfg->block_bits_count = b->nbits;
-	cfg->inode_bits_raw = i->mem;
-	cfg->inode_bits_count = i->nbits;
 	cfg->logical_processor_count = cpus;
 	cfg->alloc = g_mem;
+
+	g_iext[0].lblk = 0;
+	g_iext[0].phys_base = 0;
+	g_iext[0].length = pieces * 2ULL;
+	cfg->inode.pieces = pieces;
+	cfg->inode.extents = g_iext;
+	cfg->inode.extent_count = 1;
+	cfg->inode.fr = g_fr;
+	cfg->inode.fr_count = derive_fr(i, MAX_FR);
+	cfg->inode.grow_batch_pieces = 1;
+	cfg->inode.mem = g_mem;
 }
 
 /* ══════════════════════════ 小工具 ══════════════════════════ */
@@ -129,7 +172,7 @@ static u64 count_runs(const struct rfs_run_list *l)
 }
 
 /* dump_slice 快照到数组；返回 run 数（rc!=0 → -1）。*/
-static int dump_slice(struct rfs_allocator *a, bool ino, u32 slice,
+static int dump_slice(struct rfs_allocator *a, u32 slice,
 		      struct rfs_run *out, int cap)
 {
 	struct rfs_run_dlist dl;
@@ -137,7 +180,7 @@ static int dump_slice(struct rfs_allocator *a, bool ino, u32 slice,
 	int cnt = 0;
 
 	rfs_run_dlist_init(&dl, g_ralloc);
-	if (rfs_allocator_dump_slice(a, ino, slice, &dl) != 0) {
+	if (rfs_allocator_dump_slice(a, slice, &dl) != 0) {
 		rfs_run_dlist_fini(&dl);
 		return -1;
 	}
@@ -197,13 +240,10 @@ static void test_init_geometry(void)
 	CHECK(rfs_allocator_slice_count(&a) == 4, "slice_count==4");
 	CHECK(rfs_allocator_cpu_slots(&a) == 4, "cpu_slots==4");
 	CHECK(rfs_allocator_block_per_slice_bits(&a) == MSB, "block per==32768");
-	CHECK(rfs_allocator_inode_per_slice_bits(&a) == MSB, "inode per==32768");
-	for (c = 0; c < 4; c++) {
+	CHECK(rfs_allocator_inode_capacity(&a) == BITS, "inode capacity == nbits (pieces*32)");
+	for (c = 0; c < 4; c++)
 		CHECK(rfs_allocator_block_preferred_of(&a, c) == (c % 4),
 		      "block preferred init i%n");
-		CHECK(rfs_allocator_inode_preferred_of(&a, c) == (c % 4),
-		      "inode preferred init i%n");
-	}
 	CHECK(rfs_allocator_block_free_total(&a) == 0, "all-occupied block free==0");
 	CHECK(rfs_allocator_inode_free_total(&a) == 0, "all-occupied inode free==0");
 	CHECK(rfs_allocator_block_test(&a, 0) == true, "block 0 occupied");
@@ -212,12 +252,9 @@ static void test_init_geometry(void)
 		struct rfs_run got[4];
 		u32 s;
 
-		for (s = 0; s < 4; s++) {
-			CHECK(dump_slice(&a, false, s, got, 4) == 0,
+		for (s = 0; s < 4; s++)
+			CHECK(dump_slice(&a, s, got, 4) == 0,
 			      "dump occupied block slice empty");
-			CHECK(dump_slice(&a, true, s, got, 4) == 0,
-			      "dump occupied inode slice empty");
-		}
 	}
 	CHECK(rfs_allocator_cpu_slots(&a) == 4, "cpu_slots() const read");
 
@@ -575,32 +612,34 @@ static void test_dump_slice(void)
 	/* slice0: [0,10) + [32760,32768) */
 	want[0].base = 0; want[0].len = 10;
 	want[1].base = 32760; want[1].len = 8;
-	expect_runs(got, dump_slice(&a, false, 0, got, 8), want, 2, "dump block slice0");
+	expect_runs(got, dump_slice(&a, 0, got, 8), want, 2, "dump block slice0");
 	/* slice1: [32768,32776) */
 	want[0].base = 32768; want[0].len = 8;
-	expect_runs(got, dump_slice(&a, false, 1, got, 8), want, 1, "dump block slice1");
+	expect_runs(got, dump_slice(&a, 1, got, 8), want, 1, "dump block slice1");
 	/* slice2: [65536,65540) */
 	want[0].base = 65536; want[0].len = 4;
-	expect_runs(got, dump_slice(&a, false, 2, got, 8), want, 1, "dump block slice2");
+	expect_runs(got, dump_slice(&a, 2, got, 8), want, 1, "dump block slice2");
 	/* slice3: [100000,100008) */
 	want[0].base = 100000; want[0].len = 8;
-	expect_runs(got, dump_slice(&a, false, 3, got, 8), want, 1, "dump block slice3");
+	expect_runs(got, dump_slice(&a, 3, got, 8), want, 1, "dump block slice3");
 
-	/* inode: slice0 [5,6)，其余空 */
-	want[0].base = 5; want[0].len = 1;
-	expect_runs(got, dump_slice(&a, true, 0, got, 8), want, 1, "dump inode slice0");
-	expect_runs(got, dump_slice(&a, true, 1, got, 8), want, 0, "dump inode slice1 empty");
-	expect_runs(got, dump_slice(&a, true, 2, got, 8), want, 0, "dump inode slice2 empty");
-	expect_runs(got, dump_slice(&a, true, 3, got, 8), want, 0, "dump inode slice3 empty");
+	/* inode 面走数据面 fr 快照：[5,6) */
+	{
+		struct inode_dataplane_coordinate_free_range_t fr[4];
+
+		CHECK(rfs_inode_plane_fr_count(&a.ino_plane) == 1, "idp fr count 1");
+		CHECK(rfs_inode_plane_dump_fr(&a.ino_plane, fr, 4) == 0, "idp dump_fr ok");
+		CHECK(fr[0].base == 5 && fr[0].len == 1, "idp fr == [5,6)");
+	}
 
 	/* 门闸 */
-	CHECK(rfs_allocator_dump_slice(&a, false, 4, NULL) == -EINVAL, "dump NULL out");
+	CHECK(rfs_allocator_dump_slice(&a, 4, NULL) == -EINVAL, "dump NULL out");
 	{
 		struct rfs_run_dlist dl;
 
 		rfs_run_dlist_init(&dl, g_ralloc);
-		CHECK(rfs_allocator_dump_slice(&a, false, 4, &dl) == -EINVAL, "dump OOB slice");
-		CHECK(rfs_allocator_dump_slice(NULL, false, 0, &dl) == -EINVAL, "dump NULL self");
+		CHECK(rfs_allocator_dump_slice(&a, 4, &dl) == -EINVAL, "dump OOB slice");
+		CHECK(rfs_allocator_dump_slice(NULL, 0, &dl) == -EINVAL, "dump NULL self");
 		rfs_run_dlist_fini(&dl);
 	}
 
@@ -642,7 +681,7 @@ static void test_shutdown_drain(void)
 		struct rfs_run_dlist dl;
 
 		rfs_run_dlist_init(&dl, g_ralloc);
-		CHECK(rfs_allocator_dump_slice(&a, false, 0, &dl) == -EINVAL,
+		CHECK(rfs_allocator_dump_slice(&a, 0, &dl) == -EINVAL,
 		      "gated: dump -> -EINVAL");
 		rfs_run_dlist_fini(&dl);
 	}

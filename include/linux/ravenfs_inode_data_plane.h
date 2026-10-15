@@ -19,15 +19,16 @@
  *
  * idx 0：契约级 root，**永不可分配**；init 拒绝含 idx0 的 fr，free(0) 忽略。
  *
- * 平台纪律：本头为 **ko 专用**（`struct rw_semaphore` / 内核块 I/O 语义）；由
- *   ravenfs_allocator_top.h 在 `__KERNEL__` 下 include。算法/几何纯内存。
+ * 平台纪律：本头**平台中立**（coupled 仅 ravenfs_platform.h / run_list / rbtree /
+ *   disk_struct_v2.0.h）——内核与用户态（含独立单测）**同一份**编入；锁经
+ *   `rfs_rwsem_t` 收口，内存经注入 `rfs_mem_alloc`。由 ravenfs_allocator_top.h
+ *   **无条件** include（不再是 `__KERNEL__` 专属单元）。
  */
 #ifndef _RAVENFS_INODE_DATA_PLANE_H
 #define _RAVENFS_INODE_DATA_PLANE_H
 
-#include "ravenfs_platform.h"		/* 类型 / 内存（唯一平台收口） */
+#include "ravenfs_platform.h"		/* 类型 / 内存 / 锁（rfs_rwsem_t / rfs_mem_alloc）*/
 #include "ravenfs_rbtree_intrusive.h"	/* 侵入式 RB 核（零分配） */
-#include <linux/rwsem.h>		/* struct rw_semaphore */
 #include <disk_struct_v2.0.h>		/* inode_dataplane_coordinate_free_range_t */
 
 #ifdef __cplusplus
@@ -45,7 +46,8 @@ struct rfs_inode_extent {
 };
 
 /* ── 无状态初始化配置（调用方组装；ctor 一次消费即弃，零 I/O）──
- * 读盘（SB + 映射 B+tree + 扁 fr 快照）归 FS 适配层；本模块只吃现成数组。 */
+ * 读盘（SB + 映射 B+tree + 扁 fr 快照）归 FS 适配层；本模块只吃现成数组。
+ * `mem` = 本面自持内存来源（区间节点 + 翻译数组；轮子内零直接分配）。 */
 struct rfs_inode_plane_cfg {
 	u64	pieces;			/* 8K 片数（= Σ extent.length / 2） */
 	const struct rfs_inode_extent *extents;
@@ -53,6 +55,7 @@ struct rfs_inode_plane_cfg {
 	const struct inode_dataplane_coordinate_free_range_t *fr;
 	u64	fr_count;		/* inode 单位 */
 	u32	grow_batch_pieces;	/* 用尽增长批量（片）；0/1 = 单片 */
+	struct rfs_mem_alloc mem;	/* 元素池 / 翻译数组分配器 */
 };
 
 /* ── 空闲面区间（inode 单位；双挂主/从两棵侵入树）── */
@@ -67,17 +70,18 @@ struct rfs_ip_interval {
 struct rfs_inode_plane {
 	bool			active;
 	struct rfs_allocator	*owner;		/* grow：block_alloc_hard / block_free */
+	struct rfs_mem_alloc	mem;		/* 自持内存（区间节点 + 翻译数组）*/
 	u32			grow_batch;
 	u64			pieces;
 
 	/* 翻译面：有序动态数组 + 翻译锁（append-only；运行期从不改已有映射） */
-	struct rw_semaphore	extent_lock;
+	rfs_rwsem_t		extent_lock;
 	struct rfs_inode_extent	*ext;
 	u64			ext_n;
 	u64			ext_cap;
 
 	/* 空闲面：主从双树 + 空间锁 */
-	struct rw_semaphore	fr_lock;
+	rfs_rwsem_t		fr_lock;
 	struct rfs_rb_root	fr_pos;
 	struct rfs_rb_root	fr_size;
 	u64			fr_free;

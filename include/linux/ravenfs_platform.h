@@ -11,7 +11,7 @@
  *   · 内存          RFS_ZALLOC / RFS_FREE
  *   · CPU 身份      RFS_CPU_ID()
  *   · 日志          RFS_LOG(fmt, ...)
- *   · 锁            rfs_spin_t / rfs_mutex_t + RFS_{SPIN,MUTEX}_{INIT,LOCK,UNLOCK}
+ *   · 锁            rfs_spin_t / rfs_mutex_t / rfs_rwsem_t + RFS_{SPIN,MUTEX,RWSEM}_*
  *   · RAII 守卫     RFS_SPIN_GUARD / RFS_MUTEX_GUARD（cleanup 属性；作用域退出即解锁）
  *
  * RAII 锁守卫（C 语言模拟）：
@@ -37,6 +37,8 @@
 #  include <linux/types.h>      /* u8..u64 / bool */
 #  include <linux/spinlock.h>   /* spinlock_t */
 #  include <linux/mutex.h>      /* struct mutex */
+#  include <linux/rwsem.h>      /* struct rw_semaphore（rfs_rwsem_t）*/
+#  include <linux/string.h>     /* memcpy / memset（算法文件不直接 include 内核头）*/
 #  include <linux/slab.h>       /* kcalloc / kfree */
 #  include <linux/smp.h>        /* raw_smp_processor_id */
 #  include <linux/kernel.h>     /* pr_err */
@@ -174,6 +176,7 @@ struct rfs_mem_alloc {
 
 typedef spinlock_t     rfs_spin_t;
 typedef struct mutex   rfs_mutex_t;
+typedef struct rw_semaphore rfs_rwsem_t;
 
 #  define RFS_SPIN_INIT(l)     spin_lock_init(l)
 #  define RFS_SPIN_LOCK(l)     spin_lock(l)
@@ -182,6 +185,12 @@ typedef struct mutex   rfs_mutex_t;
 #  define RFS_MUTEX_INIT(m)    mutex_init(m)
 #  define RFS_MUTEX_LOCK(m)    mutex_lock(m)
 #  define RFS_MUTEX_UNLOCK(m)  mutex_unlock(m)
+
+#  define RFS_RWSEM_INIT(l)       init_rwsem(l)
+#  define RFS_RWSEM_DOWN_READ(l)  down_read(l)
+#  define RFS_RWSEM_UP_READ(l)    up_read(l)
+#  define RFS_RWSEM_DOWN_WRITE(l) down_write(l)
+#  define RFS_RWSEM_UP_WRITE(l)   up_write(l)
 
 static __always_inline void rfs_spin_guard_release(rfs_spin_t **l)
 { if (l && *l) spin_unlock(*l); }
@@ -192,6 +201,7 @@ static __always_inline void rfs_mutex_guard_release(rfs_mutex_t **m)
 
 typedef pthread_spinlock_t  rfs_spin_t;
 typedef pthread_mutex_t     rfs_mutex_t;
+typedef pthread_rwlock_t    rfs_rwsem_t;
 
 #  define RFS_SPIN_INIT(l)     pthread_spin_init((l), PTHREAD_PROCESS_PRIVATE)
 #  define RFS_SPIN_LOCK(l)     pthread_spin_lock(l)
@@ -200,6 +210,12 @@ typedef pthread_mutex_t     rfs_mutex_t;
 #  define RFS_MUTEX_INIT(m)    pthread_mutex_init((m), NULL)
 #  define RFS_MUTEX_LOCK(m)    pthread_mutex_lock(m)
 #  define RFS_MUTEX_UNLOCK(m)  pthread_mutex_unlock(m)
+
+#  define RFS_RWSEM_INIT(l)       pthread_rwlock_init((l), NULL)
+#  define RFS_RWSEM_DOWN_READ(l)  pthread_rwlock_rdlock(l)
+#  define RFS_RWSEM_UP_READ(l)    pthread_rwlock_unlock(l)
+#  define RFS_RWSEM_DOWN_WRITE(l) pthread_rwlock_wrlock(l)
+#  define RFS_RWSEM_UP_WRITE(l)   pthread_rwlock_unlock(l)
 
 static inline void rfs_spin_guard_release(rfs_spin_t **l)
 { if (l && *l) pthread_spin_unlock(*l); }

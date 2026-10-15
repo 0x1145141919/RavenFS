@@ -217,7 +217,7 @@ static int bm_rebuild_slice(struct ravenfs_alloc_mgr *m, u32 i, u64 base, u64 en
 
 	bits_set_range(m->blk_words, base, end);	/* 先全置占用 */
 	rfs_run_dlist_init(&dl, ko_run_alloc);
-	rc = rfs_allocator_dump_slice(&m->alloc, false, i, &dl);
+	rc = rfs_allocator_dump_slice(&m->alloc, i, &dl);
 	if (rc) {
 		rfs_run_dlist_fini(&dl);
 		return rc;

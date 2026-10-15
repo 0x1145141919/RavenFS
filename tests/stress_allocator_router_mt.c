@@ -331,6 +331,8 @@ int main(int argc, char **argv)
 	{
 		u8 *rb = NULL, *ri = NULL;
 		size_t bb = (size_t)((bn + 7) / 8), bi = (size_t)((in + 7) / 8);
+		static struct inode_dataplane_coordinate_free_range_t fr[2];
+		static struct rfs_inode_extent iext[1];
 
 		if (posix_memalign((void **)&rb, 4096, bb) != 0 ||
 		    posix_memalign((void **)&ri, 4096, bi) != 0) {
@@ -343,8 +345,19 @@ int main(int argc, char **argv)
 		memset(&cfg, 0, sizeof(cfg));
 		cfg.block_bits_raw = rb;
 		cfg.block_bits_count = bn;
-		cfg.inode_bits_raw = ri;
-		cfg.inode_bits_count = in;
+		/* v2.0：inode 面 = 全局数据面（本靶：全空闲除 idx0=root → fr=[1,in)）*/
+		fr[0].base = 1;
+		fr[0].len = in > 1 ? in - 1 : 0;
+		iext[0].lblk = 0;
+		iext[0].phys_base = 0;
+		iext[0].length = (in / RFS_IDP_INODES_PER_PIECE) * 2ULL;
+		cfg.inode.pieces = in / RFS_IDP_INODES_PER_PIECE;
+		cfg.inode.extents = iext;
+		cfg.inode.extent_count = 1;
+		cfg.inode.fr = fr;
+		cfg.inode.fr_count = 1;
+		cfg.inode.grow_batch_pieces = 1;
+		cfg.inode.mem = g_mem;
 		cfg.logical_processor_count = 8;	/* cpu_slots=8；全线程同钉 → 同槽 */
 		cfg.alloc = g_mem;
 		if (rfs_allocator_init(&g_a, &cfg) != 0) {

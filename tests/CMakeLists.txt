@@ -37,9 +37,22 @@ add_executable(ravenfs_test_allocator_router
     test_allocator_router.c
     ../linux/ravenfs_allocator_router.c
     ../linux/ravenfs_allocator_slice.c
+    ../linux/inode_data_plane.c
     ../linux/ravenfs_rbtree_intrusive.c
 )
 target_include_directories(ravenfs_test_allocator_router PRIVATE
+    ${CMAKE_SOURCE_DIR}/include/linux
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# 全局 inode 数据面 struct rfs_inode_plane **独立单测**：只编 inode_data_plane.c +
+# 侵入 RB 核（不编 router/slice/god）；grow 的 block 符号由测试内打桩 → 证明面自足。
+add_executable(ravenfs_test_inode_data_plane
+    test_inode_data_plane.c
+    ../linux/inode_data_plane.c
+    ../linux/ravenfs_rbtree_intrusive.c
+)
+target_include_directories(ravenfs_test_inode_data_plane PRIVATE
     ${CMAKE_SOURCE_DIR}/include/linux
     ${CMAKE_SOURCE_DIR}/include
 )
@@ -65,6 +78,7 @@ add_executable(ravenfs_stress_allocator_router
     stress_allocator_router.c
     ../linux/ravenfs_allocator_router.c
     ../linux/ravenfs_allocator_slice.c
+    ../linux/inode_data_plane.c
     ../linux/ravenfs_rbtree_intrusive.c
 )
 target_include_directories(ravenfs_stress_allocator_router PRIVATE
@@ -89,6 +103,7 @@ add_executable(ravenfs_stress_allocator_router_mt
     stress_allocator_router_mt.c
     ../linux/ravenfs_allocator_router.c
     ../linux/ravenfs_allocator_slice.c
+    ../linux/inode_data_plane.c
     ../linux/ravenfs_rbtree_intrusive.c
 )
 target_include_directories(ravenfs_stress_allocator_router_mt PRIVATE

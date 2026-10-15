@@ -175,6 +175,55 @@ static void raw_random(struct raw *r, u64 seed)
 	}
 }
 
+/* ══════════════════ v2.0 inode 数据面靶（由 inode 位图派生 fr）══════════════════
+ * 复用「按位图摆放空闲」的既有测试意图：把 inode 位图的空闲 run 派生成 fr（inode
+ * 单位，不含 idx0），片数 = nbits/32（1 片 = 32 inode）、翻译面单 direct extent。*/
+#define STRESS_MAX_FR 400000
+static struct inode_dataplane_coordinate_free_range_t g_ifr[STRESS_MAX_FR];
+static struct rfs_inode_extent g_iext[1];
+
+static u64 derive_inode_fr(const struct raw *i)
+{
+	u64 n = 0;
+
+	for (u64 k = 0; k < i->nbits; ) {
+		u64 start;
+
+		if ((i->mem[k >> 3] >> (k & 7)) & 1u) {
+			k++;
+			continue;
+		}
+		start = k;
+		while (k < i->nbits &&
+		       (((i->mem[k >> 3] >> (k & 7)) & 1u) == 0))
+			k++;
+		if (n >= STRESS_MAX_FR) {
+			printf("  FATAL inode fr overflow\n");
+			exit(2);
+		}
+		g_ifr[n].base = start;
+		g_ifr[n].len = k - start;
+		n++;
+	}
+	return n;
+}
+
+static void cfg_set_inode_plane(struct rfs_slices_cfg *cfg, struct raw *i)
+{
+	u64 pieces = i->nbits / RFS_IDP_INODES_PER_PIECE;
+
+	g_iext[0].lblk = 0;
+	g_iext[0].phys_base = 0;
+	g_iext[0].length = pieces * 2ULL;
+	cfg->inode.pieces = pieces;
+	cfg->inode.extents = g_iext;
+	cfg->inode.extent_count = 1;
+	cfg->inode.fr = g_ifr;
+	cfg->inode.fr_count = derive_inode_fr(i);
+	cfg->inode.grow_batch_pieces = 1;
+	cfg->inode.mem = g_mem;
+}
+
 /* ══════════════════════════ 影子账本（整组位图）══════════════════════════ */
 struct ledger {
 	u8	*b;
@@ -412,9 +461,9 @@ static int rr_alloc_hard(struct rrefslice *s, u8 align, u64 n, u64 *out)
 		if (s->v[i].len < n)
 			continue;
 		end = s->v[i].base + s->v[i].len;
-		st = (end - n) & ~mask;
-		if (st < s->v[i].base)
-			continue;
+		st = (s->v[i].base + mask) & ~mask;	/* D-14：头挖 */
+		if (st + n > end)
+			continue;		/* 头对齐越出右沿 → 跳过 */
 		if (best < 0 || s->v[i].len < s->v[best].len ||
 		    (s->v[i].len == s->v[best].len && s->v[i].base < s->v[best].base))
 			best = i;
@@ -423,7 +472,7 @@ static int rr_alloc_hard(struct rrefslice *s, u8 align, u64 n, u64 *out)
 		return -ENOSPC;
 	{
 		u64 base = s->v[best].base, len = s->v[best].len;
-		u64 end = base + len, st = (end - n) & ~mask, rb;
+		u64 end = base + len, st = (base + mask) & ~mask, rb;
 
 		rr_erase(s, best);
 		if (st > base)
@@ -451,21 +500,14 @@ static int rr_soft_alloc(struct rrefslice *s, u8 align, u64 n)
 	idx = rr_min_size(s);
 	while (idx >= 0 && remain > 0) {
 		u64 ivb = s->v[idx].base, ivl = s->v[idx].len, ive = ivb + ivl;
-		u64 t = (ivl < remain) ? ivl : remain;
-		u64 st = (ive - t) & ~mask;
+		u64 st = (ivb + mask) & ~mask;		/* D-14：头挖 */
+		u64 t;
 
-		if (st < ivb) {
-			st = (ivb + mask) & ~mask;
-			if (st >= ive) {
-				idx = rr_next_size(s, idx);
-				continue;
-			}
-			{
-				u64 avail = ive - st;
-
-				t = (avail < remain) ? avail : remain;
-			}
+		if (st >= ive) {
+			idx = rr_next_size(s, idx);
+			continue;
 		}
+		t = ((ive - st) < remain) ? (ive - st) : remain;
 		if (g_seqn >= REF_RUNS) {
 			printf("  FATAL ref soft overflow\n");
 			exit(2);
@@ -810,14 +852,59 @@ static u32 cur_cpu(void)
 
 /* ══════════════════════════ 对账 ══════════════════════════ */
 
-/* dump_slice 逐片 → 与账本 [begin,end) 的空闲极大 run 流式对比。*/
+/* block：dump_slice 逐片 → 与账本 [begin,end) 的空闲极大 run 流式对比。
+ * inode：v2.0 数据面无分片 → 一次性 dump_fr 与账本 [0,nbits) 全量对比。*/
 static void check_dump_side(const char *tag, int ino_sd)
 {
 	struct ledger *L = ino_sd ? &g_li : &g_lb;
-	u64 per = ino_sd ? rfs_allocator_inode_per_slice_bits(&g_a)
-			 : rfs_allocator_block_per_slice_bits(&g_a);
+	u64 per = rfs_allocator_block_per_slice_bits(&g_a);
 	u32 ns = rfs_allocator_slice_count(&g_a);
 	u32 i;
+
+	if (ino_sd) {
+		struct inode_dataplane_coordinate_free_range_t *fr;
+		u64 n = rfs_inode_plane_fr_count(&g_a.ino_plane);
+		u64 k = 0, p = 0;
+		int ok = 1;
+
+		fr = (struct inode_dataplane_coordinate_free_range_t *)
+			malloc((size_t)(n ? n : 1) * sizeof(*fr));
+		if (!fr) {
+			FAILF("%s: fr malloc", tag);
+			g_div = 1;
+			return;
+		}
+		if (rfs_inode_plane_dump_fr(&g_a.ino_plane, fr, n) != 0) {
+			FAILF("%s: idp dump_fr rc!=0", tag);
+			g_div = 1;
+			free(fr);
+			return;
+		}
+		while (p < L->nbits) {
+			u64 st;
+
+			if (led_get(L, p) == 1) {
+				p++;
+				continue;
+			}
+			st = p;
+			while (p < L->nbits && led_get(L, p) == 0)
+				p++;
+			if (k >= n || fr[k].base != st || fr[k].len != p - st) {
+				ok = 0;
+				break;
+			}
+			k++;
+		}
+		if (ok && k != n)
+			ok = 0;			/* 路由多吐了 run */
+		if (!ok)
+			FAILF("%s: idp fr != ledger", tag);
+		else
+			g_pass++;
+		free(fr);
+		return;
+	}
 
 	for (i = 0; i < ns; i++) {
 		u64 begin = (u64)i * per;
@@ -830,8 +917,8 @@ static void check_dump_side(const char *tag, int ino_sd)
 		if (end > L->nbits)
 			end = L->nbits;
 		rfs_run_dlist_init(&dl, g_ra);
-		if (rfs_allocator_dump_slice(&g_a, ino_sd ? true : false, i, &dl) != 0) {
-			FAILF("%s: dump_slice(%s,%u) rc!=0", tag, ino_sd ? "ino" : "blk", i);
+		if (rfs_allocator_dump_slice(&g_a, i, &dl) != 0) {
+			FAILF("%s: dump_slice(blk,%u) rc!=0", tag, i);
 			rfs_run_dlist_fini(&dl);
 			continue;
 		}
@@ -856,8 +943,8 @@ static void check_dump_side(const char *tag, int ino_sd)
 		if (ok && nd)
 			ok = 0;			/* 路由多吐了 run */
 		if (!ok)
-			FAILF("%s: dump_slice(%s,%u) != ledger (block %llu..%llu)",
-			      tag, ino_sd ? "ino" : "blk", i, ULL(begin), ULL(end));
+			FAILF("%s: dump_slice(blk,%u) != ledger (block %llu..%llu)",
+			      tag, i, ULL(begin), ULL(end));
 		else
 			g_pass++;
 		rfs_run_dlist_fini(&dl);
@@ -880,8 +967,7 @@ static void reconcile(const char *tag)
 
 	/* preferred 旋转不越界 */
 	for (c = 0; c < rfs_allocator_cpu_slots(&g_a); c++) {
-		if (rfs_allocator_block_preferred_of(&g_a, c) >= ns ||
-		    rfs_allocator_inode_preferred_of(&g_a, c) >= ns) {
+		if (rfs_allocator_block_preferred_of(&g_a, c) >= ns) {
 			FAILF("%s: preferred out of range (cpu %u)", tag, c);
 			g_div = 1;
 			return;
@@ -1258,6 +1344,10 @@ static void stress_seed(u64 seed, u64 blk_nbits, u64 ino_nbits, u32 cpus, long o
 	u64 msb = RFS_IV_SLICE_MIN_BITS;
 	long op;
 
+	/* v2.0：inode 数据面容量恒为 32 的倍数（1 片 = 32 inode）→ 靶场向下对齐，
+	 * 使 ledger / 参考模型 / 数据面容量三者一致。*/
+	ino_nbits = (ino_nbits / RFS_IDP_INODES_PER_PIECE) * RFS_IDP_INODES_PER_PIECE;
+
 	g_curseed = seed;
 	g_rng = seed * 0x9E3779B97F4A7C15ULL + 0x1234567ULL;
 	raw_init(&rb, blk_nbits);
@@ -1269,8 +1359,7 @@ static void stress_seed(u64 seed, u64 blk_nbits, u64 ino_nbits, u32 cpus, long o
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.block_bits_raw = rb.mem;
 	cfg.block_bits_count = blk_nbits;
-	cfg.inode_bits_raw = ri.mem;
-	cfg.inode_bits_count = ino_nbits;
+	cfg_set_inode_plane(&cfg, &ri);
 	cfg.logical_processor_count = cpus;
 	cfg.alloc = g_mem;
 	if (rfs_allocator_init(&g_a, &cfg) != 0) {
@@ -1284,19 +1373,17 @@ static void stress_seed(u64 seed, u64 blk_nbits, u64 ino_nbits, u32 cpus, long o
 	{
 		u64 per_b = ((blk_nbits + rfs_allocator_slice_count(&g_a) - 1) /
 			     rfs_allocator_slice_count(&g_a) + msb - 1) / msb * msb;
-		u64 per_i = ((ino_nbits + rfs_allocator_slice_count(&g_a) - 1) /
-			     rfs_allocator_slice_count(&g_a) + msb - 1) / msb * msb;
 
 		CHECK(rfs_allocator_block_per_slice_bits(&g_a) == per_b,
 		      "geometry: block per_slice_bits");
-		CHECK(rfs_allocator_inode_per_slice_bits(&g_a) == per_i,
-		      "geometry: inode per_slice_bits");
+		CHECK(rfs_allocator_inode_capacity(&g_a) == ino_nbits,
+		      "geometry: inode capacity == ino_nbits");
 		refside_init(&g_rsb, rfs_allocator_block_per_slice_bits(&g_a),
 			     (int)rfs_allocator_slice_count(&g_a), blk_nbits, rb.mem,
 			     (int)cpus);
-		refside_init(&g_rsi, rfs_allocator_inode_per_slice_bits(&g_a),
-			     (int)rfs_allocator_slice_count(&g_a), ino_nbits, ri.mem,
-			     (int)cpus);
+		/* inode 面 = 单一全局数据面：参考模型用「单段 per=nbits」承载
+		 * （rr_alloc_hard(align=0,n=1) = best-fit 最小 run 头，与数据面同语义）。*/
+		refside_init(&g_rsi, ino_nbits, 1, ino_nbits, ri.mem, (int)cpus);
 	}
 
 	led_init(&g_lb, rb.mem, blk_nbits);
@@ -1382,8 +1469,7 @@ static int router_setup(struct rfs_allocator *a, struct raw *b, struct raw *i, u
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.block_bits_raw = b->mem;
 	cfg.block_bits_count = b->nbits;
-	cfg.inode_bits_raw = i->mem;
-	cfg.inode_bits_count = i->nbits;
+	cfg_set_inode_plane(&cfg, i);
 	cfg.logical_processor_count = cpus;
 	cfg.alloc = g_mem;
 	return rfs_allocator_init(a, &cfg);
@@ -1406,11 +1492,9 @@ static void test_geometry(void)
 	CHECK(rfs_allocator_slice_count(&a) == 4, "4-slice count");
 	CHECK(rfs_allocator_cpu_slots(&a) == 4, "cpu_slots 4");
 	CHECK(rfs_allocator_block_per_slice_bits(&a) == msb, "block per==msb");
-	CHECK(rfs_allocator_inode_per_slice_bits(&a) == msb, "inode per==msb");
-	for (c = 0; c < 4; c++) {
+	CHECK(rfs_allocator_inode_capacity(&a) == msb * 4, "inode capacity==pieces*32");
+	for (c = 0; c < 4; c++)
 		CHECK(rfs_allocator_block_preferred_of(&a, c) == (c % 4), "pref init i%n");
-		CHECK(rfs_allocator_inode_preferred_of(&a, c) == (c % 4), "ipref init i%n");
-	}
 	CHECK(rfs_allocator_block_free_total(&a) == 0, "all-occupied free 0");
 	CHECK(rfs_allocator_block_test(&a, 0) == true, "blk0 occupied");
 	CHECK(rfs_allocator_inode_test(&a, 0) == true, "inode0 root occupied");
@@ -1444,8 +1528,7 @@ static void test_geometry(void)
 	CHECK(router_setup(&a, &b, &i, 2) == 0, "short-last init");
 	CHECK(rfs_allocator_slice_count(&a) == 2, "short-last 2 slices");
 	CHECK(rfs_allocator_block_per_slice_bits(&a) == msb * 2, "block per 2*msb");
-	CHECK(rfs_allocator_inode_per_slice_bits(&a) == msb * 2, "inode per 2*msb");
-	/* 末片实际覆盖：block [2m,2m+100)，inode slice1 空（cnt=777 但 2m+777>2m）*/
+	/* 末片实际覆盖：block [2m,2m+100)，inode 面与分片无关 */
 	{
 		struct rfs_run got[4];
 		struct rfs_run_dlist dl;
@@ -1456,7 +1539,7 @@ static void test_geometry(void)
 		rfs_allocator_fini(&a);
 		CHECK(router_setup(&a, &b, &i, 2) == 0, "short-last re-init");
 		rfs_run_dlist_init(&dl, g_ra);
-		CHECK(rfs_allocator_dump_slice(&a, false, 1, &dl) == 0, "dump short last");
+		CHECK(rfs_allocator_dump_slice(&a, 1, &dl) == 0, "dump short last");
 		for (nd = dl.head; nd; nd = nd->next) {
 			if (n < 4)
 				got[n] = nd->run;
@@ -1470,27 +1553,23 @@ static void test_geometry(void)
 	raw_free(&b);
 	raw_free(&i);
 
-	/* init 失败自清理：inode 组 raw 故意非 4K 对齐 */
+	/* init 失败自清理：inode 数据面缺失（pieces=0）→ -EINVAL */
 	raw_init(&b, msb * 2);
 	raw_init(&i, msb * 2);
-	cfg = (struct rfs_slices_cfg){ 0 };
 	{
-		u64 a0 = g_pool.allocs, f0 = g_pool.frees;
 		struct rfs_allocator z;
 
 		memset(&cfg, 0, sizeof(cfg));
 		cfg.block_bits_raw = b.mem;
 		cfg.block_bits_count = b.nbits;
-		cfg.inode_bits_raw = i.mem + 1;	/* 非 4K 对齐 → slice enable 失败 */
-		cfg.inode_bits_count = i.nbits;
 		cfg.logical_processor_count = 4;
 		cfg.alloc = g_mem;
-		CHECK(rfs_allocator_init(&z, &cfg) == -EINVAL, "misaligned inode raw -> -EINVAL");
+		/* 不填 cfg.inode（pieces==0）→ 拒绝 */
+		CHECK(rfs_allocator_init(&z, &cfg) == -EINVAL, "no inode plane -> -EINVAL");
 		CHECK(rfs_allocator_slice_count(&z) == 0, "failed init -> empty");
 		rfs_allocator_fini(&z);
 		CHECK(g_pool.live == 0 && g_pool.allocs == g_pool.frees,
 		      "failed init self-cleaned");
-		(void)a0; (void)f0;
 	}
 	/* 参数缺失 */
 	{
@@ -1703,20 +1782,20 @@ static void test_dump_split(void)
 	CHECK(router_setup(&a, &b, &i, 4) == 0, "init");
 
 	rfs_run_dlist_init(&dl, g_ra);
-	CHECK(rfs_allocator_dump_slice(&a, false, 0, &dl) == 0, "dump slice0");
+	CHECK(rfs_allocator_dump_slice(&a, 0, &dl) == 0, "dump slice0");
 	n = 0;
 	for (nd = dl.head; nd; nd = nd->next) if (n < 8) got[n++] = nd->run;
 	CHECK(n == 1 && got[0].base == msb - 8 && got[0].len == 8, "slice0 half");
 	rfs_run_dlist_fini(&dl);
 
 	rfs_run_dlist_init(&dl, g_ra);
-	CHECK(rfs_allocator_dump_slice(&a, false, 1, &dl) == 0, "dump slice1");
+	CHECK(rfs_allocator_dump_slice(&a, 1, &dl) == 0, "dump slice1");
 	n = 0;
 	for (nd = dl.head; nd; nd = nd->next) if (n < 8) got[n++] = nd->run;
 	CHECK(n == 1 && got[0].base == msb && got[0].len == 8, "slice1 half");
 	rfs_run_dlist_fini(&dl);
 
-	CHECK(rfs_allocator_dump_slice(&a, false, 4, NULL) == -EINVAL, "dump OOB -EINVAL");
+	CHECK(rfs_allocator_dump_slice(&a, 4, NULL) == -EINVAL, "dump OOB -EINVAL");
 	rfs_allocator_fini(&a);
 	raw_free(&b);
 	raw_free(&i);
