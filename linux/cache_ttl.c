@@ -8,18 +8,19 @@
  * 每轮（delayed_work）三趟，I/O 全在锁外：
  *   趟1 淘汰  `ops->reap(sb, now - ttl)`              —— 超时冷行：脏原地回写 → 释放
  *   趟2 回写  `ops->wb_dirty(sb, now - wb_age, 0)`    —— 超龄脏行：copy-out 回写
- *   趟3 位图  `ravenfs_bitmap_flush(sb)` —— **每 `bitmap_sync_seconds`(30s)** 闸门到点才
- *             把两组位图**全片**同步一遍（锁内快照 → 锁外块 I/O）；无脏标记。
+ *   趟3 位图  `ravenfs_allocator_flush(sb)` —— **每 `bitmap_sync_seconds`(30s)** 闸门到点才
+ *             同步 block 位图；**D-15 按脏写回**：只重建/写回「自上次落盘以来变过的片」
+ *             （分片脏标志，alloc/free 时置位），未变过的片跳过。
  *
  * 后端（架构无关 driver，仅缓存行）：`ravenfs_wb_inode_ops` / `ravenfs_wb_mdata_ops`。
- *   位图（bitmap.c）= 全量常驻内存分片，**非缓存行**、不接入本 driver：自有片级全片同步
- *   （组 wb_lock + 锁内快照/锁外 I/O；见 statemachine 文档 §6 / bitmap.c 首注）。
+ *   位图 = 运行时树分配器（`rfs_allocator`）+ FS 适配层位图镜像：片级脏标志为**片内隐状态**
+ *   （`rfs_slice.dirty` / `rfs_allocator_block_dirty_take`），checkpoint 只重建/写回脏片。
  *
  * 参数：
  *   ravenfs_ttl_seconds          默认 2   （0 = 关闭 TTL 淘汰）
  *   ravenfs_reap_ms              默认 4000（扫描周期；2026-09-27 由 1s 改 4s）
  *   ravenfs_wb_age_seconds       默认 60  （脏行回写 aging；0 = 关闭周期回写）
- *   ravenfs_bitmap_sync_seconds  默认 30  （位图全片同步闸门；0 = 关闭）
+ *   ravenfs_bitmap_sync_seconds  默认 30  （位图同步闸门；0 = 关闭；按脏写回，D-15）
  */
 #include <linux/module.h>
 #include <linux/fs.h>
@@ -99,8 +100,8 @@ static void ravenfs_ttl_work(struct work_struct *w)
 			RFS_STAT_INC(sb, ttl_round_errs);	/* 后台刷盘失败累积 */
 	}
 
-	/* 趟3：分配器同步（闸门 `bitmap_sync_seconds`；无脏标记，整轮全同步）
-	 * `ravenfs_allocator_flush` = 树快照 → 位图 words → 写回设备（落盘一步到位）。*/
+	/* 趟3：分配器同步（闸门 `bitmap_sync_seconds`；D-15 按脏写回——只重建/写回脏片）
+	 * `ravenfs_allocator_flush` = 树快照 → 位图 words（仅脏片）→ 写回设备。*/
 	if (bitmap_sync_seconds &&
 	    now - t->bm_last >= (u64)bitmap_sync_seconds * NSEC_PER_SEC) {
 		if (ravenfs_allocator_flush(sb))
@@ -119,9 +120,9 @@ static void ravenfs_ttl_work(struct work_struct *w)
 	if (bm)
 		t->bm_total++;
 	if (freed || wb || bm)
-		pr_info_ratelimited("ravenfs: ttl: reap=%ld(累计 %lu) wb_err=%ld(累计 %lu) bm_err=%ld(累计 %lu) (ttl=%us wb_age=%us bm_sync=%us round=%lu)\n",
-				    freed, t->reaped_total, wb, t->wb_total, bm, t->bm_total,
-				    ttl_seconds, wb_age_seconds, bitmap_sync_seconds, t->rounds);
+		pr_debug_ratelimited("ravenfs: ttl: reap=%ld(累计 %lu) wb_err=%ld(累计 %lu) bm_err=%ld(累计 %lu) (ttl=%us wb_age=%us bm_sync=%us round=%lu)\n",
+				     freed, t->reaped_total, wb, t->wb_total, bm, t->bm_total,
+				     ttl_seconds, wb_age_seconds, bitmap_sync_seconds, t->rounds);
 
 	RFS_STAT_INC(sb, ttl_rounds);	/* 后台还活着吗（数不涨 = work 卡死） */
 	schedule_delayed_work(&t->work, msecs_to_jiffies(reap_ms ? reap_ms : 4000));

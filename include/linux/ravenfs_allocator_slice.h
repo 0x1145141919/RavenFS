@@ -96,6 +96,7 @@ struct rfs_slice {
 	struct rfs_rb_root	size;		/* 从树 by_size（派生索引，从 ⊆ 主）*/
 	u64			last_finish_hint;/* 分配游标（只进不退）*/
 	u64			free_count;	/* 空闲位数（增量维护）*/
+	bool			dirty;		/* D-15 片内隐状态：自上次落盘以来空闲区间集已变 */
 	rfs_mutex_t		lock;		/* 片锁（可睡）；调用方持有 */
 };
 
@@ -111,6 +112,15 @@ int	rfs_slice_shutdown(struct rfs_slice *self);
 
 /* free_count：读空闲位数（唯一免锁接口）。*/
 u64	rfs_slice_free_count(const struct rfs_slice *self);
+
+/* dirty_take：取「自上次落盘以来空闲区间集已变」标志并清除（读-改-清，调用方持锁）。
+ * 返回 true = 该片变过（checkpoint 应重建 / 回写其位图块）。
+ * 「隐状态」语义（D-15）：`dirty` 由**片内**变更点（alloc_hard / soft_alloc /
+ *   soft_occupy / free_interval 中 `free_count` 更新处）置位，`enable` 建树后归零
+ *   （enable = 载入盘面 = 已持久基线）。故「是否需落盘」是片自己的属性，不靠外层
+ *   逐接口枚举 / 注入钩子。清标志在**重建之前**取（见 FS 侧 checkpoint）：期间并发
+ *   变更会重新置位 → 下轮再写，绝不丢更新。*/
+bool	rfs_slice_dirty_take(struct rfs_slice *self);
 
 /* alloc_hard：best-fit（从树 len≥bitscount 最小者）+ 头部上挖，不部分分配。*/
 int	rfs_slice_alloc_hard(struct rfs_slice *self, u8 align_log2, u64 bitscount,

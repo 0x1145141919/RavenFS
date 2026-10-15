@@ -286,6 +286,11 @@ u32	rfs_allocator_inode_preferred_of(const struct rfs_allocator *self, u32 cpu);
 int	rfs_allocator_dump_slice(struct rfs_allocator *self, bool ino, u32 slice,
 				 struct rfs_run_dlist *out);
 
+/* block 片脏标志（D-15 按脏写回）：取并清片 `slice` 的「空闲区间集自上次落盘已变」
+ * 标志（读-改-清，持片锁）；供 FS 适配层 checkpoint 只重建 / 回写「变过的片」。
+ * 越界 / 未装配 → false。语义真值在片内（`rfs_slice.dirty`，见片头）。*/
+bool	rfs_allocator_block_dirty_take(struct rfs_allocator *self, u32 slice);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

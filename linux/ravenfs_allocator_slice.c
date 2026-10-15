@@ -156,6 +156,7 @@ int rfs_slice_enable(struct rfs_slice *self, const struct rfs_slice_cfg *cfg)
 	self->slice_bitscount = cfg->slice_bitscount;
 	self->free_count = 0;
 	self->last_finish_hint = 0;
+	self->dirty = false;			/* 建树 = 载入盘面 = 已持久基线 */
 
 	bits = cfg->slice_base;
 	/* 逐段扫出极大空闲 run（连续 0）；每个 run 双挂主从树。*/
@@ -201,6 +202,7 @@ int rfs_slice_shutdown(struct rfs_slice *self)
 	iv_free_all(self);			/* 拆双树 + 还全部区间节点 */
 	self->free_count = 0;
 	self->last_finish_hint = 0;
+	self->dirty = false;
 	self->in_global_base_idx = 0;		/* 对位：清内部化字段 */
 	self->slice_bitscount = 0;
 	self->is_workable = false;
@@ -212,6 +214,19 @@ int rfs_slice_shutdown(struct rfs_slice *self)
 u64 rfs_slice_free_count(const struct rfs_slice *self)
 {
 	return self ? self->free_count : 0;
+}
+
+/* dirty_take：取「自上次落盘以来空闲区间集已变」标志并清除（读-改-清）。
+ * 前置：调用方持 self->lock（与 free_count 同锁保护）。返回 true = 变过。*/
+bool rfs_slice_dirty_take(struct rfs_slice *self)
+{
+	bool was;
+
+	if (!self)
+		return false;
+	was = self->dirty;
+	self->dirty = false;
+	return was;
 }
 
 /* ══════════════════════════ 范围校验（test / free 共用）══════════════════════════ */
@@ -324,6 +339,7 @@ int rfs_slice_free_interval(struct rfs_slice *self, u64 base, u64 len)
 		return rc;			/* 分配失败（god 抛 bad_alloc 对位）*/
 
 	self->free_count += len;
+	self->dirty = true;		/* D-15：空闲区间集已变（待落盘）*/
 	return 0;
 }
 
@@ -436,6 +452,7 @@ int rfs_slice_soft_occupy(struct rfs_slice *self, u64 base, u64 len,
 	}
 
 	self->free_count -= claimed;
+	self->dirty = true;		/* D-15：空闲区间集已变（待落盘）*/
 	if (base + claimed > self->last_finish_hint)/* 只进不退 */
 		self->last_finish_hint = base + claimed;
 	*rest_bits = len - claimed;
@@ -504,6 +521,7 @@ int rfs_slice_alloc_hard(struct rfs_slice *self, u8 align_log2, u64 bitscount,
 		}
 
 		self->free_count -= bitscount;
+		self->dirty = true;		/* D-15：空闲区间集已变（待落盘）*/
 		if (right_base > self->last_finish_hint)/* 只进不退 */
 			self->last_finish_hint = right_base;
 		*out_base_idx = s;
@@ -575,6 +593,7 @@ int rfs_slice_soft_alloc(struct rfs_slice *self, u8 align_log2, u64 bitscount,
 		/* 先扣账、再 push_front：挖段已从树摘除但此前未扣账，故**必须先扣**；
 		 * 失败回滚 rfs_slice_free_interval 会 += t，与上式相抵（否则净多记 t）。*/
 		self->free_count -= t;
+		self->dirty = true;		/* D-15：空闲区间集已变（待落盘）*/
 		rc = rfs_run_list_push_front(out_runs, s, t);
 		if (rc) {
 			(void)rfs_slice_free_interval(self, s, t);	/* += t，与上式相抵 */

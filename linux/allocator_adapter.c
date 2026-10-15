@@ -28,6 +28,8 @@
 #include <linux/smp.h>
 #include <linux/cpumask.h>
 #include <linux/crc32.h>
+#include <linux/bitmap.h>
+#include <linux/mutex.h>
 
 #include "ravenfs.h"
 #include "ravenfs_allocator_adapter.h"
@@ -83,6 +85,7 @@ struct ravenfs_alloc_mgr {
 	struct rfs_allocator alloc;	/* 运行期真值（首成员；sbi->alloc 直指此处）*/
 	u8		*blk_words;	/* block 位图镜像（checkpoint 底座 + 落盘载体）*/
 	u64		 blk_nbits;
+	struct mutex	 flush_lock;	/* flush 串行化（sync_fs/fsync/TTL/put_super 并发）*/
 };
 
 /* ═══════════════════════ 位区间读写（LSB-first）═══════════════════════ */
@@ -135,73 +138,163 @@ static int bm_image_load(struct super_block *sb, u8 *words, u64 nblocks, u64 dis
 	return 0;
 }
 
-static int bm_image_save(struct super_block *sb, const u8 *words, u64 nblocks, u64 disk_start)
+/* 片 i 覆盖的位图块区间 [*b0, *b1)（块下标，相对 bitmap_start）。
+ * 片基址恒为 32768 位（= 1 位图块）倍数 → *b0 精确；末片可短 → *b1 向上取整并夹到
+ * 位图总块数。*/
+static void bm_slice_block_range(const struct ravenfs_alloc_mgr *m, u64 bitmap_blocks,
+				 u32 i, u64 per, u64 *b0, u64 *b1)
 {
-	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	u64 b;
+	u64 base = (u64)i * per;
+	u64 end = base + per;
 
-	for (b = 0; b < nblocks; b++) {
-		struct buffer_head *bh = sb_bread(sb, ravenfs_dev_blk(sbi, disk_start + b));
-
-		if (!bh) {
-			RFS_STAT_INC(sb, err_meta_io);
-			pr_err("ravenfs: bitmap image save fail at FS_blk %llu\n",
-			       (unsigned long long)(disk_start + b));
-			return -EIO;
-		}
-		memcpy(bh->b_data, words + (b << 12), RAVENFS_BLOCK_SIZE);
-		mark_buffer_dirty(bh);
-		sync_dirty_buffer(bh);
-		brelse(bh);
-		RFS_STAT_INC(sb, io_write_ops);
-		RFS_STAT_ADD(sb, io_write_bytes, RAVENFS_BLOCK_SIZE);
-	}
-	return 0;
+	if (end > m->blk_nbits)
+		end = m->blk_nbits;
+	*b0 = base / RAVENFS_BITS_PER_BLOCK;
+	*b1 = DIV_ROUND_UP(end, RAVENFS_BITS_PER_BLOCK);
+	if (*b1 > bitmap_blocks)
+		*b1 = bitmap_blocks;
 }
 
-/* block 组补集重建：全片置占用 → 逐片 dump 空闲区间清零。 */
-static int checkpoint_block(struct ravenfs_alloc_mgr *m)
+/* 写回 block 位图镜像（D-15 按脏写回）。
+ *   · `wr` 非空：只写「本次 checkpoint 收集到的待写片」覆盖的位图块；
+ *   · `wr` 空（分配失败降级 / 无脏位图）：退化为全量写。
+ * 返回 0 / -EIO；实际写出的块数写入 *out_blocks（供 `al_checkpoint_blocks` 记脏块数）。
+ * 保留逐块 mark + `sync_dirty_buffer` 的确定性落盘语义（批量提交 = D-15 正交第二刀，
+ * 本轮暂不引入，先只收敛「写多少」）。*/
+static int bm_image_save(struct super_block *sb, struct ravenfs_alloc_mgr *m,
+			 const unsigned long *wr, u64 *out_blocks)
 {
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	u64 per = rfs_allocator_block_per_slice_bits(&m->alloc);
 	u32 ns = rfs_allocator_slice_count(&m->alloc);
+	u64 wrote = 0;
 	u32 i;
-	u64 nbits = m->blk_nbits;
 
+	if (out_blocks)
+		*out_blocks = 0;
 	if (!m->blk_words || !per || !ns)
 		return -EINVAL;
 	for (i = 0; i < ns; i++) {
+		u64 b0, b1, b;
+
+		if ((u64)i * per >= m->blk_nbits)
+			break;
+		if (wr && !test_bit(i, wr))
+			continue;			/* 非待写片：跳过 */
+		bm_slice_block_range(m, sbi->bitmap_blocks, i, per, &b0, &b1);
+		for (b = b0; b < b1; b++) {
+			struct buffer_head *bh =
+				sb_bread(sb, ravenfs_dev_blk(sbi, sbi->bitmap_start + b));
+
+			if (!bh) {
+				RFS_STAT_INC(sb, err_meta_io);
+				pr_err("ravenfs: bitmap image save fail at FS_blk %llu\n",
+				       (unsigned long long)(sbi->bitmap_start + b));
+				if (out_blocks)
+					*out_blocks = wrote;
+				return -EIO;
+			}
+			memcpy(bh->b_data, m->blk_words + (b << 12), RAVENFS_BLOCK_SIZE);
+			mark_buffer_dirty(bh);
+			sync_dirty_buffer(bh);
+			brelse(bh);
+			RFS_STAT_INC(sb, io_write_ops);
+			RFS_STAT_ADD(sb, io_write_bytes, RAVENFS_BLOCK_SIZE);
+			wrote++;
+		}
+	}
+	if (out_blocks)
+		*out_blocks = wrote;
+	return 0;
+}
+
+/* 单片补集重建：全片置占用 → dump 该片空闲区间清零（树为唯一真值）。*/
+static int bm_rebuild_slice(struct ravenfs_alloc_mgr *m, u32 i, u64 base, u64 end)
+{
+	struct rfs_run_dlist dl;
+	struct rfs_run_node *n;
+	int rc;
+
+	bits_set_range(m->blk_words, base, end);	/* 先全置占用 */
+	rfs_run_dlist_init(&dl, ko_run_alloc);
+	rc = rfs_allocator_dump_slice(&m->alloc, false, i, &dl);
+	if (rc) {
+		rfs_run_dlist_fini(&dl);
+		return rc;
+	}
+	for (n = dl.head; n; n = n->next) {
+		u64 s = n->run.base;
+		u64 e = s + n->run.len;
+
+		if (s < base)
+			s = base;
+		if (e > end)
+			e = end;
+		if (s < e)
+			bits_clear_range(m->blk_words, s, e);
+	}
+	rfs_run_dlist_fini(&dl);
+	return 0;
+}
+
+/* block 组补集重建（D-15 按脏重建）：
+ *   · `wr` 非空：只重建「自上次落盘以来变过」的片——脏标志取自**片内隐状态**
+ *     （`rfs_allocator_block_dirty_take`，读-改-清、持片锁），非外层注入钩子。
+ *     取脏在重建**之前**：期间并发 alloc/free 会重新置脏 → 下轮再写，绝不丢更新。
+ *   · `wr` 空（分配失败降级）：退化旧「全片重建」。
+ * 重建出的待写片集合写入调用方本地 `wr`，供 bm_image_save 定写回范围。*/
+static int checkpoint_block(struct ravenfs_alloc_mgr *m, bool full,
+			    unsigned long *wr)
+{
+	u64 per = rfs_allocator_block_per_slice_bits(&m->alloc);
+	u32 ns = rfs_allocator_slice_count(&m->alloc);
+	u64 nbits = m->blk_nbits;
+	bool selective = !full && wr;
+	u32 i;
+
+	if (!m->blk_words || !per || !ns)
+		return -EINVAL;
+	if (wr)
+		bitmap_zero(wr, ns);
+	for (i = 0; i < ns; i++) {
 		u64 base = (u64)i * per;
 		u64 end = base + per;
-		struct rfs_run_dlist dl;
-		struct rfs_run_node *n;
 		int rc;
 
 		if (base >= nbits)
 			break;
 		if (end > nbits)
 			end = nbits;
-		bits_set_range(m->blk_words, base, end);	/* 先全置占用 */
 
-		rfs_run_dlist_init(&dl, ko_run_alloc);
-		rc = rfs_allocator_dump_slice(&m->alloc, false, i, &dl);
-		if (rc) {
-			rfs_run_dlist_fini(&dl);
+		if (selective && !rfs_allocator_block_dirty_take(&m->alloc, i))
+			continue;			/* 该片自上次落盘未变：跳过 */
+		rc = bm_rebuild_slice(m, i, base, end);
+		if (rc)
 			return rc;
-		}
-		for (n = dl.head; n; n = n->next) {
-			u64 s = n->run.base;
-			u64 e = s + n->run.len;
-
-			if (s < base)
-				s = base;
-			if (e > end)
-				e = end;
-			if (s < e)
-				bits_clear_range(m->blk_words, s, e);
-		}
-		rfs_run_dlist_fini(&dl);
+		if (wr)
+			set_bit(i, wr);
 	}
 	return 0;
+}
+
+/* D-15 组合入口：重建（按脏）→ 写回（按待写片）。待写片集合**本调用本地化**
+ * （栈外小位图，片数不过数百位），无共享可变态 → 并发 flush（TTL vs sync_fs）安全。
+ * 位图分配失败 → wr=NULL → checkpoint/bm_image_save 自动全量（旧行为）。*/
+static int bm_checkpoint_save(struct super_block *sb, struct ravenfs_alloc_mgr *m,
+			      u64 *out_blocks)
+{
+	u32 ns = rfs_allocator_slice_count(&m->alloc);
+	unsigned long *wr;
+	int rc;
+
+	if (out_blocks)
+		*out_blocks = 0;
+	wr = ns ? bitmap_zalloc(ns, GFP_NOFS) : NULL;
+	rc = checkpoint_block(m, wr == NULL, wr);
+	if (!rc)
+		rc = bm_image_save(sb, m, wr, out_blocks);
+	bitmap_free(wr);
+	return rc;
 }
 
 /* ═══════════════════ inode 数据面：装载（SB 四字段）═══════════════════════ */
@@ -707,10 +800,7 @@ int ravenfs_inode_plane_compact(struct super_block *sb)
 	}
 
 	/* ③ 位图落盘：新段已亮、旧树/旧片仍亮（保守）。失败 = 不可提交 → 回退。 */
-	rc = checkpoint_block(m);
-	if (!rc)
-		rc = bm_image_save(sb, m->blk_words, sbi->bitmap_blocks,
-				   sbi->bitmap_start);
+	rc = bm_checkpoint_save(sb, m, NULL);
 	if (rc) {
 		if (moved)
 			(void)rfs_allocator_block_free(a, new_base, pieces * 2ULL);
@@ -744,9 +834,7 @@ int ravenfs_inode_plane_compact(struct super_block *sb)
 			ravenfs_mdata_drop(sb, ea[i].phys_base);
 		}
 	}
-	(void)checkpoint_block(m);
-	(void)bm_image_save(sb, m->blk_words, sbi->bitmap_blocks,
-			    sbi->bitmap_start);
+	(void)bm_checkpoint_save(sb, m, NULL);
 	kfree(ea);
 
 	RFS_AL_INC(sb, al_idp_compact_ok);
@@ -782,6 +870,7 @@ int ravenfs_allocator_create(struct super_block *sb)
 	m = kzalloc(sizeof(*m), GFP_KERNEL);
 	if (!m)
 		return -ENOMEM;
+	mutex_init(&m->flush_lock);
 	m->blk_nbits = bn;
 	m->blk_words = vzalloc(bn >> 3);
 	if (!m->blk_words) {
@@ -843,17 +932,12 @@ int ravenfs_allocator_create(struct super_block *sb)
 	return 0;
 }
 
-int ravenfs_allocator_flush(struct super_block *sb)
+/* flush 主体（**须持 m->flush_lock**）：inode 面维护 → mdata → block 位图（按脏）→ SB。*/
+static int ravenfs_allocator_flush_locked(struct super_block *sb,
+					  struct ravenfs_alloc_mgr *m)
 {
-	struct ravenfs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
-	struct ravenfs_alloc_mgr *m = (sbi && sbi->alloc)
-		? container_of(sbi->alloc, struct ravenfs_alloc_mgr, alloc) : NULL;
+	u64 wrote = 0;
 	int rc;
-
-	if (!m)
-		return 0;
-	if (!ravenfs_sb_writable(sb))		/* ro 挂载：不落盘 */
-		return 0;
 
 	/* (1) inode 数据面维护（取块 → 建树 / 重写 fr；刷新 SB 四字段） */
 	rc = ravenfs_inode_plane_sync(sb);
@@ -870,26 +954,42 @@ int ravenfs_allocator_flush(struct super_block *sb)
 	}
 	(void)ravenfs_issue_flush(sb);
 
-	/* (3) block 位图补集重建 + 写回 */
-	rc = checkpoint_block(m);
+	/* (3) block 位图补集重建 + 写回（D-15：只重建/回写脏片） */
+	rc = bm_checkpoint_save(sb, m, &wrote);
 	if (rc) {
 		RFS_AL_INC(sb, al_checkpoint_fail);
-		return rc;
-	}
-	rc = bm_image_save(sb, m->blk_words, sbi->bitmap_blocks, sbi->bitmap_start);
-	if (rc) {
-		RFS_AL_INC(sb, al_checkpoint_fail);
-		pr_err("ravenfs: block bitmap image save 失败 (%d)\n", rc);
 		return rc;
 	}
 	RFS_AL_INC(sb, al_checkpoint);
-	RFS_AL_ADD(sb, al_checkpoint_blocks, sbi->bitmap_blocks);
+	RFS_AL_ADD(sb, al_checkpoint_blocks, wrote);	/* 语义：实际写出的脏块数 */
 	(void)ravenfs_issue_flush(sb);
 
 	/* (4) SB 最后写（crc + latest_syn_time + inode 四字段） */
 	rc = ravenfs_sb_write_sync(sb);
 	if (rc)
 		RFS_AL_INC(sb, al_checkpoint_fail);
+	return rc;
+}
+
+int ravenfs_allocator_flush(struct super_block *sb)
+{
+	struct ravenfs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+	struct ravenfs_alloc_mgr *m = (sbi && sbi->alloc)
+		? container_of(sbi->alloc, struct ravenfs_alloc_mgr, alloc) : NULL;
+	int rc;
+
+	if (!m)
+		return 0;
+	if (!ravenfs_sb_writable(sb))		/* ro 挂载：不落盘 */
+		return 0;
+
+	/* 串行化 flush：`sync_fs` / 每文件 `fsync` / TTL / `put_super` 可并发进入。
+	 * 不加锁时 SB 块 0 缓冲是**共享可变态**（`ravenfs_sb_write_sync` 读-改-写 + crc），
+	 * 两路并发会 crc 自撞 → -EIO → force_shutdown；inode 面 fr 重写亦会重复 alloc/free
+	 * 抖动。此锁令整段 flush 独占（可睡锁，块 I/O 内持锁可接受）。*/
+	mutex_lock(&m->flush_lock);
+	rc = ravenfs_allocator_flush_locked(sb, m);
+	mutex_unlock(&m->flush_lock);
 	return rc;
 }
 
@@ -906,6 +1006,7 @@ void ravenfs_allocator_destroy(struct super_block *sb)
 		RFS_AL_INC(sb, al_drain_timeout);
 	rfs_allocator_fini(&m->alloc);
 	sbi->alloc = NULL;
+	mutex_destroy(&m->flush_lock);
 	vfree(m->blk_words);
 	kfree(m);
 }

@@ -335,7 +335,7 @@ int main(void)
 	CHECK(rfs_slice_free_interval(&s, 510, 6) == 0, "occ: restitute mid");
 	CHECK(rfs_slice_free_count(&s) == 64, "occ: restored 64");
 
-	/* ═══ 5. alloc_hard：best-fit + 尾部下挖 + 对齐跳过 + 失败 ═══ */
+	/* ═══ 5. alloc_hard：best-fit + 头部上挖 + 对齐跳过 + 失败 ═══ */
 	puts("[5] alloc_hard");
 	CHECK(rfs_slice_shutdown(&s) == 0, "alloc_hard: shutdown");
 	bits_free(&b);
@@ -352,24 +352,24 @@ int main(void)
 	{
 		u64 o = 0;
 
-		/* 需 10 → 最小 len≥10 的 [500,516) → 尾部下挖 [506,516)，余 [500,6) */
+		/* 需 10 → 最小 len≥10 的 [500,516) → 头部上挖 [500,510)，余 [510,6) */
 		CHECK(rfs_slice_alloc_hard(&s, 0, 10, &o) == 0, "hard: rc");
-		CHECK(o == 506, "hard: tail-carve base 506");
-		want[0].base = 500; want[0].len = 6;
+		CHECK(o == 500, "hard: head-carve base 500");
+		want[0].base = 510; want[0].len = 6;
 		want[1].base = 524; want[1].len = 8;
 		want[2].base = 540; want[2].len = 24;
 		expect_runs(&s, want, 3, "hard: remainder");
 		CHECK(rfs_slice_free_count(&s) == 38, "hard: count 48-10");
 		check_trees(&s, "hard: rb_check");
 
-		/* 需 8、align=2^3：跳过非 8 对齐的 [524,532)(起点 724 不齐)，
-		 * 选 [540,564) → 尾部对齐到 552？(564-8)&~7 = 556&~7 = 552 ≥ 540 → [552,560)，余 [540,12)+[560,4) */
+		/* 需 8、align=2^3：跳过非 8 对齐的 [524,532)（头对齐 528 越出 532 → 容不下），
+		 * 选 [540,564) → 头部对齐 (540+7)&~7 = 544 → [544,552)，余 [540,4)+[552,12) */
 		CHECK(rfs_slice_alloc_hard(&s, 3, 8, &o) == 0, "hard: aligned rc");
-		CHECK(o == 552, "hard: aligned base 552");
-		want[0].base = 500; want[0].len = 6;
+		CHECK(o == 544, "hard: aligned base 544");
+		want[0].base = 510; want[0].len = 6;
 		want[1].base = 524; want[1].len = 8;
-		want[2].base = 540; want[2].len = 12;
-		want[3].base = 560; want[3].len = 4;
+		want[2].base = 540; want[2].len = 4;
+		want[3].base = 552; want[3].len = 12;
 		expect_runs(&s, want, 4, "hard: aligned split");
 		CHECK(rfs_slice_free_count(&s) == 30, "hard: count 38-8");
 
@@ -379,6 +379,38 @@ int main(void)
 		CHECK(o == 0xDEADBEEFULL, "hard: out param untouched");
 		CHECK(rfs_slice_alloc_hard(&s, 0, 0, &o) == -EINVAL, "hard: zero rejected");
 		CHECK(rfs_slice_alloc_hard(&s, 64, 1, &o) == -EINVAL, "hard: align>63 rejected");
+	}
+
+	/* ═══ 5b. D-14 方向契约：头挖 → 连续分配物理升序（令锚定/融合可命中）═══ */
+	puts("[5b] D-14 direction (head-dig)");
+	CHECK(rfs_slice_shutdown(&s) == 0, "d14: shutdown");
+	bits_free(&b);
+	bits_alloc(&b, NBITS);
+	bits_set_free(&b, 0, NBITS);		/* 整片空闲（片首起）*/
+	cfg.slice_base = b.mem;
+	cfg.in_global_base_idx = OFF;
+	cfg.slice_bitscount = NBITS;
+	cfg.alloc = g_pool;
+	CHECK(rfs_slice_enable(&s, &cfg) == 0, "d14: enable whole-free");
+	{
+		u64 a0 = 0, a1 = 0, a2 = 0;
+
+		/* 同一自由区间连续三次硬分配 → 落点必须严格升序（头挖）*/
+		CHECK(rfs_slice_alloc_hard(&s, 0, 8, &a0) == 0, "d14: a0 rc");
+		CHECK(rfs_slice_alloc_hard(&s, 0, 8, &a1) == 0, "d14: a1 rc");
+		CHECK(rfs_slice_alloc_hard(&s, 0, 8, &a2) == 0, "d14: a2 rc");
+		CHECK(a0 == OFF, "d14: a0 at slice head");
+		CHECK(a1 == OFF + 8, "d14: a1 ascending (a0+8)");
+		CHECK(a2 == OFF + 16, "d14: a2 ascending (a1+8)");
+		CHECK(a0 < a1 && a1 < a2, "d14: physical order ascending");
+		/* 对齐：align=3 需 8；余段 [524,564) → 向上对齐到 528（头挖 + 对齐）*/
+		{
+			u64 a3 = 0;
+
+			CHECK(rfs_slice_alloc_hard(&s, 3, 8, &a3) == 0,
+			      "d14: aligned head rc");
+			CHECK(a3 == OFF + 28, "d14: aligned head-dig continues (528)");
+		}
 	}
 
 	/* ═══ 6. soft_alloc：多段 + 部分交付 ═══ */
@@ -397,7 +429,7 @@ int main(void)
 		u64 sum = 0;
 		struct rfs_run_node *nd;
 
-		/* 请求 12：碎片优先 → [560,4)(整段) + [500,10) 尾挖 [502,8) */
+		/* 请求 12：碎片优先 → [560,4)(整段) + [500,10) 头挖 [500,8) */
 		rfs_run_list_init(&rl, g_ralloc);
 		CHECK(rfs_slice_soft_alloc(&s, 0, 12, &rl, &sat) == 0, "soft: rc");
 		CHECK(sat == true, "soft: all_satisfied");
@@ -405,7 +437,7 @@ int main(void)
 			sum += nd->run.len;
 		CHECK(sum == 12, "soft: delivered sum 12");
 		CHECK(rfs_slice_free_count(&s) == 24 - 12, "soft: count 12");
-		want[0].base = 500; want[0].len = 2;
+		want[0].base = 508; want[0].len = 2;
 		want[1].base = 530; want[1].len = 10;
 		expect_runs(&s, want, 2, "soft: remainder");
 		rfs_run_list_fini(&rl);
@@ -464,6 +496,59 @@ int main(void)
 	CHECK(rfs_slice_enable(&s, &cfg) == 0, "re-enable ok");
 	CHECK(rfs_slice_free_count(&s) == 24, "re-enable: count 24");
 	CHECK(rfs_slice_shutdown(&s) == 0, "final shutdown");
+
+	/* ═══ 9. 片内脏标志（D-15：分片按脏写回的隐状态）═══ */
+	puts("[9] dirty flag（片内隐状态）");
+	{
+		struct rfs_slice s2;
+		struct bits b2;
+		struct rfs_slice_cfg cfg2;
+		struct rfs_run_list rl;
+		u64 rest = 0, out = 0;
+
+		slice_zero(&s2);
+		bits_alloc(&b2, NBITS);
+		bits_set_free(&b2, 0, NBITS);	/* 全空闲 → 单 run */
+		memset(&cfg2, 0, sizeof(cfg2));
+		cfg2.slice_base = b2.mem;
+		cfg2.in_global_base_idx = OFF;
+		cfg2.slice_bitscount = NBITS;
+		cfg2.alloc = g_pool;
+		CHECK(rfs_slice_enable(&s2, &cfg2) == 0, "dirty: enable ok");
+		CHECK(rfs_slice_dirty_take(&s2) == false, "dirty: enable -> clean（载入盘面=基线）");
+		CHECK(rfs_slice_dirty_take(&s2) == false, "dirty: clean take idempotent");
+
+		/* soft_occupy：变更 → 置脏；take 取走并清除 */
+		CHECK(rfs_slice_soft_occupy(&s2, OFF, 4, &rest) == 0, "dirty: occupy ok");
+		CHECK(rfs_slice_dirty_take(&s2) == true, "dirty: occupy -> dirty");
+		CHECK(rfs_slice_dirty_take(&s2) == false, "dirty: take clears");
+
+		/* alloc_hard：变更 → 置脏 */
+		CHECK(rfs_slice_alloc_hard(&s2, 0, 8, &out) == 0, "dirty: alloc_hard ok");
+		CHECK(rfs_slice_dirty_take(&s2) == true, "dirty: alloc_hard -> dirty");
+
+		/* soft_alloc：变更 → 置脏 */
+		rfs_run_list_init(&rl, g_ralloc);
+		{
+			bool sat = false;
+
+			CHECK(rfs_slice_soft_alloc(&s2, 0, 8, &rl, &sat) == 0,
+			      "dirty: soft_alloc ok");
+			rfs_run_list_fini(&rl);
+		}
+		CHECK(rfs_slice_dirty_take(&s2) == true, "dirty: soft_alloc -> dirty");
+
+		/* free_interval：变更 → 置脏 */
+		CHECK(rfs_slice_free_interval(&s2, out, 8) == 0, "dirty: free ok");
+		CHECK(rfs_slice_dirty_take(&s2) == true, "dirty: free -> dirty");
+
+		/* re-enable：重建 = 载入盘面 → 归零 */
+		CHECK(rfs_slice_shutdown(&s2) == 0, "dirty: shutdown ok");
+		CHECK(rfs_slice_enable(&s2, &cfg2) == 0, "dirty: re-enable ok");
+		CHECK(rfs_slice_dirty_take(&s2) == false, "dirty: re-enable -> clean");
+		CHECK(rfs_slice_shutdown(&s2) == 0, "dirty: final shutdown");
+		bits_free(&b2);
+	}
 
 	bits_free(&b);
 

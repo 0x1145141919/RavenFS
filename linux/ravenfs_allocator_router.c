@@ -907,6 +907,25 @@ int rfs_allocator_dump_slice(struct rfs_allocator *self, bool ino, u32 slice,
 	return rfs_slice_all_dump(s, out);
 }
 
+/* D-15 片脏标志：读-改-清片 `slice` 的「空闲区间集自上次落盘已变」标志。持片锁，
+ * 与片内变更点（alloc/free 等）互斥；清标志后并发变更会重新置位 → 绝不丢更新。*/
+bool rfs_allocator_block_dirty_take(struct rfs_allocator *self, u32 slice)
+{
+	struct rfs_slice *s;
+	bool was;
+
+	if (!self || !self->blk_.slices || slice >= self->slice_count)
+		return false;
+	if (!rfs_allocator_enter(self))
+		return false;
+	RFS_IV_SESSION(rfs_iv_guard, self);
+	s = &self->blk_.slices[slice];
+	RFS_MUTEX_LOCK(&s->lock);
+	was = rfs_slice_dirty_take(s);
+	RFS_MUTEX_UNLOCK(&s->lock);
+	return was;
+}
+
 /* ══════════════════════════ inode 数据面翻译（v2.0，内核）══════════════════════════
  * InodeSession 唯一翻译入口：inum → 物理 8K 片基 + 片内字节偏移。 */
 int rfs_allocator_inode_locate(struct rfs_allocator *self, u64 inum,
