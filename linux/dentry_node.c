@@ -19,13 +19,12 @@
 
 #include "ravenfs.h"
 #include "ravenfs_dentry_node.h"
-#include "ravenfs_cache.h"
-#include "ravenfs_mdata_cache.h"
+#include "ravenfs_inode_session.h"
 #include "ravenfs_allocator_top.h"
 #include "ravenfs_name_data_plane.h"
 
 /* ── 8K 节点 / 跨块字节读 ── */
-/* ── 8K 节点读取已移至 mdata_cache.c（走 mdata_piece_cache_mgr + session） ── */
+/* ── 8K 节点读取统一走 mdata 核心缓存（ravenfs_read_node → mdata_cache_core.c） ── */
 
 /* 物化 dentry 名字：≤40 内联；>40 从所属目录名字数据面读尾部
  * （owner_dir_inum 定位目录 inode；full_char_remain_offset 为数据面内逻辑偏移） */
@@ -199,26 +198,22 @@ int rfs_propagate(struct super_block *sb, const struct rfs_dpath *p, u32 child_l
 	int lvl;
 
 	for (lvl = (int)child_level - 1; lvl >= 0; lvl--) {
-		struct ravenfs_msession *ms = ravenfs_mdata_get(sb, p->blk[lvl]);
 		struct Bptree_ddentry_inner_node_t *nd;
 		u32 cnt, idx = p->cidx[lvl];
 
-		if (IS_ERR(ms))
+		RAVENFS_MDATA_SESSION(ms, ravenfs_mdata_cache_of(sb),
+				      p->blk[lvl]);
+		if (!RAVENFS_MDATA_SESSION_VALID(ms))
 			return PTR_ERR(ms);
-		nd = ravenfs_msession_node(ms);
+		nd = RAVENFS_MDATA_SESSION_DATA(ms);
 		if (!RFS_PP_IS_INNER(nd->meta.parent_ptr) ||
 		    rfs_meta_ok(&nd->meta, &cnt, &(u32){0}, &(u32){0}, &(u64){0}) ||
-		    idx >= cnt) {
-			ravenfs_mdata_put(ms);
+		    idx >= cnt)
 			return -EIO;
-		}
 		nd->hints[idx].hash_max = cur_max;
-		NODE_DIRTY(ms);
-		if (idx == cnt - 1) {		/* 父 max 亦变 → 继续上溯 */
-			ravenfs_mdata_put(ms);
-			continue;
-		}
-		ravenfs_mdata_put(ms);
+		RAVENFS_MDATA_SESSION_DIRTY(ms);
+		if (idx == cnt - 1)		/* 父 max 亦变 → 继续上溯 */
+			continue;		/* ms 由 cleanup 自动 put */
 		break;
 	}
 	return 0;
@@ -230,46 +225,41 @@ int rfs_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 			  u64 *out_low, u64 *out_high, bool *out_was_root, u64 *out_dotdot)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_msession *vms = ravenfs_mdata_get(sb, victim_blk);
-	struct ravenfs_msession *nms = NULL;
 	struct Bptree_ddentry_leaf_node_t *vl, *nl;
 	u32 cnt, inner, root;
 	u64 pptr, parent, old_next, dotdot, new_blk = (u64)PTR_INVALID;
 	bool was_root;
 	int err;
 
-	if (IS_ERR(vms))
+	RAVENFS_MDATA_SESSION(vms, ravenfs_mdata_cache_of(sb), victim_blk);
+	if (!RAVENFS_MDATA_SESSION_VALID(vms))
 		return PTR_ERR(vms);
-	vl = ravenfs_msession_node(vms);
+	vl = RAVENFS_MDATA_SESSION_DATA(vms);
 	err = rfs_meta_ok_x(&vl->meta, &cnt, &inner, &root, &pptr, RFS_DENTRY_ORDER + 1);
-	if (err || inner || cnt != RFS_DENTRY_ORDER + 1) {
-		ravenfs_mdata_put(vms);
+	if (err || inner || cnt != RFS_DENTRY_ORDER + 1)
 		return err ? err : -EIO;
-	}
 	was_root = root != 0;
 	parent = pptr;
 	old_next = RFS_PTR_ADDR(vl->meta.ptrs[2]);	/* ⚠ 先读后写 */
 	dotdot = was_root ? RFS_PTR_ADDR(vl->meta.ptrs[1]) : (u64)RFS_MASK52;	/* ⚠ ".." 先读后写 */
 	*out_dotdot = dotdot;
-	ravenfs_mdata_put(vms);
+	RAVENFS_MDATA_SESSION_RELEASE(vms);		/* 分配新块前先归还会话 */
 
 	new_blk = rfs_allocator_block_alloc_hard(sbi->alloc, 2, 1);	/* 2 块连续、2^1 对齐 */
 	if (new_blk == (u64)PTR_INVALID)
 		return -ENOSPC;
 
-	vms = ravenfs_mdata_get(sb, victim_blk);
-	nms = ravenfs_mdata_get(sb, new_blk);
-	if (IS_ERR(vms) || IS_ERR(nms)) {
-		err = IS_ERR(vms) ? PTR_ERR(vms) : PTR_ERR(nms);
-		if (!IS_ERR(vms))
-			ravenfs_mdata_put(vms);
-		if (!IS_ERR(nms))
-			ravenfs_mdata_put(nms);
+	RAVENFS_MDATA_SESSION_RESET(vms, ravenfs_mdata_cache_of(sb), victim_blk);
+	RAVENFS_MDATA_SESSION(nms, ravenfs_mdata_cache_of(sb), new_blk);
+	if (!RAVENFS_MDATA_SESSION_VALID(vms) ||
+	    !RAVENFS_MDATA_SESSION_VALID(nms)) {
+		err = !RAVENFS_MDATA_SESSION_VALID(vms) ?
+		      PTR_ERR(vms) : PTR_ERR(nms);
 		(void)rfs_allocator_block_free(sbi->alloc, new_blk, 2);
 		return err;
 	}
-	vl = ravenfs_msession_node(vms);
-	nl = ravenfs_msession_node(nms);
+	vl = RAVENFS_MDATA_SESSION_DATA(vms);
+	nl = RAVENFS_MDATA_SESSION_DATA(nms);
 
 	rfs_node_init(nl, 64, 0, 0, parent);
 	memcpy(&nl->entries[0], &vl->entries[63], 64 * sizeof(struct ddentry_t));
@@ -281,23 +271,25 @@ int rfs_leaf_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 	if (was_root)
 		vl->meta.ptrs[1].v = RFS_PTR_INV_V;			/* ".." 移走，左叶无前驱 */
 
-	NODE_DIRTY(vms);
-	NODE_DIRTY(nms);
+	RAVENFS_MDATA_SESSION_DIRTY(vms);
+	RAVENFS_MDATA_SESSION_DIRTY(nms);
 	*out_low = vl->entries[62].hash;
 	*out_high = nl->entries[63].hash;
 	*out_was_root = was_root;
-	ravenfs_mdata_put(vms);
-	ravenfs_mdata_put(nms);
+	RAVENFS_MDATA_SESSION_RELEASE(nms);
+	RAVENFS_MDATA_SESSION_RELEASE(vms);
 
 	/* 旧后继 prev = new */
 	if (!was_root && old_next != (u64)RFS_MASK52) {
-		struct ravenfs_msession *oms = ravenfs_mdata_get(sb, old_next);
+		RAVENFS_MDATA_SESSION(oms, ravenfs_mdata_cache_of(sb),
+				      old_next);
 
-		if (IS_ERR(oms))
+		if (!RAVENFS_MDATA_SESSION_VALID(oms))
 			return PTR_ERR(oms);
-		rfs_set_addr(&((struct Bptree_meta_t *)ravenfs_msession_node(oms))->ptrs[1], new_blk);
-		NODE_DIRTY(oms);
-		ravenfs_mdata_put(oms);
+		rfs_set_addr(&((struct Bptree_meta_t *)
+				RAVENFS_MDATA_SESSION_DATA(oms))->ptrs[1],
+			     new_blk);
+		RAVENFS_MDATA_SESSION_DIRTY(oms);
 	}
 	*out_new = new_blk;
 	return 0;
@@ -308,83 +300,75 @@ static int rfs_inner_split(struct super_block *sb, u64 victim_blk, u64 *out_new,
 			   u64 *out_low, u64 *out_high, u64 *out_dotdot)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_msession *vms = ravenfs_mdata_get(sb, victim_blk);
-	struct ravenfs_msession *nms = NULL;
 	struct Bptree_ddentry_inner_node_t *vi, *ni;
 	u32 cnt, inner, root, i;
 	u64 pptr, parent, new_blk = (u64)PTR_INVALID;
 	int err;
 
-	if (IS_ERR(vms))
+	RAVENFS_MDATA_SESSION(vms, ravenfs_mdata_cache_of(sb), victim_blk);
+	if (!RAVENFS_MDATA_SESSION_VALID(vms))
 		return PTR_ERR(vms);
-	vi = ravenfs_msession_node(vms);
+	vi = RAVENFS_MDATA_SESSION_DATA(vms);
 	err = rfs_meta_ok_x(&vi->meta, &cnt, &inner, &root, &pptr, RFS_DENTRY_ORDER + 1);
-	if (err || !inner || cnt != RFS_DENTRY_ORDER + 1) {
-		ravenfs_mdata_put(vms);
+	if (err || !inner || cnt != RFS_DENTRY_ORDER + 1)
 		return err ? err : -EIO;
-	}
 	parent = pptr;
 	*out_dotdot = (root != 0) ? RFS_PTR_ADDR(vi->meta.ptrs[1]) : (u64)RFS_MASK52;	/* ⚠ 先读后写 */
-	ravenfs_mdata_put(vms);
+	RAVENFS_MDATA_SESSION_RELEASE(vms);
 
 	new_blk = rfs_allocator_block_alloc_hard(sbi->alloc, 2, 1);
 	if (new_blk == (u64)PTR_INVALID)
 		return -ENOSPC;
 
-	vms = ravenfs_mdata_get(sb, victim_blk);
-	nms = ravenfs_mdata_get(sb, new_blk);
-	if (IS_ERR(vms) || IS_ERR(nms)) {
-		err = IS_ERR(vms) ? PTR_ERR(vms) : PTR_ERR(nms);
-		if (!IS_ERR(vms))
-			ravenfs_mdata_put(vms);
-		if (!IS_ERR(nms))
-			ravenfs_mdata_put(nms);
+	RAVENFS_MDATA_SESSION_RESET(vms, ravenfs_mdata_cache_of(sb), victim_blk);
+	RAVENFS_MDATA_SESSION(nms, ravenfs_mdata_cache_of(sb), new_blk);
+	if (!RAVENFS_MDATA_SESSION_VALID(vms) ||
+	    !RAVENFS_MDATA_SESSION_VALID(nms)) {
+		err = !RAVENFS_MDATA_SESSION_VALID(vms) ?
+		      PTR_ERR(vms) : PTR_ERR(nms);
 		(void)rfs_allocator_block_free(sbi->alloc, new_blk, 2);
 		return err;
 	}
-	vi = ravenfs_msession_node(vms);
-	ni = ravenfs_msession_node(nms);
+	vi = RAVENFS_MDATA_SESSION_DATA(vms);
+	ni = RAVENFS_MDATA_SESSION_DATA(nms);
 
 	rfs_node_init(ni, 64, 1, 0, parent);
 	memcpy(&ni->hints[0], &vi->hints[63], 64 * sizeof(struct ddentry_hint_t));
 	vi->meta.parent_ptr.v = RFS_PP_PACK(63, 1, root, parent);
-	NODE_DIRTY(vms);
-	NODE_DIRTY(nms);
+	RAVENFS_MDATA_SESSION_DIRTY(vms);
+	RAVENFS_MDATA_SESSION_DIRTY(nms);
 	*out_low = vi->hints[62].hash_max;
 	*out_high = ni->hints[63].hash_max;
-	ravenfs_mdata_put(vms);
-	ravenfs_mdata_put(nms);
+	RAVENFS_MDATA_SESSION_RELEASE(nms);
+	RAVENFS_MDATA_SESSION_RELEASE(vms);
 
 	/* 右半孩子 reparent → new_blk */
 	for (i = 0; i < 64; i++) {
 		u64 child;
-		struct ravenfs_msession *cms;
 		struct Bptree_meta_t *cm;
 		u32 cc, ci, cr;
 		u64 cp;
 
 		{
-			struct ravenfs_msession *tms = ravenfs_mdata_get(sb, new_blk);
 			const struct Bptree_ddentry_inner_node_t *tin;
 
-			if (IS_ERR(tms))
+			RAVENFS_MDATA_SESSION(tms, ravenfs_mdata_cache_of(sb),
+					      new_blk);
+			if (!RAVENFS_MDATA_SESSION_VALID(tms))
 				return PTR_ERR(tms);
-			tin = ravenfs_msession_node(tms);
+			tin = RAVENFS_MDATA_SESSION_DATA(tms);
 			child = RFS_PTR_ADDR(tin->hints[i].sub_ptr);
-			ravenfs_mdata_put(tms);
-		}
-		cms = ravenfs_mdata_get(sb, child);
-		if (IS_ERR(cms))
+		}	/* tms 由 cleanup 自动 put */
+
+		RAVENFS_MDATA_SESSION(cms, ravenfs_mdata_cache_of(sb), child);
+		if (!RAVENFS_MDATA_SESSION_VALID(cms))
 			return PTR_ERR(cms);
-		cm = ravenfs_msession_node(cms);
+		cm = RAVENFS_MDATA_SESSION_DATA(cms);
 		err = rfs_meta_ok(cm, &cc, &ci, &cr, &cp);
-		if (err || cr) {
-			ravenfs_mdata_put(cms);
+		if (err || cr)
 			return err ? err : -EIO;
-		}
 		cm->parent_ptr.v = RFS_PP_PACK(cc, ci, 0, new_blk);
-		NODE_DIRTY(cms);
-		ravenfs_mdata_put(cms);
+		RAVENFS_MDATA_SESSION_DIRTY(cms);
 	}
 	*out_new = new_blk;
 	return 0;
@@ -395,11 +379,9 @@ int rfs_new_root_inner(struct super_block *sb, u64 dir_ino, u64 left_blk, u64 le
 			      u64 right_blk, u64 right_max, u64 dotdot)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, dir_ino);
-	struct ravenfs_msession *rms = NULL;
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = ravenfs_inode_session_get(sb, dir_ino);
 	struct Bptree_ddentry_inner_node_t *ri;
 	u64 root_blk;
-	int err = 0;
 
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
@@ -407,13 +389,12 @@ int rfs_new_root_inner(struct super_block *sb, u64 dir_ino, u64 left_blk, u64 le
 	if (root_blk == (u64)PTR_INVALID)
 		return -ENOSPC;
 
-	rms = ravenfs_mdata_get(sb, root_blk);
-	if (IS_ERR(rms)) {
-		err = PTR_ERR(rms);
+	RAVENFS_MDATA_SESSION(rms, ravenfs_mdata_cache_of(sb), root_blk);
+	if (!RAVENFS_MDATA_SESSION_VALID(rms)) {
 		(void)rfs_allocator_block_free(sbi->alloc, root_blk, 2);
-		return err;
+		return PTR_ERR(rms);
 	}
-	ri = ravenfs_msession_node(rms);
+	ri = RAVENFS_MDATA_SESSION_DATA(rms);
 	rfs_node_init(ri, 2, 1, 1, dir_ino);
 	rfs_set_addr(&ri->meta.ptrs[0], RFS_MASK52);	/* 预留 */
 	rfs_set_addr(&ri->meta.ptrs[1], dotdot);	/* `..` 继承自旧根（非根目录 = 父目录 inum；根目录 = 自身） */
@@ -422,8 +403,8 @@ int rfs_new_root_inner(struct super_block *sb, u64 dir_ino, u64 left_blk, u64 le
 	ri->hints[0].hash_max = left_max;
 	rfs_set_addr(&ri->hints[1].sub_ptr, right_blk);
 	ri->hints[1].hash_max = right_max;
-	NODE_DIRTY(rms);
-	ravenfs_mdata_put(rms);
+	RAVENFS_MDATA_SESSION_DIRTY(rms);
+	RAVENFS_MDATA_SESSION_RELEASE(rms);
 
 	/* 两子 reparent → new root；root 位清零；左叶清 ptrs[1]（原 ".." / prev） */
 	{
@@ -431,27 +412,26 @@ int rfs_new_root_inner(struct super_block *sb, u64 dir_ino, u64 left_blk, u64 le
 		int k;
 
 		for (k = 0; k < 2; k++) {
-			struct ravenfs_msession *kms = ravenfs_mdata_get(sb, kids[k]);
 			struct Bptree_meta_t *km;
 			u32 cc, ci, cr;
 			u64 cp;
+			int err;
 
-			if (IS_ERR(kms))
+			RAVENFS_MDATA_SESSION(kms, ravenfs_mdata_cache_of(sb),
+					      kids[k]);
+			if (!RAVENFS_MDATA_SESSION_VALID(kms))
 				return PTR_ERR(kms);
-			km = ravenfs_msession_node(kms);
+			km = RAVENFS_MDATA_SESSION_DATA(kms);
 			err = rfs_meta_ok(km, &cc, &ci, &cr, &cp);
-			if (err) {
-				ravenfs_mdata_put(kms);
+			if (err)
 				return err;
-			}
 			km->parent_ptr.v = RFS_PP_PACK(cc, ci, 0, root_blk);
-			NODE_DIRTY(kms);
-			ravenfs_mdata_put(kms);
+			RAVENFS_MDATA_SESSION_DIRTY(kms);
 		}
 	}
 
-	ravenfs_session_inode(ds)->data_root = root_blk;
-	RFS_ROW_MARK_DIRTY(ds->row);
+	ravenfs_inode_session_record(ds)->data_root = root_blk;
+	RAVENFS_MDATA_DIRTY(ds->mdata_session);
 	return 0;
 }
 
@@ -461,32 +441,35 @@ int rfs_apply_up(struct super_block *sb, u64 dir_ino, const struct rfs_dpath *p,
 			u64 new_blk, u64 high_max)
 {
 	for (;;) {
-		struct ravenfs_msession *ms = ravenfs_mdata_get(sb, p->blk[level]);
 		struct Bptree_ddentry_inner_node_t *nd;
 		u32 pcnt, idx = child_idx, new_cnt;
 		u32 is_root;
 		int err = 0;
 
-		if (IS_ERR(ms))
-			return PTR_ERR(ms);
-		nd = ravenfs_msession_node(ms);
-		if (rfs_meta_ok(&nd->meta, &pcnt, &(u32){0}, &(u32){0}, &(u64){0}) ||
-		    !RFS_PP_IS_INNER(nd->meta.parent_ptr) ||
-		    idx >= pcnt || pcnt > RFS_DENTRY_ORDER ||
-		    RFS_PTR_ADDR(nd->hints[idx].sub_ptr) != cur_victim) {
-			ravenfs_mdata_put(ms);
-			return -EIO;
-		}
-		nd->hints[idx].hash_max = low_max;
-		memmove(&nd->hints[idx + 2], &nd->hints[idx + 1],
-			(size_t)(pcnt - idx - 1) * sizeof(struct ddentry_hint_t));
-		rfs_set_addr(&nd->hints[idx + 1].sub_ptr, new_blk);
-		nd->hints[idx + 1].hash_max = high_max;
-		new_cnt = pcnt + 1;
-		is_root = RFS_PP_IS_ROOT(nd->meta.parent_ptr);
-		nd->meta.parent_ptr.v = RFS_PP_PACK(new_cnt, 1, is_root, RFS_PP_PTR(nd->meta.parent_ptr));
-		NODE_DIRTY(ms);
-		ravenfs_mdata_put(ms);
+		{
+			RAVENFS_MDATA_SESSION(ms, ravenfs_mdata_cache_of(sb),
+					      p->blk[level]);
+			if (!RAVENFS_MDATA_SESSION_VALID(ms))
+				return PTR_ERR(ms);
+			nd = RAVENFS_MDATA_SESSION_DATA(ms);
+			if (rfs_meta_ok(&nd->meta, &pcnt, &(u32){0},
+					&(u32){0}, &(u64){0}) ||
+			    !RFS_PP_IS_INNER(nd->meta.parent_ptr) ||
+			    idx >= pcnt || pcnt > RFS_DENTRY_ORDER ||
+			    RFS_PTR_ADDR(nd->hints[idx].sub_ptr) != cur_victim)
+				return -EIO;
+			nd->hints[idx].hash_max = low_max;
+			memmove(&nd->hints[idx + 2], &nd->hints[idx + 1],
+				(size_t)(pcnt - idx - 1) *
+				sizeof(struct ddentry_hint_t));
+			rfs_set_addr(&nd->hints[idx + 1].sub_ptr, new_blk);
+			nd->hints[idx + 1].hash_max = high_max;
+			new_cnt = pcnt + 1;
+			is_root = RFS_PP_IS_ROOT(nd->meta.parent_ptr);
+			nd->meta.parent_ptr.v = RFS_PP_PACK(new_cnt, 1, is_root,
+					RFS_PP_PTR(nd->meta.parent_ptr));
+			RAVENFS_MDATA_SESSION_DIRTY(ms);
+		}	/* 放锁后再裂变，避免同块嵌套会话 */
 
 		if (new_cnt <= RFS_DENTRY_ORDER) {
 			if (idx + 1 == new_cnt - 1)	/* 新 hint 是末位 → 父 max 变 */
@@ -523,7 +506,6 @@ static int rfs_reparent_children(struct super_block *sb,
 
 	for (i = 0; i < cnt; i++) {
 		u64 cblk = RFS_PTR_ADDR(nd->hints[i].sub_ptr);
-		struct ravenfs_msession *cms;
 		struct Bptree_meta_t *cm;
 		u32 cc, ci, cr;
 		u64 cp;
@@ -531,20 +513,17 @@ static int rfs_reparent_children(struct super_block *sb,
 
 		if (cblk == (u64)RFS_MASK52)
 			return -EIO;
-		cms = ravenfs_mdata_get(sb, cblk);
-		if (IS_ERR(cms))
+		RAVENFS_MDATA_SESSION(cms, ravenfs_mdata_cache_of(sb), cblk);
+		if (!RAVENFS_MDATA_SESSION_VALID(cms))
 			return PTR_ERR(cms);
-		cm = ravenfs_msession_node(cms);
+		cm = RAVENFS_MDATA_SESSION_DATA(cms);
 		err = rfs_meta_ok(cm, &cc, &ci, &cr, &cp);
-		if (err || cr) {
-			ravenfs_mdata_put(cms);
+		if (err || cr)
 			return err ? err : -EIO;
-		}
 		if (RFS_PP_PTR(cm->parent_ptr) != node_blk) {
 			cm->parent_ptr.v = RFS_PP_PACK(cc, ci, 0, node_blk);
-			NODE_DIRTY(cms);
+			RAVENFS_MDATA_SESSION_DIRTY(cms);
 		}
-		ravenfs_mdata_put(cms);
 	}
 	return 0;
 }
@@ -557,7 +536,9 @@ static int rfs_reparent_children(struct super_block *sb,
 static int rfs_node_balance(struct super_block *sb, u64 parent_blk, u32 idx, bool *need)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_msession *pms, *cms = NULL, *nms = NULL;
+	RAVENFS_MDATA_SESSION_NULL(pms);
+	RAVENFS_MDATA_SESSION_NULL(cms);
+	RAVENFS_MDATA_SESSION_NULL(nms);
 	struct Bptree_ddentry_inner_node_t *pi;
 	struct Bptree_meta_t *cm, *nm;
 	u32 pcnt, pin, proot, cc = 0, ci, cr, nc = 0, ni, nr;
@@ -566,23 +547,22 @@ static int rfs_node_balance(struct super_block *sb, u64 parent_blk, u32 idx, boo
 	int ret = 0;
 
 	*need = false;
-	pms = ravenfs_mdata_get(sb, parent_blk);
-	if (IS_ERR(pms))
+	RAVENFS_MDATA_SESSION_OPEN(pms, ravenfs_mdata_cache_of(sb), parent_blk);
+	if (!RAVENFS_MDATA_SESSION_VALID(pms))
 		return PTR_ERR(pms);
-	pi = ravenfs_msession_node(pms);
+	pi = RAVENFS_MDATA_SESSION_DATA(pms);
 	ret = rfs_meta_ok(&pi->meta, &pcnt, &pin, &proot, &pptr);
 	if (ret || !pin || idx >= pcnt) {
 		ret = ret ? ret : -EIO;
 		goto out;
 	}
 	child_blk = RFS_PTR_ADDR(pi->hints[idx].sub_ptr);
-	cms = ravenfs_mdata_get(sb, child_blk);
-	if (IS_ERR(cms)) {
+	RAVENFS_MDATA_SESSION_OPEN(cms, ravenfs_mdata_cache_of(sb), child_blk);
+	if (!RAVENFS_MDATA_SESSION_VALID(cms)) {
 		ret = PTR_ERR(cms);
-		cms = NULL;
 		goto out;
 	}
-	cm = ravenfs_msession_node(cms);
+	cm = RAVENFS_MDATA_SESSION_DATA(cms);
 	ret = rfs_meta_ok(cm, &cc, &ci, &cr, &cp);
 	if (ret)
 		goto out;
@@ -600,13 +580,12 @@ static int rfs_node_balance(struct super_block *sb, u64 parent_blk, u32 idx, boo
 		nidx = idx - 1;
 	}
 	nblk = RFS_PTR_ADDR(pi->hints[nidx].sub_ptr);
-	nms = ravenfs_mdata_get(sb, nblk);
-	if (IS_ERR(nms)) {
+	RAVENFS_MDATA_SESSION_OPEN(nms, ravenfs_mdata_cache_of(sb), nblk);
+	if (!RAVENFS_MDATA_SESSION_VALID(nms)) {
 		ret = PTR_ERR(nms);
-		nms = NULL;
 		goto out;
 	}
-	nm = ravenfs_msession_node(nms);
+	nm = RAVENFS_MDATA_SESSION_DATA(nms);
 	ret = rfs_meta_ok(nm, &nc, &ni, &nr, &np);
 	if (ret)
 		goto out;
@@ -633,7 +612,7 @@ static int rfs_node_balance(struct super_block *sb, u64 parent_blk, u32 idx, boo
 				       nc * sizeof(struct ddentry_hint_t));
 			}
 			PP_SET_COUNT(&cnd->meta, total);
-			NODE_DIRTY(cms);
+			RAVENFS_MDATA_DIRTY(cms);
 			ret = rfs_reparent_children(sb, cnd, child_blk, (u32)total);
 			if (ret)
 				goto out;
@@ -649,12 +628,17 @@ static int rfs_node_balance(struct super_block *sb, u64 parent_blk, u32 idx, boo
 				nnext = RFS_PTR_ADDR(nnd->meta.ptrs[2]);
 				rfs_set_addr(&cnd->meta.ptrs[2], nnext);
 				if (nnext != (u64)RFS_MASK52) {
-					struct ravenfs_msession *x = ravenfs_mdata_get(sb, nnext);
+					RAVENFS_MDATA_SESSION(x,
+						ravenfs_mdata_cache_of(sb), nnext);
 
-					if (IS_ERR(x)) { ret = PTR_ERR(x); goto out; }
-					rfs_set_addr(&((struct Bptree_meta_t *)ravenfs_msession_node(x))->ptrs[1], child_blk);
-					NODE_DIRTY(x);
-					ravenfs_mdata_put(x);
+					if (!RAVENFS_MDATA_SESSION_VALID(x)) {
+						ret = PTR_ERR(x);
+						goto out;
+					}
+					rfs_set_addr(&((struct Bptree_meta_t *)
+						RAVENFS_MDATA_SESSION_DATA(x))->ptrs[1],
+						child_blk);
+					RAVENFS_MDATA_SESSION_DIRTY(x);
 				}
 			} else {
 				u64 nprev;
@@ -666,23 +650,27 @@ static int rfs_node_balance(struct super_block *sb, u64 parent_blk, u32 idx, boo
 				nprev = RFS_PTR_ADDR(nnd->meta.ptrs[1]);
 				rfs_set_addr(&cnd->meta.ptrs[1], nprev);
 				if (nprev != (u64)RFS_MASK52) {
-					struct ravenfs_msession *x = ravenfs_mdata_get(sb, nprev);
+					RAVENFS_MDATA_SESSION(x,
+						ravenfs_mdata_cache_of(sb), nprev);
 
-					if (IS_ERR(x)) { ret = PTR_ERR(x); goto out; }
-					rfs_set_addr(&((struct Bptree_meta_t *)ravenfs_msession_node(x))->ptrs[2], child_blk);
-					NODE_DIRTY(x);
-					ravenfs_mdata_put(x);
+					if (!RAVENFS_MDATA_SESSION_VALID(x)) {
+						ret = PTR_ERR(x);
+						goto out;
+					}
+					rfs_set_addr(&((struct Bptree_meta_t *)
+						RAVENFS_MDATA_SESSION_DATA(x))->ptrs[2],
+						child_blk);
+					RAVENFS_MDATA_SESSION_DIRTY(x);
 				}
 			}
 			PP_SET_COUNT(&cnd->meta, total);
 			memset(&cnd->entries[total], 0,
 			       (RFS_DENTRY_ORDER + 1 - total) * sizeof(struct ddentry_t));
-			NODE_DIRTY(cms);
+			RAVENFS_MDATA_DIRTY(cms);
 		}
 		/* 邻居内容已搬入 child → 丢弃其缓存行 + 释放块 */
-		ravenfs_mdata_put(nms);
-		nms = NULL;
-		ravenfs_mdata_drop(sb, nblk);
+		RAVENFS_MDATA_SESSION_RELEASE(nms);
+		ravenfs_mdata_drop(ravenfs_mdata_cache_of(sb), nblk);
 		(void)rfs_allocator_block_free(sbi->alloc, nblk, 2);
 
 		/* 父删 hint + 更新保留 hint 的 hash_max */
@@ -699,7 +687,7 @@ static int rfs_node_balance(struct super_block *sb, u64 parent_blk, u32 idx, boo
 			PP_SET_COUNT(&pi->meta, pcnt);
 			pi->hints[kept_after].hash_max =
 				rfs_node_max(ravenfs_msession_node(cms), is_inner, (u32)total);
-			NODE_DIRTY(pms);
+			RAVENFS_MDATA_DIRTY(pms);
 		}
 		if (!proot && pcnt < RFS_DENTRY_MIN)
 			*need = true;
@@ -739,8 +727,8 @@ static int rfs_node_balance(struct super_block *sb, u64 parent_blk, u32 idx, boo
 			PP_SET_COUNT(&r->meta, right);
 			memset(&l->hints[left], 0, (RFS_DENTRY_ORDER + 1 - left) * sizeof(struct ddentry_hint_t));
 			memset(&r->hints[right], 0, (RFS_DENTRY_ORDER + 1 - right) * sizeof(struct ddentry_hint_t));
-			NODE_DIRTY(lms);
-			NODE_DIRTY(rms);
+			RAVENFS_MDATA_DIRTY(lms);
+			RAVENFS_MDATA_DIRTY(rms);
 			ret = rfs_reparent_children(sb, l, lblk, left);
 			if (ret)
 				goto out;
@@ -769,32 +757,28 @@ static int rfs_node_balance(struct super_block *sb, u64 parent_blk, u32 idx, boo
 			PP_SET_COUNT(&r->meta, right);
 			memset(&l->entries[left], 0, (RFS_DENTRY_ORDER + 1 - left) * sizeof(struct ddentry_t));
 			memset(&r->entries[right], 0, (RFS_DENTRY_ORDER + 1 - right) * sizeof(struct ddentry_t));
-			NODE_DIRTY(lms);
-			NODE_DIRTY(rms);
+			RAVENFS_MDATA_DIRTY(lms);
+			RAVENFS_MDATA_DIRTY(rms);
 		}
 		pi->hints[idx].hash_max =
 			rfs_node_max(ravenfs_msession_node(cms), is_inner, child_left ? left : right);
 		pi->hints[nidx].hash_max =
 			rfs_node_max(ravenfs_msession_node(nms), is_inner, child_left ? right : left);
-		NODE_DIRTY(pms);
+		RAVENFS_MDATA_DIRTY(pms);
 		*need = false;
 	}
 
 out:
-	if (nms)
-		ravenfs_mdata_put(nms);
-	if (cms)
-		ravenfs_mdata_put(cms);
-	ravenfs_mdata_put(pms);
-	return ret;
+	return ret;	/* pms/cms/nms 由 cleanup 按 LIFO 自动 put */
 }
 
 /* 根收缩：根（内）只剩 1 孩时，把唯一孩子提升为新根（读 dir inode 的 data_root） */
 static int rfs_root_shrink(struct super_block *sb, u64 dir_ino)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, dir_ino);
-	struct ravenfs_msession *rms, *cms = NULL;
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = ravenfs_inode_session_get(sb, dir_ino);
+	RAVENFS_MDATA_SESSION_NULL(rms);
+	RAVENFS_MDATA_SESSION_NULL(cms);
 	struct Bptree_meta_t *rm, *cm;
 	u64 root_blk, child_blk;
 	u32 rc, rin, rrt, cc, ci, crr;
@@ -803,13 +787,13 @@ static int rfs_root_shrink(struct super_block *sb, u64 dir_ino)
 
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
-	root_blk = ravenfs_session_inode(ds)->data_root;
+	root_blk = ravenfs_inode_session_record(ds)->data_root;
 	if (root_blk == (u64)PTR_INVALID)
 		return -EIO;
-	rms = ravenfs_mdata_get(sb, root_blk);
-	if (IS_ERR(rms))
+	RAVENFS_MDATA_SESSION_OPEN(rms, ravenfs_mdata_cache_of(sb), root_blk);
+	if (!RAVENFS_MDATA_SESSION_VALID(rms))
 		return PTR_ERR(rms);
-	rm = ravenfs_msession_node(rms);
+	rm = RAVENFS_MDATA_SESSION_DATA(rms);
 	err = rfs_meta_ok(rm, &rc, &rin, &rrt, &rp);
 	if (err)
 		goto out;
@@ -817,13 +801,12 @@ static int rfs_root_shrink(struct super_block *sb, u64 dir_ino)
 		goto out;
 
 	child_blk = RFS_PTR_ADDR(((struct Bptree_ddentry_inner_node_t *)rm)->hints[0].sub_ptr);
-	cms = ravenfs_mdata_get(sb, child_blk);
-	if (IS_ERR(cms)) {
+	RAVENFS_MDATA_SESSION_OPEN(cms, ravenfs_mdata_cache_of(sb), child_blk);
+	if (!RAVENFS_MDATA_SESSION_VALID(cms)) {
 		err = PTR_ERR(cms);
-		cms = NULL;
 		goto out;
 	}
-	cm = ravenfs_msession_node(cms);
+	cm = RAVENFS_MDATA_SESSION_DATA(cms);
 	err = rfs_meta_ok(cm, &cc, &ci, &crr, &cp);
 	if (err || crr) {
 		err = err ? err : -EIO;
@@ -841,18 +824,15 @@ static int rfs_root_shrink(struct super_block *sb, u64 dir_ino)
 
 		rfs_set_addr(&cin->meta.ptrs[1], RFS_PTR_ADDR(rm->ptrs[1]));	/* ".." 继承自旧根 */
 	}
-	NODE_DIRTY(cms);
+	RAVENFS_MDATA_DIRTY(cms);
 
-	ravenfs_session_inode(ds)->data_root = child_blk;
-	RFS_ROW_MARK_DIRTY(ds->row);
+	ravenfs_inode_session_record(ds)->data_root = child_blk;
+	RAVENFS_MDATA_DIRTY(ds->mdata_session);
 
-	ravenfs_mdata_drop(sb, root_blk);
+	ravenfs_mdata_drop(ravenfs_mdata_cache_of(sb), root_blk);
 	(void)rfs_allocator_block_free(sbi->alloc, root_blk, 2);
 out:
-	if (cms)
-		ravenfs_mdata_put(cms);
-	ravenfs_mdata_put(rms);
-	return err;
+	return err;	/* rms/cms 由 cleanup 按 LIFO 自动 put */
 }
 
 /* 欠载上溯：从叶的父层一路 balance；收尾统一尝试根收缩。返回 <0 错误 */

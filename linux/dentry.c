@@ -18,7 +18,7 @@
  *   R-NS-01 lookup（hash 引导下行 + d_splice_alias）
  *   R-NS-11 iterate_shared（cookie = (叶块号, 槽) 编码 + 叶链续读；`. `/`..` 由 VFS 合成）
  *
- * 结构真值：include/disk_struct_v1.2.h；参考 `tools/audit_v1.2/audit_v1.2.cpp`
+ * 结构真值：include/disk_struct_v2.0.h
  * （已验证的 v1.2 走树/名字堆读逻辑，其读侧移植随三分拆分入 dentry_tree/node.c）。
  *
  * 【实现边界（readdir 管线）】
@@ -44,8 +44,7 @@
 #include "ravenfs_iomap.h"
 #include "ravenfs_dentry_tree.h"
 #include "ravenfs_dentry_node.h"
-#include "ravenfs_cache.h"
-#include "ravenfs_mdata_cache.h"
+#include "ravenfs_inode_session.h"
 #include "ravenfs_allocator_top.h"
 #include "ravenfs_name_data_plane.h"
 #include "ravenfs_xattr.h"
@@ -67,11 +66,11 @@ unsigned int ravenfs_type_dt(u32 type)
 /* d_type 探测：经 disk_inode_cache_mgr 取盘记录（缓存命中即零盘读，§4.11.1） */
 static unsigned int ravenfs_dt(struct super_block *sb, u64 inum)
 {
-	struct ravenfs_session *ses __free(ravenfs_session) = ravenfs_session_get(sb, inum);
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = ravenfs_inode_session_get(sb, inum);
 
 	if (IS_ERR_OR_NULL(ses))
 		return DT_UNKNOWN;
-	return ravenfs_type_dt(RFS_INO1_GET_TYPE(ravenfs_session_inode(ses)->word1));
+	return ravenfs_type_dt(RFS_INO1_GET_TYPE(ravenfs_inode_session_record(ses)->word1));
 }
 
 /* ── lookup：hash 引导下行到叶，再按 (hash,name) 精确匹配 ── */
@@ -81,8 +80,8 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 {
 	struct super_block *sb = dir->i_sb;
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
-	struct ravenfs_session *ts __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = NULL;
+	struct ravenfs_inode_session *ts __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *dr, *tr;
 	struct rfs_dpath path;
 	struct timespec64 now;
@@ -98,10 +97,10 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (!S_ISDIR(dir->i_mode))
 		return -ENOTDIR;
 
-	ds = ravenfs_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
+	ds = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
-	dr = ravenfs_session_inode(ds);
+	dr = ravenfs_inode_session_record(ds);
 	if (RFS_INO1_GET_TYPE(dr->word1) != INODE_TYPE_DIR)
 		return -ENOTDIR;
 	root_blk = dr->data_root;
@@ -123,12 +122,12 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		RFS_STAT_INC(sb, err_enospc);
 		return -ENOSPC;
 	}
-	ts = ravenfs_session_get(sb, inum);
+	ts = ravenfs_inode_session_get(sb, inum);
 	if (IS_ERR(ts)) {
 		rfs_allocator_inode_free(sbi->alloc, inum);
 		return PTR_ERR(ts);
 	}
-	tr = ravenfs_session_inode(ts);
+	tr = ravenfs_inode_session_record(ts);
 	now = current_time(dir);
 	memset(tr, 0, RAVENFS_INODE_SIZE);
 	tr->word1 = RFS_INO1_PACK(INODE_TYPE_REGULAR, 0, 0);
@@ -144,7 +143,7 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	tr->c_ns_stamp = (u32)now.tv_nsec;
 	tr->atime = now.tv_sec;
 	tr->a_ns_stamp = (u32)now.tv_nsec;
-	RFS_ROW_MARK_DIRTY(ts->row);
+	RAVENFS_MDATA_DIRTY(ts->mdata_session);
 
 	/* 长名（>40B）：尾段外置到所属目录名字数据面（逻辑偏移，物理经映射树解析） */
 	if (nlen > DENTRY_INLINE_NAME_MAX) {
@@ -182,7 +181,7 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
 	dr->c_ns_stamp = (u32)now.tv_nsec;
-	RFS_ROW_MARK_DIRTY(ds->row);
+	RAVENFS_MDATA_DIRTY(ds->mdata_session);
 	dir->i_size = dr->size;
 	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
 	inode_set_ctime(dir, now.tv_sec, now.tv_nsec);
@@ -205,7 +204,7 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 {
 	struct super_block *sb = dir->i_sb;
 	struct inode *inode = d_inode(dentry);
-	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *dr;
 	struct rfs_dpath path;
 	struct rfs_delinfo di;
@@ -217,10 +216,10 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 	RFS_STAT_INC(sb, op_unlink);
 	if (nlen == 0 || nlen > RAVENFS_MAX_NAME_LEN)
 		return -ENAMETOOLONG;
-	ds = ravenfs_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
+	ds = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
-	dr = ravenfs_session_inode(ds);
+	dr = ravenfs_inode_session_record(ds);
 	root_blk = dr->data_root;
 	if (root_blk == (u64)PTR_INVALID)
 		return -EIO;
@@ -247,7 +246,7 @@ int ravenfs_unlink(struct inode *dir, struct dentry *dentry)
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
 	dr->c_ns_stamp = (u32)now.tv_nsec;
-	RFS_ROW_MARK_DIRTY(ds->row);
+	RAVENFS_MDATA_DIRTY(ds->mdata_session);
 	dir->i_size = dr->size;
 	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
 	inode_set_ctime(dir, now.tv_sec, now.tv_nsec);
@@ -286,8 +285,8 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 {
 	struct super_block *sb = dir->i_sb;
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
-	struct ravenfs_session *ts __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = NULL;
+	struct ravenfs_inode_session *ts __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *dr, *tr;
 	struct raven_dir_Inode_t *dtr;
 	struct rfs_dpath path;
@@ -304,10 +303,10 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (!S_ISDIR(dir->i_mode))
 		return ERR_PTR(-ENOTDIR);
 
-	ds = ravenfs_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
+	ds = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
 	if (IS_ERR(ds))
 		return ERR_CAST(ds);
-	dr = ravenfs_session_inode(ds);
+	dr = ravenfs_inode_session_record(ds);
 	if (RFS_INO1_GET_TYPE(dr->word1) != INODE_TYPE_DIR)
 		return ERR_PTR(-ENOTDIR);
 	root_blk = dr->data_root;
@@ -343,13 +342,13 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		return ERR_PTR(err);
 	}
 
-	ts = ravenfs_session_get(sb, inum);
+	ts = ravenfs_inode_session_get(sb, inum);
 	if (IS_ERR(ts)) {
 		(void)rfs_allocator_block_free(sbi->alloc, new_root, 2);
 		rfs_allocator_inode_free(sbi->alloc, inum);
 		return ERR_CAST(ts);
 	}
-	tr = ravenfs_session_inode(ts);
+	tr = ravenfs_inode_session_record(ts);
 	now = current_time(dir);
 	memset(tr, 0, RAVENFS_INODE_SIZE);
 	tr->word1 = RFS_INO1_PACK(INODE_TYPE_DIR, 0, 0);
@@ -372,7 +371,7 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	dtr->name_data_free_ranges_ctl = RFS_ND_FR_CTL_INACTIVE;
 	dtr->name_data_free_ranges_count = 0;
 	memset(dtr->possible_inline_free_ranges, 0, sizeof(dtr->possible_inline_free_ranges));
-	RFS_ROW_MARK_DIRTY(ts->row);
+	RAVENFS_MDATA_DIRTY(ts->mdata_session);
 
 	if (nlen > DENTRY_INLINE_NAME_MAX) {
 		u16 tlen = (u16)(nlen - DENTRY_INLINE_NAME_MAX);
@@ -405,7 +404,7 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
 	dr->c_ns_stamp = (u32)now.tv_nsec;
-	RFS_ROW_MARK_DIRTY(ds->row);
+	RAVENFS_MDATA_DIRTY(ds->mdata_session);
 	dir->i_size = dr->size;
 	set_nlink(dir, dr->link_count);
 	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
@@ -427,7 +426,7 @@ fail_root:
 	if (nlen > DENTRY_INLINE_NAME_MAX && remain_ptr != (u64)PTR_INVALID)
 		ravenfs_nd_free(sb, RFS_INO_TO_IDX(dir->i_ino), remain_ptr,
 				(u16)(nlen - DENTRY_INLINE_NAME_MAX));
-	ravenfs_mdata_drop(sb, new_root);
+	ravenfs_mdata_drop(ravenfs_mdata_cache_of(sb), new_root);
 	(void)rfs_allocator_block_free(sbi->alloc, new_root, 2);
 	ravenfs_inode_reclaim(sb, inum);
 	return ERR_PTR(err);
@@ -443,8 +442,8 @@ int ravenfs_rmdir(struct inode *dir, struct dentry *dentry)
 	struct super_block *sb = dir->i_sb;
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
 	struct inode *target = d_inode(dentry);
-	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
-	struct ravenfs_session *ts __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = NULL;
+	struct ravenfs_inode_session *ts __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *dr, *tr;
 	struct rfs_dpath path;
 	struct rfs_delinfo di;
@@ -459,19 +458,19 @@ int ravenfs_rmdir(struct inode *dir, struct dentry *dentry)
 	if (!target || !S_ISDIR(target->i_mode))
 		return -ENOTDIR;
 
-	ds = ravenfs_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
+	ds = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
-	dr = ravenfs_session_inode(ds);
+	dr = ravenfs_inode_session_record(ds);
 	root_blk = dr->data_root;
 	if (root_blk == (u64)PTR_INVALID)
 		return -EIO;
 
 	/* 盘上判空（零副作用：失败前不碰树） */
-	ts = ravenfs_session_get(sb, RFS_INO_TO_IDX(target->i_ino));
+	ts = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(target->i_ino));
 	if (IS_ERR(ts))
 		return PTR_ERR(ts);
-	tr = ravenfs_session_inode(ts);
+	tr = ravenfs_inode_session_record(ts);
 	if (RFS_INO1_GET_TYPE(tr->word1) != INODE_TYPE_DIR)
 		return -EINVAL;
 	if (tr->size != 0)
@@ -499,7 +498,7 @@ int ravenfs_rmdir(struct inode *dir, struct dentry *dentry)
 
 	/* 目标目录资源回收：名字数据面（全归还）→ 树根 2 块 */
 	ravenfs_nd_release(sb, RFS_INO_TO_IDX(target->i_ino));
-	ravenfs_mdata_drop(sb, t_root);
+	ravenfs_mdata_drop(ravenfs_mdata_cache_of(sb), t_root);
 	(void)rfs_allocator_block_free(sbi->alloc, t_root, 2);
 
 	now = current_time(dir);
@@ -511,7 +510,7 @@ int ravenfs_rmdir(struct inode *dir, struct dentry *dentry)
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
 	dr->c_ns_stamp = (u32)now.tv_nsec;
-	RFS_ROW_MARK_DIRTY(ds->row);
+	RAVENFS_MDATA_DIRTY(ds->mdata_session);
 	dir->i_size = dr->size;
 	set_nlink(dir, dr->link_count);
 	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
@@ -539,13 +538,13 @@ int ravenfs_rmdir(struct inode *dir, struct dentry *dentry)
  */
 static int rfs_dir_adjust(struct super_block *sb, struct inode *dir, int size_delta, int nlink_delta)
 {
-	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
 	struct raven_Inode_t *dr;
 	struct timespec64 now;
 
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
-	dr = ravenfs_session_inode(ds);
+	dr = ravenfs_inode_session_record(ds);
 	RFS_STAT_INC(sb, dir_nlink_adjust);	/* nlink 维护频次 */
 	dr->size = (u64)((s64)dr->size + size_delta);
 	dr->link_count = (u32)((s64)dr->link_count + nlink_delta);
@@ -554,7 +553,7 @@ static int rfs_dir_adjust(struct super_block *sb, struct inode *dir, int size_de
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
 	dr->c_ns_stamp = (u32)now.tv_nsec;
-	RFS_ROW_MARK_DIRTY(ds->row);
+	RAVENFS_MDATA_DIRTY(ds->mdata_session);
 	dir->i_size = dr->size;
 	set_nlink(dir, dr->link_count);
 	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
@@ -566,11 +565,11 @@ static int rfs_dir_adjust(struct super_block *sb, struct inode *dir, int size_de
 /* 目录是否为空（盘上 size==0；不用 dcache） */
 static int rfs_dir_is_empty(struct super_block *sb, struct inode *d)
 {
-	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, RFS_INO_TO_IDX(d->i_ino));
+	struct ravenfs_inode_session *s __free(ravenfs_inode_session) = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(d->i_ino));
 
 	if (IS_ERR(s))
 		return PTR_ERR(s);
-	return ravenfs_session_inode(s)->size == 0;
+	return ravenfs_inode_session_record(s)->size == 0;
 }
 
 int ravenfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
@@ -672,15 +671,15 @@ int ravenfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry
 		if (err)
 			return err;
 		if (new_is_dir) {
-			struct ravenfs_session *t __free(ravenfs_session) =
-				ravenfs_session_get(sb, RFS_INO_TO_IDX(new_inode->i_ino));
+			struct ravenfs_inode_session *t __free(ravenfs_inode_session) =
+				ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(new_inode->i_ino));
 			u64 troot = (u64)PTR_INVALID;
 
 			if (!IS_ERR(t))
-				troot = ravenfs_session_inode(t)->data_root;
+				troot = ravenfs_inode_session_record(t)->data_root;
 			ravenfs_nd_release(sb, RFS_INO_TO_IDX(new_inode->i_ino));
 			if (troot != (u64)PTR_INVALID) {
-				ravenfs_mdata_drop(sb, troot);
+				ravenfs_mdata_drop(ravenfs_mdata_cache_of(sb), troot);
 				(void)rfs_allocator_block_free(sbi->alloc, troot, 2);
 			}
 			clear_nlink(new_inode);
@@ -759,7 +758,7 @@ out_heap:
 /* ══════════════════════════════════════════════════════════════════
  * M5 残（R-NS-05/06/07/09）：link / symlink+get_link / mknod / tmpfile
  * 规格：不变量 17–21（link_count 契约、link(2) 前置、先删 dentry 后计数）；
- *   disk_layout_v1.2_inode.md §3/§4（type 值域、rdev@inline_data[0:4] 小端 u32）；
+ *   disk_layout_v2.0.md §8（type 值域、rdev@inline_data[0:4] 小端 u32）；
  *   ko-requirements-spec §4.3（get_link fast/slow 双态）。
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -770,7 +769,7 @@ out_heap:
 static int rfs_dir_link_inode(struct super_block *sb, struct inode *dir,
 			      const struct dentry *dentry, u64 inum)
 {
-	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *dr;
 	struct rfs_dpath path;
 	struct timespec64 now;
@@ -781,10 +780,10 @@ static int rfs_dir_link_inode(struct super_block *sb, struct inode *dir,
 
 	if (nlen == 0 || nlen > RAVENFS_MAX_NAME_LEN)
 		return -ENAMETOOLONG;
-	ds = ravenfs_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
+	ds = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
-	dr = ravenfs_session_inode(ds);
+	dr = ravenfs_inode_session_record(ds);
 	if (RFS_INO1_GET_TYPE(dr->word1) != INODE_TYPE_DIR)
 		return -ENOTDIR;
 
@@ -823,7 +822,7 @@ static int rfs_dir_link_inode(struct super_block *sb, struct inode *dir,
 	dr->m_ns_stamp = (u32)now.tv_nsec;
 	dr->ctime = now.tv_sec;
 	dr->c_ns_stamp = (u32)now.tv_nsec;
-	RFS_ROW_MARK_DIRTY(ds->row);
+	RAVENFS_MDATA_DIRTY(ds->mdata_session);
 	dir->i_size = dr->size;
 	set_nlink(dir, dr->link_count);
 	inode_set_mtime(dir, now.tv_sec, now.tv_nsec);
@@ -838,7 +837,7 @@ static int rfs_new_inode_record(struct super_block *sb, struct inode *dir, u32 t
 				umode_t mode, dev_t rdev, u64 *inum_out)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_session *ts __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ts __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *tr;
 	struct timespec64 now;
 	u64 inum;
@@ -848,12 +847,12 @@ static int rfs_new_inode_record(struct super_block *sb, struct inode *dir, u32 t
 		inum = (u64)PTR_INVALID;
 	if (inum == (u64)PTR_INVALID)
 		return -ENOSPC;
-	ts = ravenfs_session_get(sb, inum);
+	ts = ravenfs_inode_session_get(sb, inum);
 	if (IS_ERR(ts)) {
 		rfs_allocator_inode_free(sbi->alloc, inum);
 		return PTR_ERR(ts);
 	}
-	tr = ravenfs_session_inode(ts);
+	tr = ravenfs_inode_session_record(ts);
 	now = current_time(dir);
 	memset(tr, 0, RAVENFS_INODE_SIZE);
 	tr->word1 = RFS_INO1_PACK(type, 0, 0);
@@ -876,7 +875,7 @@ static int rfs_new_inode_record(struct super_block *sb, struct inode *dir, u32 t
 
 		memcpy(tr->inline_data + RFS_INODE_RDEV_OFF, &rdev_le, sizeof(rdev_le));
 	}
-	RFS_ROW_MARK_DIRTY(ts->row);
+	RAVENFS_MDATA_DIRTY(ts->mdata_session);
 	*inum_out = inum;
 	return 0;
 }
@@ -887,7 +886,7 @@ int ravenfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *de
 {
 	struct inode *inode = d_inode(old_dentry);
 	struct super_block *sb = dir->i_sb;
-	struct ravenfs_session *ts __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ts __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *tr;
 	struct timespec64 now;
 	int err;
@@ -907,10 +906,10 @@ int ravenfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *de
 		return -EPERM;
 
 	/* 不变量 19 前置：源已分配、type ≠ DIR、link_count < UINT32_MAX */
-	ts = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+	ts = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ts))
 		return PTR_ERR(ts);
-	tr = ravenfs_session_inode(ts);
+	tr = ravenfs_inode_session_record(ts);
 	if (RFS_INO1_GET_TYPE(tr->word1) == INODE_TYPE_DIR)
 		return -EPERM;
 	if (tr->link_count >= (u32)-1)
@@ -926,7 +925,7 @@ int ravenfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *de
 	now = current_time(inode);
 	tr->ctime = now.tv_sec;
 	tr->c_ns_stamp = (u32)now.tv_nsec;
-	RFS_ROW_MARK_DIRTY(ts->row);
+	RAVENFS_MDATA_DIRTY(ts->mdata_session);
 
 	inode_inc_link_count(inode);
 	inode_set_ctime(inode, now.tv_sec, now.tv_nsec);
@@ -995,7 +994,7 @@ int ravenfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		    struct dentry *dentry, const char *symname)
 {
 	struct super_block *sb = dir->i_sb;
-	struct ravenfs_session *ts __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ts __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *tr;
 	struct inode *inode;
 	u32 len = (u32)strlen(symname);
@@ -1020,16 +1019,16 @@ int ravenfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 
 	/* fast：target 内联入盘记录（不变量 22：size ≤ 160 ⇒ inline） */
 	if (len <= RAVENFS_SYMLINK_INLINE_MAX) {
-		ts = ravenfs_session_get(sb, inum);
+		ts = ravenfs_inode_session_get(sb, inum);
 		if (IS_ERR(ts)) {
 			ravenfs_inode_reclaim(sb, inum);
 			return PTR_ERR(ts);
 		}
-		tr = ravenfs_session_inode(ts);
+		tr = ravenfs_inode_session_record(ts);
 		memcpy(tr->inline_data, symname, len);
 		tr->size = len;
-		RFS_ROW_MARK_DIRTY(ts->row);
-		ravenfs_session_put(ts);
+		RAVENFS_MDATA_DIRTY(ts->mdata_session);
+		ravenfs_inode_session_put(ts);
 		ts = NULL;
 	}
 
@@ -1229,7 +1228,7 @@ int ravenfs_iterate(struct file *file, struct dir_context *ctx)
 	struct inode *dir = file_inode(file);
 	struct super_block *sb = dir->i_sb;
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_session *ses __free(ravenfs_session) = ravenfs_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(dir->i_ino));
 	void *buf;
 	u64 blk, nxt, guard;
 	u32 cnt, from = 0;
@@ -1259,7 +1258,7 @@ int ravenfs_iterate(struct file *file, struct dir_context *ctx)
 		if (from > cnt)
 			from = cnt;
 	} else {
-		err = ravenfs_leftmost_leaf(sb, ravenfs_session_inode(ses)->data_root, &blk);
+		err = ravenfs_leftmost_leaf(sb, ravenfs_inode_session_record(ses)->data_root, &blk);
 		if (err) { kfree(buf); return err; }
 		if (ravenfs_read_leaf(sb, blk, buf, &cnt)) { kfree(buf); return -EIO; }
 	}

@@ -8,10 +8,12 @@
  *
  * 内核适配要点（⚠️ 与 god 的差异）：
  *   · god 直接开 `InodeSession` / `mdata_piece_session`；ko 统一走
- *     `ravenfs_session_get` / `ravenfs_mdata_get`。
+ *     `ravenfs_inode_session_get` / 核心 `ravenfs_mdata_get`。
  *   · fr 层（`rfs_ndfr_*`）零直接 I/O：节点 pin/alloc 经注入 ops vtable。
- *     本文件是**内核侧 ops shim**：node_pin/node_unpin 包 `ravenfs_mdata_get/put`
- *     （dirty 经 NODE_DIRTY 标脏），node_alloc/node_free 包运行时树分配器。
+ *     本文件是**内核侧 ops shim**：node_pin/node_unpin 包
+ *     核心 RAII 会话宏 `RAVENFS_MDATA_SESSION()`（作用域退出自动 put；
+ *     dirty 经 `RAVENFS_MDATA_SESSION_DIRTY()` 标脏），
+ *     node_alloc/node_free 包运行时树分配器。
  *     fr 可能**同时** pin 多枚不同节点（叶裂级联 / free_tree 沿树高），故 host
  *     持一个按 blk 去重的定长并发 pin 表；超限或同块双 pin 干净失败。
  *   · god 的 4K 块读写 → 本文件用 mdata 8K 片 read-modify-write（字节粒度，
@@ -26,8 +28,7 @@
 #include <linux/timekeeping.h>
 
 #include "ravenfs.h"
-#include "ravenfs_cache.h"
-#include "ravenfs_mdata_cache.h"
+#include "ravenfs_inode_session.h"
 #include "ravenfs_allocator_top.h"
 #include "ravenfs_extent.h"
 #include "ravenfs_name_data_freeranges.h"
@@ -61,7 +62,7 @@ static void nd_host_fini(struct rfs_nd_host *h)
 {
 	while (h->nr > 0) {
 		h->nr--;
-		ravenfs_mdata_put(h->pins[h->nr].ms);
+		RAVENFS_MDATA_SESSION_RELEASE(h->pins[h->nr].ms);
 	}
 }
 
@@ -83,21 +84,23 @@ static struct ravenfs_msession *nd_host_find(struct rfs_nd_host *h, u64 blk,
 static void *nd_node_pin(void *host, u64 blk, bool *err)
 {
 	struct rfs_nd_host *h = host;
-	struct ravenfs_msession *ms;
+	void *node;
 
 	if (h->nr >= RFS_ND_MAX_PINS || nd_host_find(h, blk, NULL)) {
 		*err = true;			/* 超限 / 同块双 pin：干净失败 */
 		return NULL;
 	}
-	ms = ravenfs_mdata_get(h->sb, blk);
-	if (IS_ERR(ms)) {
+	RAVENFS_MDATA_SESSION(ms, ravenfs_mdata_cache_of(h->sb), blk);
+	if (!RAVENFS_MDATA_SESSION_VALID(ms)) {
 		*err = true;
 		return NULL;
 	}
+	node = RAVENFS_MDATA_SESSION_DATA(ms);
 	h->pins[h->nr].blk = blk;
 	h->pins[h->nr].ms = ms;
 	h->nr++;
-	return ravenfs_msession_node(ms);
+	RAVENFS_MDATA_SESSION_DISARM(ms);	/* 所有权转交 pin 表 */
+	return node;
 }
 
 static void nd_node_unpin(void *host, u64 blk, void *node, bool dirty)
@@ -110,11 +113,11 @@ static void nd_node_unpin(void *host, u64 blk, void *node, bool dirty)
 	if (!ms)
 		return;
 	if (dirty)
-		NODE_DIRTY(ms);
+		RAVENFS_MDATA_DIRTY(ms);
 	if (idx != h->nr - 1)			/* 乱序 unpin：尾部补位 */
 		h->pins[idx] = h->pins[h->nr - 1];
 	h->nr--;
-	ravenfs_mdata_put(ms);
+	RAVENFS_MDATA_SESSION_RELEASE(ms);
 }
 
 static u64 nd_node_alloc(void *host, bool *err)
@@ -135,7 +138,7 @@ static int nd_node_free(void *host, u64 blk)
 	struct rfs_nd_host *h = host;
 	struct ravenfs_sb_info *sbi = h->sb->s_fs_info;
 
-	ravenfs_mdata_drop(h->sb, blk);		/* 防陈旧脏行回写污染复用块 */
+	ravenfs_mdata_drop(ravenfs_mdata_cache_of(h->sb), blk);	/* 防陈旧脏行回写污染复用块 */
 	return rfs_allocator_block_free(sbi->alloc, blk, 2);
 }
 
@@ -183,13 +186,12 @@ static int nd_read_bytes(struct super_block *sb, u64 fs_blk, u32 off,
 		u64 piece = fs_blk & ~1ULL;
 		u32 in_piece = (u32)((fs_blk - piece) * RAVENFS_BLOCK_SIZE + off);
 		u32 n;
-		struct ravenfs_msession *ms __free(ravenfs_msession) =
-			ravenfs_mdata_get(sb, piece);
+		RAVENFS_MDATA_SESSION(ms, ravenfs_mdata_cache_of(sb), piece);
 
-		if (IS_ERR(ms))
+		if (!RAVENFS_MDATA_SESSION_VALID(ms))
 			return PTR_ERR(ms);
 		n = min_t(u32, len, RAVENFS_MDATA_NODE_BYTES - in_piece);
-		memcpy(p, (char *)ravenfs_msession_node(ms) + in_piece, n);
+		memcpy(p, (char *)RAVENFS_MDATA_SESSION_DATA(ms) + in_piece, n);
 		p += n;
 		len -= n;
 		if (in_piece + n >= RAVENFS_MDATA_NODE_BYTES) {
@@ -212,14 +214,13 @@ static int nd_write_bytes(struct super_block *sb, u64 fs_blk, u32 off,
 		u64 piece = fs_blk & ~1ULL;
 		u32 in_piece = (u32)((fs_blk - piece) * RAVENFS_BLOCK_SIZE + off);
 		u32 n;
-		struct ravenfs_msession *ms __free(ravenfs_msession) =
-			ravenfs_mdata_get(sb, piece);
+		RAVENFS_MDATA_SESSION(ms, ravenfs_mdata_cache_of(sb), piece);
 
-		if (IS_ERR(ms))
+		if (!RAVENFS_MDATA_SESSION_VALID(ms))
 			return PTR_ERR(ms);
 		n = min_t(u32, len, RAVENFS_MDATA_NODE_BYTES - in_piece);
-		memcpy((char *)ravenfs_msession_node(ms) + in_piece, p, n);
-		NODE_DIRTY(ms);
+		memcpy((char *)RAVENFS_MDATA_SESSION_DATA(ms) + in_piece, p, n);
+		RAVENFS_MDATA_SESSION_DIRTY(ms);
 		p += n;
 		len -= n;
 		if (in_piece + n >= RAVENFS_MDATA_NODE_BYTES) {
@@ -392,20 +393,20 @@ static int nd_grow_core(struct super_block *sb, u64 dir_idx,
 
 int ravenfs_nd_grow(struct super_block *sb, u64 dir_idx)
 {
-	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = NULL;
 	struct raven_dir_Inode_t *dino;
 	int rc;
 
-	ds = ravenfs_session_get(sb, dir_idx);
+	ds = ravenfs_inode_session_get(sb, dir_idx);
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
-	dino = (struct raven_dir_Inode_t *)ravenfs_session_inode(ds);
+	dino = (struct raven_dir_Inode_t *)ravenfs_inode_session_record(ds);
 	if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR)
 		return -EINVAL;
 
 	rc = nd_grow_core(sb, dir_idx, dino);
 	if (rc == 0)
-		RFS_ROW_MARK_DIRTY(ds->row);
+		RAVENFS_MDATA_DIRTY(ds->mdata_session);
 	return rc;
 }
 
@@ -417,7 +418,7 @@ int ravenfs_nd_alloc(struct super_block *sb, u64 dir_idx, u16 tail_len,
 		     u64 *out_offset)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = NULL;
 	struct raven_dir_Inode_t *dino;
 	struct rfs_nd_host host;
 	struct rfs_ndfr_ctx ctx;
@@ -427,10 +428,10 @@ int ravenfs_nd_alloc(struct super_block *sb, u64 dir_idx, u16 tail_len,
 	if (!out_offset || tail_len == 0 || tail_len > 512)
 		return -EINVAL;
 
-	ds = ravenfs_session_get(sb, dir_idx);
+	ds = ravenfs_inode_session_get(sb, dir_idx);
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
-	dino = (struct raven_dir_Inode_t *)ravenfs_session_inode(ds);
+	dino = (struct raven_dir_Inode_t *)ravenfs_inode_session_record(ds);
 	if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR)
 		return -EINVAL;
 
@@ -462,7 +463,7 @@ int ravenfs_nd_alloc(struct super_block *sb, u64 dir_idx, u16 tail_len,
 
 		rc = rfs_ndfr_take_fit(&ctx, dino, tail_len, &off);
 		if (rc == 0) {
-			RFS_ROW_MARK_DIRTY(ds->row);
+			RAVENFS_MDATA_DIRTY(ds->mdata_session);
 			*out_offset = off;
 			goto out;
 		}
@@ -482,7 +483,7 @@ int ravenfs_nd_alloc(struct super_block *sb, u64 dir_idx, u16 tail_len,
 		rc = rfs_ndfr_insert(&ctx, dino, L + tail_len, 8192 - tail_len);
 		if (rc)
 			goto out;	/* 已增长片：上报（记账偏差，不悬挂） */
-		RFS_ROW_MARK_DIRTY(ds->row);
+		RAVENFS_MDATA_DIRTY(ds->mdata_session);
 		*out_offset = L;
 	}
 out:
@@ -493,7 +494,7 @@ out:
 /* ══════════════════════ name_data_free ══════════════════════ */
 int ravenfs_nd_free(struct super_block *sb, u64 dir_idx, u64 offset, u16 tail_len)
 {
-	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = NULL;
 	struct raven_dir_Inode_t *dino;
 	struct rfs_nd_host host;
 	struct rfs_ndfr_ctx ctx;
@@ -503,10 +504,10 @@ int ravenfs_nd_free(struct super_block *sb, u64 dir_idx, u64 offset, u16 tail_le
 	if (tail_len == 0)
 		return 0;
 
-	ds = ravenfs_session_get(sb, dir_idx);
+	ds = ravenfs_inode_session_get(sb, dir_idx);
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
-	dino = (struct raven_dir_Inode_t *)ravenfs_session_inode(ds);
+	dino = (struct raven_dir_Inode_t *)ravenfs_inode_session_record(ds);
 	if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR)
 		return -EINVAL;
 
@@ -514,7 +515,7 @@ int ravenfs_nd_free(struct super_block *sb, u64 dir_idx, u64 offset, u16 tail_le
 	nd_fr_ctx_init(&ctx, &host, dir_idx);
 	rc = rfs_ndfr_insert(&ctx, dino, offset, tail_len);
 	if (rc == 0)
-		RFS_ROW_MARK_DIRTY(ds->row);
+		RAVENFS_MDATA_DIRTY(ds->mdata_session);
 	nd_host_fini(&host);
 	return rc;
 }
@@ -523,7 +524,7 @@ int ravenfs_nd_free(struct super_block *sb, u64 dir_idx, u64 offset, u16 tail_le
 int ravenfs_nd_read(struct super_block *sb, u64 dir_idx, u64 offset, u16 tail_len,
 		    char *out)
 {
-	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = NULL;
 	struct raven_dir_Inode_t *dino;
 	u64 fblk = 0;
 	u16 off = 0;
@@ -533,10 +534,10 @@ int ravenfs_nd_read(struct super_block *sb, u64 dir_idx, u64 offset, u16 tail_le
 	if (!out || tail_len == 0 || tail_len > 512)
 		return -EINVAL;
 
-	ds = ravenfs_session_get(sb, dir_idx);
+	ds = ravenfs_inode_session_get(sb, dir_idx);
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
-	dino = (struct raven_dir_Inode_t *)ravenfs_session_inode(ds);
+	dino = (struct raven_dir_Inode_t *)ravenfs_inode_session_record(ds);
 	if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR)
 		return -EINVAL;
 
@@ -549,7 +550,7 @@ int ravenfs_nd_read(struct super_block *sb, u64 dir_idx, u64 offset, u16 tail_le
 int ravenfs_nd_write(struct super_block *sb, u64 dir_idx, u64 offset, u16 tail_len,
 		     const char *tail)
 {
-	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = NULL;
 	struct raven_dir_Inode_t *dino;
 	u64 fblk = 0;
 	u16 off = 0;
@@ -559,10 +560,10 @@ int ravenfs_nd_write(struct super_block *sb, u64 dir_idx, u64 offset, u16 tail_l
 	if (!tail || tail_len == 0 || tail_len > 512)
 		return -EINVAL;
 
-	ds = ravenfs_session_get(sb, dir_idx);
+	ds = ravenfs_inode_session_get(sb, dir_idx);
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
-	dino = (struct raven_dir_Inode_t *)ravenfs_session_inode(ds);
+	dino = (struct raven_dir_Inode_t *)ravenfs_inode_session_record(ds);
 	if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR)
 		return -EINVAL;
 
@@ -593,46 +594,37 @@ void ravenfs_nd_map_reclaim(struct super_block *sb, u64 tree_root)
 
 	/* 1. 下钻到最左叶（深度受限，防环） */
 	for (d = 0; d < 64; d++) {
-		struct ravenfs_msession *ms = ravenfs_mdata_get(sb, cur);
 		struct Bptree_meta_t *m;
 		u64 next;
 
-		if (IS_ERR(ms))
+		RAVENFS_MDATA_SESSION(ms, ravenfs_mdata_cache_of(sb), cur);
+		if (!RAVENFS_MDATA_SESSION_VALID(ms))
 			return;
-		m = ravenfs_msession_node(ms);
-		if (!nd_is_map_node(m)) {
-			ravenfs_mdata_put(ms);
+		m = RAVENFS_MDATA_SESSION_DATA(ms);
+		if (!nd_is_map_node(m))
 			return;
-		}
-		if (!RFS_PP_IS_INNER(m->parent_ptr)) {
-			ravenfs_mdata_put(ms);
+		if (!RFS_PP_IS_INNER(m->parent_ptr))
 			break;
-		}
-		if (RFS_PP_COUNT(m->parent_ptr) == 0) {
-			ravenfs_mdata_put(ms);
+		if (RFS_PP_COUNT(m->parent_ptr) == 0)
 			return;
-		}
 		next = RFS_PTR_ADDR(((struct Bptree_extent_inner_node_t *)m)
 					->extents[0].sub_node_ptr);
-		ravenfs_mdata_put(ms);
 		cur = next;
 	}
 
 	/* 2. 叶链遍历收集物理段（while，链长无上限；护栏防脏指针死循环） */
 	for (guard = 0; guard <= sbi->total_blocks / 2; guard++) {
-		struct ravenfs_msession *ms = ravenfs_mdata_get(sb, cur);
 		const struct Bptree_meta_t *m;
 		const struct Bptree_extent_leaf_node_t *lf;
 		u64 next;
 		u32 cnt, i;
 
-		if (IS_ERR(ms))
+		RAVENFS_MDATA_SESSION(ms, ravenfs_mdata_cache_of(sb), cur);
+		if (!RAVENFS_MDATA_SESSION_VALID(ms))
 			break;
-		m = ravenfs_msession_node(ms);
-		if (!nd_is_map_node(m) || RFS_PP_IS_INNER(m->parent_ptr)) {
-			ravenfs_mdata_put(ms);
+		m = RAVENFS_MDATA_SESSION_DATA(ms);
+		if (!nd_is_map_node(m) || RFS_PP_IS_INNER(m->parent_ptr))
 			break;
-		}
 		lf = (const struct Bptree_extent_leaf_node_t *)m;
 		cnt = RFS_PP_COUNT(m->parent_ptr);
 		for (i = 0; i < cnt; i++)
@@ -640,7 +632,6 @@ void ravenfs_nd_map_reclaim(struct super_block *sb, u64 tree_root)
 					RFS_PTR_ADDR(lf->extents[i].block_base),
 					lf->extents[i].length);
 		next = RFS_PTR_ADDR(m->ptrs[2]);
-		ravenfs_mdata_put(ms);
 		if (next == PTR52)
 			break;
 		cur = next;
@@ -656,17 +647,17 @@ void ravenfs_nd_map_reclaim(struct super_block *sb, u64 tree_root)
 int ravenfs_nd_release(struct super_block *sb, u64 dir_idx)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_session *ds __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = NULL;
 	struct raven_dir_Inode_t *dino;
 	struct rfs_nd_host host;
 	struct rfs_ndfr_ctx ctx;
 	u64 ctl, pieces, ptr;
 
 	RFS_STAT_INC(sb, nd_release);
-	ds = ravenfs_session_get(sb, dir_idx);
+	ds = ravenfs_inode_session_get(sb, dir_idx);
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
-	dino = (struct raven_dir_Inode_t *)ravenfs_session_inode(ds);
+	dino = (struct raven_dir_Inode_t *)ravenfs_inode_session_record(ds);
 	if (RFS_INO1_GET_TYPE(dino->word1) != INODE_TYPE_DIR)
 		return -EINVAL;
 
@@ -681,7 +672,7 @@ int ravenfs_nd_release(struct super_block *sb, u64 dir_idx)
 	ptr = RFS_ND_CTL_PTR(ctl);
 
 	if (ptr == RFS_ND_CTL_PTR_INVALID && pieces == 0) {
-		RFS_ROW_MARK_DIRTY(ds->row);	/* fr 复位落盘 */
+		RAVENFS_MDATA_DIRTY(ds->mdata_session);	/* fr 复位落盘 */
 		return 0;
 	}
 
@@ -697,6 +688,6 @@ int ravenfs_nd_release(struct super_block *sb, u64 dir_idx)
 	dino->name_data_free_ranges_count = 0;
 	memset(dino->possible_inline_free_ranges, 0,
 	       sizeof(dino->possible_inline_free_ranges));
-	RFS_ROW_MARK_DIRTY(ds->row);
+	RAVENFS_MDATA_DIRTY(ds->mdata_session);
 	return 0;
 }

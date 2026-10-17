@@ -6,9 +6,10 @@
 #   guest 内构建由 vm/share/install-ravenfs-module.sh 走 `make -C $KDIR M=<src>/linux modules`
 #
 obj-m += ravenfs.o
-ravenfs-y := version.o super.o dentry.o dentry_tree.o dentry_node.o inode_cache.o mdata_cache.o cache_ttl.o allocator_adapter.o inode_data_plane.o name_data_plane.o name_data_freeranges.o iomap.o file.o extent_write.o xattr.o \
+ravenfs-y := version.o super.o dentry.o dentry_tree.o dentry_node.o inode_cache.o mdata_cache_core.o mdata_cache_adapter.o cache_ttl.o allocator_adapter.o inode_data_plane.o name_data_plane.o name_data_freeranges.o iomap.o file.o extent_write.o xattr.o \
              ravenfs_rbtree_intrusive.o ravenfs_rbtree_owning.o \
              ravenfs_allocator_slice.o ravenfs_allocator_router.o
+ravenfs-y += mdata_cache_ioctl.o
 
 # ── 版本：以打包版本为唯一真值（PKGBUILD pkgver）─────────────────────────────
 #   宿主 dev 构建 ：从 PKGBUILD 提取 pkgver（PKGBUILD 已升格至 linux/ 本目录）；

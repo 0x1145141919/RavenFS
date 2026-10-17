@@ -35,8 +35,8 @@
 #include "ravenfs_allocator_adapter.h"
 #include "ravenfs_allocator_top.h"
 #include "ravenfs_run_list.h"
-#include "ravenfs_mdata_cache.h"
 #include "ravenfs_extent.h"
+#include "ravenfs_mdata_cache_core.h"
 
 /* ═══════════════════════ 注入分配回调（GFP_NOFS）═══════════════════════ */
 
@@ -831,7 +831,7 @@ int ravenfs_inode_plane_compact(struct super_block *sb)
 		for (i = 0; i < en; i++) {
 			(void)rfs_allocator_block_free(a, ea[i].phys_base,
 						       ea[i].length);
-			ravenfs_mdata_drop(sb, ea[i].phys_base);
+			ravenfs_mdata_drop(ravenfs_mdata_cache_of(sb), ea[i].phys_base);
 		}
 	}
 	(void)bm_checkpoint_save(sb, m, NULL);
@@ -946,8 +946,10 @@ static int ravenfs_allocator_flush_locked(struct super_block *sb,
 		pr_err("ravenfs: inode plane sync 失败 (%d)\n", rc);
 		return rc;
 	}
-	/* (2) mdata 脏节点（新树节点 / inode 片内容）落盘 */
-	rc = ravenfs_mdata_writeback_all(sb);
+	/* (2) mdata 脏节点（新树节点 / inode 片内容）落盘。
+	 * 停机后不再碰设备（原 sb 薄壳的闸，内联到调用点）。*/
+	rc = ravenfs_is_shutdown(sb) ? 0 :
+	     ravenfs_mdata_writeback_all(ravenfs_mdata_cache_of(sb));
 	if (rc) {
 		RFS_AL_INC(sb, al_checkpoint_fail);
 		return rc;

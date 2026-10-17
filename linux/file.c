@@ -33,8 +33,7 @@
 #include "ravenfs_file.h"
 #include "ravenfs_iomap.h"
 #include "ravenfs_extent.h"
-#include "ravenfs_cache.h"
-#include "ravenfs_mdata_cache.h"
+#include "ravenfs_inode_session.h"
 #include "ravenfs_allocator_top.h"
 
 /* inline 态字节上限（不变量 22）：size ≤ 160 ⇒ 内容在 inode.inline_data */
@@ -99,7 +98,7 @@ static int ravenfs_writepages_inline(struct inode *inode, struct writeback_contr
 {
 	struct address_space *mapping = inode->i_mapping;
 	struct super_block *sb = inode->i_sb;
-	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *r;
 	struct folio *folio = NULL;
 	u64 limit = (u64)i_size_read(inode);
@@ -111,10 +110,10 @@ static int ravenfs_writepages_inline(struct inode *inode, struct writeback_contr
 	if (limit == 0)
 		return 0;		/* 空文件：任何 mmap 写都在 size 之外 → 全部丢弃 */
 
-	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+	ses = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
-	r = ravenfs_session_inode(ses);
+	r = ravenfs_inode_session_record(ses);
 
 	while ((folio = writeback_iter(mapping, wbc, folio, &error))) {
 		u64 fpos = folio_pos(folio);
@@ -135,8 +134,8 @@ static int ravenfs_writepages_inline(struct inode *inode, struct writeback_contr
 	}
 
 	if (dirtied) {
-		RFS_ROW_MARK_DIRTY(ses->row);
-		atomic64_set(&ses->row->acc_stamp, ktime_get_ns());
+		RAVENFS_MDATA_DIRTY(ses->mdata_session);
+		RFS_ATOMIC64_SET(&ses->mdata_row->acc_stamp, (s64)RFS_NOW_NS());
 	}
 	return error;
 }
@@ -266,7 +265,7 @@ out:
 #define RFS_EXT_DEPTH_MAX_PUB	64u	/* 深度上限（防成环） */
 #define RFS_NBLK(b)		(((u64)(b) + RAVENFS_BLOCK_SIZE - 1) >> RAVENFS_BLK_SHIFT)
 #define RFS_IS_BLK_ALIGN(b)	((((u64)(b)) & (RAVENFS_BLOCK_SIZE - 1)) == 0)
-#define RFS_SES_PUT(_s)	do { if (!IS_ERR_OR_NULL(_s)) { ravenfs_session_put(_s); (_s) = NULL; } } while (0)
+#define RFS_SES_PUT(_s)	do { if (!IS_ERR_OR_NULL(_s)) { ravenfs_inode_session_put(_s); (_s) = NULL; } } while (0)
 
 
 /* ── 延迟返还账本（**先 inode 后 free**）—— 2026-10-04 起直用分配器原语 ──
@@ -391,7 +390,7 @@ static int rfs_release_tree_rec(struct super_block *sb, u64 root, struct rfs_run
 	}
 	kfree(buf);
 	/* 本节点已成功读出且校验通过 → 确定自有：兄弟失败后仍释放 */
-	ravenfs_mdata_drop(sb, root);
+	ravenfs_mdata_drop(ravenfs_mdata_cache_of(sb), root);
 	(void)rfs_allocator_block_free(sbi->alloc, root, 2);
 	return nerr;
 }
@@ -438,20 +437,20 @@ static int rfs_commit_inode(struct inode *inode, u64 new_size, u64 new_root,
 			    int new_direct, const void *inline_src)
 {
 	struct super_block *sb = inode->i_sb;
-	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *r;
 
-	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+	ses = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
-	r = ravenfs_session_inode(ses);
+	r = ravenfs_inode_session_record(ses);
 	r->size = new_size;
 	r->data_root = new_root;
 	RFS_INO1_SET_DIRECT(*r, new_direct ? 1 : 0);
 	if (inline_src)
 		memcpy(r->inline_data, inline_src, RAVENFS_INLINE_BYTES);
-	RFS_ROW_MARK_DIRTY(ses->row);
-	atomic64_set(&ses->row->acc_stamp, ktime_get_ns());
+	RAVENFS_MDATA_DIRTY(ses->mdata_session);
+	RFS_ATOMIC64_SET(&ses->mdata_row->acc_stamp, (s64)RFS_NOW_NS());
 	return 0;	/* 落盘交 TTL/周期回写 + sync（与 iomap_end 同款） */
 }
 
@@ -459,14 +458,14 @@ static int rfs_commit_inode(struct inode *inode, u64 new_size, u64 new_root,
 static int rfs_commit_size(struct inode *inode, u64 new_size)
 {
 	struct super_block *sb = inode->i_sb;
-	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = NULL;
 
-	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+	ses = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
-	ravenfs_session_inode(ses)->size = new_size;
-	RFS_ROW_MARK_DIRTY(ses->row);
-	atomic64_set(&ses->row->acc_stamp, ktime_get_ns());
+	ravenfs_inode_session_record(ses)->size = new_size;
+	RAVENFS_MDATA_DIRTY(ses->mdata_session);
+	RFS_ATOMIC64_SET(&ses->mdata_row->acc_stamp, (s64)RFS_NOW_NS());
 	return 0;
 }
 
@@ -498,16 +497,16 @@ static int rfs_read_inode_bytes(struct inode *inode, void *out, u64 len)
 static bool rfs_block_mapped(struct inode *inode, u64 blk)
 {
 	struct super_block *sb = inode->i_sb;
-	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = NULL;
 	const struct raven_Inode_t *r;
 	struct extent_t ext;
 	u64 next, size;
 	bool ret;
 
-	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+	ses = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return false;
-	r = ravenfs_session_inode(ses);
+	r = ravenfs_inode_session_record(ses);
 	size = r->size;
 	if (size <= RAVENFS_INLINE_BYTES)
 		return true;
@@ -579,7 +578,7 @@ static void rfs_rl_free_blocks(struct super_block *sb, struct rfs_root_list *rl)
 	int i;
 
 	for (i = 0; i < rl->n; i++) {
-		ravenfs_mdata_drop(sb, rl->v[i]);
+		ravenfs_mdata_drop(ravenfs_mdata_cache_of(sb), rl->v[i]);
 		(void)rfs_allocator_block_free(sbi->alloc, rl->v[i], 2);
 	}
 }
@@ -675,16 +674,16 @@ static int rfs_punch_hole(struct inode *inode, loff_t off, loff_t len)
 {
 	struct super_block *sb = inode->i_sb;
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *r;
 	u64 size, clamp_end, db_start, db_end, oldceil, head_end, tail_start;
 	bool direct;
 	int err = 0;
 
-	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+	ses = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
-	r = ravenfs_session_inode(ses);
+	r = ravenfs_inode_session_record(ses);
 	size = r->size;
 	if ((u64)off >= size)
 		return 0;			/* P3：offset ≥ size → no-op */
@@ -697,8 +696,8 @@ static int rfs_punch_hole(struct inode *inode, loff_t off, loff_t len)
 	/* inline：size ≤ 160，纯内联字节清零（无块可释） */
 	if (size <= RAVENFS_INLINE_BYTES) {
 		memset(r->inline_data + off, 0, clamp_end - (u64)off);
-		RFS_ROW_MARK_DIRTY(ses->row);
-		atomic64_set(&ses->row->acc_stamp, ktime_get_ns());
+		RAVENFS_MDATA_DIRTY(ses->mdata_session);
+		RFS_ATOMIC64_SET(&ses->mdata_row->acc_stamp, (s64)RFS_NOW_NS());
 		RFS_SES_PUT(ses);
 		truncate_pagecache_range(inode, off, clamp_end - 1);	/* 失效陈旧页缓存 */
 		return 0;
@@ -718,15 +717,15 @@ static int rfs_punch_hole(struct inode *inode, loff_t off, loff_t len)
 		/* direct + 整块域非空 → 物化上树（保 direct 不成立） */
 		u64 root = (u64)PTR_INVALID, base;
 		struct extent_t e0, e1;
-		struct ravenfs_session *s2 = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+		struct ravenfs_inode_session *s2 = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 		struct rfs_run_list *fl;
 
 		if (IS_ERR(s2)) {
 			filemap_invalidate_unlock(inode->i_mapping);
 			return PTR_ERR(s2);
 		}
-		base = ravenfs_session_inode(s2)->data_root;
-		ravenfs_session_put(s2);
+		base = ravenfs_inode_session_record(s2)->data_root;
+		ravenfs_inode_session_put(s2);
 		fl = rfs_fl_new();
 		if (!fl) {
 			filemap_invalidate_unlock(inode->i_mapping);
@@ -800,7 +799,7 @@ out_free_fl:
 	{
 		u64 root;
 		struct rfs_root_list rl;
-		struct ravenfs_session *s2;
+		struct ravenfs_inode_session *s2;
 		struct rfs_run_list *fl = rfs_fl_new();
 
 		rfs_rl_init(&rl);
@@ -808,14 +807,14 @@ out_free_fl:
 			filemap_invalidate_unlock(inode->i_mapping);
 			return -ENOMEM;
 		}
-		s2 = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+		s2 = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 		if (IS_ERR(s2)) {
 			rfs_fl_put(fl);
 			filemap_invalidate_unlock(inode->i_mapping);
 			return PTR_ERR(s2);
 		}
-		root = ravenfs_session_inode(s2)->data_root;
-		ravenfs_session_put(s2);
+		root = ravenfs_inode_session_record(s2)->data_root;
+		ravenfs_inode_session_put(s2);
 
 		err = rfs_zero_mapped_bytes(inode, off, head_end);
 		if (err)
@@ -866,7 +865,7 @@ out_inval:
 static int rfs_truncate(struct inode *inode, loff_t new_size){
 	struct super_block *sb = inode->i_sb;
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *r;
 	u64 old, newceil, oldceil;
 	bool direct;
@@ -876,10 +875,10 @@ static int rfs_truncate(struct inode *inode, loff_t new_size){
 	if (new_size < 0)
 		return -EINVAL;
 
-	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+	ses = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
-	r = ravenfs_session_inode(ses);
+	r = ravenfs_inode_session_record(ses);
 	old = r->size;
 	if ((u64)new_size == old)
 		return 0;
@@ -1002,7 +1001,7 @@ static int rfs_truncate(struct inode *inode, loff_t new_size){
 			}
 			/* 后置 free（commit 之后）：坍缩旧根 + 收缩产生的旧根 + 被删数据块 */
 			if (collapse) {
-				ravenfs_mdata_drop(sb, root);
+				ravenfs_mdata_drop(ravenfs_mdata_cache_of(sb), root);
 				(void)rfs_allocator_block_free(sbi->alloc, root, 2);
 			}
 			rfs_rl_free_blocks(sb, &rl);
@@ -1066,15 +1065,15 @@ out_inval:
 static int rfs_alloc_range(struct inode *inode, loff_t off, loff_t len)
 {
 	struct super_block *sb = inode->i_sb;
-	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *r;
 	u64 size, end = (u64)off + (u64)len, b, b_end;
 	int err = 0;
 
-	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+	ses = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
-	r = ravenfs_session_inode(ses);
+	r = ravenfs_inode_session_record(ses);
 	size = r->size;
 
 	if (size <= RAVENFS_INLINE_BYTES) {

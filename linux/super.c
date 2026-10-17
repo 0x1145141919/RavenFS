@@ -40,8 +40,8 @@
 #include "ravenfs.h"
 #include "ravenfs_dir.h"
 #include "ravenfs_file.h"
-#include "ravenfs_cache.h"
-#include "ravenfs_mdata_cache.h"
+#include "ravenfs_inode_session.h"
+#include "ravenfs_mdata_ioctl.h"
 #include "ravenfs_allocator_top.h"
 #include "ravenfs_allocator_adapter.h"
 #include "ravenfs_extent.h"
@@ -87,8 +87,16 @@ static const char *const ravenfs_stat_names[] = {
 	"op_acl_get", "op_acl_set",
 	/* B ic_ */  "ic_get", "ic_get_err", "ic_locate_err", "ic_dirty",
 	"ic_evict", "ic_flush", "ic_err",
-	/* C md_ */  "md_hit", "md_miss", "md_node_load", "md_retry", "md_drop",
-	"md_reap", "md_node_wb", "md_err",
+	/* C md_ */  "md_init_ok", "md_init_fail", "md_slices",
+	"md_init_ctrl_array", "md_init_radix",
+	"md_hit", "md_miss", "md_node_load", "md_retry", "md_put", "md_dirty",
+	"md_err",
+	"md_table_alloc_internal", "md_table_alloc_leaf", "md_table_free",
+	"md_reap", "md_reap_strong", "md_node_wb", "md_flush_wb",
+	"md_flush_drop",
+	"md_resident_add_bytes", "md_resident_del_bytes",
+	"md_table_add_bytes", "md_table_del_bytes",
+	"md_drop",
 	/* D ttl_ */ "ttl_rounds", "ttl_round_errs",
 	/* E io_ */  "io_read_ops", "io_read_bytes", "io_write_ops", "io_write_bytes",
 	"io_flush_ops",
@@ -214,6 +222,16 @@ int ravenfs_issue_flush(struct super_block *sb)
  * 靠 data_root 递推走树；深度上限防成环。节点不在缓存 = 已落盘（no-op）。 */
 #define RFS_FLUSH_DEPTH_MAX 64u
 
+/* 定向回写单节点：ro / 停机一律 no-op（不碰设备）；动作本体在核心。*/
+static int ravenfs_flush_cached_node(struct super_block *sb, u64 blk)
+{
+	struct ravenfs_mdata_cache *mc = ravenfs_mdata_cache_of(sb);
+
+	if (!mc || !ravenfs_sb_writable(sb) || ravenfs_is_shutdown(sb))
+		return 0;
+	return ravenfs_mdata_wb_node(mc, blk);
+}
+
 static int ravenfs_flush_extent_tree(struct super_block *sb, u64 root, u32 depth)
 {
 	const struct Bptree_meta_t *m;
@@ -236,7 +254,7 @@ static int ravenfs_flush_extent_tree(struct super_block *sb, u64 root, u32 depth
 		kfree(buf);
 		return 0;
 	}
-	if (ravenfs_mdata_wb_node(sb, root))
+	if (ravenfs_flush_cached_node(sb, root))
 		err = -EIO;
 	cnt = RFS_PP_COUNT(m->parent_ptr);
 	if (RFS_PP_IS_INNER(m->parent_ptr)) {
@@ -272,7 +290,7 @@ static int ravenfs_flush_ddentry_tree(struct super_block *sb, u64 root, u32 dept
 		kfree(buf);
 		return 0;
 	}
-	if (ravenfs_mdata_wb_node(sb, root))
+	if (ravenfs_flush_cached_node(sb, root))
 		err = -EIO;
 	cnt = RFS_PP_COUNT(m->parent_ptr);
 	if (RFS_PP_IS_INNER(m->parent_ptr)) {
@@ -289,12 +307,12 @@ static int ravenfs_flush_ddentry_tree(struct super_block *sb, u64 root, u32 dept
 /* 该 inode 是否需要/是否有 mdata 树：DIR → dentry 树；REG/SYM（非 inline 非 direct）→ extent 树 */
 static int ravenfs_flush_inode_trees(struct super_block *sb, struct inode *inode)
 {
-	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+	struct ravenfs_inode_session *s __free(ravenfs_inode_session) = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	struct raven_Inode_t *r;
 
 	if (IS_ERR_OR_NULL(s))
 		return 0;		/* 行不在缓存 → 无脏元数据 */
-	r = ravenfs_session_inode(s);
+	r = ravenfs_inode_session_record(s);
 	if (S_ISDIR(inode->i_mode)) {
 		if (r->data_root == (u64)PTR_INVALID)
 			return 0;
@@ -509,7 +527,7 @@ static int ravenfs_read_inode(struct inode *inode)
 {
 	struct super_block *sb = inode->i_sb;
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = NULL;
 	const struct raven_Inode_t *r;
 	/* D-10 契约：VFS 面 ino → 内部盘 idx（唯一穿越点之一，禁散落 ±1） */
 	u64 inum = RFS_INO_TO_IDX(inode->i_ino);
@@ -518,10 +536,10 @@ static int ravenfs_read_inode(struct inode *inode)
 	if (inum >= rfs_allocator_inode_capacity(sbi->alloc))
 		return -EIO;
 
-	ses = ravenfs_session_get(sb, inum);	/* 经 disk_inode_cache_mgr + session 取盘记录 */
+	ses = ravenfs_inode_session_get(sb, inum);	/* 经 disk_inode_cache_mgr + session 取盘记录 */
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
-	r = ravenfs_session_inode(ses);
+	r = ravenfs_inode_session_record(ses);
 
 	type = RFS_INO1_GET_TYPE(r->word1);
 	perm = RFS_MODE_GET(r->mode_xattr);
@@ -698,7 +716,7 @@ static int ravenfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 }
 
 struct ravenfs_fs_context {
-	unsigned int	row_size;	/* 0 = 默认 4K；mount option `row_size=` */
+	unsigned int	row_size;	/* 兼容旧脚本：解析但已无消费者（忽略） */
 	bool		idp_compact;	/* 挂载期 inode 数据面压实（tree→direct）；默认开 */
 };
 
@@ -785,12 +803,12 @@ static void ravenfs_evict_inode(struct inode *inode)
 	 * 仅 REG/SOFT_SYM（DIR 资产归 rmdir 自清；inline size ≤160 无外置资产 → 跳过 ③）。
 	 */
 	if (!inode->i_nlink) {
-		struct ravenfs_session *s __free(ravenfs_session) =
-			ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+		struct ravenfs_inode_session *s __free(ravenfs_inode_session) =
+			ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 		u64 xptr = (u64)RFS_XATTR_NONE;
 
 		if (!IS_ERR_OR_NULL(s)) {
-			struct raven_Inode_t *r = ravenfs_session_inode(s);
+			struct raven_Inode_t *r = ravenfs_inode_session_record(s);
 
 			xptr = RFS_XATTRPTR_GET(r->mode_xattr);	/* M6：xattr 块指针 */
 			if (r->size > 160 &&
@@ -823,8 +841,7 @@ static void ravenfs_put_super(struct super_block *sb)
 	if (sbi && ravenfs_sb_writable(sb) && !ravenfs_is_shutdown(sb))
 		(void)ravenfs_allocator_flush(sb);
 	ravenfs_issue_flush(sb);
-	ravenfs_mdata_cache_destroy(sb);	/* 折构：全量刷回（幂等）+ 释放 mdata 缓存 */
-	ravenfs_cache_destroy(sb);		/* v2.0：inode 缓存空壳 no-op */
+	ravenfs_mdata_cache_detach(sb);	/* 折构：全量刷回（幂等）+ 释放 mdata 缓存 */
 	ravenfs_allocator_destroy(sb);		/* 排空 + 拆 inode 面/block 树 + 释放 words */
 
 	/*
@@ -979,6 +996,8 @@ static const struct file_operations ravenfs_dir_operations = {
 	.read		= generic_read_dir,
 	.iterate_shared	= ravenfs_iterate,
 	.fsync		= ravenfs_fsync,		/* 目录 fsync（durable-create：创建后 fsync 父目录） */
+	.unlocked_ioctl	= ravenfs_mdata_ioctl,		/* RAVENFS_IOC_CACHE_SQUEEZE：FS 级缓存强淘汰 */
+	.compat_ioctl	= compat_ptr_ioctl,		/* UAPI 无指针字段，32 位进程直接透传 */
 };
 
 static int ravenfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
@@ -1046,19 +1065,29 @@ static const struct file_operations ravenfs_file_operations = {
 	.splice_read	= filemap_splice_read,
 	.splice_write	= iter_file_splice_write,
 	.fsync		= ravenfs_fsync,
+	.unlocked_ioctl	= ravenfs_mdata_ioctl,		/* RAVENFS_IOC_CACHE_SQUEEZE：FS 级缓存强淘汰 */
+	.compat_ioctl	= compat_ptr_ioctl,		/* UAPI 无指针字段，32 位进程直接透传 */
 };
 
 /* ═══════════════════════════════════════════════════════════════════
- * SB 读 + 校验 + 几何（R-KP-03）
+ * 挂载阶段 A：SB 读 + 校验 + 几何（R-KP-03）
+ *
+ * **纯读侧**：校验 magic/version/crc，推导几何，产出一个新的
+ * `struct ravenfs_sb_info`（经 `out` 返回，**不修改 sb**）。
+ * 不启动任何子系统（缓存 / 分配器 / TTL）；子系统初始化在下一阶段的
+ * `ravenfs_mount_subsystems_init()`，由 fill_super 按依赖顺序显式调用 ——
+ * 避免「parse 表面校验、实际建缓存 / 挂 sbi」的名实错位。
  * ═══════════════════════════════════════════════════════════════════ */
 
 static int ravenfs_parse_superblock(struct super_block *sb, const void *buf,
-				    unsigned int row_size)
+				    struct ravenfs_sb_info **out)
 {
 	const struct RavenSuperblock *dsb = buf;
 	struct ravenfs_sb_info *sbi;
 	u32 crc_stored, crc_calc;
 	void *tmp;
+
+	*out = NULL;
 
 	if (le64_to_cpu(dsb->magic[0]) != (u64)RFS_SB_MAGIC_W0) {
 		pr_err("ravenfs: bad superblock magic[0]\n");
@@ -1123,35 +1152,54 @@ static int ravenfs_parse_superblock(struct super_block *sb, const void *buf,
 		goto bad;
 	}
 
-	sb->s_fs_info = sbi;
-	if (ravenfs_cache_create(sb, row_size) ||	/* disk_inode_cache_mgr（§4.11.1/M2.2） */
-	    ravenfs_mdata_cache_create(sb)) {	/* mdata_piece_cache_mgr（8K 节点） */
-		ravenfs_cache_destroy(sb);
-		sb->s_fs_info = NULL;
-		kfree(sbi);
-		return -ENOMEM;
-	}
-	if (ravenfs_ttl_start(sb)) {	/* 自写 TTL 淘汰器（cache_ttl.c） */
-		ravenfs_mdata_cache_destroy(sb);
-		ravenfs_cache_destroy(sb);
-		sb->s_fs_info = NULL;
-		kfree(sbi);
-		return -ENOMEM;
-	}
-	/* 运行时树分配器：设备读位图镜像 → 建树（挂载必建、无回退）。
-	 * 失败（几何 / IO / 内存）→ 非零 → 按挂载失败回滚。*/
-	if (ravenfs_allocator_create(sb)) {
-		ravenfs_ttl_stop(sb);
-		ravenfs_mdata_cache_destroy(sb);
-		ravenfs_cache_destroy(sb);
-		sb->s_fs_info = NULL;
-		kfree(sbi);
-		return -EIO;
-	}
+	*out = sbi;
 	return 0;
 bad:
 	kfree(sbi);
 	return -EINVAL;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 挂载阶段 B：子系统初始化（严格依赖序）
+ *
+ *   B1 mdata 8K 节点缓存
+ *        B2 的 inode 数据面/位图装载要经 `ravenfs_read_node()` 读盘，
+ *        必须先有节点缓存。
+ *   B2 运行时树分配器
+ *        inode 面 / block 位图镜像 → 建树（挂载必建、无回退）。
+ *   B3 TTL 淘汰/回写 work
+ *        后台 work 会同时触碰 B1/B2；**最后启动**，保证它第一次运行看到的是
+ *        完整挂载态，而不是半初始化结构。
+ *
+ * v2.0 inode 缓存无独立实体（inode 记录随 8K 片落 mdata），故没有 B0 缓存壳。
+ * 失败回滚按 B3→B2→B1 逆序就地完成；`sbi` 本身由 fill_super 释放。
+ * ═══════════════════════════════════════════════════════════════════ */
+static int ravenfs_mount_subsystems_init(struct super_block *sb)
+{
+	int err;
+
+	/* B1：mdata 8K 节点缓存（挂载期唯一的元数据缓存本体） */
+	err = ravenfs_mdata_cache_attach(sb);
+	if (err)
+		return err;
+
+	/* B2：运行时树分配器（失败已自清理，sbi->alloc 保持 NULL） */
+	err = ravenfs_allocator_create(sb);
+	if (err)
+		goto err_mdata;
+
+	/* B3：后台 TTL —— 必须最后启动 */
+	err = ravenfs_ttl_start(sb);
+	if (err)
+		goto err_alloc;
+
+	return 0;
+
+err_alloc:
+	ravenfs_allocator_destroy(sb);
+err_mdata:
+	ravenfs_mdata_cache_detach(sb);
+	return err;
 }
 
 /*
@@ -1179,7 +1227,7 @@ bad:
  *   parse_superblock 一直用这个表达式校验 mkfs 写出的盘且校验通过（本盘 crc OK、
  *   ko 能挂载）→ 两边逐位一致已被实盘证明。在 ko 内再抄一份表只会多一处真值
  *   （DISCIPLINE：两份真值必然分叉，且分叉时无从察觉）。
- *   附带记录（不动文档）：mkfs.cpp 第 23 行把 0xEDB88320 注释成 “Castagnoli”，
+ *   附带记录（不动文档）：mkfs 早期把 0xEDB88320 注释成 "Castagnoli"，
  *   实际它是 CRC-32/ISO-HDLC（zlib/Ethernet）；标签写错了但算法没错，ko 跟算法、
  *   不跟标签。
  *
@@ -1359,12 +1407,19 @@ out:
 static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct ravenfs_fs_context *ctx = fc->fs_private;
-	struct ravenfs_sb_info *sbi;
+	struct ravenfs_sb_info *parsed_sbi, *sbi;
 	struct buffer_head *bh;
 	struct inode *root;
-	unsigned int row_size = (ctx && ctx->row_size) ? ctx->row_size : RAVENFS_ROW_DEFAULT;
 	int err;
 
+	/*
+	 * 挂载三段式（严格时间序，禁止把后段工作塞进前段）：
+	 *   A. ravenfs_parse_superblock()      纯读侧：校验 + 构造 sbi
+	 *   B. ravenfs_mount_subsystems_init() mdata 缓存 → 分配器 → TTL（依赖序）
+	 *   C. 数据面压实 → root inode → 时间戳 → debugfs/procfs 出口
+	 * 失败回滚：A 失败由自身释放 sbi；B 失败由 init 逆序回滚 + 本函数释放 sbi；
+	 * C 失败时 s_root 可能已建立，由 VFS → ravenfs_put_super() 统一收口。
+	 */
 	sb_set_blocksize(sb, RAVENFS_BLOCK_SIZE);
 	sb->s_magic = RAVENFS_SUPER_MAGIC;
 	sb->s_maxbytes = RAVENFS_MAX_FILESIZE;
@@ -1378,11 +1433,26 @@ static int ravenfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		RFS_STAT_INC(sb, err_sb_read);	/* 盘/设备健康 */
 		return -EIO;
 	}
-	err = ravenfs_parse_superblock(sb, bh->b_data, row_size);
+	/* ── 阶段 A：读盘校验 + 构造 sbi（不修改 sb、不启动子系统）── */
+	err = ravenfs_parse_superblock(sb, bh->b_data, &parsed_sbi);
 	brelse(bh);
 	if (err)
 		return err;
 
+	/* A→B 的唯一提交点：sbi 挂到 sb。
+	 * B 失败 → init 逆序回滚 + 本函数释放 sbi；C 失败 → put_super 兜底。*/
+	sb->s_fs_info = parsed_sbi;
+
+	/* ── 阶段 B：按依赖序启动挂载期子系统（mdata → allocator → TTL）──
+	 * 失败时 init 已逆序回滚自己启动的部分；这里只负责释放 sbi。*/
+	err = ravenfs_mount_subsystems_init(sb);
+	if (err) {
+		kfree(sb->s_fs_info);
+		sb->s_fs_info = NULL;
+		return err;
+	}
+
+	/* ── 阶段 C：数据面压实 / root inode / 时间戳 / 对外出口 ── */
 	/* M6（R-XA-01/02）：s_xattr 处理器（user/security/system；trusted 不注册 → 拒）。
 	 * 注册即置 IOP_XATTR（fs/inode.c），set 路径 inode_lock 已由 VFS 把持。 */
 	sb->s_xattr = ravenfs_xattr_handlers;

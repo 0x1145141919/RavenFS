@@ -34,14 +34,13 @@
 #include "ravenfs.h"
 #include "ravenfs_dentry_tree.h"
 #include "ravenfs_dentry_node.h"
-#include "ravenfs_cache.h"
-#include "ravenfs_mdata_cache.h"
+#include "ravenfs_inode_session.h"
 
 /* ══ 多级 walk：填 path（blk/cidx）、hit、插入位 ══ */
 int ravenfs_ddentry_walk(struct super_block *sb, u64 dir_ino, const char *name, u32 nlen,
 			struct rfs_dpath *p)
 {
-	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, dir_ino);
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = ravenfs_inode_session_get(sb, dir_ino);
 	void *buf;
 	u64 blk;
 	u32 depth = 0;
@@ -52,7 +51,7 @@ int ravenfs_ddentry_walk(struct super_block *sb, u64 dir_ino, const char *name, 
 	buf = kmalloc(RAVENFS_NODE_BYTES, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
-	blk = ravenfs_session_inode(ds)->data_root;
+	blk = ravenfs_inode_session_record(ds)->data_root;
 	p->hit = false;
 	for (;;) {
 		u32 cnt, inner, root;
@@ -108,19 +107,17 @@ int ravenfs_ddentry_insert(struct super_block *sb, u64 dir_ino, const struct rfs
 	int err = 0;
 
 	{
-		struct ravenfs_msession *ms = ravenfs_mdata_get(sb, leaf_blk);
 		struct Bptree_ddentry_leaf_node_t *lf;
 		struct ddentry_t *e;
 		u32 c, inner, root;
 		u64 pptr;
 
-		if (IS_ERR(ms))
+		RAVENFS_MDATA_SESSION(ms, ravenfs_mdata_cache_of(sb), leaf_blk);
+		if (!RAVENFS_MDATA_SESSION_VALID(ms))
 			return PTR_ERR(ms);
-		lf = ravenfs_msession_node(ms);
-		if (rfs_meta_ok(&lf->meta, &c, &inner, &root, &pptr) || inner) {
-			ravenfs_mdata_put(ms);
+		lf = RAVENFS_MDATA_SESSION_DATA(ms);
+		if (rfs_meta_ok(&lf->meta, &c, &inner, &root, &pptr) || inner)
 			return -EIO;
-		}
 		if (idx > c)
 			idx = c;
 		old_max = (c > 0) ? lf->entries[c - 1].hash : 0;
@@ -135,8 +132,7 @@ int ravenfs_ddentry_insert(struct super_block *sb, u64 dir_ino, const struct rfs
 		lf->meta.parent_ptr.v = RFS_PP_PACK(c + 1, 0, root, pptr);
 		cnt = c + 1;
 		new_max = lf->entries[cnt - 1].hash;
-		NODE_DIRTY(ms);
-		ravenfs_mdata_put(ms);
+		RAVENFS_MDATA_SESSION_DIRTY(ms);
 	}
 
 	if (cnt <= RFS_DENTRY_ORDER) {
@@ -171,22 +167,19 @@ int ravenfs_ddentry_delete(struct super_block *sb, u64 dir_ino, const struct rfs
 	u32 depth = p->depth;
 	u64 leaf_blk = p->blk[depth - 1];
 	u32 idx = p->cidx[depth - 1];
-	struct ravenfs_msession *ms;
 	struct Bptree_ddentry_leaf_node_t *lf;
 	u32 cnt, inner, root;
 	u64 pptr, new_max;
 	bool is_last, is_root;
 	int err;
 
-	ms = ravenfs_mdata_get(sb, leaf_blk);
-	if (IS_ERR(ms))
+	RAVENFS_MDATA_SESSION(ms, ravenfs_mdata_cache_of(sb), leaf_blk);
+	if (!RAVENFS_MDATA_SESSION_VALID(ms))
 		return PTR_ERR(ms);
-	lf = ravenfs_msession_node(ms);
+	lf = RAVENFS_MDATA_SESSION_DATA(ms);
 	err = rfs_meta_ok(&lf->meta, &cnt, &inner, &root, &pptr);
-	if (err || inner || idx >= cnt) {
-		ravenfs_mdata_put(ms);
+	if (err || inner || idx >= cnt)
 		return err ? err : -EIO;
-	}
 	if (info) {
 		info->name_len = RFS_PTR_FREE(lf->entries[idx].inode_ptr);
 		info->remain = lf->entries[idx].full_char_remain_offset;
@@ -200,8 +193,7 @@ int ravenfs_ddentry_delete(struct super_block *sb, u64 dir_ino, const struct rfs
 	cnt--;
 	lf->meta.parent_ptr.v = RFS_PP_PACK(cnt, 0, root, pptr);
 	new_max = (cnt > 0) ? lf->entries[cnt - 1].hash : 0;
-	NODE_DIRTY(ms);
-	ravenfs_mdata_put(ms);
+	RAVENFS_MDATA_SESSION_DIRTY(ms);
 
 	if (is_last || cnt == 0)
 		err = rfs_propagate(sb, p, depth - 1, new_max);
@@ -218,12 +210,12 @@ int ravenfs_dir_find(struct super_block *sb, u64 dir_ino,
 	u32 depth = 0;
 	void *buf;
 	int err = 0;
-	struct ravenfs_session *ses __free(ravenfs_session) = ravenfs_session_get(sb, dir_ino);
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = ravenfs_inode_session_get(sb, dir_ino);
 
 	*ino = (u64)PTR_INVALID;
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
-	blk = ravenfs_session_inode(ses)->data_root;	/* 盘记录经 session 取（§4.11.1） */
+	blk = ravenfs_inode_session_record(ses)->data_root;	/* 盘记录经 session 取（§4.11.1） */
 	buf = kmalloc(RAVENFS_NODE_BYTES, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
@@ -333,22 +325,21 @@ int ravenfs_leftmost_leaf(struct super_block *sb, u64 blk, u64 *leaf)
 /* 写目录的盘上父指针（根节点 ptrs[1] = ".."；叶/内根一致） */
 int rfs_dir_set_dotdot(struct super_block *sb, u64 dir_ino, u64 parent_ino)
 {
-	struct ravenfs_session *ds __free(ravenfs_session) = ravenfs_session_get(sb, dir_ino);
-	struct ravenfs_msession *ms __free(ravenfs_msession) = NULL;
+	struct ravenfs_inode_session *ds __free(ravenfs_inode_session) = ravenfs_inode_session_get(sb, dir_ino);
 	struct Bptree_meta_t *m;
 	u64 root;
 
 	if (IS_ERR(ds))
 		return PTR_ERR(ds);
-	root = ravenfs_session_inode(ds)->data_root;
+	root = ravenfs_inode_session_record(ds)->data_root;
 	if (root == (u64)PTR_INVALID)
 		return -EIO;
-	ms = ravenfs_mdata_get(sb, root);
-	if (IS_ERR(ms))
+	RAVENFS_MDATA_SESSION(ms, ravenfs_mdata_cache_of(sb), root);
+	if (!RAVENFS_MDATA_SESSION_VALID(ms))
 		return PTR_ERR(ms);
-	m = ravenfs_msession_node(ms);
+	m = RAVENFS_MDATA_SESSION_DATA(ms);
 	m->ptrs[1].v = RFS_PTR_PACK(0, parent_ino);
-	RFS_ROW_MARK_DIRTY(ms->row);
+	RAVENFS_MDATA_SESSION_DIRTY(ms);
 	return 0;
 }
 
@@ -358,35 +349,29 @@ int rfs_swap_entries(struct super_block *sb, const struct rfs_dpath *op,
 {
 	u64 oblk = op->blk[op->depth - 1], nblk = np->blk[np->depth - 1];
 	u32 oi = op->cidx[op->depth - 1], ni = np->cidx[np->depth - 1];
-	struct ravenfs_msession *oms, *nms = NULL;
 	struct Bptree_ddentry_leaf_node_t *ol, *nl;
 	u64 tmp;
 
-	oms = ravenfs_mdata_get(sb, oblk);
-	if (IS_ERR(oms))
+	RAVENFS_MDATA_SESSION(oms, ravenfs_mdata_cache_of(sb), oblk);
+	if (!RAVENFS_MDATA_SESSION_VALID(oms))
 		return PTR_ERR(oms);
-	ol = ravenfs_msession_node(oms);
+	ol = RAVENFS_MDATA_SESSION_DATA(oms);
 	if (oblk == nblk) {
 		tmp = ol->entries[oi].inode_ptr.v;
 		ol->entries[oi].inode_ptr.v = ol->entries[ni].inode_ptr.v;
 		ol->entries[ni].inode_ptr.v = tmp;
-		NODE_DIRTY(oms);
-		ravenfs_mdata_put(oms);
+		RAVENFS_MDATA_SESSION_DIRTY(oms);
 		return 0;
 	}
-	nms = ravenfs_mdata_get(sb, nblk);
-	if (IS_ERR(nms)) {
-		ravenfs_mdata_put(oms);
+	RAVENFS_MDATA_SESSION(nms, ravenfs_mdata_cache_of(sb), nblk);
+	if (!RAVENFS_MDATA_SESSION_VALID(nms))
 		return PTR_ERR(nms);
-	}
-	nl = ravenfs_msession_node(nms);
+	nl = RAVENFS_MDATA_SESSION_DATA(nms);
 	tmp = ol->entries[oi].inode_ptr.v;
 	ol->entries[oi].inode_ptr.v = nl->entries[ni].inode_ptr.v;
 	nl->entries[ni].inode_ptr.v = tmp;
-	NODE_DIRTY(oms);
-	NODE_DIRTY(nms);
-	ravenfs_mdata_put(nms);
-	ravenfs_mdata_put(oms);
+	RAVENFS_MDATA_SESSION_DIRTY(oms);
+	RAVENFS_MDATA_SESSION_DIRTY(nms);
 	return 0;
 }
 
@@ -397,13 +382,12 @@ int rfs_swap_entries(struct super_block *sb, const struct rfs_dpath *op,
  */
 int ravenfs_dir_root_leaf_init(struct super_block *sb, u64 blk, u64 inum, u64 parent_ino)
 {
-	struct ravenfs_msession *ms;
 	struct Bptree_ddentry_leaf_node_t *lf;
 
-	ms = ravenfs_mdata_get(sb, blk);
-	if (IS_ERR(ms))
+	RAVENFS_MDATA_SESSION(ms, ravenfs_mdata_cache_of(sb), blk);
+	if (!RAVENFS_MDATA_SESSION_VALID(ms))
 		return PTR_ERR(ms);
-	lf = ravenfs_msession_node(ms);
+	lf = RAVENFS_MDATA_SESSION_DATA(ms);
 	memset(lf, 0, RAVENFS_NODE_BYTES);
 	lf->meta.magics[0] = DENTRY_MAGIC1;
 	lf->meta.magics[1] = DENTRY_MAGIC2;
@@ -413,7 +397,6 @@ int ravenfs_dir_root_leaf_init(struct super_block *sb, u64 blk, u64 inum, u64 pa
 	lf->meta.ptrs[0].v = RFS_PTR_PACK(0, RFS_MASK52);
 	lf->meta.ptrs[1].v = RFS_PTR_PACK(0, parent_ino);	/* ".." */
 	lf->meta.ptrs[2].v = RFS_PTR_PACK(0, RFS_MASK52);
-	RFS_ROW_MARK_DIRTY(ms->row);
-	ravenfs_mdata_put(ms);
+	RAVENFS_MDATA_SESSION_DIRTY(ms);
 	return 0;
 }

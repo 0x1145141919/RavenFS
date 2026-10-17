@@ -2,7 +2,7 @@
 /*
  * xattr.c —— RavenFS ko：扩展属性 / POSIX ACL / capability（M6，R-XA-01..04）
  *
- * 盘面真值：Docs/disk_layout_v1.2_inode.md §5（xattr 块）+ include/disk_struct_v1.2.h。
+ * 盘面真值：Docs/disk_layout_v2.0.md §13（xattr 块）+ include/disk_struct_v2.0.h。
  * 规格：Docs/linux/ravenfs-linux-ko-requirements-spec.md §4.6（R-XA-01..04）/§4.5.1。
  * 参考真值（内核）：fs/xattr.c（VFS 分派）、fs/ext2/xattr.c（get/set 机械）、
  *   fs/posix_acl.c + include/linux/posix_acl*.h（ACL 通用格式/helper）、
@@ -22,7 +22,7 @@
  * ── 并发 ───────────────────────────────────────────────────────────────────
  *   set/ACL 走 XATTR 块的「读-改-写」；VFS set 路径持 inode_lock；get/list 不持。
  *   故 per-inode `xattr_sem`（read for get/list，write for set）序列化；盘 inode 指针
- *   的 RMW 另持缓存行 io_lock（与 write_inode 的 sync_from_vfs 互斥）。
+ *   的 RMW 先改内容、再经 mdata 会话标脏（核心片锁与回写互斥）。
  *   写序（先 inode 后 free）：新建块「写块 → 置 inode 指针」；删空块「清 inode 指针 → free 块」。
  */
 #include <linux/module.h>
@@ -37,7 +37,7 @@
 #include <linux/user_namespace.h>
 
 #include "ravenfs.h"
-#include "ravenfs_cache.h"
+#include "ravenfs_inode_session.h"
 #include "ravenfs_allocator_top.h"
 #include "ravenfs_xattr.h"
 
@@ -89,32 +89,30 @@ static int rfs_xb_store(struct super_block *sb, u64 blk, const void *buf)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * 盘 inode 指针读写（mode_xattr 高 52 位；RMW 持 io_lock 与 write_inode 互斥）
+ * 盘 inode 指针读写（mode_xattr 高 52 位；先写内容、后经 mdata 会话标脏）
  * ═══════════════════════════════════════════════════════════════════ */
 
 static int rfs_xattr_ptr(struct super_block *sb, u64 inum, u64 *out)
 {
-	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, inum);
+	struct ravenfs_inode_session *s __free(ravenfs_inode_session) = ravenfs_inode_session_get(sb, inum);
 
 	if (IS_ERR(s))
 		return PTR_ERR(s);
-	*out = RFS_XATTRPTR_GET(ravenfs_session_inode(s)->mode_xattr);
+	*out = RFS_XATTRPTR_GET(ravenfs_inode_session_record(s)->mode_xattr);
 	return 0;
 }
 
 static int rfs_xattr_set_ptr(struct super_block *sb, u64 inum, u64 newptr)
 {
-	struct ravenfs_session *s __free(ravenfs_session) = ravenfs_session_get(sb, inum);
+	struct ravenfs_inode_session *s __free(ravenfs_inode_session) = ravenfs_inode_session_get(sb, inum);
 	struct raven_Inode_t *r;
 
 	if (IS_ERR(s))
 		return PTR_ERR(s);
-	down_write(&s->row->io_lock);
-	r = ravenfs_session_inode(s);
+	r = ravenfs_inode_session_record(s);
 	r->mode_xattr = RFS_MODE_XATTR_PACK(RFS_MODE_GET(r->mode_xattr), newptr);
-	up_write(&s->row->io_lock);
-	RFS_ROW_MARK_DIRTY(s->row);
-	atomic64_set(&s->row->acc_stamp, ktime_get_ns());
+	RAVENFS_MDATA_DIRTY(s->mdata_session);
+	RFS_ATOMIC64_SET(&s->mdata_row->acc_stamp, (s64)RFS_NOW_NS());
 	return 0;
 }
 
@@ -148,7 +146,7 @@ static bool rfs_xattr_hdr_valid(const struct rfs_xattr_block_hdr *h)
 }
 
 /* 遍历校验整块结构（头另校验）；*min_offs = 值区最低地址（无值则 = 块尾）。
- * 返回 0 合法，-EIO 非法（对齐 audit_v1.2 §5.5 口径）。 */
+ * 返回 0 合法，-EIO 非法。 */
 static int rfs_xb_check(const void *blk, u32 *min_offs, u32 *nent)
 {
 	const char *rend = RFS_XI_END(blk);
@@ -802,20 +800,18 @@ int ravenfs_init_acl(struct inode *inode, struct inode *dir)
 
 	/* 把（可能被 umask / 默认 ACL 改过的）mode 落进盘记录（确定性，不依赖 write_inode 时机） */
 	if (!err) {
-		struct ravenfs_session *s __free(ravenfs_session) =
-			ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+		struct ravenfs_inode_session *s __free(ravenfs_inode_session) =
+			ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 
 		if (!IS_ERR(s)) {
 			struct raven_Inode_t *r;
 
-			down_write(&s->row->io_lock);
-			r = ravenfs_session_inode(s);
+			r = ravenfs_inode_session_record(s);
 			r->mode_xattr = RFS_MODE_XATTR_PACK(
 				inode->i_mode & 0o7777,
 				RFS_XATTRPTR_GET(r->mode_xattr));
-			up_write(&s->row->io_lock);
-			RFS_ROW_MARK_DIRTY(s->row);
-			atomic64_set(&s->row->acc_stamp, ktime_get_ns());
+			RAVENFS_MDATA_DIRTY(s->mdata_session);
+			RFS_ATOMIC64_SET(&s->mdata_row->acc_stamp, (s64)RFS_NOW_NS());
 		}
 		mark_inode_dirty(inode);
 	}

@@ -12,7 +12,9 @@
  *             同步 block 位图；**D-15 按脏写回**：只重建/写回「自上次落盘以来变过的片」
  *             （分片脏标志，alloc/free 时置位），未变过的片跳过。
  *
- * 后端（架构无关 driver，仅缓存行）：`ravenfs_wb_inode_ops` / `ravenfs_wb_mdata_ops`。
+ * 后端（唯一实效 driver）：`ravenfs_wb_mdata_ops`（定义在
+ *   `mdata_cache_adapter.c`，仅做 sb→self 取值与 ro/停机闸）。v2.0 inode 记录
+ *   随 8K 片落 mdata，inode 专用 no-op 后端已删除。
  *   位图 = 运行时树分配器（`rfs_allocator`）+ FS 适配层位图镜像：片级脏标志为**片内隐状态**
  *   （`rfs_slice.dirty` / `rfs_allocator_block_dirty_take`），checkpoint 只重建/写回脏片。
  *
@@ -31,7 +33,7 @@
 #include <linux/kernel.h>
 
 #include "ravenfs.h"
-#include "ravenfs_cache.h"
+#include "ravenfs_inode_session.h"
 #include "ravenfs_allocator_adapter.h"
 
 static unsigned int ttl_seconds = 2;
@@ -50,11 +52,6 @@ static unsigned int bitmap_sync_seconds = 30;
 module_param(bitmap_sync_seconds, uint, 0644);
 MODULE_PARM_DESC(bitmap_sync_seconds, "位图全片同步闸门（秒）；0 = 关闭周期同步");
 
-static const struct ravenfs_wb_ops *const ravenfs_wb_backends[] = {
-	&ravenfs_wb_inode_ops,
-	&ravenfs_wb_mdata_ops,
-};
-
 struct ravenfs_ttl {
 	struct delayed_work	work;
 	struct super_block	*sb;
@@ -71,7 +68,6 @@ static void ravenfs_ttl_work(struct work_struct *w)
 	struct super_block *sb = t->sb;
 	u64 now, ttl_cutoff, wb_cutoff;
 	long freed = 0, wb = 0, bm = 0;
-	unsigned int i;
 
 	if (!sb->s_fs_info || (sb->s_flags & SB_RDONLY) || ravenfs_is_shutdown(sb)) {
 		schedule_delayed_work(&t->work, msecs_to_jiffies(reap_ms ? reap_ms : 4000));
@@ -81,19 +77,17 @@ static void ravenfs_ttl_work(struct work_struct *w)
 	t->rounds++;
 	now = ktime_get_ns();
 
-	/* 趟1：淘汰超时冷行 */
+	/* 趟1：淘汰超时冷行（唯一后端 = mdata） */
 	if (ttl_seconds) {
 		ttl_cutoff = now - (u64)ttl_seconds * NSEC_PER_SEC;
-		for (i = 0; i < ARRAY_SIZE(ravenfs_wb_backends); i++)
-			freed += ravenfs_wb_backends[i]->reap(sb, ttl_cutoff);
+		freed = ravenfs_wb_mdata_ops.reap(sb, ttl_cutoff);
 	}
 
-	/* 趟2：超龄脏行周期回写 */
+	/* 趟2：超龄脏行周期回写（唯一后端 = mdata） */
 	if (wb_age_seconds) {
 		wb_cutoff = now - (u64)wb_age_seconds * NSEC_PER_SEC;
-		for (i = 0; i < ARRAY_SIZE(ravenfs_wb_backends); i++)
-			if (ravenfs_wb_backends[i]->wb_dirty(sb, wb_cutoff, false))
-				wb = -1;
+		if (ravenfs_wb_mdata_ops.wb_dirty(sb, wb_cutoff, false))
+			wb = -1;
 		if (wb)
 			ravenfs_force_shutdown(sb, "ttl: periodic writeback failed");
 		if (wb)

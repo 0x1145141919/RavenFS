@@ -42,8 +42,7 @@
 #include "ravenfs.h"
 #include "ravenfs_iomap.h"
 #include "ravenfs_extent.h"
-#include "ravenfs_cache.h"
-#include "ravenfs_mdata_cache.h"
+#include "ravenfs_inode_session.h"
 #include "ravenfs_allocator_top.h"
 
 /* inline 态字节上限（不变量 22）：size ≤ 160 ⇒ 内容在 inode.inline_data */
@@ -140,7 +139,7 @@ static int rfs_store_block(struct super_block *sb, u64 fs_blk, const void *buf)
 #define RFS_MIGRATE_INLINE_DEGRADE	1
 
 static int ravenfs_migrate_inline_direct(struct super_block *sb, struct raven_Inode_t *r,
-					 struct ravenfs_session *ses, loff_t pos, u64 end,
+					 struct ravenfs_inode_session *ses, loff_t pos, u64 end,
 					 u64 end_blk, struct iomap *iomap)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
@@ -197,7 +196,7 @@ static int ravenfs_migrate_inline_direct(struct super_block *sb, struct raven_In
 	r->data_root = run;
 	if (end > r->size)
 		r->size = end;
-	RFS_ROW_MARK_DIRTY(ses->row);
+	RAVENFS_MDATA_DIRTY(ses->mdata_session);
 
 	iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
 	iomap->type = IOMAP_MAPPED;
@@ -215,7 +214,7 @@ err_free_run:
 }
 
 static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *inode,
-					struct raven_Inode_t *r, struct ravenfs_session *ses,
+					struct raven_Inode_t *r, struct ravenfs_inode_session *ses,
 					loff_t pos, u64 end, struct iomap *iomap)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
@@ -339,7 +338,7 @@ static int ravenfs_write_migrate_inline(struct super_block *sb, struct inode *in
 	r->data_root = root;
 	if (end > r->size)
 		r->size = end;
-	RFS_ROW_MARK_DIRTY(ses->row);
+	RAVENFS_MDATA_DIRTY(ses->mdata_session);
 	return 0;
 
 err_free_run:
@@ -350,7 +349,7 @@ err_free_run:
 
 /* direct→extent 迁移（增长不可续）：旧连续区物化一条 + 新增长区一条（零搬移） */
 static int ravenfs_write_migrate_direct(struct super_block *sb, struct inode *inode,
-					struct raven_Inode_t *r, struct ravenfs_session *ses,
+					struct raven_Inode_t *r, struct ravenfs_inode_session *ses,
 					loff_t pos, u64 end, struct iomap *iomap)
 {
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
@@ -417,7 +416,7 @@ static int ravenfs_write_migrate_direct(struct super_block *sb, struct inode *in
 	/* 提交记录：direct=0；data_root=root（size 不变，仍 >160 → extent 解码） */
 	RFS_INO1_SET_DIRECT(*r, 0);
 	r->data_root = root;
-	RFS_ROW_MARK_DIRTY(ses->row);
+	RAVENFS_MDATA_DIRTY(ses->mdata_session);
 
 	blk = (u64)pos >> RAVENFS_BLK_SHIFT;
 	if (blk < old_ceil) {
@@ -441,17 +440,17 @@ static int ravenfs_iomap_begin_write(struct inode *inode, loff_t pos, loff_t len
 {
 	struct super_block *sb = inode->i_sb;
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *r;
 	u64 size, end, blk, end_blk;
 	int err;
 
 	if (flags & IOMAP_DIRECT)
 		return -EOPNOTSUPP;		/* O_DIRECT 后置（D-M4-5） */
-	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+	ses = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
-	r = ravenfs_session_inode(ses);
+	r = ravenfs_inode_session_record(ses);
 
 	memset(iomap, 0, sizeof(*iomap));
 	iomap->bdev = sb->s_bdev;
@@ -559,12 +558,12 @@ static int ravenfs_iomap_begin_write(struct inode *inode, loff_t pos, loff_t len
 			}
 			if (newroot != r->data_root) {
 				r->data_root = newroot;	/* 叶裂升根 / both 根收缩 → 新根 */
-				RFS_ROW_MARK_DIRTY(ses->row);
+				RAVENFS_MDATA_DIRTY(ses->mdata_session);
 			}
 			/* P10 延迟 free：both 致根收缩的旧根，在 data_root 提交**之后**统一释放
 			 * （先 free = 悬挂）。*/
 			if (old_root != (u64)PTR_INVALID) {
-				ravenfs_mdata_drop(sb, old_root);
+				ravenfs_mdata_drop(ravenfs_mdata_cache_of(sb), old_root);
 				(void)rfs_allocator_block_free(sbi->alloc, old_root, 2);
 			}
 			iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
@@ -586,7 +585,7 @@ int ravenfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 {
 	struct super_block *sb = inode->i_sb;
 	struct ravenfs_sb_info *sbi = sb->s_fs_info;
-	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = NULL;
 	const struct raven_Inode_t *r;
 	u64 size, off, blk, end_blk;
 	int err;
@@ -600,10 +599,10 @@ int ravenfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
 	memset(iomap, 0, sizeof(*iomap));
 	iomap->bdev = sb->s_bdev;
 
-	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+	ses = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
-	r = ravenfs_session_inode(ses);
+	r = ravenfs_inode_session_record(ses);
 
 	size = r->size;				/* 判据真值（不变量 22） */
 	iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
@@ -702,16 +701,16 @@ static int ravenfs_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 			     ssize_t written, unsigned int flags, struct iomap *iomap)
 {
 	struct super_block *sb = inode->i_sb;
-	struct ravenfs_session *ses __free(ravenfs_session) = NULL;
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = NULL;
 	struct raven_Inode_t *r;
 
 	if (!(flags & IOMAP_WRITE))
 		return 0;		/* 只读：无分配需提交/回滚 */
 
-	ses = ravenfs_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+	ses = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return 0;		/* 提交失败不致命：内存 inode 已更新 */
-	r = ravenfs_session_inode(ses);
+	r = ravenfs_inode_session_record(ses);
 
 	/* inline 写：把 inode 私有镜像回灌盘记录（iomap_write_end_inline 只写镜像） */
 	if (iomap->type == IOMAP_INLINE) {
@@ -726,7 +725,7 @@ static int ravenfs_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 	/* i_blocks 诚实化 */
 	ravenfs_write_update_blocks(sb, inode, r);
 
-	RFS_ROW_MARK_DIRTY(ses->row);
+	RAVENFS_MDATA_DIRTY(ses->mdata_session);
 	return 0;
 }
 
