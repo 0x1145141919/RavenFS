@@ -31,7 +31,7 @@
  * 退出码： 0 = 全部轮次比对一致；1 = 有不符/IO 错；2 = 用法/环境错。
  *
  * 宿主 `gcc -static` 编译后投递 guest；目标目录须在 ravenfs 挂载点内。
- * 完事 `sync` 后可另跑 `audit_v1.2 <dev>` 做结构自洽审计。
+ * 完事 `sync` 后可另跑 `audit <dev>` 做结构自洽审计。
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -399,6 +399,6 @@ int main(int argc, char **argv)
 	}
 	printf("\nPASS: %d 轮 × %d 文件（写 %.1f MiB / truncate %llu / punch %llu），逐轮影子比对一致；sync 后复检一致\n",
 	       rounds, nfiles, (double)total_bytes / (1024.0 * 1024.0), g_truncs, g_punches);
-	printf("提示：可 `sync` 后跑 audit_v1.2 <device> 做结构自洽审计\n");
+	printf("提示：可 `sync` 后跑 audit <device> 做结构自洽审计\n");
 	return 0;
 }

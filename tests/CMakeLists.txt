@@ -349,3 +349,18 @@ target_include_directories(ravenfs_test_name_data_freeranges PRIVATE
     ${CMAKE_SOURCE_DIR}/include/linux
     ${CMAKE_SOURCE_DIR}/include
 )
+
+# mdata 节点缓存平台中立核心（多分片静态基数树 + CTRL_ARRAY）单测（2026-10-17）：
+# 直接编 test_mdata_cache_core.c + ../linux/mdata_cache_core.c（+ 兼容空 TU），
+# 不链 god/ko 其它任何东西；覆盖几何/statey、get-put-read、wb、drop、reap、
+# flush、故障注入与多线程 get/put/reap/drop 竞争。
+add_executable(ravenfs_test_mdata_cache_core
+    test_mdata_cache_core.c
+    ../linux/mdata_cache_core.c
+    ../linux/mdata_cache_self_contained.c
+)
+target_include_directories(ravenfs_test_mdata_cache_core PRIVATE
+    ${CMAKE_SOURCE_DIR}/include/linux
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(ravenfs_test_mdata_cache_core PRIVATE Threads::Threads)

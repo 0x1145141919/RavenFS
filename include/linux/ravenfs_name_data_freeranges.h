@@ -15,7 +15,7 @@
  *               击穿）。hint = 子树最大复合键 (max_len, max_base)。
  *   第 10 条 insert 隐式升格 tree（建根叶，把 9 条就地把新条合并进去）。
  *
- * 平台纪律：只 include ravenfs_platform.h（唯一平台收口）+ disk_struct_v1.3.h
+ * 平台纪律：只 include ravenfs_platform.h（唯一平台收口）+ disk_struct_v2.0.h
  *   + magics.h；**无** `#ifdef __KERNEL__`、无 `<linux/...>`、无 STL。
  *   I/O / 节点分配**全部经 ops vtable 注入**（零直接 I/O → 宿主可测）。
  *

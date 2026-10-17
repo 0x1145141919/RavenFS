@@ -18,7 +18,8 @@
 #   D-7/D-8 由分配器 v2 结构性消解（best-fit 无位置游标 / 独立几何查询取代共用前移游标）。
 #   详见 Docs/linux/ravenfs-linux-ko-defects.md。
 pkgname=ravenfs-dkms
-pkgver=0.2.0
+pkgver=0.2.1
+
 pkgrel=1
 pkgdesc="RavenFS (experimental) kernel module, built via DKMS"
 arch=('x86_64')
