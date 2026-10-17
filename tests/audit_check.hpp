@@ -19,12 +19,13 @@ inline uint64_t audit_clean(RavenFS_juvenile &fs, const char *tag)
     audit_walk_report_t r;
     fs.audit_dfs_root(&r, stderr);   /* 详细日志到 stderr（保持旧行为） */
     const uint64_t bad = r.total_bad();
-    printf("[audit:%s] bad=%llu (btree=%llu inode=%llu heap=%llu xattr=%llu "
+    printf("[audit:%s] bad=%llu (btree=%llu inode=%llu namedata=%llu inodeplane=%llu xattr=%llu "
            "multi_ref=%llu multi_claim=%llu link=%llu dotdot=%llu | "
            "unprot b/i=%llu/%llu leak b/i=%llu/%llu) inodes=%llu nodes=%llu recs=%llu\n",
            tag, (unsigned long long)bad,
            (unsigned long long)r.btree_bad, (unsigned long long)r.inode_bad,
-           (unsigned long long)r.heap_bad, (unsigned long long)r.xattr_bad,
+           (unsigned long long)r.namedata_bad, (unsigned long long)r.inodeplane_bad,
+           (unsigned long long)r.xattr_bad,
            (unsigned long long)r.multi_ref_ino, (unsigned long long)r.multi_claim_blk,
            (unsigned long long)r.link_mismatch, (unsigned long long)r.dotdot_mismatch,
            (unsigned long long)r.unprotected_blk, (unsigned long long)r.unprotected_ino,

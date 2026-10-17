@@ -49,14 +49,15 @@ static linux_userspace_mount_t make_mount(const char *path) {
 
 static void dump_rep(const char *tag, const audit_walk_report_t &r) {
     printf("  [audit:%s] inodes=%llu nodes=%llu inner=%llu leaves=%llu recs=%llu | "
-           "btree=%llu inode=%llu heap=%llu xattr=%llu multi_ref=%llu multi_claim=%llu "
+           "btree=%llu inode=%llu namedata=%llu inodeplane=%llu xattr=%llu multi_ref=%llu multi_claim=%llu "
            "link=%llu dotdot=%llu | unprot[b=%llu i=%llu] leak[b=%llu i=%llu] bad=%llu\n",
            tag,
            (unsigned long long)r.inodes_walked, (unsigned long long)r.nodes,
            (unsigned long long)r.inner, (unsigned long long)r.leaves,
            (unsigned long long)r.records,
            (unsigned long long)r.btree_bad, (unsigned long long)r.inode_bad,
-           (unsigned long long)r.heap_bad, (unsigned long long)r.xattr_bad,
+           (unsigned long long)r.namedata_bad, (unsigned long long)r.inodeplane_bad,
+           (unsigned long long)r.xattr_bad,
            (unsigned long long)r.multi_ref_ino, (unsigned long long)r.multi_claim_blk,
            (unsigned long long)r.link_mismatch, (unsigned long long)r.dotdot_mismatch,
            (unsigned long long)r.unprotected_blk, (unsigned long long)r.unprotected_ino,
@@ -113,12 +114,13 @@ int main(int argc, char **argv) {
         audit_walk_report_t r2;
         fs.audit_dfs_root(&r2, stdout);
         dump_rep("content", r2);
-        CHECK(r2.btree_bad == 0 && r2.inode_bad == 0 && r2.heap_bad == 0 &&
+        CHECK(r2.btree_bad == 0 && r2.inode_bad == 0 && r2.namedata_bad == 0 &&
+              r2.inodeplane_bad == 0 &&
               r2.multi_ref_ino == 0 && r2.multi_claim_blk == 0 &&
               r2.unprotected_blk == 0 && r2.unprotected_ino == 0 &&
               r2.leaked_blk == 0 && r2.leaked_ino == 0,
-              "建内容后结构/XOR 全净 (btree=%llu heap=%llu unprot=%llu leak=%llu)",
-              (unsigned long long)r2.btree_bad, (unsigned long long)r2.heap_bad,
+              "建内容后结构/XOR 全净 (btree=%llu namedata=%llu unprot=%llu leak=%llu)",
+              (unsigned long long)r2.btree_bad, (unsigned long long)r2.namedata_bad,
               (unsigned long long)r2.unprotected_blk, (unsigned long long)r2.leaked_blk);
         CHECK(r2.records == (uint64_t)ins_ok, "审计条目数 == 成功插入数 (%llu)",
               (unsigned long long)r2.records);

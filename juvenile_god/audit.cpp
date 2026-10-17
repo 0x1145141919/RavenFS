@@ -60,6 +60,15 @@ inline bool fr_node_magic(const Bptree_meta_t *m)
            m->magics[3] == NAMEDATA_FREERANGES_MAGIC4;
 }
 
+/* 全局 inode 数据面映射树节点魔数自识别（v2.0） */
+inline bool idp_node_magic(const Bptree_meta_t *m)
+{
+    return m->magics[0] == INODE_DATA_EXTENT_MAGIC1 &&
+           m->magics[1] == INODE_DATA_EXTENT_MAGIC2 &&
+           m->magics[2] == INODE_DATA_EXTENT_MAGIC3 &&
+           m->magics[3] == INODE_DATA_EXTENT_MAGIC4;
+}
+
 /* fr 复合键 (len 主序, base 副序) 比较：a < b / a > b */
 inline bool fr_key_lt(uint64_t alen, uint64_t abase, uint64_t blen, uint64_t bbase)
 { return alen < blen || (alen == blen && abase < bbase); }
@@ -68,7 +77,7 @@ inline bool fr_key_gt(uint64_t alen, uint64_t abase, uint64_t blen, uint64_t bba
 
 constexpr uint16_t FR_ORDER = 337;   /* fr 树阶（数组 338 = 337 階 + 1 瞬时槽） */
 
-constexpr uint32_t XATTR_MAGIC = 0x52465358u;   /* "RFSX"（v1.2 §5.2） */
+constexpr uint32_t XATTR_MAGIC = 0x52465358u;   /* "RFSX"（单块自描述 xattr 头魔数） */
 
 /* ── 日志（全部写 ctx.out；默认 stdout）── */
 void audit_vlog(audit_walk_ctx_t &ctx, const char *lvl, const char *fmt, va_list ap)
@@ -99,8 +108,13 @@ void bad_inode(audit_walk_ctx_t &ctx, const char *fmt, ...)
 }
 void bad_name_data(audit_walk_ctx_t &ctx, const char *fmt, ...)
 {
-    ctx.rep.heap_bad++;
+    ctx.rep.namedata_bad++;
     va_list ap; va_start(ap, fmt); audit_vlog(ctx, "BAD_NAMEDATA", fmt, ap); va_end(ap);
+}
+void bad_inodeplane(audit_walk_ctx_t &ctx, const char *fmt, ...)
+{
+    ctx.rep.inodeplane_bad++;
+    va_list ap; va_start(ap, fmt); audit_vlog(ctx, "BAD_INODEPLANE", fmt, ap); va_end(ap);
 }
 void bad_xattr(audit_walk_ctx_t &ctx, const char *fmt, ...)
 {
@@ -122,24 +136,53 @@ bool RavenFS_juvenile::audit_node_read(uint64_t blk, void *dst)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * audit_claim_inode_plane — 认领 inode 数据面结构块（v2.0）
+ * audit_inode_data_plane — 全局 inode 数据面（v2.0）独立审计
  *
- * 数据面物理结构 = 映射树节点（8K，EXTENT_TREE_INODE 魔数）+ 数据片（extent 覆盖的
- * 物理块）+ fr 扁快照区。它们被分配器占用但不在 DFS 可达域内——不认领就会在收口
- * 被误报「泄露」。此处按 SB 控制字独立重画（不借 God 的 is_extent_node_kind 之外假设）：
- *   · ctl direct → 认领 [ptr, ptr + pieces*2)
- *   · ctl tree   → DFS 认领全部节点块 + 每条 extent 覆盖的物理片
- *   · fr 区      → 认领 [fr_ptr, fr_ptr + ceil((64+count*16)/4096))
- * 只置影子位（blk_set），不计数（结构块非「活结构」）。
+ * 双职：
+ *   A. 认领结构块到块影子图（避免「分配了但 DFS 不可达」误报泄露）：
+ *      · 数据片：用 allocator **活值**（内存翻译树）——覆盖运行期 grow 出、尚未
+ *        落盘的片（SB 此时可能还是 direct）；这是 insert 中途 audit 不误报的关键。
+ *      · tree 节点：按 SB 指针对盘上映射树走一遍，认领节点块（数据片已由活值覆盖）。
+ *      · fr 区：按 SB 控制字认领 [fr_ptr, +ceil((64+count*16)/4096))。
+ *   B. 按 SB 控制字**独立重画并校验盘上快照结构**（违例计 inodeplane_bad）：
+ *      · SB 控制字自洽（direct/tree、指针有效性与 8K 对齐、pieces 保留位、fr 空态）；
+ *      · direct 态：单连续物理段 [ptr, ptr+pieces*2) 界内；
+ *      · tree  态：audit_inode_data_tree（映射树 DFS）+ 叶链；
+ *      · fr 扁快照：audit_inode_data_fr_snapshot（hdr/crc/条目）。
+ * 仅观测，不修复。观察面：inodeplane_{is_tree,pieces,data_blk,tree_blk,fr_blk}。
  * ═══════════════════════════════════════════════════════════════════ */
-void RavenFS_juvenile::audit_claim_inode_plane(audit_walk_ctx_t &ctx)
+void RavenFS_juvenile::audit_inode_data_plane(audit_walk_ctx_t &ctx)
 {
     auto claim_range = [&](uint64_t base, uint64_t len) {
-        for (uint64_t i = 0; i < len; i++) ctx.blk_set(base + i);
+        for (uint64_t i = 0; i < len && base + i < total_blocks; i++) ctx.blk_set(base + i);
     };
 
-    /* ① 数据片：用**活值**（allocator 内存翻译树）——覆盖运行期 grow 出、尚未落盘
-     * 的片（SB 此时可能还是 direct）。这是 insert 中途 audit 不误报的关键。 */
+    const uint64_t ctl    = sb.inode_data_ctl;
+    const uint64_t ptr    = RFS_IDP_CTL_PTR(ctl);
+    const bool     direct = RFS_IDP_CTL_IS_DIRECT(ctl) != 0;
+    const uint64_t pieces = RFS_IDP_PIECE_COUNT(sb.inode_data_plane_pieces_count);
+    const uint64_t target = pieces * 2ULL;     /* 逻辑 4K 块总数（片=8K=2 块） */
+
+    ctx.rep.inodeplane_is_tree = direct ? 0 : 1;
+    ctx.rep.inodeplane_pieces  = pieces;
+
+    /* ── B0. SB 控制字自洽 ── */
+    if (RFS_IDP_CTL_RSV(ctl) != 0)
+        bad_inodeplane(ctx, "SB inode_data_ctl 保留位非 0 (rsv=%#x)", RFS_IDP_CTL_RSV(ctl));
+    if (RFS_IDP_PIECE_RSV(sb.inode_data_plane_pieces_count) != 0)
+        bad_inodeplane(ctx, "SB inode_data_plane_pieces_count 保留位非 0");
+    if (ptr == RFS_IDP_CTL_PTR_INVALID) {
+        if (pieces != 0)
+            bad_inodeplane(ctx, "inode 数据面空态（ptr 全 1）但 pieces=%llu",
+                           (unsigned long long)pieces);
+    } else if (pieces == 0) {
+        bad_inodeplane(ctx, "inode 数据面 ptr=%llu 但 pieces=0", (unsigned long long)ptr);
+    }
+    if (ptr != RFS_IDP_CTL_PTR_INVALID && ptr != PTR52 && (ptr & 1))
+        bad_inodeplane(ctx, "inode 数据面 %s 指针=%llu 未 8K 对齐",
+                       direct ? "direct base" : "tree 根", (unsigned long long)ptr);
+
+    /* ── A① 数据片：allocator 活值（运行期 grow 的片可能尚未落盘）── */
     bool have_live = false;
     if (allocator) {
         std::list<fs_inode_extent_t> el;
@@ -149,51 +192,504 @@ void RavenFS_juvenile::audit_claim_inode_plane(audit_walk_ctx_t &ctx)
         }
     }
 
-    const uint64_t ctl = sb.inode_data_ctl;
-    const uint64_t ptr = RFS_IDP_CTL_PTR(ctl);
-    const uint64_t pieces = RFS_IDP_PIECE_COUNT(sb.inode_data_plane_pieces_count);
-
-    if (!have_live && ptr != RFS_IDP_CTL_PTR_INVALID) {
-        /* 退化：无 allocator（只读静态审计）→ 按 SB 认领 */
-        if (RFS_IDP_CTL_IS_DIRECT(ctl)) claim_range(ptr, pieces * 2ULL);
-    }
-
-    /* ② 盘上映射树节点（tree 态；sync 后/重挂载）——数据片已由 ① 覆盖，这里只补节点块 */
-    if (ptr != RFS_IDP_CTL_PTR_INVALID && !RFS_IDP_CTL_IS_DIRECT(ctl)) {
-        std::vector<uint64_t> stack; stack.push_back(ptr);
-        uint64_t guard = 0;
-        const uint64_t PTR52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
-        while (!stack.empty()) {
-            if (++guard > (1ull << 26)) break;
-            const uint64_t blk = stack.back(); stack.pop_back();
-            if (blk == PTR52 || blk >= total_blocks) continue;
-            mdata_piece_session s(mdata_piece_mgr, blk);
-            if (s.index_error() || !s) continue;
-            Bptree_meta_t *m = (Bptree_meta_t *)s.data;
-            if (!is_extent_node_kind(m, EXTENT_TREE_INODE)) continue;
-            claim_range(blk, 2);                                   /* 节点恒 2 块 */
-            if (RFS_PP_IS_INNER(m->parent_ptr)) {
-                Bptree_extent_inner_node_t *in = (Bptree_extent_inner_node_t *)s.data;
-                const uint16_t cnt = (uint16_t)RFS_PP_COUNT(in->meta.parent_ptr);
-                for (uint16_t i = cnt; i-- > 0;)
-                    stack.push_back(RFS_PTR_ADDR(in->extents[i].sub_node_ptr));
+    /* ── 形态分派：认领（B 的校验顺带在此）── */
+    if (ptr != RFS_IDP_CTL_PTR_INVALID) {
+        if (direct) {
+            /* direct：单连续物理段，逻辑 [0,target) 线性直算 */
+            if (ptr >= total_blocks || target > total_blocks - ptr) {
+                bad_inodeplane(ctx, "inode 数据面 direct 区间越界 base=%llu blk=%llu total=%llu",
+                               (unsigned long long)ptr, (unsigned long long)target,
+                               (unsigned long long)total_blocks);
             } else {
-                Bptree_extent_leaf_node_t *lf = (Bptree_extent_leaf_node_t *)s.data;
-                const uint16_t cnt = (uint16_t)RFS_PP_COUNT(lf->meta.parent_ptr);
-                for (uint16_t i = 0; i < cnt; i++)
-                    claim_range(RFS_PTR_ADDR(lf->extents[i].block_base), lf->extents[i].length);
+                ctx.rep.inodeplane_data_blk += target;
+                if (!have_live) claim_range(ptr, target);   /* 退化：无 allocator 按 SB 认领 */
             }
+        } else {
+            audit_inode_data_tree_t w;
+            w.limit = target;
+            bool sub_ok = false;
+            (void)audit_inode_data_tree(ctx, ptr, RFS_ROOT_INODE_IDX, RFS_ROOT_INODE_IDX,
+                                        true, 0, w, sub_ok);
+            if (w.logical_end != target)
+                bad_inodeplane(ctx, "inode 数据面映射树逻辑覆盖 end=%llu != pieces*2=%llu",
+                               (unsigned long long)w.logical_end, (unsigned long long)target);
+            ctx.rep.inodeplane_data_blk += w.data_blocks;
+            ctx.rep.inodeplane_tree_blk += w.tree_blocks;
+            audit_inode_data_leaf_chain(ctx, w, ptr);
         }
     }
 
-    /* ③ fr 扁快照区（1 块对齐；块数 = ceil((hdr + count*16)/4096)） */
-    const uint64_t fptr = RFS_IDP_FR_CTL_PTR(sb.inode_data_fr_ctl);
-    if (fptr != RFS_IDP_FR_CTL_PTR_INVALID) {
-        const uint64_t cnt = RFS_IDP_FR_COUNT(sb.inode_data_fr_count);
-        uint64_t fb = sizeof(inode_data_fr_snapshot_hdr)
-                    + cnt * sizeof(inode_dataplane_coordinate_free_range_t);
-        uint64_t fblks = (fb + 4095) / 4096; if (fblks == 0) fblks = 1;
-        claim_range(fptr, fblks);
+    /* ── fr 扁快照（认领 + 结构校验）── */
+    audit_inode_data_fr_snapshot(ctx);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * audit_inode_data_tree — 全局 inode 数据面映射树 DFS（v2.0，独立推导）
+ *
+ * 仅自识别 INODE_DATA_EXTENT_MAGIC1..4（不调用 God is_extent_node_kind）。
+ * 坐标 = 逻辑 4K 块 lblk；记录 extent_t{fblkbase, block_base, length}。
+ * 校验：角色/父指针（根 ptr=owner）/叶等深/阶/欠载；extent length>0 且
+ *   fblkbase、length 均 2 对齐；逻辑域跨叶无缝稠密始于 0 且不越 w.limit；
+ *   物理段 8K 对齐（偶）且界内；hint key 严格递增且 == 子树 max 开边界。
+ * 认领节点块（2/节点）；数据片由 allocator 活值另行认领（此处不重复认领）。
+ * 返回本子树最大开边界（叶子末项 end / 内部末 hint key）。
+ * ═══════════════════════════════════════════════════════════════════ */
+uint64_t RavenFS_juvenile::audit_inode_data_tree(audit_walk_ctx_t &ctx, uint64_t blk,
+        uint64_t owner_inum, uint64_t expect_parent, bool expect_root, int depth,
+        audit_inode_data_tree_t &w, bool &sub_ok)
+{
+    sub_ok = false;
+    if (depth > ctx.max_depth) {
+        bad_inodeplane(ctx, "inode 数据面映射树 depth 超限 %d (blk=%llu)", depth,
+                       (unsigned long long)blk);
+        return 0;
+    }
+    if (blk == PTR_INVALID || ptr52_bad(blk) || blk >= total_blocks ||
+        (blk & 1) || blk + 1 >= total_blocks) {
+        bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu 非法节点块号",
+                       (unsigned long long)blk);
+        return 0;
+    }
+    if (!ctx.blk_set(blk)) {
+        ctx.rep.multi_claim_blk++;
+        audit_logf(ctx, "MULTI_CLAIM", "inode 数据面映射树节点 blk=%llu 二次认领（环/共享）",
+                   (unsigned long long)blk);
+        return 0;
+    }
+    w.tree_blocks += 2;   /* 节点恒 8K = 2 FS_block */
+    if (!ctx.blk_set(blk + 1)) {
+        ctx.rep.multi_claim_blk++;
+        audit_logf(ctx, "MULTI_CLAIM", "inode 数据面映射树节点尾巴 blk+1=%llu 二次认领",
+                   (unsigned long long)(blk + 1));
+    }
+
+    void *nb = node_buf_alloc();
+    if (!nb) {
+        bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu 节点缓冲分配失败",
+                       (unsigned long long)blk);
+        return 0;
+    }
+    if (!audit_node_read(blk, nb)) {
+        bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu 节点读取失败",
+                       (unsigned long long)blk);
+        node_buf_free(nb);
+        return 0;
+    }
+    Bptree_meta_t *meta = (Bptree_meta_t *)nb;
+    if (!idp_node_magic(meta)) {
+        bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu magic 不符（非 INODE_DATA_EXTENT）",
+                       (unsigned long long)blk);
+        node_buf_free(nb);
+        return 0;
+    }
+
+    const uint16_t cnt   = (uint16_t)RFS_PP_COUNT(meta->parent_ptr);
+    const uint16_t it    = std::min<uint16_t>(cnt, (uint16_t)(EXTENT_ORDER + 1));
+    const bool     inner = RFS_PP_IS_INNER(meta->parent_ptr);
+
+    if (cnt > EXTENT_ORDER)
+        bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu entry_count=%u > 阶 %u",
+                       (unsigned long long)blk, cnt, (unsigned)EXTENT_ORDER);
+    if ((bool)RFS_PP_IS_ROOT(meta->parent_ptr) != expect_root)
+        bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu is_root=%d 期望 %d",
+                       (unsigned long long)blk, (int)RFS_PP_IS_ROOT(meta->parent_ptr),
+                       (int)expect_root);
+    if (expect_root) {
+        if (RFS_PP_PTR(meta->parent_ptr) != owner_inum)
+            bad_inodeplane(ctx, "inode 数据面映射树根 blk=%llu ptr=%llu != owner %llu",
+                           (unsigned long long)blk,
+                           (unsigned long long)RFS_PP_PTR(meta->parent_ptr),
+                           (unsigned long long)owner_inum);
+    } else {
+        if (RFS_PP_PTR(meta->parent_ptr) != expect_parent)
+            bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu parent_ptr=%llu != 实际父 %llu",
+                           (unsigned long long)blk,
+                           (unsigned long long)RFS_PP_PTR(meta->parent_ptr),
+                           (unsigned long long)expect_parent);
+    }
+
+    /* ══════ 叶子 ══════ */
+    if (!inner) {
+        if (!w.leaf_depth_set) { w.leaf_depth = (uint64_t)depth; w.leaf_depth_set = true; }
+        else if ((uint64_t)depth != w.leaf_depth)
+            bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu 叶深度 %d != %llu（不平衡）",
+                           (unsigned long long)blk, depth, (unsigned long long)w.leaf_depth);
+        w.leaves.push_back(blk);
+
+        if (cnt == 0) {
+            if (!expect_root)
+                bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu 非根叶空",
+                               (unsigned long long)blk);
+            else if (w.limit != 0)
+                bad_inodeplane(ctx, "inode 数据面映射树根叶空但 pieces*2=%llu",
+                               (unsigned long long)w.limit);
+        } else if (!expect_root && cnt < EXTENT_MINA) {
+            bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu 叶欠载 cnt=%u < %u",
+                           (unsigned long long)blk, cnt, (unsigned)EXTENT_MINA);
+        }
+
+        Bptree_inode_data_extent_leaf_node_t *leaf =
+            (Bptree_inode_data_extent_leaf_node_t *)nb;
+        uint64_t leaf_max = 0;
+        for (uint16_t i = 0; i < it; i++) {
+            const extent_t &e = leaf->extents[i];
+            const uint64_t beg = e.fblkbase;
+            const uint64_t len = e.length;
+            const uint64_t end = beg + len;
+
+            if (len == 0)
+                bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu extents[%u] length==0",
+                               (unsigned long long)blk, i);
+            if (beg & 1)
+                bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu extents[%u] fblkbase=%llu 未 2 对齐",
+                               (unsigned long long)blk, i, (unsigned long long)beg);
+            if (len & 1)
+                bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu extents[%u] length=%llu 非偶（未 2 对齐）",
+                               (unsigned long long)blk, i, (unsigned long long)len);
+            if (end > w.limit)
+                bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu extents[%u] 逻辑越界 end=%llu > pieces*2=%llu",
+                               (unsigned long long)blk, i, (unsigned long long)end,
+                               (unsigned long long)w.limit);
+
+            if (!w.started) {
+                w.started = true;
+                if (beg != 0)
+                    bad_inodeplane(ctx, "inode 数据面映射树首条 fblkbase=%llu != 0（逻辑域不始于 0）",
+                                   (unsigned long long)beg);
+            } else if (beg < w.logical_end) {
+                bad_inodeplane(ctx, "inode 数据面映射树 extents[%u] 逻辑重叠 (prev_end=%llu > fblkbase=%llu)",
+                               i, (unsigned long long)w.logical_end, (unsigned long long)beg);
+            } else if (beg > w.logical_end) {
+                bad_inodeplane(ctx, "inode 数据面映射树 extents[%u] 逻辑空洞 (prev_end=%llu < fblkbase=%llu)",
+                               i, (unsigned long long)w.logical_end, (unsigned long long)beg);
+            }
+            w.logical_end = end;
+            w.records++;
+
+            const uint64_t pb = RFS_PTR_ADDR(e.block_base);
+            if (pb == PTR52 || pb >= total_blocks || (pb & 1) ||
+                len > total_blocks - pb) {
+                bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu extents[%u] 物理段非法 base=%llu len=%llu",
+                               (unsigned long long)blk, i, (unsigned long long)pb,
+                               (unsigned long long)len);
+            } else {
+                w.data_blocks += len;
+            }
+            leaf_max = end;
+        }
+        sub_ok = true;
+        node_buf_free(nb);
+        return leaf_max;
+    }
+
+    /* ══════ 内部节点 ══════ */
+    if (cnt == 0) {
+        bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu 内部节点空",
+                       (unsigned long long)blk);
+        node_buf_free(nb);
+        return 0;
+    }
+    if (expect_root && cnt == 1)
+        bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu 根内部仅 1 孩子（待收缩）",
+                       (unsigned long long)blk);
+    if (!expect_root && cnt < EXTENT_MINA)
+        bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu 内部欠载 cnt=%u < %u",
+                       (unsigned long long)blk, cnt, (unsigned)EXTENT_MINA);
+
+    sub_ok = true;
+    std::vector<std::pair<uint64_t, uint64_t>> hints(it);   /* (child, key) */
+    for (uint16_t i = 0; i < it; i++) {
+        Bptree_inode_data_extent_inner_node_t *nd =
+            (Bptree_inode_data_extent_inner_node_t *)nb;
+        hints[i].first  = RFS_PTR_ADDR(nd->extents[i].sub_node_ptr);
+        hints[i].second = nd->extents[i].key;
+    }
+    node_buf_free(nb);
+
+    uint64_t prev_key = 0, ret = 0;
+    for (uint16_t i = 0; i < it; i++) {
+        const uint64_t child = hints[i].first;
+        const uint64_t key   = hints[i].second;
+        if (i > 0 && key <= prev_key)
+            bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu hint[%u] key=%llu 非严格递增",
+                           (unsigned long long)blk, i, (unsigned long long)key);
+        prev_key = key;
+        if (child == PTR52 || child >= total_blocks) {
+            bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu hint[%u] child 指针非法=%llu",
+                           (unsigned long long)blk, i, (unsigned long long)child);
+            continue;
+        }
+        bool cok = false;
+        const uint64_t cmax = audit_inode_data_tree(ctx, child, owner_inum, blk, false,
+                                                    depth + 1, w, cok);
+        if (cok && cmax != key)
+            bad_inodeplane(ctx, "inode 数据面映射树 blk=%llu hint[%u] key=%llu != 子树 max=%llu",
+                           (unsigned long long)blk, i, (unsigned long long)key,
+                           (unsigned long long)cmax);
+        ret = cok ? cmax : key;
+    }
+    return ret;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * audit_inode_data_leaf_chain — inode 数据面映射树叶链校验
+ *   从根下钻最左叶 → 沿 ptrs[2] 走链，逐节点核对 ptrs[1]/ptrs[2] 双向自洽，
+ *   且链序 == DFS 叶序；单叶则要求 prev/next 皆 INVALID。
+ *   全部违例经 bad_inodeplane；节点须为 INODE_DATA_EXTENT 魔数。
+ * ═══════════════════════════════════════════════════════════════════ */
+void RavenFS_juvenile::audit_inode_data_leaf_chain(audit_walk_ctx_t &ctx,
+        const audit_inode_data_tree_t &w, uint64_t root_blk)
+{
+    auto node_ok = [&](uint64_t b) {
+        return !(b == PTR_INVALID || ptr52_bad(b) || b >= total_blocks ||
+                 (b & 1) || b + 1 >= total_blocks);
+    };
+
+    if (w.leaves.empty()) return;
+
+    /* 单叶：根叶不应有兄弟 */
+    if (w.leaves.size() == 1) {
+        void *nb = node_buf_alloc();
+        if (!nb) return;
+        if (!audit_node_read(w.leaves[0], nb)) {
+            bad_inodeplane(ctx, "inode 数据面映射树单叶 blk=%llu 读取失败",
+                           (unsigned long long)w.leaves[0]);
+            node_buf_free(nb);
+            return;
+        }
+        Bptree_meta_t *m = (Bptree_meta_t *)nb;
+        if (!idp_node_magic(m))
+            bad_inodeplane(ctx, "inode 数据面映射树单叶 blk=%llu magic 不符",
+                           (unsigned long long)w.leaves[0]);
+        const uint64_t pv = RFS_PTR_ADDR(m->ptrs[1]);
+        const uint64_t nx = RFS_PTR_ADDR(m->ptrs[2]);
+        if (pv != PTR52 || nx != PTR52)
+            bad_inodeplane(ctx, "inode 数据面映射树单叶 blk=%llu 兄弟指针非 INVALID (prev=%llu next=%llu)",
+                           (unsigned long long)w.leaves[0], (unsigned long long)pv,
+                           (unsigned long long)nx);
+        node_buf_free(nb);
+        return;
+    }
+
+    /* 从根下钻最左叶 */
+    uint64_t blk = root_blk;
+    for (int d = 0; d <= ctx.max_depth; d++) {
+        if (!node_ok(blk)) return;
+        void *nb = node_buf_alloc();
+        if (!nb) return;
+        if (!audit_node_read(blk, nb)) {
+            bad_inodeplane(ctx, "inode 数据面映射树叶链下钻读取失败 blk=%llu",
+                           (unsigned long long)blk);
+            node_buf_free(nb);
+            return;
+        }
+        Bptree_meta_t *m = (Bptree_meta_t *)nb;
+        if (!idp_node_magic(m)) {
+            bad_inodeplane(ctx, "inode 数据面映射树叶链下钻 magic 不符 blk=%llu",
+                           (unsigned long long)blk);
+            node_buf_free(nb);
+            return;
+        }
+        if (!RFS_PP_IS_INNER(m->parent_ptr)) { node_buf_free(nb); break; }
+        const uint16_t c = (uint16_t)RFS_PP_COUNT(m->parent_ptr);
+        if (c == 0) {
+            bad_inodeplane(ctx, "inode 数据面映射树叶链下钻遇空内部节点 blk=%llu",
+                           (unsigned long long)blk);
+            node_buf_free(nb);
+            return;
+        }
+        blk = RFS_PTR_ADDR(((Bptree_inode_data_extent_inner_node_t *)nb)->extents[0].sub_node_ptr);
+        node_buf_free(nb);
+    }
+
+    size_t idx = 0;
+    uint64_t cur = blk;
+    for (int guard = 0; guard < (int)w.leaves.size() + 2; guard++) {
+        if (cur == PTR52) break;
+        if (idx >= w.leaves.size()) {
+            bad_inodeplane(ctx, "inode 数据面映射树兄弟链多出叶子 blk=%llu",
+                           (unsigned long long)cur);
+            return;
+        }
+        if (cur != w.leaves[idx])
+            bad_inodeplane(ctx, "inode 数据面映射树兄弟链序 != DFS 叶序 (cur=%llu expect=%llu idx=%zu)",
+                           (unsigned long long)cur, (unsigned long long)w.leaves[idx], idx);
+        void *nb = node_buf_alloc();
+        if (!nb) return;
+        if (!audit_node_read(cur, nb)) {
+            bad_inodeplane(ctx, "inode 数据面映射树叶链节点读取失败 blk=%llu",
+                           (unsigned long long)cur);
+            node_buf_free(nb);
+            return;
+        }
+        Bptree_meta_t *m = (Bptree_meta_t *)nb;
+        if (!idp_node_magic(m)) {
+            bad_inodeplane(ctx, "inode 数据面映射树叶链节点 magic 不符 blk=%llu",
+                           (unsigned long long)cur);
+            node_buf_free(nb);
+            return;
+        }
+        const uint64_t prev = RFS_PTR_ADDR(m->ptrs[1]);
+        const uint64_t next = RFS_PTR_ADDR(m->ptrs[2]);
+        node_buf_free(nb);
+
+        if (idx == 0 && prev != PTR52)
+            bad_inodeplane(ctx, "inode 数据面映射树最左叶 blk=%llu prev=%llu 非 INVALID",
+                           (unsigned long long)cur, (unsigned long long)prev);
+
+        if (prev != PTR52) {
+            if (!node_ok(prev)) {
+                bad_inodeplane(ctx, "inode 数据面映射树前驱块非法 blk=%llu prev=%llu",
+                               (unsigned long long)cur, (unsigned long long)prev);
+            } else {
+                void *pb = node_buf_alloc();
+                if (!pb || !audit_node_read(prev, pb)) {
+                    bad_inodeplane(ctx, "inode 数据面映射树前驱块读取失败 blk=%llu prev=%llu",
+                                   (unsigned long long)cur, (unsigned long long)prev);
+                    if (pb) node_buf_free(pb);
+                } else {
+                    Bptree_meta_t *pm = (Bptree_meta_t *)pb;
+                    if (!idp_node_magic(pm) || RFS_PTR_ADDR(pm->ptrs[2]) != cur)
+                        bad_inodeplane(ctx, "inode 数据面映射树兄弟链断裂: blk=%llu.prev=%llu 但前驱.next != blk",
+                                       (unsigned long long)cur, (unsigned long long)prev);
+                    node_buf_free(pb);
+                }
+            }
+        }
+        if (next != PTR52) {
+            if (!node_ok(next)) {
+                bad_inodeplane(ctx, "inode 数据面映射树后继块非法 blk=%llu next=%llu",
+                               (unsigned long long)cur, (unsigned long long)next);
+            } else {
+                void *nn = node_buf_alloc();
+                if (!nn || !audit_node_read(next, nn)) {
+                    bad_inodeplane(ctx, "inode 数据面映射树后继块读取失败 blk=%llu next=%llu",
+                                   (unsigned long long)cur, (unsigned long long)next);
+                    if (nn) node_buf_free(nn);
+                } else {
+                    Bptree_meta_t *nm = (Bptree_meta_t *)nn;
+                    if (!idp_node_magic(nm) || RFS_PTR_ADDR(nm->ptrs[1]) != cur)
+                        bad_inodeplane(ctx, "inode 数据面映射树兄弟链断裂: blk=%llu.next=%llu 但后继.prev != blk",
+                                       (unsigned long long)cur, (unsigned long long)next);
+                    node_buf_free(nn);
+                }
+            }
+        }
+        cur = next;
+        idx++;
+    }
+    if (idx != w.leaves.size())
+        bad_inodeplane(ctx, "inode 数据面映射树叶链叶子数 %zu != DFS 叶数 %zu",
+                       idx, w.leaves.size());
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * audit_inode_data_fr_snapshot — inode 数据面「扁 fr 快照」独立审计（v2.0）
+ *
+ * 契约（仅据 disk_struct_v2.0.h 推导）：
+ *   · fr_ctl：[0]=rsv0 恒 0；[1:52)=区首块指针（可奇/偶）；空态 ptr 全 1
+ *     （RFS_IDP_FR_CTL_PTR_INVALID）⇔ fr_count==0。
+ *   · 区布局：[0,64) hdr + entry_count × {base,len}（inode 单位，256B）。
+ *   · hdr：256-bit 魔数 INODE_DATA_FR_SNAPSHOT_MAGIC*、entry_count（= SB）、
+ *     capacity（≥ count）、crc32（覆盖 hdr（除 crc 自身）+ entries）。
+ *   · 条目：base 严格递增、互不重叠、[base, base+len) ⊆ [0, pieces×32)、len>0。
+ * 认领快照区块（ceil((64+count*16)/4096)）；违例计 inodeplane_bad。
+ * ═══════════════════════════════════════════════════════════════════ */
+void RavenFS_juvenile::audit_inode_data_fr_snapshot(audit_walk_ctx_t &ctx)
+{
+    const uint64_t fr_ctl = sb.inode_data_fr_ctl;
+    const uint64_t fr_cnt = RFS_IDP_FR_COUNT(sb.inode_data_fr_count);
+    const uint64_t ptr    = RFS_IDP_FR_CTL_PTR(fr_ctl);
+    const uint64_t pieces = RFS_IDP_PIECE_COUNT(sb.inode_data_plane_pieces_count);
+    const uint64_t limit  = pieces * RFS_IDP_INODES_PER_PIECE;   /* 逻辑 inode 总数 */
+
+    if (!RFS_IDP_FR_CTL_RSV0_OK(fr_ctl))
+        bad_inodeplane(ctx, "SB inode_data_fr_ctl rsv0 非 0");
+    if (RFS_IDP_FR_CTL_RSV(fr_ctl) != 0)
+        bad_inodeplane(ctx, "SB inode_data_fr_ctl 保留位非 0");
+
+    /* ── 空态自洽 ── */
+    if (ptr == RFS_IDP_FR_CTL_PTR_INVALID) {
+        if (fr_cnt != 0)
+            bad_inodeplane(ctx, "inode 数据面 fr 空态（ptr 全 1）但 fr_count=%llu",
+                           (unsigned long long)fr_cnt);
+        return;
+    }
+    if (fr_cnt == 0)
+        bad_inodeplane(ctx, "inode 数据面 fr ptr=%llu 但 fr_count=0",
+                       (unsigned long long)ptr);
+
+    const uint64_t bytes = sizeof(inode_data_fr_snapshot_hdr)
+                         + fr_cnt * sizeof(inode_dataplane_coordinate_free_range_t);
+    uint64_t fblks = (bytes + 4095) / 4096; if (fblks == 0) fblks = 1;
+    if (ptr >= total_blocks || fblks > total_blocks - ptr) {
+        bad_inodeplane(ctx, "inode 数据面 fr 区越界 ptr=%llu blks=%llu total=%llu",
+                       (unsigned long long)ptr, (unsigned long long)fblks,
+                       (unsigned long long)total_blocks);
+        return;
+    }
+    for (uint64_t k = 0; k < fblks; k++) ctx.blk_set(ptr + k);
+    ctx.rep.inodeplane_fr_blk += fblks;
+
+    std::vector<uint8_t> buf((size_t)fblks * 4096, 0);
+    if (read_buff(ptr, fblks, buf.data()) != RC_OK) {
+        bad_inodeplane(ctx, "inode 数据面 fr 区读取失败 ptr=%llu", (unsigned long long)ptr);
+        return;
+    }
+    const inode_data_fr_snapshot_hdr *h = (const inode_data_fr_snapshot_hdr *)buf.data();
+    if (h->magic[0] != INODE_DATA_FR_SNAPSHOT_MAGIC1 ||
+        h->magic[1] != INODE_DATA_FR_SNAPSHOT_MAGIC2 ||
+        h->magic[2] != INODE_DATA_FR_SNAPSHOT_MAGIC3 ||
+        h->magic[3] != INODE_DATA_FR_SNAPSHOT_MAGIC4) {
+        bad_inodeplane(ctx, "inode 数据面 fr 区 ptr=%llu hdr magic 不符", (unsigned long long)ptr);
+    }
+    if (h->entry_count != fr_cnt)
+        bad_inodeplane(ctx, "inode 数据面 fr hdr.entry_count=%llu != SB fr_count=%llu",
+                       (unsigned long long)h->entry_count, (unsigned long long)fr_cnt);
+    if (h->capacity < fr_cnt)
+        bad_inodeplane(ctx, "inode 数据面 fr hdr.capacity=%llu < count=%llu",
+                       (unsigned long long)h->capacity, (unsigned long long)fr_cnt);
+
+    /* crc32：覆盖 hdr（除 crc 自身）+ fr_cnt 条 entries */
+    {
+        const size_t span = sizeof(inode_data_fr_snapshot_hdr)
+                          + (size_t)fr_cnt * sizeof(inode_dataplane_coordinate_free_range_t);
+        if (span <= buf.size()) {
+            std::vector<uint8_t> cpy(buf.begin(), buf.begin() + span);
+            inode_data_fr_snapshot_hdr *hc = (inode_data_fr_snapshot_hdr *)cpy.data();
+            const uint32_t want = hc->crc32;
+            hc->crc32 = 0;
+            const uint32_t got = crc32_compute(cpy.data(), span);
+            if (want != got)
+                bad_inodeplane(ctx, "inode 数据面 fr crc32 不符 stored=%#x recalc=%#x", want, got);
+        }
+    }
+
+    /* 条目：base 严格递增、互不重叠、界内、len>0。
+     * fr_count 为无位域裸值（可被损坏为巨值）→ 先按快照区实读容量截断，杜绝越界读。 */
+    const inode_dataplane_coordinate_free_range_t *e =
+        (const inode_dataplane_coordinate_free_range_t *)(buf.data() + sizeof(*h));
+    const uint64_t room = (buf.size() > sizeof(*h))
+                        ? (buf.size() - sizeof(*h)) / sizeof(*e) : 0;
+    const uint64_t nent = fr_cnt < room ? fr_cnt : room;
+    if (fr_cnt > room)
+        bad_inodeplane(ctx, "inode 数据面 fr_count=%llu 超出快照区容量 %llu（截断审计）",
+                       (unsigned long long)fr_cnt, (unsigned long long)room);
+    bool have = false;
+    uint64_t prev_end = 0;
+    for (uint64_t i = 0; i < nent; i++) {
+        if (e[i].len == 0)
+            bad_inodeplane(ctx, "inode 数据面 fr[%llu] len==0", (unsigned long long)i);
+        if (e[i].base > limit || e[i].len > limit - e[i].base)
+            bad_inodeplane(ctx, "inode 数据面 fr[%llu] 越界 base=%llu len=%llu limit=%llu",
+                           (unsigned long long)i, (unsigned long long)e[i].base,
+                           (unsigned long long)e[i].len, (unsigned long long)limit);
+        if (have && e[i].base < prev_end)
+            bad_inodeplane(ctx, "inode 数据面 fr[%llu] 重叠/非递增 base=%llu < prev_end=%llu",
+                           (unsigned long long)i, (unsigned long long)e[i].base,
+                           (unsigned long long)prev_end);
+        prev_end = e[i].base + e[i].len;
+        have = true;
     }
 }
 
@@ -250,8 +746,9 @@ result_code_t RavenFS_juvenile::audit_dfs_root(audit_walk_report_t *rep, FILE *o
                (unsigned long long)ctx.meta_lo, (unsigned long long)ctx.meta_hi,
                ctx.backup_blocks.size());
 
-    /* v2.0：先认领 inode 数据面结构块（映射树/数据片/fr 区），再 DFS——否则收口误报泄露 */
-    audit_claim_inode_plane(ctx);
+    /* v2.0：先审计 inode 数据面结构（映射树/数据片/fr 区）并认领其块，再 DFS——
+     * 否则收口把「分配了但 DFS 不可达」的数据面块误报为泄露。 */
+    audit_inode_data_plane(ctx);
 
     /* ── 从 root 先序 DFS（重画两张影子图）── */
     audit_walk_inode(ctx, root_inum, PTR_INVALID);
@@ -340,21 +837,30 @@ result_code_t RavenFS_juvenile::audit_dfs_root(audit_walk_report_t *rep, FILE *o
 
     audit_logf(ctx, "NAMEDATA_SUM",
                "active_dirs=%llu | data_blk=%llu tree_node_blk=%llu | pieces=%llu",
-               (unsigned long long)ctx.rep.heap_active,
-               (unsigned long long)ctx.rep.heap_active_data_blk,
-               (unsigned long long)ctx.rep.heap_active_bitmap_blk,
-               (unsigned long long)ctx.rep.heap_used_bits);
+               (unsigned long long)ctx.rep.namedata_active_dirs,
+               (unsigned long long)ctx.rep.namedata_data_blk,
+               (unsigned long long)ctx.rep.namedata_tree_blk,
+               (unsigned long long)ctx.rep.namedata_pieces);
+
+    audit_logf(ctx, "INODEPLANE_SUM",
+               "mode=%s | pieces=%llu | data_blk=%llu tree_node_blk=%llu fr_blk=%llu",
+               ctx.rep.inodeplane_is_tree ? "tree" : "direct",
+               (unsigned long long)ctx.rep.inodeplane_pieces,
+               (unsigned long long)ctx.rep.inodeplane_data_blk,
+               (unsigned long long)ctx.rep.inodeplane_tree_blk,
+               (unsigned long long)ctx.rep.inodeplane_fr_blk);
 
     audit_logf(ctx, "SUM",
                "inodes=%llu | nodes=%llu inner=%llu leaves=%llu recs=%llu | "
-               "btree_bad=%llu inode_bad=%llu heap_bad=%llu xattr_bad=%llu "
+               "btree_bad=%llu inode_bad=%llu namedata_bad=%llu inodeplane_bad=%llu xattr_bad=%llu "
                "multi_ref=%llu multi_claim=%llu link=%llu dotdot=%llu | "
                "没有被保护: blk=%llu ino=%llu | 疑似泄露: blk=%llu ino=%llu | bad_total=%llu",
                (unsigned long long)ctx.rep.inodes_walked,
                (unsigned long long)ctx.rep.nodes, (unsigned long long)ctx.rep.inner,
                (unsigned long long)ctx.rep.leaves, (unsigned long long)ctx.rep.records,
                (unsigned long long)ctx.rep.btree_bad, (unsigned long long)ctx.rep.inode_bad,
-               (unsigned long long)ctx.rep.heap_bad, (unsigned long long)ctx.rep.xattr_bad,
+               (unsigned long long)ctx.rep.namedata_bad, (unsigned long long)ctx.rep.inodeplane_bad,
+               (unsigned long long)ctx.rep.xattr_bad,
                (unsigned long long)ctx.rep.multi_ref_ino, (unsigned long long)ctx.rep.multi_claim_blk,
                (unsigned long long)ctx.rep.link_mismatch, (unsigned long long)ctx.rep.dotdot_mismatch,
                (unsigned long long)ctx.rep.unprotected_blk, (unsigned long long)ctx.rep.unprotected_ino,
@@ -434,7 +940,7 @@ void RavenFS_juvenile::audit_walk_inode(audit_walk_ctx_t &ctx, uint64_t inum, ui
         break;
     }
 
-    /* xattr（单块；v1.2 §5.5） */
+    /* xattr（单块自描述） */
     {
         const uint64_t xptr = (raw.mode_xattr >> 12) & PTR52;
         if (xptr != RFS_XATTR_NONE) {
@@ -456,7 +962,7 @@ void RavenFS_juvenile::audit_walk_inode(audit_walk_ctx_t &ctx, uint64_t inum, ui
                         bad_xattr(ctx, "inode %llu xattr 块 %llu magic=%#x 不符",
                                   (unsigned long long)inum, (unsigned long long)xptr, magic);
                     if (rc1 != 1 || hblk != 1)
-                        bad_xattr(ctx, "inode %llu xattr 块 %llu refcount=%u blocks=%u（v1.2 应 1/1）",
+                        bad_xattr(ctx, "inode %llu xattr 块 %llu refcount=%u blocks=%u（应 1/1）",
                                   (unsigned long long)inum, (unsigned long long)xptr, rc1, hblk);
                 }
             }
@@ -481,7 +987,7 @@ void RavenFS_juvenile::audit_walk_dir(audit_walk_ctx_t &ctx, uint64_t inum, uint
     }
     const raven_dir_Inode_t *d = (const raven_dir_Inode_t *)&raw;
 
-    /* 目录名字数据面（v1.3：映射 direct/tree + fr）独立审计 + 全物理块认领。
+    /* 目录名字数据面（v2.0：映射 direct/tree + fr）独立审计 + 全物理块认领。
      * 先于 ddentry 根校验：即使 dentry 树根损坏也要认领数据面块，避免误报泄露。 */
     audit_name_data_plane(ctx, inum, d);
 
@@ -725,7 +1231,7 @@ uint64_t RavenFS_juvenile::audit_walk_btree(audit_walk_ctx_t &ctx,
                               name_len, (unsigned)RAVENFS_MAX_NAME_LEN);
 
                 /* 名字重建（≤40 内联 / >40 经目录名字数据面读）→ hash 重算。
-                 * v1.3 名字堆已退役；映射树/fr 树完整校验见 audit_name_data_plane（独立轨）。 */
+                 * v2.0 名字数据面：映射树/fr 树完整校验见 audit_name_data_plane（独立轨）。 */
                 char full[RAVENFS_MAX_NAME_LEN + 1];
                 const uint16_t ncopy = name_len < DENTRY_INLINE_NAME_MAX ? name_len : DENTRY_INLINE_NAME_MAX;
                 std::memcpy(full, e.name, ncopy);
@@ -957,9 +1463,9 @@ void RavenFS_juvenile::audit_leaf_chain(audit_walk_ctx_t &ctx, const audit_walk_
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * audit_name_data_plane — 目录名字数据面（v1.3）独立审计
+ * audit_name_data_plane — 目录名字数据面（v2.0）独立审计
  *
- * 契约（仅据 include/disk_struct_v1.3.h 推导；不借 God 实现假设）：
+ * 契约（仅据 include/disk_struct_v2.0.h 推导；不借 God 实现假设）：
  *   · name_data_ctl：[0]=direct(1)/tree(0)，[1:52)=指针（51 位）；
  *       空态 ptr 全 1（RFS_ND_CTL_PTR_INVALID）⇔ piece_count==0。
  *   · direct：ptr = 单连续物理段基块（8K 对齐），段长 = pieces×2 FS_block，
@@ -973,7 +1479,7 @@ void RavenFS_juvenile::audit_leaf_chain(audit_walk_ctx_t &ctx, const audit_walk_
  *
  * 认领：数据面占用的**全部物理块**（direct 段 / tree 各 extent + 映射树节点 +
  * fr 树节点）在收口 XOR 前登记进 ctx.blk_set；二次认领计 multi_claim_blk。
- * 所有不变量违例经 bad_name_data → rep.heap_bad。
+ * 所有不变量违例经 bad_name_data → rep.namedata_bad。
  * ═══════════════════════════════════════════════════════════════════ */
 void RavenFS_juvenile::audit_name_data_plane(audit_walk_ctx_t &ctx, uint64_t inum,
                                              const raven_dir_Inode_t *d)
@@ -999,8 +1505,8 @@ void RavenFS_juvenile::audit_name_data_plane(audit_walk_ctx_t &ctx, uint64_t inu
         /* 不 early return：继续认领（段/树），避免收口把活块误报 leaked */
     }
 
-    ctx.rep.heap_active++;
-    ctx.rep.heap_used_bits += pieces;
+    ctx.rep.namedata_active_dirs++;
+    ctx.rep.namedata_pieces += pieces;
 
     /* ── direct 态 ── */
     if (RFS_ND_CTL_IS_DIRECT(ctl)) {
@@ -1020,7 +1526,7 @@ void RavenFS_juvenile::audit_name_data_plane(audit_walk_ctx_t &ctx, uint64_t inu
                            (unsigned long long)(ptr + k), (unsigned long long)inum);
             }
         }
-        ctx.rep.heap_active_data_blk += target;
+        ctx.rep.namedata_data_blk += target;
         if (ctx.verbose)
             audit_logf(ctx, "NAMEDATA",
                        "DIR inode %llu direct base=%llu pieces=%llu (%llu blks)",
@@ -1045,10 +1551,10 @@ void RavenFS_juvenile::audit_name_data_plane(audit_walk_ctx_t &ctx, uint64_t inu
                       (unsigned long long)inum, (unsigned long long)w.logical_end,
                       (unsigned long long)target);
 
-    ctx.rep.heap_active_data_blk += w.data_blocks;
-    ctx.rep.heap_active_bitmap_blk += w.tree_blocks;
+    ctx.rep.namedata_data_blk += w.data_blocks;
+    ctx.rep.namedata_tree_blk += w.tree_blocks;
 
-    /* 叶链双向自洽 + 链序 == DFS 叶序（数据面专用：违例计 heap_bad） */
+    /* 叶链双向自洽 + 链序 == DFS 叶序（数据面专用：违例计 namedata_bad） */
     audit_name_data_leaf_chain(ctx, w, ptr, inum);
 }
 
@@ -1270,7 +1776,7 @@ uint64_t RavenFS_juvenile::audit_name_data_tree(audit_walk_ctx_t &ctx, uint64_t 
  * audit_name_data_leaf_chain — 名字数据面映射树叶链校验
  *   从根下钻最左叶 → 沿 ptrs[2] 走链，逐节点核对 ptrs[1]/ptrs[2] 双向自洽，
  *   且链序 == DFS 叶序；单叶则要求 prev/next 皆 INVALID。
- *   全部违例经 bad_name_data（heap_bad）；节点须为 NAMEDATA_EXTENT 魔数。
+ *   全部违例经 bad_name_data（namedata_bad）；节点须为 NAMEDATA_EXTENT 魔数。
  * ═══════════════════════════════════════════════════════════════════ */
 void RavenFS_juvenile::audit_name_data_leaf_chain(audit_walk_ctx_t &ctx,
         const audit_name_data_tree_t &w, uint64_t root_blk, uint64_t owner_inum)
@@ -1428,14 +1934,14 @@ void RavenFS_juvenile::audit_name_data_leaf_chain(audit_walk_ctx_t &ctx,
 /* ═══════════════════════════════════════════════════════════════════
  * audit_name_data_free_ranges — 空闲区间树（fr）独立审计（形态分派 + 认领）
  *
- * 契约（仅据 disk_struct_v1.3.h）：
+ * 契约（仅据 disk_struct_v2.0.h）：
  *   · fr_ctl：[0]=inline(1)/tree(0)；[1:52)=树根块号。空态 ptr 全 1
  *     （RFS_ND_FR_CTL_INACTIVE）且 fr_count==0。
  *   · fr_count = 全域空闲区间总数 = fr 树叶条目总数。
  *   · inline 态：possible_inline_free_ranges[9]（键序同叶），fr_count ≤ 9；
  *     区间数 > 9 ⇒ 必须 tree 态（隐式升格）。
  *   · tree：节点 NAMEDATA_FREERANGES_MAGIC1..4；hint=子树最大复合键。
- * 认领 fr 树全部节点块（2/节点）；违例经 bad_name_data 计 heap_bad。
+ * 认领 fr 树全部节点块（2/节点）；违例经 bad_name_data 计 namedata_bad。
  * ═══════════════════════════════════════════════════════════════════ */
 void RavenFS_juvenile::audit_name_data_free_ranges(audit_walk_ctx_t &ctx, uint64_t inum,
                                                    const raven_dir_Inode_t *d)
@@ -1504,7 +2010,7 @@ void RavenFS_juvenile::audit_name_data_free_ranges(audit_walk_ctx_t &ctx, uint64
                       (unsigned long long)inum, (unsigned long long)fr_cnt,
                       (unsigned long long)w.records);
 
-    ctx.rep.heap_active_bitmap_blk += w.node_blocks;
+    ctx.rep.namedata_tree_blk += w.node_blocks;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1513,7 +2019,7 @@ void RavenFS_juvenile::audit_name_data_free_ranges(audit_walk_ctx_t &ctx, uint64
  * 仅自识别 NAMEDATA_FREERANGES_MAGIC1..4。校验：角色/父指针/叶等深、
  *   count≤337、leaf 复合键 (len,base) 全局严格递增且 len>0、区间
  *   [base,base+len)⊆[0,limit)、inner hint==子树最大复合键且严格递增。
- * 认领节点块（2/节点）；违例计 heap_bad，二次认领计 multi_claim_blk。
+ * 认领节点块（2/节点）；违例计 namedata_bad，二次认领计 multi_claim_blk。
  * 不校验最小占用/合并（God 本轮不做）。出参 out_max_{len,base}=本子树最大复合键。
  * ═══════════════════════════════════════════════════════════════════ */
 void RavenFS_juvenile::audit_fr_tree(audit_walk_ctx_t &ctx, uint64_t blk,

@@ -10,6 +10,7 @@ struct audit_walk_ctx_t;
 struct audit_walk_report_t;
 struct audit_walk_tree_t;
 struct audit_name_data_tree_t;
+struct audit_inode_data_tree_t;
 struct audit_fr_tree_t;
 /* 缓存子模块前置声明（仅成员指针用，不拉完整头）：
  * 完整类型由使用方 cpp 各自 include inode_cache_radix.hpp /
@@ -28,7 +29,7 @@ class fs_allocator_t;           /* 双组分配器（block 分片 + 全局 inode
 #include <atomic>
 
 /* ═══════════════════════════════════════════════════════════════════
- * RavenFS v1.1 — 幼年期上帝类（RavenFS_juvenile）
+ * RavenFS — 幼年期上帝类接口（RavenFS_juvenile）
  *
  * 范围：仅对 root_dir 进行操纵，专用于构建 dentry B+tree 操作原型。
  * 本头文件是接口契约草案，实现待写；设计约束如下：
@@ -41,17 +42,17 @@ class fs_allocator_t;           /* 双组分配器（block 分片 + 全局 inode
  *    不追求事务安全）。两组接口：block 组 / inode 组。
  * 3. 名字上限 RAVENFS_MAX_NAME_LEN=552B：≤40B 内联（ddentry_t.name），>40B 走
  *    目录名字数据面（字节粒度逻辑空间 + 映射树 + fr 空闲区间树，见
- *    Docs/disk_layout_v1.3_name_data_plane.md）。
- * 4. 删除 = 物理删除（v1.1 §6.5）：memmove + 刷父 hash_max（上界路由
+ *    Docs/disk_layout_v2.0.md §11）。
+ * 4. 删除 = 物理删除（disk_layout_v2.0.md §10）：memmove + 刷父 hash_max（上界路由
  *    对称代价，必走路径）；欠载不合并（min occupancy 待定，幼年期跳过）。
- * 5. hash 用 XXH64（seed=0，v1.1 §9 已定；64 位熵 + 跨挂载稳定，
+ * 5. hash 用 XXH64（seed=0；64 位熵 + 跨挂载稳定，
  *    抗 DoS 升级路径：siphash + SB 持久 key，接口签名不变）。
  * 6. backup 链容灾不做（幼年期只认 Primary SB：magic/version/crc32/
  *    bitmap 自描述四连验）。
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* 磁盘格式版本：由 disk_struct_v2.0.h 的 RAVENFS_VERSION 宏提供（v2.0 = 0）。
- * v1.1 起版本常量统一下沉到磁盘结构头，避免与宏重定义冲突。 */
+ * 版本常量统一下沉到磁盘结构头，避免与宏重定义冲突。 */
 
 /* ── readdir 输出项 ──
  * 名字 ≤ RAVENFS_MAX_NAME_LEN（552B），character 含结尾 '\0'。 */
@@ -92,6 +93,7 @@ namespace ravenfs_juvenile_god_ctrl_words_bits{
     constexpr uint64_t BLOCK_CACHE_ENABLE_MASK=4;//MMAP_BACKEND_CONTROL_MASK为1时强制这个bit翻1,虽然内核会做缓存但是上层业务的预取，写回,失效是有意义的，MMAP_BACKEND_CONTROL_MASK=0时这个位为1则手动用户态缓存，为0则相应的session直接分配内存，硬读
     constexpr uint64_t INODE_CACHE_ENABLE_MASK=8;//同上
 };
+
 class RavenFS_juvenile {
 public:
     /* 构造即挂载：fd 由外部打开并提供（生命周期完全归外部，类只借不关）。
@@ -147,7 +149,7 @@ public:
     /* 查找：命中 → RC_OK 且 *out_inum 输出；未命中 → RC_ERR_NOT_FOUND。 */
     result_code_t root_dir_lookup(const char *name, uint64_t *out_inum);
 
-    /* 遍历 root_dir：按 hash 乱序（v1.1 §6.4 接受）。
+    /* 遍历 root_dir：按 hash 乱序。
      * 返回条目数 n（≥0），失败返回负错误码。
      * 成功时 *out_buf 指向堆上分配的连续数组 dentry_out[n]，
      * 使用时直接取 (*out_buf)[i]（线性数组，非指针数组）。
@@ -200,7 +202,7 @@ private:
     /* 按 kind 校验节点 256-bit 魔数（extent 机械内部统一走此谓词）。 */
     static bool is_extent_node_kind(const Bptree_meta_t *meta, extent_tree_kind_t kind);
     /* 核心版本：按 inode_type 初始化 + 插入。dir 型急建树根（magic + . / ..）；
-     * 目标目录 inode_idx 的 data_root 恒有效（v1.1 §10 不变量 11），
+     * 目标目录 inode_idx 的 data_root 恒有效，
      * 遇 PTR_INVALID = 严重内部磁盘契约违反 → RC_ERR_STATE。 */
     result_code_t dir_insert_dentry(uint64_t inode_idx,const char *name,uint8_t inode_type);
     result_code_t dir_rm_dentry(uint64_t inode_idx,const char *name,bool destroy_data);
@@ -265,9 +267,8 @@ private:
                                        extent_tree_kind_t kind = EXTENT_TREE_FILE);
     result_code_t df_extentify(uint64_t inode_idx);//把REGULAR/INODE型的
     /* ══════════════════════════════════════════════════════════
-     * 位图接口组 A/B：薄转发 → bitmap_slices_mgr_t（独立模块）
-     * 2026-09-03 顶出：完整契约 / 锁纪律 / 几何推导见
-     * include/ravenfs/bitmap_slices.hpp（bitmap_slices_mgr_t）。
+     * 块分配接口组 A/B：转发 → 运行时区间分配器（主从红黑树）。
+     * 完整契约 / 锁纪律见 include/ravenfs/fs_allocator.hpp。
      * 本层仅保留签名不变的转发壳——调用点（dentry/extent/name_data/
      * root_dir）零改动。失败哨兵 PTR_INVALID（0 是合法块号/槽号）。 */
     uint64_t block_alloc_hard(uint64_t require_count, uint8_t align_log2);
@@ -350,7 +351,7 @@ private:
     static result_code_t fs_io_read(void *io_ctx, uint64_t blk, uint64_t blk_len, void *buf);
     static result_code_t fs_io_write(void *io_ctx, uint64_t blk, uint64_t blk_len, const void *buf);
 
-    /* ── 名字 hash（XXH64 seed=0，v1.1 §9 已定；跨挂载稳定）── */
+    /* ── 名字 hash（XXH64 seed=0；跨挂载稳定）── */
     uint64_t name_hash(const char *name) const;
 
     /* ── dentry B+tree（仅 root_dir 单树）──
@@ -422,7 +423,7 @@ private:
         uint64_t inum;                  /* 插入时调用方分配的真实 inode 槽；dentry_leaf_entry_insert 落 inode_ptr.ptr（非插入路径恒 0） */
         uint64_t owner_dir_inum = 0;    /* 本次比较/读取所属目录（读长名 tail 需映射树根）；≤40B 不消费 */
     };
-    /* ── 目录名字数据面（name data plane）原语（v1.3；取代 v1.2 名字堆）──
+    /* ── 目录名字数据面（name data plane）原语（v2.0；取代 v1.x 名字堆）──
      * 每目录一个稠密、无空洞、8K 对齐的逻辑字节空间：
      *   · 映射 name_data_ctl（direct 单连续段 / tree 映射树根）+ name_data_piece_count；
      *   · 空闲区间 name_data_free_ranges_ctl（inline 表 / fr B+树）。
@@ -739,12 +740,27 @@ private:
     /* ── audit 内部机械（juvenile_god/audit.cpp；新可达性模型）── */
     /* 读一个 8K 树节点到 dst（8192B，8K 对齐）；失败 false。 */
     bool audit_node_read(uint64_t blk, void *dst);
-    /* v2.0：认领 inode 数据面结构块（映射树节点 + 数据片 + fr 快照区）到块影子图，
-     * 避免「分配了但 DFS 不可达」误报泄露。 */
-    void audit_claim_inode_plane(audit_walk_ctx_t &ctx);
+    /* v2.0 全局 inode 数据面独立审计：
+     *   ① 认领结构块（映射树节点 + 数据片 + fr 快照区）到块影子图，避免
+     *      「分配了但 DFS 不可达」误报泄露（数据片用 allocator 活值）；
+     *   ② 按 SB 控制字独立重画并校验盘上快照结构（映射树 + 扁 fr 快照），
+     *      违例计 inodeplane_bad。 */
+    void audit_inode_data_plane(audit_walk_ctx_t &ctx);
+    /* inode 数据面映射树 DFS 递归核：校验角色/父指针/叶深/欠载/hint key 严格递增且
+     * == 子树 max 开边界/extent 2 对齐、无洞稠密覆盖 [0, pieces*2)、物理段合法；
+     * 认领节点块（2/节点；数据片由 allocator 活值另行认领）。返回子树最大开边界。 */
+    uint64_t audit_inode_data_tree(audit_walk_ctx_t &ctx, uint64_t blk, uint64_t owner_inum,
+                                   uint64_t expect_parent, bool expect_root, int depth,
+                                   audit_inode_data_tree_t &w, bool &sub_ok);
+    /* inode 数据面映射树叶链：兄弟链双向自洽 + 链序 == DFS 叶序。 */
+    void audit_inode_data_leaf_chain(audit_walk_ctx_t &ctx, const audit_inode_data_tree_t &w,
+                                     uint64_t root_blk);
+    /* inode 数据面「扁 fr 快照」独立审计：magic/entry_count/capacity/crc32 + 条目
+     * 界内/互不重叠/键序；认领快照区块。违例计 inodeplane_bad。 */
+    void audit_inode_data_fr_snapshot(audit_walk_ctx_t &ctx);
     /* 单 inode 访问（先序：置影子 → 校验 → 下钻）。parent_inum = 父目录（root 传 PTR_INVALID）。 */
     void audit_walk_inode(audit_walk_ctx_t &ctx, uint64_t inum, uint64_t parent_inum);
-    /* DIR：字段校验 + 目录名字数据面（v1.3）+ dentry 树 DFS + 子目录先序下钻。 */
+    /* DIR：字段校验 + 目录名字数据面（v2.0）+ dentry 树 DFS + 子目录先序下钻。 */
     void audit_walk_dir(audit_walk_ctx_t &ctx, uint64_t inum, uint64_t parent_inum);
     /* REG / LNK：inline/direct/extent 数据面（size 优先解码）。 */
     void audit_walk_file(audit_walk_ctx_t &ctx, uint64_t inum, const raven_Inode_t *ino);
@@ -757,7 +773,7 @@ private:
     /* 叶链一致性：兄弟链双向自洽 + 链序 == DFS 叶序。 */
     void audit_leaf_chain(audit_walk_ctx_t &ctx, const audit_walk_tree_t &t, uint64_t root_blk,
                           bool is_dentry, uint64_t owner_inum);
-    /* 目录名字数据面（v1.3）独立审计：空态/direct/tree 不变量校验 + 全物理块认领。
+    /* 目录名字数据面（v2.0）独立审计：空态/direct/tree 不变量校验 + 全物理块认领。
      * tree 态走映射树 DFS（audit_name_data_tree），自识别 NAMEDATA_EXTENT 魔数。 */
     void audit_name_data_plane(audit_walk_ctx_t &ctx, uint64_t inum, const raven_dir_Inode_t *dino);
     /* 名字数据面映射树 DFS 递归核：校验角色/父指针/叶深/欠载/hint key/
@@ -765,11 +781,11 @@ private:
     uint64_t audit_name_data_tree(audit_walk_ctx_t &ctx, uint64_t blk, uint64_t owner_inum,
                                   uint64_t expect_parent, bool expect_root, int depth,
                                   audit_name_data_tree_t &w, bool &sub_ok);
-    /* 名字数据面映射树叶链：兄弟链双向自洽 + 链序 == DFS 叶序（违例计 heap_bad）。 */
+    /* 名字数据面映射树叶链：兄弟链双向自洽 + 链序 == DFS 叶序（违例计 namedata_bad）。 */
     void audit_name_data_leaf_chain(audit_walk_ctx_t &ctx, const audit_name_data_tree_t &w,
                                     uint64_t root_blk, uint64_t owner_inum);
     /* 名字数据面「空闲区间树（fr）」独立审计：形态（空/inline/tree）分派 +
-     * 节点块认领 + 复合键序/界内/计数校验。违例计 heap_bad。 */
+     * 节点块认领 + 复合键序/界内/计数校验。违例计 namedata_bad。 */
     void audit_name_data_free_ranges(audit_walk_ctx_t &ctx, uint64_t inum,
                                      const raven_dir_Inode_t *dino);
     /* fr 树 DFS 递归核：校验角色/父指针/叶深/hint==子树最大复合键/hint 严格递增/

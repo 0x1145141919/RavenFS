@@ -121,18 +121,11 @@ add_executable(ravenfs_juv_insert
 )
 target_link_libraries(ravenfs_juv_insert PRIVATE ravenfs_juvenile)
 
-# ── v1.1 stale 测试隔离（2026-10-05）───────────────────────────────────────
-# 以下目标仍按 v1.1 位域 API（parent_ptr.entry_count / .is_inner_node / .ptr、
-# inode_ptr.ptr / .free_to_use、is_data_root_direct_bit 等）编写，v1.2 掩码迁移
-# 时即已编不过，卡 `ninja all`。源文件保留供日后移植；暂不入构建
-# （先例：test_name_heap*）。已迁移的 dir 顶层测试见上方
-# ravenfs_juv_insert / ravenfs_juv_delete。
-# v1.1 extent_Bptree_walk 左闭右开语义专项测试（手工铺双层树打边界）
-# add_executable(ravenfs_juv_extent_walk
-#     test_extent_walk.cpp
-#     ${CPU_ID_STUB}
-# )
-# target_link_libraries(ravenfs_juv_extent_walk PRIVATE ravenfs_juvenile)
+# 注：原「v1.1 stale 测试隔离」的一批目标（extent_walk / extent_fusion /
+# bitmap_slice / block_occupy / 名字堆 / benchmark_radix / benchmark_session /
+# extent_unmap_loose / extent_loose_stress / pwrite_* / pread_smoke /
+# punch_truncate_smoke 等）已随 v1.x 盘面清理**整体删除**（2026-10-16）。
+# 现役测试见下方（v1.3 / v2.0）。
 
 # v1.1 extent_map_range / extent_unmap_range 原语对专项测试（root_dir 建真文件 + 跃迁建树根）
 add_executable(ravenfs_juv_extent_ops
@@ -141,13 +134,6 @@ add_executable(ravenfs_juv_extent_ops
 )
 target_link_libraries(ravenfs_juv_extent_ops PRIVATE ravenfs_juvenile Threads::Threads)
 
-# v1.1 map 自动融合路线专项测试（F 组：简单融合矩阵 → 12 万 BOSS → 并行；
-# 含区间取样工具 range_sample 与跨界左并盲区探测）—— **stale，隔离（见上）**
-# add_executable(ravenfs_juv_extent_fusion
-#     test_extent_fusion.cpp
-#     ${CPU_ID_STUB}
-# )
-# target_link_libraries(ravenfs_juv_extent_fusion PRIVATE ravenfs_juvenile Threads::Threads)
 
 # v1.3 dir_rm_dentry 接口专项测试（长名 split/merge/复用 + 正反向批量删+收缩 +
 # 审计 + 重挂载；offload/nocache/selfreliat 三后端）；共享 dir_tree_check.hpp
@@ -158,91 +144,8 @@ add_executable(ravenfs_juv_delete
 )
 target_link_libraries(ravenfs_juv_delete PRIVATE ravenfs_juvenile)
 
-# v1.1 bitmap_slice_t 分片位图自治单元单测 —— **退役**（v2.0 起 bitmap_slices 整体删除）
-# add_executable(ravenfs_juv_bitmap_slice
-#     test_bitmap_slice.cpp
-#     ${CPU_ID_STUB}
-# )
-# target_link_libraries(ravenfs_juv_bitmap_slice PRIVATE ravenfs_juvenile)
-
-# v1.1 block_occupy_soft 定点占领路由测试 —— **退役**（随 bitmap_slices 删除）
-# add_executable(ravenfs_juv_block_occupy
-#     test_block_occupy.cpp
-#     ${CPU_ID_STUB}
-# )
-# target_link_libraries(ravenfs_juv_block_occupy PRIVATE ravenfs_juvenile)
-
-# v1.1 名字堆专项/压测 —— **退役**：v1.3 名字堆（10 档 heaps_*）已由目录名字
-# 数据面（映射 direct/tree + fr 树）取代，旧测试断的正是被删字段。新的
-# name-data 专项测试待正式树落地后另立（见 test_name_data_plane*.cpp TODO）。
-# 原 test_name_heap.cpp / test_name_heap_stress.cpp 保留在树内供移植参考，暂不入构建。
-
-# 以下 8 个目标 **stale，隔离（见上）**：命令已注释，描述保留备查。
-# v1.1 Inode 缓存控制器真盘大测（RADIX 模式，按超级块链式推导初始化）
-# 用法: ./benchmark_radix [/dev/nvme1n1]
-# add_executable(ravenfs_bench_radix
-#     benchmark_radix.cpp
-#     ${CPU_ID_STUB}
-# )
-# target_link_libraries(ravenfs_bench_radix PRIVATE ravenfs_juvenile)
-
-# v1.1 InodeSession 缓存命中 vs 直接 NVMe 读 对比
-# add_executable(ravenfs_bench_session
-#     benchmark_session_vs_nvme.cpp
-#     ${CPU_ID_STUB}
-# )
-# target_link_libraries(ravenfs_bench_session PRIVATE ravenfs_juvenile)
-
-# v1.1 extent_unmap_range_loose 子集删除原语专项（发烟：三分支 + 契约 + 满叶分裂）
-# add_executable(ravenfs_juv_extent_unmap_loose
-#     test_extent_unmap_loose.cpp
-#     ${CPU_ID_STUB}
-# )
-# target_link_libraries(ravenfs_juv_extent_unmap_loose PRIVATE ravenfs_juvenile)
-
-# v1.1 extent_unmap_range_loose 大型压测（12 万打底：A 规整 + B 混沌 + 乱序全删 + NO_BLOCK 注入）
-# add_executable(ravenfs_juv_extent_loose_stress
-#     test_extent_loose_stress.cpp
-#     ${CPU_ID_STUB}
-# )
-# target_link_libraries(ravenfs_juv_extent_loose_stress PRIVATE ravenfs_juvenile)
-
-# v1.1 dfprealloc_and_plan（pwrite phase1）专项：三初始态 × 覆盖/增长/洞写 × 锚定成败/用尽回滚
-# add_executable(ravenfs_juv_pwrite_phase1
-#     test_pwrite_phase1.cpp
-#     ${CPU_ID_STUB}
-# )
-# target_link_libraries(ravenfs_juv_pwrite_phase1 PRIVATE ravenfs_juvenile)
-
-# v1.1 direct_file_pwrite 五段管线发烟 step1：inline 升格 direct/extent 双路径
-# （audit = 测试侧 hack helper：ftype/InodeSession/walk+iterator/read_block/位图账本）
-# add_executable(ravenfs_juv_pwrite_smoke
-#     test_pwrite_smoke.cpp
-#     ${CPU_ID_STUB}
-# )
-# target_link_libraries(ravenfs_juv_pwrite_smoke PRIVATE ravenfs_juvenile)
-
-# v1.1 direct_file_pread 发烟：三形态读 + 洞读 0 + EOF 短读/越界 + 受理
-# add_executable(ravenfs_juv_pread_smoke
-#     test_pread_smoke.cpp
-#     ${CPU_ID_STUB}
-# )
-# target_link_libraries(ravenfs_juv_pread_smoke PRIVATE ravenfs_juvenile)
-
-# v1.1 direct_file_punch_hole / direct_file_trunacate 发烟：三形态段化 + KEEP_SIZE +
-# 缩小三出口 + 增大 P4（规格 punch_truncate_pread_spec.md §5/§6）
-# add_executable(ravenfs_juv_punch_truncate_smoke
-#     test_punch_truncate_smoke.cpp
-#     ${CPU_ID_STUB}
-# )
-# target_link_libraries(ravenfs_juv_punch_truncate_smoke PRIVATE ravenfs_juvenile)
-
-# v1.1 pwrite 真盘规模阶梯：超大 direct（GB 级）+ 超多 extent（洞写 10^5+ 记录）
-# add_executable(ravenfs_juv_pwrite_big
-#     test_pwrite_big.cpp
-#     ${CPU_ID_STUB}
-# )
-# target_link_libraries(ravenfs_juv_pwrite_big PRIVATE ravenfs_juvenile)
+# v1.1 名字堆（name heap）/ 分片位图（bitmap_slices）/ block_occupy 专项测试
+# —— **已随 v1.x 清理整体删除**（2026-10-16）。v2.0 仅存名字数据面（见下）。
 
 # v1.1 mgr_slice_t 主从红黑树分片分配器单测（2026-10-03）：
 # enable/test_interval/free_interval/free_intervals/all_dump/soft_occupy
@@ -322,15 +225,7 @@ add_executable(ravenfs_stress_name_data_fr
 )
 target_link_libraries(ravenfs_stress_name_data_fr PRIVATE ravenfs_juvenile)
 
-# disk_struct_v1.3.h 自校验 TU（2026-10-05）：**纯编译期护栏 + IDE 收录**。
-# 让 v1.3 盘面头进入 compile_commands.json（真实 -I include / -std=gnu++20），
-# clangd/VSCode 不再退回带 -D__KERNEL__ 的兜底配置而刷假错；
-# 同时以 static_assert 钉死 v1.3 结构尺寸与关键 offset。无运行时符号。
-add_executable(ravenfs_header_selfcheck_v13
-    header_selfcheck_v13.cpp
-)
-
-# disk_struct_v2.0.h 自校验 TU：同 v13 套路 —— 让 v2.0 盘面头进入
+# disk_struct_v2.0.h 自校验 TU：让 v2.0 盘面头进入
 # compile_commands.json（真实 -I include / -std=gnu++20），VSCode 不再
 # 退回带 -D__KERNEL__ 的兜底配置而刷假错；同时钉死 SB 32B magic +
 # 全局 inode 数据面四字段的尺寸/offset。无运行时符号。

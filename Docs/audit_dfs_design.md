@@ -38,7 +38,8 @@ XOR → 分类「没有被保护 / 疑似泄露」。全部经 `FILE*`（默认 
 非 mmap 挂载 → `RC_ERR_STATE`。
 
 ```
-real_block_bm / real_inode_bm  ← 分配器账本（1 = 已分配；经 block_test/inode_test）
+real_block_bm                  ← 分配器块账本活值（1 = 已分配；经 block_test / all_dump）
+real_inode_plane               ← v2.0 无 inode 位图；inode 分配态经 inode_test()（全局 inode 数据面）
 shadow_blk    (1 bit / FS_block) ← 审计重画的"应该被占"
 shadow_ino    (1 bit / inode)    ← 审计重画的"应该被占"
 ```
@@ -50,7 +51,8 @@ shadow_ino    (1 bit / inode)    ← 审计重画的"应该被占"
 | dentry / extent 树节点（各 2 块） | ✅ | |
 | direct 数据 run `[base, +ceil(size/4K))` | ✅ | |
 | extent 记录 `[block_base, +length)` | ✅ | |
-| 名字堆激活区（bitmap 面 + data 面整段） | ✅ | |
+| 名字数据面（direct 段 / 映射树节点 / fr 树节点） | ✅ | |
+| 全局 inode 数据面（数据片 / 映射树节点 / 扁 fr 快照区） | ✅ | |
 | xattr 块 | ✅ | |
 | root inode + 每条 dentry 目标 inode | | ✅ |
 
@@ -69,8 +71,9 @@ B \ A  → 已分配但不可达            = 【疑似泄露】（空间捞不�
 A ∩ B  → 正常在用     ~A ∩ ~B → 真空闲
 ```
 
-- 块侧只对 `[0, inode_bm_base)` 对账；白名单 = 尾巴三段 `[inode_bm_base, total_blocks)`
-  + backup SB 链（mkfs 常亮、无 owner）。
+- 块侧只对 `[0, bitmap_start)` 对账（v2.0 无 inode 位图；白名单起点 = 块位图区
+  `bitmap_start`）；白名单 = `[bitmap_start, total_blocks)` + backup SB 链
+  （mkfs 常亮、无 owner）。
 - 块侧按**字节**扫描（`shadow_blk[i] ^ block_bits[i]`）：干净盘零差异 → 极快；
   仅在差异字节处逐位分类。输出合并成**区间**（`[start, +len)`）。
 - 老 `dangling_refs` = 「没有被保护的 inode」；老 `orphan_inodes` = 「疑似泄露的
@@ -84,7 +87,7 @@ A ∩ B  → 正常在用     ~A ∩ ~B → 真空闲
 /* public（ravenfs_v1.1.hpp） */
 result_code_t audit_dfs_root(audit_walk_report_t *rep = nullptr, FILE *out = stdout,
                              bool verbose = false);
-/* verbose=false（默认）：只打 发现/HEAP/SUM —— 大盛盘（1.8T 实测 347k inode）
+/* verbose=false（默认）：只打 发现/NAMEDATA_SUM/INODEPLANE_SUM/SUM —— 大盛盘（1.8T 实测 347k inode）
  *   逐 inode WALK 会刷 39MB 日志，故默认关；需 trace 时传 true（CLI `-v`）。 */
 
 /* 类型（ravenfs_audit.hpp）：瘦身 = 两张影子图 + 白名单 + 路径栈 + 计数 */
@@ -95,26 +98,30 @@ struct audit_walk_ctx_t {   // 递归携带
     std::vector<uint64_t> path_inum;  std::vector<std::string> path_name;
     int depth, max_depth;   bool verbose;   audit_walk_report_t rep;
 };
-struct audit_walk_report_t { /* btree/inode/heap/xattr_bad, multi_ref/claim,
-    link/dotdot, unprotected_{blk,ino}, leaked_{blk,ino}; total_bad() 求和 */ };
-struct audit_heap_region_t { /* 名字堆激活区（长名归属校验；每目录 transient）*/ };
+struct audit_walk_report_t { /* btree/inode/namedata/inodeplane/xattr_bad, multi_ref/claim,
+    link/dotdot, unprotected_{blk,ino}, leaked_{blk,ino}; namedata_*/inodeplane_* 观察面;
+    total_bad() 求和 */ };
+struct audit_name_data_tree_t { /* 目录名字数据面映射树（每目录 transient）*/ };
+struct audit_inode_data_tree_t{ /* 全局 inode 数据面映射树（全盘一份 transient）*/ };
 struct audit_walk_tree_t   { /* leaves / leaf_depth / records_total（每树 transient）*/ };
 ```
 
 打印规格：`[AUDIT][WALK] <path> inum=.. type=.. size=.. lc=..`、
-`[AUDIT][BAD*]`、`[AUDIT][MULTI_REF|MULTI_CLAIM]`、`[AUDIT][UNPROT_BLK|LEAK_BLK]`
-（区间）、`[AUDIT][UNPROT_INO|LEAK_INO]`、`[AUDIT][SUM]`。
+`[AUDIT][BAD*|BAD_NAMEDATA|BAD_INODEPLANE]`、`[AUDIT][MULTI_REF|MULTI_CLAIM]`、
+`[AUDIT][UNPROT_BLK|LEAK_BLK]`（区间）、`[AUDIT][UNPROT_INO|LEAK_INO]`、
+`[AUDIT][NAMEDATA_SUM]`、`[AUDIT][INODEPLANE_SUM]`、`[AUDIT][SUM]`。
 
 ---
 
 ## 5. DFS 骨架
 
 ```
+audit_inode_data_plane(...)   // 全局 inode 数据面：先审计/认领（数据片用 allocator 活值 + 映射树 + 扁 fr 快照）
 visit_ino(inum, parent):
   ├─ 深度超限 / inum 越界        → BAD
   ├─ shadow_ino 已置位           → MULTI_REF（环/共享/双引用），return
   ├─ 置 shadow_ino；读 256B inode；print WALK
-  ├─ DIR:  lc==size+2 / data_root；名字堆；dentry 树 DFS（认领节点+条目+长名归属）；
+  ├─ DIR:  lc==2+子目录数 / size==条目数；名字数据面（映射树+fr）；dentry 树 DFS（认领节点+条目）；
   │        先序下钻子目录（父=本目录 inum，校验子目录根 ptrs[1]=='..'==parent）
   ├─ REG/LNK: size 解码 inline/direct/extent（extent 则区段树 DFS）
   ├─ FIFO/CHR/BLK/SOCK: 不变量 26（size==0 ∧ data_root==PTR_INVALID）
@@ -122,7 +129,7 @@ visit_ino(inum, parent):
 ```
 
 B+树递归核 `audit_walk_btree` 沿用旧模型的全部结构不变量检查（键序 / 欠载 /
-等深 / 环 / hint key==子树 max / 环 / 叶链序 / hash 重算 / 长名归属 / 物理越界），
+等深 / 环 / hint key==子树 max / 叶链序 / hash 重算 / 长名经名字数据面读取 / 物理越界），
 只是记账口从 `ctx.claim_bits/visited_nodes` 换到 `shadow_blk/shadow_ino`；
 节点数据**先拷出**再递归（解耦会话生命周期，跨模式安全）。
 
@@ -160,7 +167,7 @@ B+树递归核 `audit_walk_btree` 沿用旧模型的全部结构不变量检查�
 
 ```
 [PASS] 干净盘 total_bad==0
-[PASS] 建内容后结构/XOR 全净（btree=0 heap=0 unprot=0 leak=0）
+[PASS] 建内容后结构/XOR 全净（btree=0 namedata=0 inodeplane=0 unprot=0 leak=0）
 [PASS] 审计条目数 == 成功插入数 (323)
 [PASS] dotdot<=1（root-split '..' 已知缺口，审计已捕获：1）
 [PASS] 污染（翻 hash）→ btree_bad>=1；还原 → 归零
@@ -169,6 +176,7 @@ B+树递归核 `audit_walk_btree` 沿用旧模型的全部结构不变量检查�
 11 passed, 0 failed
 ```
 
-**真盘（/dev/nvme0n1，1.8T）**：`total_blocks=488378645 inode_count=122094672`，
-走 347489 inode / 65172 节点（230 内 + 64942 叶），`bad_total=0`（零 BAD/UNPROT/LEAK）。
-日志默认安静（仅 START/HEAP/SUM），`-v` 出逐 inode WALK。
+**真盘（/dev/nvme0n1，1.8T）**：`total_blocks=488378645 inode_count=349472`，
+走 349459 inode / 47442 节点（369 内 + 47073 叶），`bad_total=0`（零 BAD/UNPROT/LEAK）；
+`namedata` data_blk=9230 tree_node_blk=176 active_dirs=4610 pieces=4615。
+日志默认安静（仅 START/NAMEDATA_SUM/INODEPLANE_SUM/SUM），`-v` 出逐 inode WALK。

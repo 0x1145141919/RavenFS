@@ -28,9 +28,9 @@
 
 class RavenFS_juvenile;   /* 前置：ctx 只持指针 */
 
-/* ── 目录名字数据面（v1.3）映射树 DFS 瞬态工作态（每目录一份）──
+/* ── 目录名字数据面（v2.0）映射树 DFS 瞬态工作态（每目录一份）──
  * 由 audit_name_data_tree 在审某目录时递归累积；用完即弃，不挂进 ctx。
- * 仅据 disk_struct_v1.3.h 的 NAMEDATA_EXTENT_* 契约独立推导。 */
+ * 仅据 disk_struct_v2.0.h 的 NAMEDATA_EXTENT_* 契约独立推导。 */
 struct audit_name_data_tree_t {
     std::vector<uint64_t> leaves;   /* DFS 序叶子块号（对账兄弟链序） */
     uint64_t leaf_depth = 0;        /* 首见叶深度（等深校验） */
@@ -44,7 +44,7 @@ struct audit_name_data_tree_t {
 
 /* ── 目录名字数据面「空闲区间树（fr）」DFS 瞬态工作态（每目录一份）──
  * 由 audit_fr_tree 在审某目录时递归累积；用完即弃，不挂进 ctx。
- * 仅据 disk_struct_v1.3.h 的 NAMEDATA_FREERANGES_* / free_ranges_hint_t 契约推导。 */
+ * 仅据 disk_struct_v2.0.h 的 NAMEDATA_FREERANGES_* / free_ranges_hint_t 契约推导。 */
 struct audit_fr_tree_t {
     std::vector<uint64_t> leaves;   /* DFS 序叶子块号（观测） */
     uint64_t leaf_depth = 0;        /* 首见叶深度（等深校验） */
@@ -55,6 +55,22 @@ struct audit_fr_tree_t {
     uint64_t records = 0;           /* leaf 条目总数（对 fr_count） */
     uint64_t node_blocks = 0;       /* 认领的 fr 树节点块合计（2 块/节点） */
     uint64_t limit = 0;             /* 逻辑空间字节上界（pieces×8K） */
+};
+
+/* ── 全局 inode 数据面映射树 DFS 瞬态工作态（v2.0；全盘一份）──
+ * 由 audit_inode_data_tree 递归累积；用完即弃，不挂进 ctx。
+ * 仅据 disk_struct_v2.0.h 的 INODE_DATA_EXTENT_* 契约独立推导。
+ * 坐标 = 逻辑 4K 块 lblk（extent_t 单位恒 4K；fblkbase/length 均 2 对齐）。 */
+struct audit_inode_data_tree_t {
+    std::vector<uint64_t> leaves;   /* DFS 序叶子块号（对账兄弟链序） */
+    uint64_t leaf_depth = 0;        /* 首见叶深度（等深校验） */
+    bool     leaf_depth_set = false;
+    bool     started = false;       /* 全局首条 extent 已见（逻辑域须始于 0） */
+    uint64_t logical_end = 0;       /* 跨叶逻辑覆盖游标（末条 extent 开边界，单位 4K 块） */
+    uint64_t records = 0;           /* extent 记录条数 */
+    uint64_t data_blocks = 0;       /* 认领的数据片物理块合计 */
+    uint64_t tree_blocks = 0;       /* 认领的映射树节点块合计（2 块/节点） */
+    uint64_t limit = 0;             /* 逻辑块上界 pieces*2（覆盖/越界校验） */
 };
 
 /* ── 每棵树的瞬态工作态（DFS 内累积；每棵树一份）──
@@ -74,41 +90,45 @@ struct audit_walk_report_t {
     /* 结构不变量违例（重点） */
     uint64_t btree_bad = 0;          /* B+树结构不变量违例 */
     uint64_t inode_bad = 0;          /* inode 字段硬矛盾 */
-    uint64_t heap_bad  = 0;          /* 目录名字数据面（映射 direct/tree + fr）不变量 / 归属异常 */
+    uint64_t namedata_bad = 0;       /* 目录名字数据面（映射 direct/tree + fr）不变量 / 归属异常 */
+    uint64_t inodeplane_bad = 0;     /* 全局 inode 数据面（映射树 + 扁 fr 快照）不变量异常 */
     uint64_t xattr_bad = 0;          /* xattr 块描述符异常 */
     uint64_t multi_ref_ino  = 0;     /* inode 二次触达（环 / 共享 / 硬链接 / 双引用） */
     uint64_t multi_claim_blk = 0;    /* 物理块二次认领 */
     uint64_t link_mismatch = 0;      /* link_count 对不上 */
     uint64_t dotdot_mismatch = 0;    /* dir 根 '..' 对不上实际父 */
 
-    /* ── 目录名字数据面（v1.3）观察面；不进 total_bad ──
-     * 字段名沿用旧 heap_* 以降低外部波及，语义已按 v1.3 数据面重述：
-     *   heap_active           = 非空数据面目录数（direct + tree）
-     *   heap_active_data_blk  = 数据片物理块合计（direct 段 + tree 各 extent）
-     *   heap_active_bitmap_blk= 映射树 + fr 树节点块合计（tree 态；2 块/节点）
-     *   heap_used_bits        = 数据片总数（8K 片）
-     * 其余 heap_slot_* / heap_total_bits / heap_zero_used 为 v1.2 名字堆遗留，
-     * v1.3 不再产生（恒 0；保留仅为兼容旧工具编译）。 */
-    uint64_t heap_active = 0;             /* 非空名字数据面目录数 */
-    uint64_t heap_active_bitmap_blk = 0;  /* 映射树 + fr 树节点占块合计（tree 态） */
-    uint64_t heap_active_data_blk = 0;    /* 数据片物理块合计 */
-    uint64_t heap_used_bits = 0;          /* 数据片总数（片=8K） */
-    uint64_t heap_total_bits = 0;         /* v1.2 堆遗留（v1.3 恒 0） */
-    uint64_t heap_zero_used = 0;          /* v1.2 堆遗留（v1.3 恒 0） */
-    uint64_t heap_slot_active[10] = {};   /* v1.2 堆遗留（v1.3 恒 0） */
-    uint64_t heap_slot_data_blk[10] = {}; /* v1.2 堆遗留（v1.3 恒 0） */
-    uint64_t heap_slot_used_bits[10] = {};/* v1.2 堆遗留（v1.3 恒 0） */
-    uint64_t heap_slot_total_bits[10] = {};/* v1.2 堆遗留（v1.3 恒 0） */
+    /* ── 目录名字数据面（v2.0）观察面；不进 total_bad ──
+     *   namedata_active_dirs = 非空数据面目录数（direct + tree）
+     *   namedata_tree_blk    = 映射树 + fr 树节点块合计（tree 态；2 块/节点）
+     *   namedata_data_blk    = 数据片物理块合计（direct 段 + tree 各 extent）
+     *   namedata_pieces      = 数据片总数（8K 片） */
+    uint64_t namedata_active_dirs = 0;
+    uint64_t namedata_tree_blk = 0;
+    uint64_t namedata_data_blk = 0;
+    uint64_t namedata_pieces = 0;
+
+    /* ── 全局 inode 数据面（v2.0）观察面；不进 total_bad ──
+     *   inodeplane_mode      = 1 tree / 0 direct
+     *   inodeplane_pieces    = 8K 数据面片数
+     *   inodeplane_data_blk  = 数据片物理块合计
+     *   inodeplane_tree_blk  = 映射树节点块合计（tree 态；2 块/节点）
+     *   inodeplane_fr_blk    = 扁 fr 快照区占块 */
+    uint64_t inodeplane_is_tree = 0;
+    uint64_t inodeplane_pieces = 0;
+    uint64_t inodeplane_data_blk = 0;
+    uint64_t inodeplane_tree_blk = 0;
+    uint64_t inodeplane_fr_blk = 0;
 
     /* 收口 XOR（核心输出） */
     uint64_t unprotected_blk = 0;    /* 可达 ∧ 块位图暗  → 没有被保护 */
-    uint64_t unprotected_ino = 0;    /* 可达 ∧ inode 位图暗 → 没有被保护（悬挂引用） */
+    uint64_t unprotected_ino = 0;    /* 可达 ∧ inode 数据面标空 → 没有被保护（悬挂引用） */
     uint64_t leaked_blk = 0;         /* 块位图亮 ∧ 不可达 → 疑似泄露 */
-    uint64_t leaked_ino = 0;         /* inode 位图亮 ∧ 不可达 → 疑似泄露（孤儿） */
+    uint64_t leaked_ino = 0;         /* inode 数据面已分配 ∧ 不可达 → 疑似泄露（孤儿） */
 
     uint64_t total_bad() const {
-        return btree_bad + inode_bad + heap_bad + xattr_bad + multi_ref_ino +
-               multi_claim_blk + link_mismatch + dotdot_mismatch +
+        return btree_bad + inode_bad + namedata_bad + inodeplane_bad + xattr_bad +
+               multi_ref_ino + multi_claim_blk + link_mismatch + dotdot_mismatch +
                unprotected_blk + unprotected_ino + leaked_blk + leaked_ino;
     }
 
