@@ -1,6 +1,6 @@
 # RavenFS Linux KO · 缺陷名单（Defects）
 
-> 2026-09-29 · Raven（2026-09-30 修订：D-2 部分落地 / D-9 修复；**2026-10-01 修订：去版本化 + 并入 D-10**；**2026-10-04 修订：新增 D-11 / D-12；D-10 修复落地**；**2026-10-05 修订：D-12 修复落地 + 新增 D-13（名字堆粒度灾难，含审计统计面铁证）**）
+> 2026-09-29 · Raven（2026-09-30 修订：D-2 部分落地 / D-9 修复；**2026-10-01 修订：去版本化 + 并入 D-10**；**2026-10-04 修订：新增 D-11 / D-12；D-10 修复落地**；**2026-10-05 修订：D-12 修复落地 + 新增 D-13（名字堆粒度灾难，含审计统计面铁证）**；**2026-10-06 修订：新增 D-14（分配器 hard_alloc「尾挖」方向契约：令锚定与叶内四形态融合永久空转，含真盘 trace 铁证）；D-14 修复落地（ko + god 同步「尾挖」→「头挖」）**；**2026-10-13 修订：新增 D-15（block 位图 checkpoint 全量写回 → 按脏写；即 D-2「30s 全量回写」遗留的具体化）**；**2026-10-13 修订（二）：新增 D-16（mdata 脏行回写触发缺口：KO 无「最后引用释放即回写」，且 TTL reap 丢弃 god 的「脏原地回写」→ 脏行仅靠 60s 周期 aging；god 真值为 ~2s）**；**2026-10-15 修订：D-15 部分落地（分片脏标志 + TTL 同步按脏写回，非全量；`al_checkpoint_blocks` 语义改记脏块数；TTL 心跳日志 `pr_info`→`pr_debug`，不再淹没 dmesg）**；**2026-10-17 修订：新增 D-17（新 inode 属主/gid 取父目录而非创建者：create/mkdir/mknod/symlink/tmpfile 全部受影响；VM 冒烟实测暴露）**）
 > **定位**：本文件是 **linux-ko 的缺陷总名单**（跨版本累积），**不按版本归类**。
 > **口径（2026-10-01 定，用户裁定）**：缺陷的组织轴是「**当前处理状态**」，**不是版本**。缺陷真正关心的是「**现在处理到哪一步**」；版本号只作「首次暴露 / 修复落点」的**附注**，不作分类依据。
 > **为何去版本化**：有些缺陷是**设计期就被忽视的点**——把它归到 0.1.0 / 0.1.1 / 0.1.2 **都是错的**（例：D-10，`i_ino` 契约从第一天起就不存在）。故本名单**不设版本归属**。
@@ -17,7 +17,7 @@
 | **D-2** | **位图分片器全量常驻（80MB），内存浪费 + 30s 全量回写** | 内存/写放大 | 中（对 SparrowOS 目标机为硬伤） | **ko 已落地 CHUNK 后端**（`rfs_bm` 类 + 挂载选项 `bitmap_mode=chunk`；运行时常驻内存 ↓）；「30s 全量回写」未收敛（**2026-09-30 用户接受**，NVMe SLC 写量小） |
 | **D-3** | **mount / umount 时间戳不回写** | 正确性（元数据） | 低-中 | **已修 + 已提交**（`linux/super.c` 时间戳回写；随 `8b32497` 入仓）——仍未随包发布 |
 | **D-4** | **O_DIRECT（`direct_IO`）故意留白 → `open(O_DIRECT)` 被拒** | 能力缺口（设计级留白） | 低（实验期）→ 中（长期通用） | **mainline 有意不做**（R-FD-10「可降级」） |
-| **D-5** | **ko 移植时降级：丢掉 god 的叶内 extent 融合（四形态）→ 写请求粒度即碎片** | 功能缺失（移植降级） | 中（元数据膨胀 / 读放大 / 回收负担） | **ko 无对等实现**（仅「出口坍缩」单条特例；**god 侧已完备**） |
+| **D-5** | **ko 移植时降级：丢掉 god 的叶内 extent 融合（四形态）→ 写请求粒度即碎片** | 功能缺失（移植降级） | 中（元数据膨胀 / 读放大 / 回收负担） | **D-5a 叶内四形态已落 ko**（`extent_write.c`，2026-10-06 前）；此前曾被 **D-14 分配方向压灭而空转**，D-14 修复后生效 |
 | **D-6** | **inline→extent 不试 direct：>160B 文件恒背 8K 区段树节点（单 extent 也背）** | 元数据膨胀（实现缺口） | 中 | ko 无（`iomap.c:195` 恒建树；direct 仅 truncate 坍缩） |
 | **D-7** | **分配 hint 不持久化：每次 mount 重置到片首 → 低地址被反复复用** | 局部性 / 恢复友好度（实现缺口） | 中 | **已由分配器 v2（树版）结构性消解（2026-10-04）**——best-fit 无位置游标，hint 生态位被算法消灭 |
 | **D-8** | **元数据与数据共用分配 hint：区段树叶插进数据流 → 自噬式碎片（2 块洞）** | 碎片放大（分配器耦合） | 中 | **已由分配器 v2（树版）结构性消解（2026-10-04）**——独立 best-fit 几何查询取代共用前移游标 |
@@ -26,12 +26,20 @@
 | **D-11** | **计数器出口放错位置：仅 debugfs（`/sys/kernel/debug` 为 `0700`），普通用户不可读** | 可观测性（出口位置） | 中 | **已修（2026-10-04，新增 procfs 公开面；未随包发布）** |
 | **D-12** | **目录 `st_nlink` 不符 POSIX：用「全条目数+2」而非「直属子目录数+2」** | 契约语义（对外 ABI）+ AI 协作放大事故 | 中 | **已修（2026-10-05，ko + god + audit 落地；未随包发布）** |
 | **D-13** | **名字堆（name_heap）粒度灾难：0.0094% 利用率、1592.7 MiB 被占、25 个空堆泄露** | 空间放大（惰性堆粒度/归还缺口）+ 已建可观测面 | 中（1.8T 实测：≈1.56 GiB 白占 + 12.6 MiB 泄漏） | **未做（待办，修复落点 v1.2；审计统计面已落）** |
+| **D-14** | **分配器 hard_alloc「尾挖」方向契约：新块一律落在自由区间【尾】→ 物理降序；锚定（只认上沿）与叶内四形态融合（只认升序）永久空转** | 分配策略（方向契约）/ 碎片放大 | 中-高（元数据 ~20×；令 D-5a 融合空转） | **已修（2026-10-06，ko + god 同步改「头挖」；未随包发布）** |
+| **D-15** | **block 位图 checkpoint 全量写回：无按脏写，每周期重写 58 MiB / 14,905 块 + 逐块 `sync_dirty_buffer`** | 写放大 / 抖动（元数据回写策略） | 低-中（NVMe 为毛毛雨；对耐久 + 抖动仍值得） | **部分落地（2026-10-15：ko 分片脏标志 + TTL 同步按脏写回；`al_checkpoint_blocks` 改记脏块数。遗留：逐块 `sync_dirty_buffer` 未改批量提交）** |
+| **D-16** | **mdata 脏行回写触发缺口：KO 无「最后引用释放即回写」；TTL reap 主动排除脏行 → 脏行仅靠 60s 周期 aging 落盘（god 真值：TTL 淘汰时原地回写，~2s）** | 回写策略（**触发时机**）/ 移植降级（god→ko 丢行为） | 中（崩溃丢窗 60s vs god 2s + 脏行内存滞留） | **未做（待办）；注释与实现相反（`cache_ttl.c:9` / `mdata_cache.c:401`）** |
+| **D-17** | **新 inode 属主/gid 取父目录而非创建者：`create/mkdir/mknod/symlink/tmpfile` 全部把 `dir->i_uid/gid` 复制进盘记录 → 非 root 在 root-owned 可写目录中创建的文件变成 root:root** | 权限/属主语义（POSIX 契约 + 安全完整性）/ 移植遗漏 | **高**（跨用户属主错置 + 后续写/utimens EACCES + quota/ACL/idmap 失真） | **未做（待办）；2026-10-17 VM 冒烟实测暴露** |
 
 > **四类性质，勿混**：**D-1~D-3 = “发布落后 mainline”**（mainline 已有修复，未进包）；**D-4 = “有意留白 / 能力缺口”**（非发布落后）；**D-5 = 移植降级**（god 有完整实现，ko 移植时丢掉）；**D-6~D-8 = ko 实现/分配器层缺口**（D-6/7 迁移与持久化，D-8 为元数据/数据分配器耦合）；**D-9 = 两版共有的接口缺口**（发布版与 mainline 都缺，**非“发布落后”**）；**D-10 = 契约缺失（设计级 ABI）+ AI 协作事故**——与全部实现级缺陷**不同类**：不是“实现没跟上”，是“**该契约从第一天起就没被定义过**”。
 > D-1 与 D-2 有交集（D-2 的 CHUNK 后端需要 D-1 的计数器做 A/B 判据，见 counters 设计 §3.F）。
 > **D-11 与 D-1 同族但独立**：D-1 管「有没有观测面」，D-11 管「观测面放的位置是否人人可读」——D-1 已落地**不消解** D-11（出口仍 `0700` root-only）。
 > **D-12 与 D-10 同族**：均为**对外契约层**问题，且**同含 AI 协作放大事故维度**——D-10 是「契约没定义」，D-12 是「把『dentry 条目数』与『直属 DIR 型 inode 数』当成一个量、契约定义得反 POSIX」；D-12 的错语义由 v1.1 #13 落定，本条即推翻该决策（**修复落点 v1.2**）。
 > **D-13 为空间放大（非契约/语义）类**：名字堆（长名尾段外置存储）的**最小激活粒度**与**归还**缺口——每激活一个堆即整块占住数据面（8B 档 512 KiB），实测利用率 0.0094%；且长名删后空堆不归还（泄漏）。**与 D-5/D-6/D-8 同属"元数据/空间放大"家族**，但这是**设计级粒度选择 + 实现级归还缺口**的叠加。**本条的审计统计面（分区级开启率/利用率/空堆判定）已落地为铁证**（见该节）。
+> **D-14 为分配策略（方向）类，与 D-5/D-7/D-8 同指向同一段代码但结论相反**：它不是「融合没实现」（mainline 已落 D-5a 叶内四形态），而是**分配方向与融合/锚定契约相反**——`rfs_slice_alloc_hard` 从自由区间**尾**取块 → 物理降序；而上层锚定（`iomap.c:523`，取左邻**上沿**）与叶内四形态（`extent_write.c:875/882`，只认升序相邻）恒不命中。**与 D-7/D-8 的「v2 结构性消解」存在张力**：D-7/D-8 归功于 v2 的「best-fit + 尾部下挖」，而正是该「尾部下挖」构成本条根因——碎片**游标耦合**确已消解，但**融合被方向压灭**（两账并存，勿互相抵消）。
+> **D-15 为元数据回写策略类（写放大/抖动），是 D-2 遗留的具体化**：D-2 的「30s 全量回写」在 **block 位图 checkpoint 路径**上就是「每周期全量重写 58 MiB / 14,905 块 + 逐块 `sync_dirty_buffer`」；**且与 D-2 内部不一致**——god v2 CHUNK 已按脏写，KO checkpoint 仍全量。**非正确性缺陷**；修复 = 按脏写 + 批量提交（见该节）。与 **D-1/D-11 的计数器面耦合**（`al_checkpoint_blocks` 改记脏块数即判据）。
+> **D-16 为回写「触发时机」类，与 D-15 同属回写策略但关注点正交**：D-15 管「写多少」（写放大），D-16 管「**什么时候写**」（触发扳机与时延）。**与 D-5 同构**——都是「god 有完整行为、ko 移植时丢掉/改写」（D-5 丢叶内融合；D-16 丢「TTL 淘汰即脏回写」）。**非正确性缺陷**（干净卸载 `flush_all` 仍全量落盘），但把脏行落盘时延从 god 的 ~2s 拉大到 KO 的 ~60s（`wb_age_seconds`），并**与两处自述注释相反**。与 D-2/D-15 共享「回写由谁驱动」的问题域。
+> **D-17 为权限/属主语义类（POSIX 契约 + 实现遗漏）**：与 D-10/D-12 同属**用户态可见语义/契约**家族，但性质是“VFS 标准 `inode_init_owner()` 路径没接”，不是“契约未定义”。它把父目录 owner 当成新 inode owner，导致跨用户属主错置并持久化到盘记录；严重度定为**高**（权限完整性 + quota/ACL/idmap 连带失真）。VM 已实测复现，修复必须覆盖五条创建路径并补 owner 矩阵回归。
 
 ---
 
@@ -169,7 +177,7 @@ state  : 从未挂载（或挂载路径未回写时间戳）
 **影响**：ko 同 workload 下**碎片数 ≈ 写请求数**（本例 133k 条，god 叶内融合后应大幅收敛）；**元数据膨胀**（本例 ≈ 794 叶 × 8K ≈ **6.2 MiB** 只为描述一份几乎连续的 32 GiB 文件）、**读放大**（每 256 KiB 跨一条树记录）、**回收/恢复的元数据负担**上升。
 > 附注：对**数据恢复（内容雕复）**而言，细粒度映射反而更友好（局部覆盖最多丢 256 KiB 单元）——这是同一设计的双面。
 
-**mainline 状态**：**ko 无对等实现** —— `linux/extent_write.c:14` 明确留白「**交后续收敛**」，后续只落了单条特例「出口坍缩」（`file.c:568`）；**god 侧已完备**。→ **修复 = 把 god 的叶内四形态（不跨界）移植进 ko 的 map 路径**（顺带：`hint` 持久化，避免每次 mount 从片首重开吃——见会话记录）。
+**mainline 状态（2026-10-06 复核）**：**叶内四形态（D-5a）已落 ko** —— `linux/extent_write.c:867-888` 完成 `L/R` 叶内判定与 `NONE/LEFT/RIGHT/BOTH` 四形态执行（刻意不跨界），god 侧同源完备。**但曾长期空转**：D-14 的「尾挖」令 `L/R`（升序相邻）恒不命中 → 四形态「实现存在 ≠ 生效」。**D-14 已修（头挖）**，本条随之复活。另：`hint` 持久化（D-7）由分配器 v2 结构性消解（无游标）。
 
 **现场验证（同日 09-29/09-30 恢复实验）**
 
@@ -241,6 +249,8 @@ state  : 从未挂载（或挂载路径未回写时间戳）
   **不是 D-7 的『片内分配位置游标』**——即便停在亲和片 0，片内落点仍由 best-fit 几何决定。
   故不重新触发 D-7。真值实现：`linux/ravenfs_allocator_router.c:252-266`、`linux/ravenfs_allocator_slice.c:472-514`。
 
+> **D-14 后注（2026-10-06）**：`rfs_slice_alloc_hard` 取位已由**尾部下挖**改为**头部上挖**（D-14）。D-7 的消解依据是「落点纯由 best-fit 几何决定、无前移游标」，该性质**不依赖尾/头方向**，故本条结论不变；仅原文「尾部下挖」应读作「头部上挖」。
+
 **mainline**：无。
 
 ---
@@ -272,6 +282,8 @@ state  : 从未挂载（或挂载路径未回写时间戳）
   应较 D-8 原始证据（775 个）**显著下降**；新埋点 `al_merge_*` / `al_tree_*` 佐证碎片融合行为。
 - **不变量**：D-8 的修复**不依赖**任何「元数据/数据分离游标」的新增字段——是算法几何自然分离，
   故**无需**在 SB / slice 表引入分离游标（旧『应有形态』的第 2 方案属游标时代的补丁，已无必要）。
+
+> **D-14 后注（2026-10-06）**：`rfs_slice_alloc_hard`/`soft_alloc` 的取位已由**尾部下挖**改为**头部上挖**（D-14）。D-8 的消解依据是「每次分配为独立 best-fit 几何查询、无共用前移游标」，该性质**不依赖尾/头方向**，故本条结论不变；原文「尾部」应读作「头部」。
 
 **mainline**：无。
 
@@ -539,7 +551,266 @@ state  : 从未挂载（或挂载路径未回写时间戳）
 
 ---
 
-## 发布建议（D-1~D-3 的统一出口；D-4~D-13 另论）
+## D-14 分配器 hard_alloc「尾挖」：方向契约与融合/锚定相反 → 叶内四形态融合与锚定永久空转
+
+> 2026-10-06 新增 · **已修（ko + god 同步「头挖」）** · **真盘 trace 铁证**
+
+**现象**：真盘 `nvmelog.txt`（1.8T `/dev/nvme0n1`，RavenFS v2.0 audit）显示——文件数据面**物理连续却被全记成降序碎条**：
+
+- `[TRACE][EXTENT]`：**7,857** 个 extent 型文件、**670,437** 条区段；逻辑相邻区段 **662,580** 对中 **639,591 = 96.53% 物理相邻**，但**全部降序**（`prev.pblk == next.pblk + next.len`）、**升序相邻 = 0**；**97.73%** 的 inode 含此现象（7,679/7,857）。
+- 典型：`inum=36608`（29.7 MB）物理区间 `[30363794, 30371040)` **整块连续 ~29 MB**，却记成 **57 条**（56×128 块 + 尾 76 块），且**文件逻辑序 = 物理降序**（fblk 越大 phys 越低）。
+- delta 分布（`next.pblk-(prev.pblk+prev.len)`）：**`-128`×608,583、`-256`×24,698**——即「每个分配量子向下退一格」。
+
+**定性**：**分配策略缺陷（方向契约）**——不是「融合没实现」，而是**分配方向与上层契约相反**：
+- 分配器 `ravenfs_allocator_slice.c:489` 在自由区间**尾部下挖**（`s = (iv_end - bitscount) & ~align_mask`，注释「尽量贴尾」）→ 连续分配物理地址**单调递减**；
+- 上层两条消费者**只认升序相邻**：
+  · **锚定** `iomap.c:523` `anchor = 左邻.phys + 左邻.len`（左邻**上沿**一格）——尾挖下该格恒已被占 → `occupancy_soft` 恒失败 → 回退 hard；
+  · **叶内四形态融合**（D-5a，`extent_write.c:875/882`）`L`/`R` 条件均要求 `左邻.phys + 左邻.len == ext.phys`（升序）——实测恒为反向 → `merge = NONE` → **纯插，一次分配记一条**。
+
+**根因**：`rfs_slice_alloc_hard`（`ravenfs_allocator_slice.c:451`）取位在区间尾（`:489`），而 `extent_t` 是**严格升序映射**（`disk_struct_v1.3.h:471`：`phys = block_base + (fblk - fblkbase)`，**无方向位**）→ 降序相邻**无法表示成单条**。三重叠加：**方向反 + 锚点只认上沿 + 格式无反向** → 融合路永不触发。同一「尾挖」在 `:552`（soft_alloc）亦存在。
+
+**证据（一手）**
+- trace：`ravenfs/nvmelog.txt`（`[TRACE][EXTENT]` / `[TRACE][IDPEXT]`），2026-10-06 本会话实测（脚本 `file_extent_mergeability.txt` / `tmp_file_merge*.py`）。
+- 代码：`ravenfs_allocator_slice.c:451/489/552`（尾挖）、`iomap.c:74/523`（锚定升序）、`extent_write.c:777/875/882/886`（四形态升序）、`disk_struct_v1.3.h:471`（extent_t 升序无方向）。
+
+**量化（若方向修正为升序 / 或支持反向 extent 表示）**
+- 文件数据面区段：**670,437 → 30,846（−95.4%）**；平均段/inode **85.33 → ~3.9**；**2,975** 个文件塌成单 extent、**6,706** 个 ≤2 条。
+- 边界位置：同叶边界 636,441 / 跨叶 3,150（跨叶者须动两节点）。
+- 对照：IDP（inode 面）本就分散（10890 片/21842 块，仅 2.93% 反向相邻），非本条主诉。
+
+**应有形态（二选一，须裁）**
+- **(a) 分配器改「头挖」**（最小改动，取）：`s = (iv_base + align_mask) & ~align_mask`（自由区间**底**取块）→ 连续分配**升序**，锚点（上沿）命中 → `L` 融合成立 → 顺序写塌成单条 extent。`soft_alloc`（`:552`）须同步。
+- **(b) 保留尾挖 + 引入「反向 extent」表示**（格式级）：`extent_t` 增方向位/反向语义 → 降序连续段亦可单条表达。**动盘格式**，代价大，**不取（除非另有动机）**。
+- **退出条件**：既有「尾挖」决策在**方向**维度不成立（D-7/D-8 曾据以称「结构性消解」），须以 (a) 复位。
+
+**影响**
+- 元数据放大 **~20×**（670,437 条 vs 理论 30,846）；区段树节点/叶数随之膨胀（读放大、回收/恢复元数据负担）。
+- **令 D-5a 叶内四形态融合与锚定路径永久空转**——功能已落而恒不生效（**「实现存在 ≠ 生效」**）。
+- 与 D-5/D-6/D-8 同属「元数据/空间放大」家族；本条是**统一的根因（方向）**，D-5 的「无融合」表象部分由此造成。
+
+**mainline 状态（2026-10-06 修订）**：**已修**。取「应有形态 (a)」，把分配器 v2 的取位由**尾挖**改**头挖**，使连续分配**物理升序**、锚定（上沿）与叶内四形态融合（D-5a）复活：
+- **ko**（`linux/ravenfs_allocator_slice.c`）：`rfs_slice_alloc_hard` 起点 `s = (iv_base + align_mask) & ~align_mask`（原 `(iv_end - bitscount) & ~align_mask`），越界判据改为 `s + bitscount > iv_end`；`rfs_slice_soft_alloc` 同步头挖（`s = (iv_base + align_mask) & ~align_mask`，`t = min(iv_end - s, remain)`）。头余 = 对齐留白、右余 = `[s+t, iv.end)` 供升序续配。
+- **god**（`juvenile_god/fs_allocator.cpp`）：`mgr_slice_t::alloc_hard` / `soft_alloc` 同步改造（god 为移植真值源，两侧必须同向）；契约注释见 `include/ravenfs/fs_allocator.hpp`。
+- **头文件契约面**：`include/linux/ravenfs_allocator_slice.h`（`alloc_hard` 注释「头部上挖」）、`include/ravenfs/fs_allocator.hpp`。
+- **回归**：ko/god 单测（`test_allocator_slice` / `test_fs_allocator`）、对抗差分压测（`stress_allocator_slice` / `stress_allocator_router`，含两处朴素参考实现同步改头挖）、路由/ inode 面单测与 `stress_fs_allocator_*` 全绿。
+- **注**：D-5 节「ko 无对等实现」口径已滞后于 D-5a 落地（四形态在 `extent_write.c:875/882`），本条修复即令其**由空转转为生效**；D-7/D-8 所归功的「无前移游标 + 独立 best-fit 几何查询」不受方向翻转影响（仅「尾部」改「头部」，游标耦合仍不存在）。
+- **未随包发布**（行为级变更，随下版 `pkgver` 升号）。
+
+**修复落点**：分配器 slice（ko `ravenfs_allocator_slice.c` + god `fs_allocator.cpp`）；行为级变更 → 随下版 `pkgver` 升号；须重跑 audit 前后对比。
+
+**验收判据**
+- 改后重建 FS + 同 workload：`[TRACE][EXTENT]` 的「升序相邻」对 **> 0**（应主导），降序相邻塌缩；区段数按上式显著下降；
+- `al_` 组计数器（`al_blk_alloc_hard_ok` / `AL_ROUTE_*`）与新增融合打点佐证「锚定命中 / 融合命中」上升；
+- 行为零变化（分配语义、容量、正确性）；`audit_v1.2` 全绿。
+
+**关联**：`Docs/linux/ravenfs-linux-ko-perf-counters-v0.1.2.md` §7.4（`al_` 组）；D-5（叶内四形态——本条为其「空转」根因）、D-6/D-8（同族空间放大）、D-7（hint 生态位——同指 `slice.c` 分配几何）；`ravenfs_allocator_slice.c:451/489/552`、`iomap.c:74/523`、`extent_write.c:777/875/882`、`disk_struct_v1.3.h:471`；一手 trace `ravenfs/nvmelog.txt`。
+
+---
+
+## D-15 block 位图 checkpoint **全量写回**：无按脏写，每周期重写 58 MiB（写放大 + 抖动）
+
+> 2026-10-13 新增 · **部分落地（2026-10-15：ko 分片脏标志 + 按脏写回）** · **即 D-2「30s 全量回写」遗留的具体形态** · **god v2 CHUNK 已有按脏写，KO 本轮已接**
+
+**现象**：KO 每次 checkpoint（及 shutdown）都**全量重写整张 block 位图**，无按脏写：
+
+- `linux/allocator_adapter.c:163 checkpoint_block()`：**补集重建**——全片置占用 → 逐片 `rfs_allocator_dump_slice` 空闲区间清零（维护 `m->blk_words`）；
+- `linux/allocator_adapter.c:138 bm_image_save()`：`for (b=0; b<nblocks; b++) { sb_bread + memcpy + mark_buffer_dirty + sync_dirty_buffer }`——**逐块全写**；
+- 调用点 `:874 checkpoint_block` + `:879 bm_image_save` + `:886 RFS_AL_ADD(sb, al_checkpoint_blocks, sbi->bitmap_blocks)`（计数即「写了全部 14,905 块」）；
+- god v1：`juvenile_god/ravenfs_juvenile.cpp:762 bitmaps_flush()` 为 `TODO(P3)` **no-op**；真正落盘在 `all_sycn()`（「全占用起步 → 各片 all_dump 清空闲位 → pwrite」，同为全量）。
+
+**定性**：**写放大 + 抖动（元数据回写策略）**，**非正确性缺陷**。与 **D-2 同源**——D-2 的「30s 全量回写」长期挂「未收敛」，本条是它在 **block 位图 checkpoint 路径**上的具体形态与修复方案；**且构成 D-2 内部的不一致**：god v2 CHUNK 后端**已实现按脏写**（`juvenile_god/bitmap_slices_v2.cpp` 的 `CHUNK_FLAG_DIRTY` + `evict_online()` 脏才回写 + `drain_chunk()` 清位即置脏；即 D-2 里「TTL 改按脏写，2.7MB/s 写放大消失」），而 KO 的 checkpoint 仍全量。
+
+**证据**
+- 代码：`linux/allocator_adapter.c:138/163/874/879/886`（全量写路径 + 计数）、`juvenile_god/ravenfs_juvenile.cpp:762`（god no-op）、`juvenile_god/bitmap_slices_v2.cpp`（`CHUNK_FLAG_DIRTY`/`evict_online`/`drain_chunk`）、`include/ravenfs/bitmap_slices_v2.hpp:106`（chunk 头部 `[2,3) dirty`）。
+- 量化基准：真盘 `total_blocks=488,378,645`、`bitmap_blocks=14,905` = **58.22 MiB**（`fr_log.txt` / `nvmelog.txt` `[AUDIT][GEO]`）。
+
+**量化（2TB 镜像）**
+- 若 checkpoint 周期 30 s：58 MiB / 30 s ≈ **1.93 MB/s ≈ 61 TB/年**（仅位图）；中端盘 600 TBW → **约 10%/年**。
+- **抖动**：每 checkpoint = **14,905 次 `sync_dirty_buffer`**（逐块等 bio 完成）→ **周期性尾延迟尖峰**。
+
+**根因**：`blk_words` 是「**重建型**」载体（树为唯一真相，checkpoint 时按补集重建位图），**改动集不显式记录** → 无法只写脏块 → `bm_image_save` 只能全量遍历。
+
+**应有形态（按脏写，须裁粒度）**
+- **(a) 每片 dirty 标志（取）**：片覆盖 `per_slice_bits/32768 ≈ 466` 块 = **1.9 MiB**；checkpoint 只写「变过的片」的位图块；O(1) 状态，与 slice 模型 / f2fs `dirty_sentries_bitmap` **同构**。
+- **(c) 影子位图 memcmp（备选，零热路径改动）**：保留上次写盘副本（58 MiB），checkpoint 逐块 memcmp 只写相异块；代价 = 一次内存扫（~ms），**绝不漏**。
+- **纪律（关键）**：脏**必须**来自「**自上次落盘以来的 alloc/free 历史**」，**不能**从补集重建推——重建每次都摸**全部**空闲段，89% 空闲 → 几乎每块都被标脏 → **白干**。写脏块后写 **SB generation**（否则掉电不知哪次 checkpoint 完成）→ 清 dirty；**全量写只在**：mkfs / clean unmount / 每 N 次 baseline / 修复后。
+- **正交第二刀（专治抖动）**：`sb_getblk + memcpy + mark_buffer_dirty` **批量 mark** + 末尾**一次 flush**（`ravenfs_issue_flush` / `blkdev_issue_flush`），取代逐块 `sync_dirty_buffer`。
+
+**崩溃语义**：**更好，非更差**。每个位图块自洽（自述其 32768 块），按块写回 = **更少撕裂写、更小窗口**；最坏仍是「位图落后 → 重挂载 audit 修」，与 happy-path 契约一致，**无回退**。
+
+**mainline 状态（2026-10-15 修订）**：**部分落地**。ko 已按「应有形态 (a)」落**分片脏标志 + TTL 同步按脏写回**：
+- **脏 = 片内隐状态（`rfs_slice.dirty`，设计裁定）**：脏标志下沉到**变更发生的那一层**（`linux/ravenfs_allocator_slice.c`），在 `alloc_hard` / `soft_alloc` / `soft_occupy` / `free_interval` 里 `free_count` 更新处一并置位；`enable` 建树后归零（= 载入盘面 = 已持久基线）。出口 `bool rfs_slice_dirty_take(struct rfs_slice *)`（读-改-清，持片锁）。
+  - **为何不用外层注入钩子**：钩子方案须在**路由层枚举每一个变更接口**（alloc/soft/occupy/free 五处），新增片内变更接口即漏记（action-at-a-distance）；且要新增 hook 结构/宏/`cfg`/`allocator` 字段与适配层脏位图。片内隐状态与之相比：变更点与 `free_count` 同函数同锁（**不可能漏**）、零新增注入面、并发天然由既有片锁保护；与既有 `last_finish_hint`/`free_count` 同族（本就是片内隐状态）。**裁定：取片内隐状态。**
+- **路由出口**（`linux/ravenfs_allocator_router.c`）：`bool rfs_allocator_block_dirty_take(self, u32 slice)`（持片锁读-改-清；越界 false），供 FS 适配层 checkpoint 用。
+- **FS 适配层**（`linux/allocator_adapter.c`）：`checkpoint_block` 只对 `dirty_take` 为真的片补集重建；`bm_image_save` 只写这些片覆盖的位图块；二步合并为 `bm_checkpoint_save`，**待写片集合按调用本地化**（无共享可变态）。**取脏在重建前**：期间并发 alloc/free 重新置脏 → 下轮再写，绝不丢更新。
+- **附带加固（本轮测试暴露，顺带修）**：`ravenfs_allocator_flush` **新增 `flush_lock` 串行化**——`sync_fs` / 每文件 `fsync` / TTL / `put_super` 可并发进入，而 `ravenfs_sb_write_sync` 对 SB 块 0 是「读-改-写 + crc」共享缓冲；并发会 crc 自撞 → `-EIO` → `force_shutdown`（**pre-existing**，非 D-15 引入，但 D-15 令 checkpoint 更快、更易命中）。见「附带项」。
+- **计数**：`al_checkpoint_blocks` 语义由「= `bitmap_blocks`」改「= 实际写出的脏块数」。
+- **日志**：`cache_ttl.c` 每轮 TTL 心跳由 `pr_info_ratelimited` 下调为 `pr_debug_ratelimited`（`dmesg` 不再被刷屏；起停两行仍 `pr_info`）。
+- **未做（遗留）**：① 逐块 `sync_dirty_buffer` 未改「批量 mark + 一次 flush」（正交第二刀，抖动）；② god 侧对齐（`ravenfs_juvenile.cpp bitmaps_flush`/`all_sycn`）未动。
+- **VM 验收（2026-10-15，`linux/vm/`）**：A/B（HEAD ko vs 本改）同 workload —— OLD 恒 **256 块/checkpoint**（= `bitmap_blocks`），NEW 负载后 **112**、近空转 **48** 块/checkpoint（`bitmap_blocks=256`、8 片、32 块/片）；无 TTL 心跳入 `dmesg`；并发写删 + 高频 checkpoint + 并发 `sync` 压测 **无 BUG/Oops**（加 `flush_lock` 前并发 `sync` 可复现 SB crc 自撞 → force_shutdown，加后 3/3 干净）、卸载后 `audit_v20 bad_total=0`、重挂 gold md5 MATCH；用户态 `test_allocator_slice`（含新增 §9 脏标志契约）**PASS 125** / `test_allocator_router` **PASS 207** / `stress_allocator_slice` **PASS 1512** / `stress_allocator_router` **PASS 844**。**未随包发布**（行为级变更 → 随下版 `pkgver` 升号）。
+
+**附带项（并发 flush SB 竞态，pre-existing）**：`ravenfs_allocator_flush` 现由 `ravenfs_alloc_mgr.flush_lock`（`linux/allocator_adapter.c`）串行化——否则 `sync_fs`/`fsync`/TTL 并发时 `ravenfs_sb_write_sync`（`super.c:1292`，块 0 读-改-写 + crc 重验）会 crc 自撞 → `-EIO` → `force_shutdown`；同时消除 inode 面 fr 的重复 alloc/free 抖动。建议后续单列一条「flush 并发」缺陷（本条仅随 D-15 加固）。
+
+**修复落点**：`linux/allocator_adapter.c`（`bm_image_save` / `checkpoint_block` / checkpoint 调用点，新增 `bm_dirty` 位图或复用片 dirty + 批量提交）；god 侧对齐（`ravenfs_juvenile.cpp bitmaps_flush` / `all_sycn`、`bitmap_slices_v2` 口径统一）。**行为级变更（写回量）→ 随下版 `pkgver` 升号**。
+
+**验收判据**
+- `al_checkpoint_blocks` 语义由「= `bitmap_blocks`」改为「= **实际写出的脏块数**」，压测下**显著下降**（计数器见 D-1/D-11）；
+- 同 workload 的 checkpoint `io_write_bytes`（位图部分）下降、**P99 checkpoint 延迟下降**（抖动）；
+- 行为零变化（容量 / 正确性）；`audit` 全绿；掉电 = 位图落后 → audit 可修（与现状同级）。
+
+**关联**：D-2（30s 全量回写——本条为其 block 位图路径的具体化）、D-1/D-11（计数器面，判据）、D-14（同属「重建型」`blk_words` 的处理链）；`linux/allocator_adapter.c:138/163/874/879/886`、`juvenile_god/ravenfs_juvenile.cpp:762`、`juvenile_god/bitmap_slices_v2.cpp`、`Docs/runtime_tech/03_chunk_backed_slices.md`。
+
+---
+
+## D-16 mdata 脏行回写触发缺口：KO 丢掉 god 的「TTL 淘汰即脏回写」，脏行仅靠 60s 周期 aging 落盘
+
+> 2026-10-13 新增 · **未做（待办）** · **移植降级（god→ko 丢行为，同 D-5 家族）** · **由 2026-10-13 会话「TTL/同步 deadline」+「最后引用释放触发回写」两问导出**
+
+**现象**：KO 的 mdata 脏行（8K 元数据 / B+tree 节点 / inode 片）**没有任何「引用释放即落盘」路径**——`ravenfs_mdata_put` 只减引用；脏行落盘**唯一**来自 `cache_ttl.c` 的**周期 aging**（默认 60s）。更关键：KO 的 TTL 淘汰**主动把脏行排除在外**——于是脏行在内存里**滞留到 aging 到点**。而 god（用户态真值）同一条 TTL 路径**在淘汰时原地回写**（默认 TTL 2s）——即 god 的「TTL 淘汰」**本身就是脏回写路径**。
+
+三点具体事实：
+
+1. **KO 的 TTL reap 不碰脏行**：`ravenfs_mdata_reap_expired`（`linux/mdata_cache.c:429-435`）victim 条件**含 `!(row->flags & ROWF_DIRTY)`**——脏行压根**不进** TTL 淘汰；只能等 `ravenfs_mdata_wb_dirty`（`linux/cache_ttl.c:90-100`，`wb_cutoff = now - wb_age_seconds`(60s)）写回，且**写回后仍驻留**（`mdata_cache.c:352` 只清 `DIRTY`、不释放），要等下一轮 reap（`reap_ms`=4s 周期）才回收。
+2. **KO 无 last-put 回写**：`ravenfs_mdata_put`（`linux/mdata_cache.c:258-265`）**只 `refcount_dec`**；ref 在 KO 里只当淘汰/丢弃的**闸门**（`reap` 要求 `ref==1`、`drop` 要求 `ref<=1`），**不是回写扳机**。
+3. **god 相反**：`mdp_ctrl_reap_one`（`juvenile_god/mdata_piece_cache.cpp:462-466`）接管超时行后 `if (DIRTY) rt.write_block(...)` → 释放；god **没有独立周期 aging**——`self_reliat_reap_expired`（TTL）与 `flush_all` 就是仅有的两条落盘路径。
+
+**净效应（KO）**：脏行**最短滞留 ≈ 60s（aging）+ ≤4s（reap 周期）**；崩溃/掉电可丢**最长 60s** 的元数据写（相对 god 的 ~2s **放大约 30×**）。记忆量上，脏行至少驻留 60s（god 2s）→ 写密集 workload 下缓存驻留量/内存压力上升。
+
+**定性**：**回写触发策略缺陷 + 移植降级**——与 **D-5**（ko 丢掉 god 的叶内四形态融合）**同构**：god 有完整行为，ko 移植时丢掉/改写。**非正确性缺陷**（happy-path 与干净卸载 `flush_all` 仍全量落盘；崩溃走「元数据/位图落后 → audit 修」的既有契约），但它**改变了回写的时延与触发语义**（2s → 60s），且**与自身两处注释相反**：
+
+- `linux/cache_ttl.c:8-9` 自述「趟1 淘汰 … 超时冷行：**脏原地回写 → 释放**」——实际 reap 不碰脏行；
+- `linux/mdata_cache.c:401` 自述 reap「超时且 ref==1 的行 → **原地回写 + 释放**」——实际只释放**非脏**行。
+
+**证据（一手）**
+- KO 淘汰排除脏行：`linux/mdata_cache.c:429-435`（`pick = !(flags&DIRTY) && !(flags&WB) && acc_stamp<cutoff`）。
+- KO 无 last-put 回写：`linux/mdata_cache.c:258-265`；ref 仅作闸门：`:298`（drop）、`:429`（reap）、`:478`（flush）。
+- KO 唯一周期回写：`linux/cache_ttl.c:44-46`（`wb_age_seconds=60`）、`:90-100`（`wb_cutoff = now - 60s`）；TTL 参数 `:36-38`（2s）、扫描周期 `:40-42`（4000ms）。
+- 注释与实现相反：`linux/cache_ttl.c:8-9`、`linux/mdata_cache.c:401`。
+- `wb_stamp` 语义（aging 基准）：`linux/mdata_cache.c:164`（装载）、`include/linux/ravenfs_cache.h:41-47`（`RFS_ROW_MARK_DIRTY` 置 `wb_stamp`）、`linux/mdata_cache.c:353`（写回后刷新）。
+- god 真值：`juvenile_god/mdata_piece_cache.cpp:442-471`（`mdp_ctrl_reap_one` 脏→`write_block`→释放）、`:337-353`（`self_reliat_reap_expired`）、`include/ravenfs/mdata_piece_caches.hpp:208-213`（reap 注释「脏写回 + 释放」）、`:83`（`ttl_bare_seconds=0` → 默认 2s）。
+
+**量化（2TB 镜像）**
+- 冷脏行落盘延迟：KO **[~2s(冷) … 60s(aging) + ≤4s]** vs god **[~2s]**。
+- 掉电丢失窗：KO 最长 **60s** 的元数据写 vs god 最长 ~2s（均属「audit 可修」级，但窗口 **~30×**）。
+- 内存滞留：脏行至少驻留 60s（god 2s）。
+
+**应有形态（二选一，须裁）**
+- **(a) 恢复 god 语义（取）**：`ravenfs_mdata_reap_expired` 允许选脏行，接管后**锁外 copy-out → 回写 → 释放**；即「**TTL 淘汰 = 唯一脏回写路径**」，删除/收敛 60s 周期 aging（或仅留兜底、把 aging 调到接近 TTL）。与 god 时间常数对齐。
+- **(b) 保留现分工（脏走 aging、clean 走 reap）**：则必须①把两处注释订正为「reap 仅回收非脏行」；②把 `wb_age_seconds` 默认由 60s 下调到接近 TTL（否则崩溃丢窗 60s 与「god 2s」语义割裂）；③把「**无 last-put 回写**」明确记为**有意决策**（含 fsync 由 `ravenfs_mdata_wb_node` 兜底）。
+- **两方案共同前置（关键）**：脏行回写当前是**在分片写锁内做同步块 I/O**——`ravenfs_mdata_wb_dirty` 在 `down_write(&sh->lock)` 内调 `ravenfs_mrow_store`（`sb_bread` + 逐块 `sync_dirty_buffer`，`mdata_cache.c:339-358`），`wb_node` 同款（`:385-396`）；这与 `mdata_cache.c:9` 自述的「驻留回写 **copy-out 排他 → 锁外 I/O**」相悖。若走 (a)，必须先把回写挪到**锁外**（补齐 `ROW_EVICTING` 接管窗口 + 删 gen），否则锁内 I/O 范围扩大。（该「锁内同步 I/O」可另立条目，此处仅作前置。）
+
+**mainline 状态**：**未做（待办）**。KO 维持「脏走 60s aging / clean 走 2s reap」；god 维持「TTL 淘汰即脏回写」（真值源）。
+
+**修复落点**：`linux/cache_ttl.c`（`ttl_seconds` / `wb_age_seconds` 语义与三趟编排）、`linux/mdata_cache.c`（`ravenfs_mdata_reap_expired` victim 条件 + `ravenfs_mdata_put` / 回写路径 + 锁外化）。god 侧为真值；若取 (b) 则反向对齐 god。**行为级变更（回写时机）→ 随下版 `pkgver` 升号**。
+
+**验收判据**
+- 冷脏行落盘时延：写元数据后不再访问，`io_write_ops`（mdata 写回）应在 **TTL 量级（~2s）内**出现（(a)），或在**收敛后的 `wb_age`** 内出现（(b)）；
+- 崩溃丢窗有界且记录在案（`wb_age_seconds` 与实测最坏落盘延迟一致）；
+- `md_` 计数器（`md_reap` / `md_node_wb`）体现「脏行经 reap 落盘」（(a)）；
+- 行为零变化（容量/正确性）；`audit` 全绿；**注释与实现一致**（`cache_ttl.c:9` / `mdata_cache.c:401`）。
+
+**关联**：god `juvenile_god/mdata_piece_cache.cpp:442-471/337-353`、`include/ravenfs/mdata_piece_caches.hpp:83/208-213`；KO `linux/cache_ttl.c:8-9/36-50/84-100`、`linux/mdata_cache.c:9/258-265/339-358/385-396/401/429-435`、`include/linux/ravenfs_cache.h:41-47`；**D-5**（同族「ko 移植丢掉 god 行为」）、**D-2/D-15**（同属回写策略族——D-15 管「写多少」、本条管「**何时写**」）、**D-1/D-11**（计数器判据）。
+
+---
+
+## D-17 新 inode 属主/gid 取父目录而非创建者：create/mkdir/mknod/symlink/tmpfile 全部受影响
+
+> 2026-10-17 新增 · **未做（待办）** · **VM mdata ioctl 冒烟时偶然暴露（非 ioctl 引入，pre-existing）** · **权限/属主语义（POSIX 契约 + 安全完整性）**
+
+**现象**：非 root 用户在 **root-owned 的可写目录**（如 `chmod 777 /mnt/rfs` 的挂载根）中创建文件/目录，新 inode 的 owner 变成 `root:root`，而不是创建者。随后该用户重写自己刚创建的文件或 `utimens` 会得到 `EACCES`。
+
+**复现（VM 实测，2026-10-17）**
+
+```bash
+mount -t ravenfs /dev/nvme1n1 /mnt/rfs
+chmod 777 /mnt/rfs
+su raven -c 'touch /mnt/rfs/a'
+ls -ln /mnt/rfs/a
+# 实际: -rw-r--r-- 0 0 ...      ← root:root
+# 期望: -rw-r--r-- 1000 1000 ...
+su raven -c 'echo x >> /mnt/rfs/a'
+# 实际: EACCES（owner=root，0644）
+```
+
+同样可复现“反向错置”：root 在属主为 `raven` 的目录中创建文件，得到 `raven:raven`，而非 `root:root`。
+铁证日志：`linux/vm/test-runs/20261017-164157-mdata-ioctl/summary.md` §5.1（uid=1000 创建 → `root root`；同 uid 重写/utimens EACCES）。
+
+**根因（代码级）**
+
+三处新 inode 记录初始化都直接把**父目录**的 uid/gid 抄进盘记录：
+
+```c
+/* linux/dentry.c: ravenfs_create() */
+tr->uid = i_uid_read(dir);
+tr->gid = i_gid_read(dir);
+
+/* linux/dentry.c: ravenfs_mkdir() */
+tr->uid = i_uid_read(dir);
+tr->gid = i_gid_read(dir);
+
+/* linux/dentry.c: rfs_new_inode_record() —— mknod / symlink / tmpfile 共用 */
+tr->uid = i_uid_read(dir);
+tr->gid = i_gid_read(dir);
+```
+
+随后 `ravenfs_iget()` → `ravenfs_read_inode()` 把盘记录原样装进 VFS inode：
+
+```c
+/* linux/super.c */
+i_uid_write(inode, r->uid);
+i_gid_write(inode, r->gid);
+```
+
+路径上没有 `inode_init_owner()` / `current_fsuid()` / `current_fsgid()` / SGID 判定，`mnt_idmap *idmap` 参数在 `ravenfs_create()` / `ravenfs_mkdir()` 中也未被使用；`rfs_new_inode_record()` 甚至没有 idmap 参数。
+因此当前错误语义是：
+
+- `uid = 父目录 uid`
+- `gid = 父目录 gid`（无条件，不看 SGID）
+
+**正确语义（POSIX / VFS）**
+
+- `uid = current_fsuid()`（经 `mnt_idmap` 映射）
+- `gid = 父目录带 `S_ISGID` ? 父目录 gid : current_fsgid()`
+- 目录在 SGID 父目录下创建时继承 `S_ISGID` 位
+- 统一由 `inode_init_owner(idmap, inode, dir, mode)` 处理，禁止各 create 路径手抄父目录 id
+
+**影响**
+
+- **权限完整性**：共享可写目录（`/tmp` 式 0777 / 1777）中，非 root 创建的文件归 root，创建者随后无法写/改时间戳；反向则 root 创建的文件归普通用户，形成**属主冒名**。
+- **持久化污染**：uid/gid 已写入 256B 盘记录；错误属主随卸载/重挂保留，不会自行修正；存量盘可能需要在修复工具中处理。
+- **跨切面失真**：quota、ACL、security module、`chown/chmod` 语义、idmapped mount 全部建立在错误 inode owner 上。
+- 与 D-10/D-12 同属**对外契约/用户态可见语义**家族；但本条是**实现遗漏**（有明确 POSIX 真值），不是契约未定义。
+
+**修复落点（建议按 VFS 标准路径，不在 create 路径手算）**
+
+1. 每条创建路径（`create / mkdir / mknod / symlink / tmpfile`）在 `ravenfs_iget()` 返回新 inode 后、`d_instantiate()` 前调用：
+   ```c
+   inode_init_owner(idmap, inode, dir, mode);
+   ```
+   `idmap` 必须从 VFS 回调透传（`rfs_new_inode_record()` 也要加参数）。
+2. 把 `inode->i_uid/i_gid/i_mode` 同步回盘记录（复用 `ravenfs_inode_sync_from_vfs()` 或抽专用 helper），再标脏；避免“先写错 owner、后改 VFS”造成盘记录与内存分叉。
+3. 注意与 `ravenfs_init_acl()` 的顺序：owner/mode 初始化后再做 default ACL/umask 处理；`inode_init_owner()` 对 SGID 位有副作用，须与 ACL 语义一起测。
+4. 统一封装，禁止在 `create/mkdir/rfs_new_inode_record` 三处再各写一份 owner 赋值。
+
+**验收判据（owner 矩阵，必须覆盖）**
+
+| 场景 | 期望 |
+|---|---|
+| root-owned 0777 目录 + uid=1000 create | `uid=1000` |
+| user-A-owned 目录 + user-B create | `uid=B` |
+| user-owned 目录 + root create | `uid=0` |
+| SGID 目录 + 任意用户 create | `gid=父目录 gid`，`uid=创建者` |
+| 普通目录（非 SGID） | `gid=创建者 fsgid` |
+| idmapped mount | 盘记录与 VFS 视图按 idmap 正确映射 |
+| `create / mkdir / mknod / symlink / tmpfile` | 五条路径全部正确，不允许只修 create |
+| 卸载 → 重挂 | `stat -c '%u:%g'` 不变 |
+| 创建者后续 write/utimens/chmod（有权限时） | 不应因 owner 错置 EACCES |
+
+**关联**：`linux/dentry.c:78/283/836`（create/mkdir/new_inode_record）、`linux/dentry.c:134-135/355-356/859-860`（错误 owner 赋值）、`linux/super.c:552-553`（read_inode 装载 owner）、`linux/dentry.c:993/1074/1118`（symlink/mknod/tmpfile 入口）；**D-10/D-12**（同属对外契约/用户态可见语义）、D-5/D-16（同属“ko 移植遗漏 god/VFS 标准行为”家族）；VM 证据：`linux/vm/test-runs/20261017-164157-mdata-ioctl/summary.md` §5.1。
+
+---
+
+## 发布建议（D-1~D-3 的统一出口；D-4~D-17 另论）
 
 D-1~D-3 的共同点是：**mainline 已有部分/全部修复，但都没进发布包**。因此：
 
@@ -556,5 +827,9 @@ D-1~D-3 的共同点是：**mainline 已有部分/全部修复，但都没进发
 11. **D-12（POSIX 语义修正；跨切面 ABI + 盘格式）**：目录 `st_nlink` 由「全条目数+2」改为「直属子目录数+2」——先裁 (a) 盘上新增 `dir_count` 字段 / (b) `getattr` 报告时另算，再落；连带修正盘面契约（`disk_layout_v1.1.md` §3.3 / #13 作废）、`audit_v1.2` 的 DIR 校验、全部维护点。**修复落点 v1.2**；且**离线修复程序（基于上帝类 `juvenile_god`）必须一并准备**——存量盘 `link_count` 为旧语义，需从 dentry 树重建（见该节「离线修复程序」）。行为级 + 盘格式级变更 → 升 `pkgver`。
 12. **D-13（名字堆粒度灾难；空间放大 + 归还缺口）**：① **先补归还**（实现级，低风险）：`name_heap_free` 释放后判该档是否全空 → 整体回收（消 25 个空堆 / 12.6 MiB）；② **再裁粒度**（设计级，高收益）：现「一档一整块」（8B 档 = 512 KiB）→ 更小档 / 按需增长 / 共享大档，**改几何 = 动盘格式，须与 v1.2 一并裁**。**统计面已落**（`HEAP_SUM`/`HEAP_SLOT`/空堆判定 + `audit_v1.2` 薄壳），为 ①② 提供验收判据。真盘 1.8T 实测：3038 堆占 1592.7 MiB、利用率 0.0094%。
 13. **审计统计面（铁证，2026-10-05 已入仓）**：`ravenfs_audit_report_t` 新增 name_heap 分区级统计（`heap_active` / `heap_active_{bitmap,data}_blk` / `heap_used_bits` / `heap_total_bits` / `heap_zero_used` / `heap_slot_*[10]`）；`audit.cpp` 出 `HEAP_SUM`/`HEAP_SLOT`，空堆判 `heap_bad`（**计入 `total_bad`**）；`audit_v1.2` 薄壳透传。证据日志：`Docs/linux/audit_log2.txt` + `tools/audit_v1.2/5c9c74b8-…_audit_log.txt`。
+14. **D-14（分配器方向契约；分配策略 + 盘面碎片）— 已修（2026-10-06，ko + god）**：将 `rfs_slice_alloc_hard`（`ravenfs_allocator_slice.c`）由**尾挖**改**头挖**（`s = (iv_base + align_mask) & ~align_mask`），`rfs_slice_soft_alloc` 同步；god 侧 `mgr_slice_t::alloc_hard`/`soft_alloc`（`fs_allocator.cpp`）同步改向——使连续分配**升序**、锚定/四形态融合（D-5a）复活；若坚持尾挖则须引入「反向 extent」表示（动盘格式，**不取**）。**取证不用新 workload**：改前已用真盘 trace 定量（96.53% 降序相邻、670,437→30,846 理论），改后**重建 FS + 同 workload 重审计**做前后对比（升序相邻对 > 0、区段数塌缩、`al_` 组融合打点上升）。行为级变更 → 升 `pkgver`。**连带复核 D-5 口径**（mainline 已有 D-5a，非「无对等实现」）；回归已覆盖 ko/god 单测 + 双侧差分压测（朴素参考实现同步改头挖）。
+15. **D-15（元数据回写策略；写放大 + 抖动）— 部分落地（2026-10-15）**：ko 已把 checkpoint block 位图回写由**全量**改**按脏写**——block 片 alloc/free 置**片内隐状态 `rfs_slice.dirty`**（变更点与 `free_count` 同函数同锁；出口 `rfs_slice_dirty_take` / `rfs_allocator_block_dirty_take`），checkpoint 只重建/写回「自上次落盘以来变过」的片（待写片集合按调用本地化）；`al_checkpoint_blocks` 改记**脏块数**；TTL 心跳 `pr_info`→`pr_debug`。**附带**：`ravenfs_allocator_flush` 加 `flush_lock` 串行化（修并发 `sync_fs`/`fsync`/TTL 的 SB crc 自撞 → force_shutdown）。VM A/B 已证（OLD 256/ckpt vs NEW 48–112/ckpt）+ 并发压测无 BUG、audit 全绿。**遗留**：① 逐块 `sync_dirty_buffer` 未改「批量 mark + 一次 flush」（正交第二刀）；② god 侧对齐未动；③ 「写脏块后写 SB generation」未引入（沿用现有 SB 写序）。行为级 → 升 `pkgver`。与 **D-2** 的「30s 全量回写」同源（本条为其 **block 位图路径**的具体化）。
+16. **D-16（mdata 脏行回写**触发时机**；移植降级）— 未做（待办）**：KO 脏行**无「最后引用释放即回写」**（`ravenfs_mdata_put` 只减引用），且 TTL reap **主动排除脏行**（`mdata_cache.c:429` 的 `!(flags&DIRTY)`）→ 脏行落盘**唯一**靠 60s 周期 aging，滞留最长 ~64s；god 真值则是「**TTL 淘汰即原地回写**」（`mdp_ctrl_reap_one`，~2s）。**修复二选一**：**(a) 取**——恢复 god 语义（reap 允许选脏行、接管后**锁外** copy-out 回写 + 释放），TTL 淘汰即唯一脏回写路径；**(b)** 保留现分工则须订正 `cache_ttl.c:9` / `mdata_cache.c:401` 两处相反注释 + 下调 `wb_age_seconds`(60s) 至接近 TTL + 把「无 last-put 回写」记为有意决策。**共同前置**：回写现于**分片写锁内**做同步块 I/O（`mdata_cache.c:339-358`），与 `:9` 自述「锁外 I/O」相悖，走 (a) 必须先锁外化（补 `ROW_EVICTING` 接管窗口）。**判据**：冷脏行落盘时延收敛到 TTL 量级（或收敛后的 `wb_age`）、崩溃丢窗有界、`md_reap`/`md_node_wb` 体现「脏经 reap 落盘」、`audit` 全绿、注释与实现一致。行为级 → 升 `pkgver`。与 D-5 同族（ko 丢 god 行为）、与 D-2/D-15 同属回写策略族（本条管「**何时写**」）。
+17. **D-17（新 inode 属主/gid 语义；权限完整性）— 未做（待办）**：三条创建路径把父目录 `dir->i_uid/gid` 直接写入新 inode 盘记录（`dentry.c:134-135/355-356/859-860`），`ravenfs_read_inode()` 再原样装入 VFS inode（`super.c:552-553`）→ 非 root 在 root-owned 0777/1777 目录中创建的文件变成 `root:root`，随后 write/utimens 被 `EACCES`；反向亦成立（root 在用户目录创建 → 用户 owner）。**修复**：五条创建路径（`create/mkdir/mknod/symlink/tmpfile`）统一在 `d_instantiate()` 前调用 `inode_init_owner(idmap, inode, dir, mode)`，再把 `i_uid/i_gid/i_mode` 同步回盘记录并标脏；`idmap` 必须透传到 `rfs_new_inode_record()`，并与 `ravenfs_init_acl()` 的 umask/default ACL 顺序一并测。**判据**：owner 矩阵（root 目录 / 用户目录 / 跨用户 / SGID / idmapped mount / 五条 syscall / 卸载重挂）全通过；创建者后续 write/utimens 不再因 owner 错置 EACCES。**存量盘**：错误 owner 已持久化，需评估是否提供离线修正工具。行为级 + 用户态可见语义变更 → 升 `pkgver`。与 **D-10/D-12** 同属对外契约/用户态可见语义家族；VM 铁证见 `linux/vm/test-runs/20261017-164157-mdata-ioctl/summary.md` §5.1。
 
 > 备注：D-1 的设计真值文档已随 linux-ko 工作文档退役（`0860fad`），需要时从 git 取回：`git show a358cc0:Docs/linux/ravenfs-linux-ko-sb-counters-design.md`。
