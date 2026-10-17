@@ -4,7 +4,7 @@ CPPFLAGS  = -I../include
 LDLIBS    = -luuid
 
 TARGET    = mkfs.ravenfs
-SRCS      = main.cpp mkfs.cpp
+SRCS      = main.cpp mkfs_common.cpp mkfs_v20.cpp
 OBJS      = $(SRCS:.cpp=.o)
 
 all: $(TARGET)
@@ -12,7 +12,7 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $^ $(LDLIBS)
 
-HEADERS = mkfs.hpp ../include/disk_struct_v1.3.h ../include/magics.h
+HEADERS = mkfs.hpp ../include/disk_struct_v2.0.h ../include/magics.h
 
 %.o: %.cpp $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<

@@ -27,6 +27,7 @@ tools/sbinfo/sbinfo
 # tools 其它二进制可执行文件（统一只提交源码）
 tools/rfs_compact/rfs_compact
 tools/rfs_slice_fr/rfs_slice_fr
+tools/rfs_freeruns/rfs_freeruns
 
 # IDE / 编辑器
 .vscode/
@@ -75,3 +76,6 @@ build_v20/
 
 # 全盘审计/TRACE 快照（大体积，含全盘文件名清单，不随仓库走）
 nvmelog.txt
+
+# audit 全盘 trace 日志（大体积测试工件）
+audit/*_audit_log.txt

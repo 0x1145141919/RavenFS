@@ -15,19 +15,12 @@ static void print_usage(const char *prog) {
         "Usage: %s [options] <device>\n"
         "\n"
         "Options:\n"
-        "  --inode-ratio=N    FS_blocks per inode (default: 8)\n"
-        "  --inode-count=N    Direct inode count (overrides --inode-ratio)\n"
-        "  --inodes=N         Alias for --inode-count\n"
         "  --backups=N        Backup Superblock count (default: 3)\n"
         "  --label=NAME       Volume label (max 48 bytes)\n"
         "  --uuid=UUID        Explicit UUID (auto-generated if omitted)\n"
-        "  --v1.1             Write v1.1 disk format (version=2, root inode 0)\n"
-        "                     for juvenile god / tests\n"
-        "  --v1.2             Write v1.2 disk format (version=3) [default]\n"
-        "  --v1.3             Write v1.3 disk format (version=4; DIR name-data double tree)\n"
-        "  --v2.0             Write v2.0 disk format (elastic inode data plane; no fixed\n"
-        "                     inode array/bitmap; initial 256KB direct data plane;\n"
-        "                     root inode idx hardcoded 0). --inode-ratio/--inode-count ignored\n"
+        "  --v2.0             Write v2.0 disk format (default and only format:\n"
+        "                     elastic inode data plane; no fixed inode array/bitmap;\n"
+        "                     initial 256KB direct data plane; root inode idx hardcoded 0)\n"
         "  -f, --force        Overwrite existing filesystem\n"
         "  -v, --verbose      Print detailed layout info\n"
         "  -h, --help         Show this help\n"
@@ -45,21 +38,14 @@ static void print_usage(const char *prog) {
 
 int main(int argc, char *argv[]) {
     MkfsParams params{};
-    params.inode_ratio = 8;
     params.backups = 3;
-    params.fmt = MKFS_FMT_V1_2;   /* 默认写 v1.2；--v1.3 写 v1.3 */
+    params.fmt = MKFS_FMT_V2_0;   /* v2.0 是唯一盘面格式 */
     uuid_clear(params.uuid);
 
     static struct option long_opts[] = {
-        {"inode-ratio", required_argument, 0, 'r'},
-        {"inode-count", required_argument, 0, 'n'},
-        {"inodes",      required_argument, 0, 'n'},
         {"backups",     required_argument, 0, 'b'},
         {"label",       required_argument, 0, 'l'},
         {"uuid",        required_argument, 0, 'u'},
-        {"v1.1",        no_argument,       0, '1'},
-        {"v1.2",        no_argument,       0, '2'},
-        {"v1.3",        no_argument,       0, '3'},
         {"v2.0",        no_argument,       0, '4'},
         {"force",       no_argument,       0, 'f'},
         {"verbose",     no_argument,       0, 'v'},
@@ -70,25 +56,6 @@ int main(int argc, char *argv[]) {
     int opt;
     while ((opt = getopt_long(argc, argv, "fvh", long_opts, nullptr)) != -1) {
         switch (opt) {
-        case 'r': {
-            char *end = nullptr;
-            params.inode_ratio = strtoull(optarg, &end, 0);
-            if (*end || params.inode_ratio == 0) {
-                fprintf(stderr, "invalid --inode-ratio: %s\n", optarg);
-                return 1;
-            }
-            break;
-        }
-        case 'n': {
-            char *end = nullptr;
-            params.inode_count = strtoull(optarg, &end, 0);
-            if (*end || params.inode_count == 0) {
-                fprintf(stderr, "invalid --inode-count: %s\n", optarg);
-                return 1;
-            }
-            params.inode_count_explicit = true;
-            break;
-        }
         case 'b': {
             char *end = nullptr;
             unsigned long n = strtoul(optarg, &end, 0);
@@ -111,15 +78,6 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "invalid UUID format\n");
                 return 1;
             }
-            break;
-        case '1':
-            params.fmt = MKFS_FMT_V1_1;   /* --v1.1：写 v1.1 盘（god/测试团队） */
-            break;
-        case '2':
-            params.fmt = MKFS_FMT_V1_2;   /* --v1.2：写 v1.2 盘（现役 mainline） */
-            break;
-        case '3':
-            params.fmt = MKFS_FMT_V1_3;   /* --v1.3：写 v1.3 盘（DIR 名字数据面双树） */
             break;
         case '4':
             params.fmt = MKFS_FMT_V2_0;   /* --v2.0：写 v2.0 盘（弹性 inode 数据面） */
@@ -205,135 +163,50 @@ int main(int argc, char *argv[]) {
         return 3;
     }
 
-    /* ─── 生成 UUID（提前：v2.0 的 256-bit magic / backup 散布都依赖 uuid）── */
+    /* ─── 生成 UUID（v2.0 的 256-bit magic / backup 散布都依赖 uuid）── */
     if (uuid_is_null(params.uuid))
         uuid_generate(params.uuid);
 
     uint64_t total_blocks = dev.bytes / 4096 - 1;
 
-    /* ═══ v2.0 分支：弹性 inode 数据面（无固定 inode 数组 / 无 inode 位图）═══ */
-    if (params.fmt == MKFS_FMT_V2_0) {
-        if (params.inode_count_explicit)
-            fprintf(stderr, "warning: --inode-count/--inode-ratio ignored for v2.0 "
-                            "(elastic inode data plane)\n");
-        V20Geometry g = calc_geometry_v20(total_blocks);
-        if (params.verbose) {
-            fprintf(stderr,
-                "device:          %s\n"
-                "type:            %s\n"
-                "bytes:           %lu\n"
-                "total_blocks:    %lu\n"
-                "backups:         %u\n"
-                "lba_size:        %lu\n"
-                "multiplier:      %lu\n"
-                "world_base_lba:  %lu\n"
-                "\n"
-                "metadata layout (FS_block world, v2.0):\n"
-                "  block bitmap:  [%lu, %lu)  (%lu blocks)\n"
-                "  (inode data plane: 256KB direct, allocated from block allocator)\n",
-                params.device,
-                dev.type == DEV_BLOCK_NVME ? "NVMe" :
-                    dev.type == DEV_BLOCK_ATA ? "ATA" : "file",
-                (unsigned long)dev.bytes,
-                (unsigned long)g.total_blocks,
-                (unsigned)params.backups,
-                (unsigned long)params.lba_size,
-                (unsigned long)params.multiplier,
-                (unsigned long)params.world_base_lba,
-                (unsigned long)g.bitmap_start,
-                (unsigned long)(g.bitmap_start + g.bitmap_blocks),
-                (unsigned long)g.bitmap_blocks);
-        }
-        int rc20 = format_fs_v20(fd, params, g);
-        close(fd);
-        if (rc20 == 0) {
-            char uuid_str[37];
-            uuid_unparse(params.uuid, uuid_str);
-            printf("mkfs.ravenfs: done  device=%s  format=%s  blocks=%lu  "
-                   "backups=%u  uuid=%s\n",
-                   params.device, mkfs_fmt_name(params.fmt),
-                   (unsigned long)g.total_blocks, (unsigned)params.backups, uuid_str);
-        }
-        return rc20;
-    }
-
-    /* ═══ v1.x 分支：固定 inode 数组 + inode 位图 ═══ */
-    if (!params.inode_count_explicit) {
-        // inode_count = ceil(total_blocks / inode_ratio)，再 16 向上取整
-        uint64_t raw = (total_blocks + params.inode_ratio - 1) / params.inode_ratio;
-        params.inode_count = ((raw + 15) / 16) * 16;
-    } else if (params.inode_count % 16 != 0) {
-        // 直指定的 inode_count 也 16 向上取整
-        params.inode_count = ((params.inode_count + 15) / 16) * 16;
-    }
-
-    /* ─── 几何计算 ─── */
-    FsGeometry geo = calc_geometry(total_blocks, params.inode_count);
-
-    if (geo.inode_array_bitmap_base <= 1) {
-        fprintf(stderr,
-            "error: device too small for %lu inodes\n",
-            (unsigned long)params.inode_count);
-        close(fd);
-        return 5;
-    }
-
+    /* ═══ v2.0：弹性 inode 数据面（无固定 inode 数组 / 无 inode 位图）═══ */
+    V20Geometry g = calc_geometry_v20(total_blocks);
     if (params.verbose) {
         fprintf(stderr,
             "device:          %s\n"
             "type:            %s\n"
             "bytes:           %lu\n"
             "total_blocks:    %lu\n"
-            "inode_ratio:     %lu\n"
-            "inode_count:     %lu\n"
             "backups:         %u\n"
             "lba_size:        %lu\n"
             "multiplier:      %lu\n"
             "world_base_lba:  %lu\n"
             "\n"
-            "metadata layout (FS_block world):\n"
-            "  bitmap:        [%lu, %lu)  (%lu blocks)\n"
-            "  inode array:   [%lu, %lu)  (%lu blocks)\n"
-            "  inode bitmap:  [%lu, %lu)  (%lu blocks)\n",
+            "metadata layout (FS_block world, v2.0):\n"
+            "  block bitmap:  [%lu, %lu)  (%lu blocks)\n"
+            "  (inode data plane: 256KB direct, allocated from block allocator)\n",
             params.device,
             dev.type == DEV_BLOCK_NVME ? "NVMe" :
                 dev.type == DEV_BLOCK_ATA ? "ATA" : "file",
             (unsigned long)dev.bytes,
-            (unsigned long)geo.total_blocks,
-            (unsigned long)params.inode_ratio,
-            (unsigned long)params.inode_count,
+            (unsigned long)g.total_blocks,
             (unsigned)params.backups,
             (unsigned long)params.lba_size,
             (unsigned long)params.multiplier,
             (unsigned long)params.world_base_lba,
-            (unsigned long)geo.bitmap_start,
-            (unsigned long)geo.total_blocks,
-            (unsigned long)geo.bitmap_blocks,
-            (unsigned long)geo.inode_array_base,
-            (unsigned long)geo.bitmap_start,
-            (unsigned long)geo.inode_blocks,
-            (unsigned long)geo.inode_array_bitmap_base,
-            (unsigned long)geo.inode_array_base,
-            (unsigned long)geo.inode_bitmap_blocks);
+            (unsigned long)g.bitmap_start,
+            (unsigned long)(g.bitmap_start + g.bitmap_blocks),
+            (unsigned long)g.bitmap_blocks);
     }
-
-    /* ─── 执行 ─── */
-    int ret = format_fs(fd, params, geo);
+    int rc = format_fs_v20(fd, params, g);
     close(fd);
-
-    if (ret == 0) {
+    if (rc == 0) {
         char uuid_str[37];
         uuid_unparse(params.uuid, uuid_str);
         printf("mkfs.ravenfs: done  device=%s  format=%s  blocks=%lu  "
-               "ratio=%lu  inodes=%lu  backups=%u  uuid=%s\n",
-               params.device,
-               mkfs_fmt_name(params.fmt),
-               (unsigned long)geo.total_blocks,
-               (unsigned long)params.inode_ratio,
-               (unsigned long)params.inode_count,
-               (unsigned)params.backups,
-               uuid_str);
+               "backups=%u  uuid=%s\n",
+               params.device, mkfs_fmt_name(params.fmt),
+               (unsigned long)g.total_blocks, (unsigned)params.backups, uuid_str);
     }
-
-    return ret;
+    return rc;
 }

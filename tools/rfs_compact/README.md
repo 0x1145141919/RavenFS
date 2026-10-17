@@ -1,17 +1,13 @@
-# tools/rfs_compact — RavenFS extent 树瘦身 + 单条坍缩 direct 修复器
+# tools/rfs_compact — RavenFS v2.0 离线「extent 文件碎片压缩」运维工具
 
-Host 侧、用户态挂载的**离线盘面修复器**，用于清除 ko `ravenfs-dkms 0.1.1-1` 留下的
-元数据/数据失衡创伤（见 `Docs/linux/ravenfs-linux-ko-defects.md`）：
-
-- **D-6**（inline→extent 不试 direct）：>160B 文件恒背一个 8K 区段树根叶（单 extent 也背）
-  → 本工具把「单条覆盖 [0, ceil(size/4K))」的树**坍缩为 direct**，消掉节点税。
-- **D-5**（ko 无叶内融合）：相邻 extent 未合并（如 `root-ext4.qcow2` 133k 条 64 块记录）
-  → 本工具先 `extent_rebuild_tree`（全量可并对全并）把同段连续记录融合，再坍缩。
+Host 侧、用户态挂载的**离线盘面修复器**：消化 REG / SOFT_SYM 的 extent 形态文件的
+**物理碎片**（逻辑连续、物理断裂的记录串），并把收敛成「单条整域」的稠密文件降级
+为 **direct**（顺带消掉 8K 区段树节点税）。契约见 `Docs/disk_layout_v2.0.md §9`。
 
 ## 构建
 
 ```sh
-cmake --build ../../build_fresh --target ravenfs_juvenile   # 确保 god 静态库在
+cmake --build ../../build_v20 --target ravenfs_juvenile   # 确保 god 静态库在
 make                                                        # → ./rfs_compact
 ```
 
@@ -22,31 +18,53 @@ sudo umount /mnt/huge_data                                  # 内核必须先不
 sudo ./rfs_compact /dev/nvme0n1                             # DRY-RUN（只读挂载，扫描报告）
 sudo ./rfs_compact /dev/nvme0n1 --apply                     # 真正修复（rw 挂载 + 写）
 sudo ./rfs_compact /dev/nvme0n1 --apply --audit             # 修复后跑全盘 audit
+sudo ./rfs_compact /dev/nvme0n1 --max-move-blocks 65536     # 单 run 搬数上限（块；0=不限）
+sudo ./rfs_compact /dev/nvme0n1 --apply --no-direct        # 只搬数、不坍缩 direct
 ```
 
 - **默认 dry-run**：`O_RDONLY` + `is_readonly=true` 只读挂载，扫描并报告
-  「extent 文件数 / 记录数(前→后) / 可坍缩数」，**不写盘**。
-- `--apply`：rw 挂载，对每个 REG extent inode 依次 `extent_rebuild_tree` → `extent_tree_collapse_to_direct`。
-- 挂载方式 = **mmap 后端 + inode/mdata_piece 缓存**（offload），非 O_DIRECT。
+  「extent 文件数 / 记录数(前→后) / runs / 将搬块数 / 将降 direct 数」，**不写盘**。
+- `--apply`：rw 挂载，对每个 REG/SOFT_SYM extent inode 调 `regular_file_compact`。
+- 挂载方式 = **mmap 后端 + inode/mdata_piece 缓存**（offload），非 O_DIRECT；
+  且 `param.slices_mode = DEFRAG`（block 单分片 + `alloc_hard_longest_first`）。
 
-## 算法
+## 算法（`RavenFS_juvenile::regular_file_compact`，实现在 `juvenile_god/file_compact.cpp`）
 
-从 `sb.root_inode`（v1.2=16）起 **DFS 全目录树**（`dir_readdir` 未实现 → 走底层
-**dentry 树下钻 `hints[0]` + 叶链 `ptrs[2]`** 枚举条目）；对每个 `type==REG` inode：
+从 `sb.root_inode`（v2.0 = 0）起 **DFS 全目录树**（dentry 树下钻 `hints[0]` +
+叶链 `ptrs[2]` 枚举条目）；对每个 REG/SOFT_SYM inode：
 
 ```
-size<=160 (inline) 或已 direct  → 跳过
-否则 extent 树形态             → extent_rebuild_tree(root)  → 回写 inode.data_root
-                               → extent_tree_collapse_to_direct(inum)  （单条 → direct + free 节点）
+size<=160 (inline) 或已 direct  → no-op
+否则 extent 树：
+  叶链收集记录 → 按逻辑相邻归并成「逻辑 run」
+  每个 run：
+    k==1                    → 原样保留
+    k>1 且 phys 连续        → 零搬数融合成单条
+    k>1 且 phys 断裂        → block_alloc_hard(run.len)（DEFRAG=最长空闲段头部）
+                              + 逐记录读→写拼到新连续段 → 单条
+  洞原样保留（稀疏语义不变；绝不 hard_alloc 整域再打洞）
+  结果单条且覆盖 [0, ceil(size/4K)) → 落 direct（不建树）
+  否则 extent_build_tree 批量建全新树
+  → inode 一次写（唯一提交点）→ free 被搬 run 旧数据 + 释放旧树节点
 ```
 
-- 先重建后坍缩（重建负责融合，坍缩负责去节点）。
-- 先 inode 提交后 free 节点（崩溃窗口 = 孤儿块，无悬垂）。
-- 边界防护：inode 索引 `< inode_count`；目录/REG 各自 visited 去重；深度/叶链上限 guard。
-- 单文件失败不中断（计入 `失败=`，跳过继续）。
+**最后一步（单 run → direct）**：稠密、单条整域的文件落 direct——压缩原语内已内联；
+工具出口再做一次**显式收口**（`extent_tree_collapse_to_direct`，幂等），保证
+「单 run 文件必为 direct」的不变式（`--no-direct` 可关掉坍缩，只做搬运）。
+
+- **稀疏安全**：只搬真实数据量（Σ 记录长度），不为洞分配。
+- **逐 run 尽力**：某 run 分配不到 / 超 `max_move_blocks` → 跳过该 run，其余照提。
+- **崩溃安全**：先分配+拷新段 → 建新树（旧树只读）→ inode 提交 → 回收旧资产；
+  提交前崩溃 = 旧态完好（新块/新树为孤儿），提交后崩溃 = 新态一致（旧资产孤儿），
+  fsck 可收。绝不出现「指向未写数据的新根」。
+- 边界防护：inode 索引 `< inode_count`；目录先序 visited 去重；文件 seen 去重；
+  深度 / 叶链上限 guard。单文件失败不中断（计入 `失败=`）。
 
 ## 安全
 
-- `--apply` **就地改写盘面**。务必：① `umount` 后再跑（否则双写者）；② 有备份或已知可接受风险；③ 先 `--dry-run` 复核。
-- 工具只动**元数据**（区段树节点 + inode 的 `data_root/direct_bit`）与**位图空闲**，**不动文件数据字节**。
-- 幂等：修过的盘再跑，`extent 形态=0`。
+- `--apply` **就地改写盘面**。务必：① `umount` 后再跑（ctor 内有
+  `device_is_kernel_mounted` 防呆，已挂载 → `RC_ERR_BUSY` 拒挂）；② 有备份或已知
+  可接受风险；③ 先 dry-run 复核。
+- 工具动**元数据**（区段树节点 + inode 的 `data_root/direct_bit`）与**数据物理位置**
+  （被搬 run 的拷贝 + 旧块 free）；**洞不被物化、文件逻辑内容逐字节不变**。
+- 幂等：修过的盘再跑，`搬迁=0`（碎裂 run 已收敛为单条）。

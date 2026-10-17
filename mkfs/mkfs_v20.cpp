@@ -1,7 +1,7 @@
 /*
  * ═══════════════════════════════════════════════════════════════════════════
  * mkfs v2.0 写出口（**独立 TU**：v2.0 盘面头与 v1.3 头类型重名且不兼容，
- *   不能与 mkfs.cpp 同 TU include —— 见 mkfs.hpp 顶部说明）。
+ *   不能与 mkfs_common.cpp 同 TU include —— 见 mkfs.hpp 顶部说明）。
  *
  * v2.0 与 v1.x 的关键差异：
  *   · 无固定 inode 数组 / 无 inode 位图；inode 存储 = 超级块统辖的**弹性数据面**。
@@ -65,7 +65,7 @@ uint64_t blk_off(uint64_t blk, const MkfsParams &p) {
     return (p.world_base_lba + blk * p.multiplier) * p.lba_size;
 }
 
-/* CRC32（与 mkfs.cpp 同源：poly 0xEDB88320 反射，初/末取反） */
+/* CRC32（与 mkfs_common.cpp 同源：poly 0xEDB88320 反射，初/末取反） */
 uint32_t crc32_of(const void *data, size_t len) {
     static uint32_t tbl[256];
     static bool init = false;

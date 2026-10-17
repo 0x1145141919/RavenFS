@@ -2,10 +2,8 @@
 /*
  * sbinfo 公共设施（多 TU 共享）。
  *
- * 为何拆 TU：v1.x 盘面头（disk_struct_v1.2.h）与 v2.0 盘面头（disk_struct_v2.0.h）
- *   `RavenSuperblock` 等类型**重名且布局不同**，不能同 TU include。故 sbinfo 按
- *   SB magic 分派：v1.x → sbinfo_v1.cpp，v2.0 → sbinfo_v20.cpp；本头 + common.cpp
- *   收共享件（结果簿 / crc32 / 小工具 / 入口声明），不拉任何盘面结构头。
+ * 盘面：**仅 v2.0**（disk_struct_v2.0.h）。本头 + common.cpp 收共享件
+ *   （结果簿 / crc32 / 小工具 / 入口声明），不拉任何盘面结构头。
  */
 
 #include <cstdint>
@@ -39,9 +37,7 @@ void        probe_enc(std::string &s);
 /* ── 收尾：打印 "checks: ..." 并返回进程退出码（不 close fd）── */
 int sbinfo_finish(void);
 
-/* ── 按 magic 分派的盘面入口（各自 TU 实现）──
+/* ── 盘面入口（sbinfo_v20.cpp 实现）──
  * raw = 设备字节 0 起 4096B 的 Primary SB 原始拷贝。 */
-int sbinfo_v1_dump (int fd, const char *path, uint64_t dev_bytes, uint64_t lba_size, const uint8_t *raw);
 int sbinfo_v20_dump(int fd, const char *path, uint64_t dev_bytes, uint64_t lba_size, const uint8_t *raw);
-int sbinfo_v1_probe (const uint8_t *raw);
 int sbinfo_v20_probe(const uint8_t *raw);

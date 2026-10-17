@@ -29,7 +29,7 @@ namespace {
 
 constexpr uint64_t BITS_PER_BLK = 32768;   /* 4096B × 8：每块位图块描述 32768 个块 */
 
-/* CRC32（poly 0xEDB88320 反射，初/末取反）——与 mkfs.cpp / god 同源，独立实现。 */
+/* CRC32（poly 0xEDB88320 反射，初/末取反）——与 mkfs_common.cpp / god 同源，独立实现。 */
 uint32_t crc32_compute(const void *data, size_t len)
 {
     static uint32_t tbl[256];

@@ -4,18 +4,15 @@
  * 定位（2026-09-29）：用户态此前只有 mkfs（写盘）+ audit（全盘深审），中间缺
  * 「只看 superblock」的轻查询——`dumpe2fs -h` 之于 ext4。秒开、只读。
  *
- * 多盘面支持（2026-10-05 拆 TU）：
- *   v1.x 与 v2.0 的 `RavenSuperblock` **类型重名且布局不同**，不能同 TU include。
- *   故本文件只做「读 4K → 按 SB magic 分派」：
- *     · magic word0 == "RAVN"(v1.x)         → sbinfo_v1.cpp
- *     · magic word0 == "RAVENFS\0"(v2.0)    → sbinfo_v20.cpp
- *   共享设施（结果簿 / crc32 / 小工具）在 sbinfo_common.{hpp,cpp}。
+ * 盘面：**仅 v2.0**（`RavenSuperblock` @ disk_struct_v2.0.h）。
+ *   本文件做「读 4K → 认 v2.0 SB magic」；共享设施（结果簿 / crc32 / 小工具）
+ *   在 sbinfo_common.{hpp,cpp}。
  *
  * 纪律：只读（无 O_WRONLY / 无 pwrite）；结果走 stdout，致命走 stderr；
  *      退出码 0 = 全部检查通过，1 = 有 BAD，2 = 用法 / IO 错误。
  *
  * 编译： make   （或 g++ -Wall -Wextra -O2 -g -I../../include \
- *                     sbinfo.cpp sbinfo_common.cpp sbinfo_v1.cpp sbinfo_v20.cpp -o sbinfo）
+ *                     sbinfo.cpp sbinfo_common.cpp sbinfo_v20.cpp -o sbinfo）
  * 运行： ./sbinfo <image-or-device>
  *        ./sbinfo --probe <dev>      （udev 探针：blkid 风格 ID_FS_*）
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -50,8 +47,7 @@ static int probe_mode(const char *path) {
 
     uint64_t w0 = 0;
     memcpy(&w0, raw, sizeof w0);
-    if (w0 == SUPERBLOCK_MAGIC)         sbinfo_v1_probe(raw);
-    else if (w0 == SUPERBLOCK_MAGIC_V20_W0) sbinfo_v20_probe(raw);
+    if (w0 == SUPERBLOCK_MAGIC_V20_W0) sbinfo_v20_probe(raw);
     return 0;   /* 恒 0：udev 只看输出 */
 }
 
@@ -102,16 +98,14 @@ int main(int argc, char **argv) {
 
     uint64_t w0 = 0;
     memcpy(&w0, raw.data(), sizeof w0);
-    if (w0 == SUPERBLOCK_MAGIC) {
-        sbinfo_v1_dump(fd, path, dev_bytes, lba_size, raw.data());
-    } else if (w0 == SUPERBLOCK_MAGIC_V20_W0) {
+    if (w0 == SUPERBLOCK_MAGIC_V20_W0) {
         sbinfo_v20_dump(fd, path, dev_bytes, lba_size, raw.data());
     } else {
-        /* 非 RavenFS：给指向性诊断（本工具存在的直接动因） */
-        bad("magic = %#llx，既非 v1.x \"RAVN\"(%#llx) 也非 v2.0 \"RAVENFS\"(%#llx)",
+        /* 非 RavenFS（或已退役的 v1.x 盘）：给指向性诊断（本工具存在的直接动因） */
+        bad("magic = %#llx，既非 v2.0 \"RAVENFS\"(%#llx) 也非 v1.x \"RAVN\"(%#llx)",
             (unsigned long long)w0,
-            (unsigned long long)SUPERBLOCK_MAGIC,
-            (unsigned long long)SUPERBLOCK_MAGIC_V20_W0);
+            (unsigned long long)SUPERBLOCK_MAGIC_V20_W0,
+            (unsigned long long)SUPERBLOCK_MAGIC);
         uint16_t ext_magic = 0;
         if (pread_full(fd, &ext_magic, 2, EXT4_MAGIC_OFF) && ext_magic == EXT4_SB_MAGIC) {
             printf("       → 偏移 0x438 检出 ext 系 magic 0x%04x：这盘是 ext2/3/4，"
