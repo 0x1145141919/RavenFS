@@ -12,7 +12,8 @@
  *   · CPU 身份      RFS_CPU_ID()
  *   · 日志          RFS_LOG(fmt, ...)
  *   · 锁            rfs_spin_t / rfs_mutex_t / rfs_rwsem_t + RFS_{SPIN,MUTEX,RWSEM}_*
- *   · RAII 守卫     RFS_SPIN_GUARD / RFS_MUTEX_GUARD（cleanup 属性；作用域退出即解锁）
+ *   · RAII 守卫     RFS_SPIN_GUARD / RFS_MUTEX_GUARD / RFS_RWSEM_{READ,WRITE}_GUARD
+ *                   （cleanup 属性；作用域退出即解锁）
  *
  * RAII 锁守卫（C 语言模拟）：
  *   用 GCC/Clang 的 `__attribute__((cleanup(fn)))`——变量离开作用域时自动调 fn。
@@ -45,6 +46,9 @@
 #  include <linux/minmax.h>     /* min / max */
 #  include <linux/math.h>       /* DIV_ROUND_UP_ULL */
 #  include <linux/errno.h>      /* -ENOENT / -EIO / -ENOSPC ... */
+#  include <linux/err.h>        /* ERR_PTR / PTR_ERR / IS_ERR(_OR_NULL) */
+#  include <linux/atomic.h>     /* atomic64_t（rfs_atomic64_t 内核选路）*/
+#  include <linux/sched.h>      /* cond_resched（RFS_YIELD）*/
 #  include <linux/bitops.h>     /* hweight64（popcount 不降级为 libgcc __popcountdi2）*/
 #  include <linux/timekeeping.h> /* ktime_get_ns（累计耗时类计数器）*/
 #  include <linux/delay.h>     /* msleep（打烊排空的时间轮询）*/
@@ -72,6 +76,7 @@ typedef uint8_t  u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
+typedef int64_t  s64;
 
 /* 内核算术助手的内核态由 linux/math.h、linux/minmax.h 提供；用户态补等价物 */
 #  ifndef DIV_ROUND_UP_ULL
@@ -171,6 +176,90 @@ struct rfs_mem_alloc {
 #define RFS_ATOMIC_LOAD_U32(p)      __atomic_load_n((p), __ATOMIC_RELAXED)
 #define RFS_ATOMIC_STORE_U32(p, v)  __atomic_store_n((p), (v), __ATOMIC_RELAXED)
 
+/* ═══════════════════ 字节串 / 数组助手（平台中立）═══════════════════ */
+/* 算法/类文件不直接 include 内核 string.h；memcpy/memset 由本头收口。*/
+#define RFS_MEMCPY(dst, src, n)   memcpy((dst), (src), (n))
+#define RFS_MEMSET(dst, c, n)     memset((dst), (c), (n))
+#ifndef RFS_ARRAY_SIZE
+#  define RFS_ARRAY_SIZE(a)       (sizeof(a) / sizeof((a)[0]))
+#endif
+
+/* ═══════════════════ 64 位有符号标量 / 原子字（平台中立）═══════════════════
+ * 目标：算法文件里只出现 s64 / rfs_atomic64_t / RFS_ATOMIC64_*，不出现
+ * atomic64_t / __atomic_* 的选路分支。
+ *   · 内核：linux/atomic.h 的 atomic64_t + atomic64_*（全序）
+ *   · 用户：s64（int64_t）+ GCC __atomic_*（统一 SEQ_CST；与内核全序语义一致）
+ * CMPXCHG 返回旧值（与 atomic64_cmpxchg 同口径），调用方可用旧值判成功。*/
+#ifdef __KERNEL__
+
+typedef atomic64_t rfs_atomic64_t;
+
+#  define RFS_ATOMIC64_INIT(v)          ATOMIC64_INIT(v)
+#  define RFS_ATOMIC64_SET(p, v)        smp_store_release(&(p)->counter, (s64)(v))
+#  define RFS_ATOMIC64_READ(p)          atomic64_read((p))
+/* SET 为 **release 发布**：用于先写普通字段（data / node_idx 等）再公布
+ * READY/IDLE 的场景；配合 acquire 方（CAS/锁）保证字段先于状态可见。
+ * ADD/SUB 统一返回**新值**（与用户态 __atomic_add/sub_fetch 同口径）。*/
+#  define RFS_ATOMIC64_ADD(p, v)        ({ atomic64_add((v), (p)); \
+					    atomic64_read((p)); })
+#  define RFS_ATOMIC64_SUB(p, v)        ({ atomic64_sub((v), (p)); \
+					    atomic64_read((p)); })
+#  define RFS_ATOMIC64_CMPXCHG(p, o, n) atomic64_cmpxchg((p), (o), (n))
+/* FETCH_OR / ANDNOT 统一返回**旧值**。*/
+#  define RFS_ATOMIC64_FETCH_OR(p, v)   atomic64_fetch_or((v), (p))
+#  define RFS_ATOMIC64_ANDNOT(p, v)     atomic64_fetch_andnot((v), (p))
+
+#else  /* 用户态 */
+
+typedef s64 rfs_atomic64_t;
+
+#  define RFS_ATOMIC64_INIT(v)          (v)
+#  define RFS_ATOMIC64_SET(p, v)        __atomic_store_n((p), (v), __ATOMIC_SEQ_CST)
+#  define RFS_ATOMIC64_READ(p)          __atomic_load_n((p), __ATOMIC_SEQ_CST)
+#  define RFS_ATOMIC64_ADD(p, v)        __atomic_add_fetch((p), (v), __ATOMIC_SEQ_CST)
+#  define RFS_ATOMIC64_SUB(p, v)        __atomic_sub_fetch((p), (v), __ATOMIC_SEQ_CST)
+#  define RFS_ATOMIC64_FETCH_OR(p, v)   __atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST)
+#  define RFS_ATOMIC64_ANDNOT(p, v)     __atomic_fetch_and((p), ~(v), __ATOMIC_SEQ_CST)
+
+/* 返回值 = 旧值；旧值与 expected 不等时 *p 不变（同 atomic64_cmpxchg 口径）。*/
+static inline s64 rfs_atomic64_cmpxchg(rfs_atomic64_t *p, s64 oldv, s64 newv)
+{
+	__atomic_compare_exchange_n(p, &oldv, newv, false,
+				    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+	return oldv;
+}
+#  define RFS_ATOMIC64_CMPXCHG(p, o, n) rfs_atomic64_cmpxchg((p), (o), (n))
+
+#endif /* __KERNEL__ */
+
+/* ═══════════════════ 让出 / 重试（可睡眠上下文）═══════════════════
+ * 用于「撞上他人 IO_ING / EVICTING」时放锁后让位重试；内核 cond_resched，
+ * 用户态 sched_yield。禁止在持锁路径调用。*/
+#ifdef __KERNEL__
+#  define RFS_YIELD()   cond_resched()
+#else
+#  define RFS_YIELD()   sched_yield()
+#endif
+
+/* ═══════════════════ 误差指针（平台中立）═══════════════════
+ * 内核 = linux/err.h 的 ERR_PTR 族；用户态 = 负数指针哨兵（语义同内核：
+ * (unsigned long)p >= -MAX_ERRNO 视为错误）。算法文件只用 RFS_* 宏。*/
+#ifdef __KERNEL__
+#  define RFS_ERR_PTR(e)        ERR_PTR(e)
+#  define RFS_PTR_ERR(p)        PTR_ERR(p)
+#  define RFS_IS_ERR(p)         IS_ERR(p)
+#  define RFS_IS_ERR_OR_NULL(p) IS_ERR_OR_NULL(p)
+#else
+#  define RFS_ERR_PTR(e)        ((void *)(long)(e))
+#  define RFS_PTR_ERR(p)        ((long)(p))
+static inline bool rfs_is_err_ptr(const void *p)
+{
+	return (unsigned long)p >= (unsigned long)-4095L;
+}
+#  define RFS_IS_ERR(p)         rfs_is_err_ptr((const void *)(p))
+#  define RFS_IS_ERR_OR_NULL(p) (!(p) || RFS_IS_ERR(p))
+#endif /* __KERNEL__ */
+
 /* ═══════════════════════════ 锁：类型 + 原语 ═══════════════════════════ */
 #ifdef __KERNEL__
 
@@ -196,6 +285,10 @@ static __always_inline void rfs_spin_guard_release(rfs_spin_t **l)
 { if (l && *l) spin_unlock(*l); }
 static __always_inline void rfs_mutex_guard_release(rfs_mutex_t **m)
 { if (m && *m) mutex_unlock(*m); }
+static __always_inline void rfs_rwsem_read_guard_release(rfs_rwsem_t **l)
+{ if (l && *l) up_read(*l); }
+static __always_inline void rfs_rwsem_write_guard_release(rfs_rwsem_t **l)
+{ if (l && *l) up_write(*l); }
 
 #else  /* 用户态 */
 
@@ -221,6 +314,10 @@ static inline void rfs_spin_guard_release(rfs_spin_t **l)
 { if (l && *l) pthread_spin_unlock(*l); }
 static inline void rfs_mutex_guard_release(rfs_mutex_t **m)
 { if (m && *m) pthread_mutex_unlock(*m); }
+static inline void rfs_rwsem_read_guard_release(rfs_rwsem_t **l)
+{ if (l && *l) pthread_rwlock_unlock(*l); }
+static inline void rfs_rwsem_write_guard_release(rfs_rwsem_t **l)
+{ if (l && *l) pthread_rwlock_unlock(*l); }
 
 #endif /* __KERNEL__ */
 
@@ -237,6 +334,14 @@ static inline void rfs_mutex_guard_release(rfs_mutex_t **m)
 
 #define RFS_MUTEX_GUARD(var, lk)                                          \
 	RFS_LOCK_GUARD(rfs_mutex_guard_release, var, (lk)); RFS_MUTEX_LOCK(var)
+
+/* rwsem 读 / 写守卫：与 spin/mutex 守卫同构，出作用域自动 up_read / up_write。
+ * 读 / 写解锁在核心态是两个原语，故分别生成两把守卫；用户态同为 rwlock_unlock。*/
+#define RFS_RWSEM_READ_GUARD(var, lk)                                     \
+	RFS_LOCK_GUARD(rfs_rwsem_read_guard_release, var, (lk)); RFS_RWSEM_DOWN_READ(var)
+
+#define RFS_RWSEM_WRITE_GUARD(var, lk)                                    \
+	RFS_LOCK_GUARD(rfs_rwsem_write_guard_release, var, (lk)); RFS_RWSEM_DOWN_WRITE(var)
 
 /* 为新锁类型生成守卫（在 include 处展开一次即可；同名重复定义用 include guard 兜）*/
 #define RFS_DEFINE_LOCK_GUARD(name, locktype, unlockfn)                   \

@@ -22,13 +22,13 @@
 `BUILD_BUG_ON(sizeof == ARRAY_SIZE(names)*8)` + `AL_STAT_COUNT == ARRAY_SIZE(al_names)` 三处自守。
 **增删字段须同改：结构 + 名字表（super.c）+ 枚举（al_）。**
 
-## 2. 主 stats 分组（93）
+## 2. 主 stats 分组（110）
 
 | 组 | 前缀 | 数量 | 变更 |
 |---|---|---|---|
 | A VFS 操作 | `op_` | 26 | 不变 |
 | B inode 会话 | `ic_` | **7** | **重设**（原行缓存 9 → v2.0 InodeSession） |
-| C mdata 片缓存 | `md_` | 8 | 不变（现同时服务 B+树节点 + inode 片） |
+| C mdata 片缓存 | `md_` | **25** | **扩到 god `mdp_stat` 全量对位**（+17：装配/表结构/strong/驻留 gauge；含 ko 独有 `md_drop`） |
 | D TTL | `ttl_` | 2 | 不变 |
 | E 块设备 IO | `io_` | 5 | 不变 |
 | G extent | `ext_` | **9** | **+ext_nd_ops/ext_idp_ops**（三族消歧） |
