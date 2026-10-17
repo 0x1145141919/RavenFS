@@ -7,8 +7,10 @@
  *
  *   H2  flush 脏写回无 pin：flush 持页写盘期间活会话改内容 + 置脏，flush 返回时
  *       fetch_and(~DIRTY) 把该脏标清掉 → 页非脏被丢弃 → 静默丢更新。**确定性**。
+ *       CTRL_ARRAY 档残留；RADIX 档已由 flush_all 片写锁关闭。
  *   H3  flush_all ⨯ reap 重叠：reap 释放 flush 正要读的页 → 读已释放内存（UAF）。
  *       **需 ASan 观测**（不加 ASan 通常不崩，仅逻辑复现）。
+ *       CTRL_ARRAY 档残留（安全卸载契约由上层保证）；RADIX 档已由片写锁关闭。
  *   H7  不平衡 put（无配对 get）→ accessor 下溢为 ~2^32 → 行永不可淘汰（契约依赖）。
  *   H5  mdp_ctrl_acquire 持读锁自旋 / 读锁跨 I/O → 写者饥饿（无确定性复现，见文档）。
  *   H6  get↔reap_expired_strong 重建抖动（无确定性复现，见文档）。
@@ -92,7 +94,7 @@ static mdata_piece_caches_mgr *make_mgr() {
     return m;
 }
 
-/* ═══ H2 — flush 脏写回无 pin → 清掉活会话的 DIRTY → 丢更新 ═══ */
+/* ═══ H2 — flush 脏写回无 pin → 清掉活会话的 DIRTY（CTRL_ARRAY 档残留） ═══ */
 static bool case_h2() {
     g_img.assign(PIECES * 8192, 0);
     mdata_piece_caches_mgr *m = make_mgr();
@@ -118,7 +120,7 @@ static bool case_h2() {
     return lost;
 }
 
-/* ═══ H3 — flush_all ⨯ reap 重叠 → 读已释放页（UAF，需 ASan） ═══ */
+/* ═══ H3 — flush_all ⨯ reap 重叠 → 读已释放页（UAF；CTRL_ARRAY 档残留，需 ASan） ═══ */
 static bool case_h3() {
     g_img.assign(PIECES * 8192, 0);
     mdata_piece_caches_mgr *m = make_mgr();

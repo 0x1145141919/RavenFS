@@ -3,7 +3,7 @@
 > 2026-08-30
 > 主题：挂载参数 → 上帝类全机工作模式（两层决策树）；大结构体无状态初始化子模块；
 > 下游双缓存（inode / mdata_piece）三工作模式（no_cache / self_reliat / offload）。
-> 代码映射：`include/ravenfs/ravenfs_v1.1.hpp`（契约）＋ `juvenile_god/ravenfs_juvenile.cpp`（编排）。
+> 代码映射：`include/ravenfs/ravenfs_juvenile.hpp`（契约）＋ `juvenile_god/ravenfs_juvenile.cpp`（编排）。
 
 ---
 

@@ -8,7 +8,7 @@
  *
  * 包含顺序约定：调用方先
  *     #define private public
- *     #include "../include/ravenfs/ravenfs_v1.1.hpp"
+ *     #include "../include/ravenfs/ravenfs_juvenile.hpp"
  *     #undef private
  * 再 include 本头。本头在 private 重定义之外拉缓存/审计完整类型
  * （inode_cache_radix.hpp / mdata_piece_caches.hpp / audit_check.hpp）。

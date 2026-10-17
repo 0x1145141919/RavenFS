@@ -284,18 +284,18 @@ int main() {
         slice_config_t c3{}; c3.slice_base = b3.mem; c3.in_global_base_idx = B3_OFF; c3.slice_bitscount = B3_N;
         CHECK(s3.enable_slice(c3) == RC_OK, "enable s3");
         CHECK(s3.alloc_hard(0, 0, o) == RC_ERR_STATE, "alloc_hard: zero rejected");
-        /* best-fit：需 10 → 最小 len≥10 的 [700,716)(16) → 头部下挖 [700,710)，余 [710,716) */
+        /* best-fit：需 10 → 最小 len≥10 的 [700,716)(16) → 头部上挖 [700,710)，余 [710,716) */
         CHECK(s3.alloc_hard(0, 10, o) == RC_OK, "alloc_hard best-fit rc");
-        CHECK(o == 706, "alloc_hard tail-carve base");
+        CHECK(o == 700, "alloc_hard head-carve base");
         { uint64_t sum=0; auto v = dump_vec(s3,&sum);
-          CHECK(eq_intervals(v, {{700,6},{724,8},{740,24}}), "alloc_hard remainder (base kept)");
+          CHECK(eq_intervals(v, {{710,6},{724,8},{740,24}}), "alloc_hard remainder (head-carved)");
           CHECK(sum == 38, "alloc_hard count 48-10"); }
-        /* 对齐：align_log2=3 需 8 → [724,732) 贴尾起点 724 非 8 对齐 → 下移 720<724 不可行 →
-         * [740,764) → 贴尾 756 下移到 752（8 对齐）；挖 [752,760) → 余 [740,12)+[760,4) */
+        /* 对齐：align_log2=3 需 8 → [724,732) 头对齐 728 越出 732 不可行 →
+         * [740,764) → 头对齐 (740+7)&~7 = 744；挖 [744,752) → 余 [740,4)+[752,12) */
         CHECK(s3.alloc_hard(3, 8, o) == RC_OK, "alloc_hard aligned rc");
-        CHECK(o == 752, "alloc_hard aligned base");
+        CHECK(o == 744, "alloc_hard aligned base");
         { uint64_t sum=0; auto v = dump_vec(s3,&sum);
-          CHECK(eq_intervals(v, {{700,6},{724,8},{740,12},{760,4}}), "alloc_hard aligned split");
+          CHECK(eq_intervals(v, {{710,6},{724,8},{740,4},{752,12}}), "alloc_hard aligned split");
           CHECK(sum == 30, "alloc_hard count 38-8"); }
         CHECK(s3.alloc_hard(0, 100, o) == RC_ERR_NO_BLOCK, "alloc_hard: no fit");
         /* shutdown：对位 true→false */
@@ -305,6 +305,50 @@ int main() {
         { std::list<fs_run_t> dl; CHECK(s3.all_dump(&dl) == RC_ERR_STATE, "after shutdown: dump gated"); }
         CHECK(s3.enable_slice(c3) == RC_OK, "re-enable after shutdown");
         b3.clear_mem();
+    }
+
+    /* ═══════ 7b. alloc_hard_longest_first：先甜后苦·最长优先（碎片运维工具件）═══════ */
+    puts("[7b] alloc_hard_longest_first");
+    {
+        Bits b7;
+        const uint64_t B7_OFF = 700, B7_N = 128;
+        b7.alloc(B7_N);                /* 全占用 */
+        b7.set_free(0, 6);             /* [700,706)  len 6  */
+        b7.set_free(10, 20);           /* [710,730)  len 20 */
+        b7.set_free(40, 20);           /* [740,760)  len 20 */
+        b7.set_free(100, 4);           /* [800,804)  len 4  */
+        mgr_slice_t s7;
+        uint64_t o = 0;
+        slice_config_t c7{}; c7.slice_base = b7.mem; c7.in_global_base_idx = B7_OFF; c7.slice_bitscount = B7_N;
+        CHECK(s7.enable_slice(c7) == RC_OK, "lf: enable");
+
+        /* 需 8：可容纳 [710,20) 与 [740,20)（同长）→ 取 base 最小 = 710；
+         * 头部上挖 [710,718)，余 [718,12) */
+        CHECK(s7.alloc_hard_longest_first(0, 8, o) == RC_OK, "lf: rc1");
+        CHECK(o == 710, "lf: longest-first tie -> min base 710");
+        { uint64_t sum=0; auto v = dump_vec(s7,&sum);
+          CHECK(eq_intervals(v, {{700,6},{718,12},{740,20},{800,4}}), "lf: remainder after rc1");
+          CHECK(sum == 42, "lf: count 50-8"); }
+
+        /* 需 8：最长是 [740,20)（best-fit 会取 len=12 的 [718,12)）→ 740；
+         * 头部上挖 [740,748)，余 [748,12) */
+        CHECK(s7.alloc_hard_longest_first(0, 8, o) == RC_OK, "lf: rc2");
+        CHECK(o == 740, "lf: longest segment wins (740)");
+        { uint64_t sum=0; auto v = dump_vec(s7,&sum);
+          CHECK(eq_intervals(v, {{700,6},{718,12},{748,12},{800,4}}), "lf: remainder after rc2");
+          CHECK(sum == 34, "lf: count 34"); }
+
+        /* 对照 best-fit：同状态会取最小的 len=12 → 718 */
+        CHECK(s7.alloc_hard(0, 8, o) == RC_OK, "lf: best-fit contrast rc");
+        CHECK(o == 718, "lf: alloc_hard(best-fit) picks 718 (contrast)");
+
+        /* 无任何段可容纳 64 → NO_BLOCK，出参不动 */
+        o = 0x55;
+        CHECK(s7.alloc_hard_longest_first(0, 64, o) == RC_ERR_NO_BLOCK, "lf: no fit");
+        CHECK(o == 0x55, "lf: out untouched on fail");
+        CHECK(s7.alloc_hard_longest_first(0, 0, o) == RC_ERR_STATE, "lf: zero rejected");
+        CHECK(s7.alloc_hard_longest_first(64, 1, o) == RC_ERR_STATE, "lf: align>63 rejected");
+        b7.clear_mem();
     }
 
     /* ═══════ 8. soft_alloc：碎片优先 + all_satisfied + 部分交付 ═══════ */
@@ -326,7 +370,7 @@ int main() {
         CHECK(s4.soft_alloc(0, 0, &r0, sat) == RC_ERR_STATE, "soft_alloc: zero rejected");
         CHECK(s4.soft_alloc(0, 1, nullptr, sat) == RC_ERR_STATE, "soft_alloc: null runs rejected");
 
-        /* 6 位：小碎片优先 [800,803)+[820,822) 整吃，再从 [840,850) 挖尾 1 → {849,1} */
+        /* 6 位：小碎片优先 [820,822)+[800,803) 整吃，再从 [840,850) 挖头 1 → {840,1} */
         fs_run_list_t r1;
         CHECK(s4.soft_alloc(0, 6, &r1, sat) == RC_OK, "soft_alloc rc");
         CHECK(sat == true, "soft_alloc: satisfied");
@@ -334,9 +378,9 @@ int main() {
           uint64_t s = 0; for (auto &x : rv) s += x.len;
           CHECK(rv.size() == 3, "soft_alloc: 3 fragments");
           CHECK(s == 6, "soft_alloc: 6 bits delivered");
-          CHECK(rv[0].base == 849 && rv[0].len == 1, "soft_alloc: tail-carve {849,1} at list head"); }
+          CHECK(rv[0].base == 840 && rv[0].len == 1, "soft_alloc: head-carve {840,1} at list head"); }
         { uint64_t sum=0; auto v = dump_vec(s4,&sum);
-          CHECK(eq_intervals(v, {{840,9},{880,20}}), "soft_alloc: big run [880,20) untouched");
+          CHECK(eq_intervals(v, {{841,9},{880,20}}), "soft_alloc: big run [880,20) untouched");
           CHECK(sum == 29, "soft_alloc count 35-6"); }
 
         /* 100 位：穷尽剩余 [840,9)+[880,20)=29 → 部分交付 + all_satisfied=false */

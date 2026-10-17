@@ -3,13 +3,13 @@
  * ═══════════════════════════════════════════════════════════════════════════
  * rc.hpp — 全局共享结果码 / 通用哨兵（轻量运行时头，C / C++ 双兼容）
  *
- * 2026-10-05 从 disk_struct_v1.2.h 剥离（方案 A）：
+ * 从盘结构头剥离（方案 A）：
  *   result_code_t / rfs_rc(RC_*) / PTR_INVALID 是**纯运行时**常量，与落盘
  *   字节布局无关，却长期埋在全量 on-disk 结构头里 —— 任何想拿错误码的模块
  *   （inode 缓存 / 元数据负载片缓存 / 位图分片分配器 / 红黑树分配器…）都被
  *   迫连整份盘结构（raven_Inode_t / raven_dir_Inode_t / superblock / 全部
  *   RFS_* 宏与 static_assert）一起拖进来。现独立成此轻量头：
- *     - 盘侧：disk_struct_v1.2.h 反向 #include 本头，对外符号集不变；
+ *     - 盘侧：盘结构头（disk_struct_v2.0.h）反向 #include 本头，对外符号集不变；
  *     - 运行时侧：缓存/分配器只 #include "ravenfs/rc.hpp"，零盘依赖。
  *
  * 值 / 枚举顺序与剥离前逐字一致（整数值被盘代码与用例断言依赖，勿改）。
@@ -17,7 +17,7 @@
  */
 
 #ifdef __KERNEL__
-#  include <linux/types.h>   /* 内核：提供 uint64_t（同 disk_struct_v1.2.h 约定） */
+#  include <linux/types.h>   /* 内核：提供 uint64_t（同盘结构头约定） */
 #else
 #  include <stdint.h>        /* 用户态 / god / C++ */
 #endif

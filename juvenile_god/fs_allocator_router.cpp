@@ -2,8 +2,8 @@
  * fs_allocator_router.cpp — fs_allocator_t 路由层实现（树版分片路由）
  *
  * 2026-10-03 新建。模块契约见 include/ravenfs/fs_allocator.hpp 头注释（逐字为
- * 规格）；本文件是「路由骨架」——与位图时代的 bitmap_slices_mgr_t（见
- * juvenile_god/bitmap_slices.cpp）**同一套路由思想**，后端从「位图 + 位扫」
+ * 规格）；本文件是「路由骨架」——沿用位图时代的路由思想（位图实现已随 v1.x
+ * 清理删除），后端从「位图 + 位扫」
  * 换成「树版片自治单元 mgr_slice_t」：
  *
  *   ┌───────────────────────────────────────────────────────────────┐
@@ -22,7 +22,7 @@
  *      阻塞 lock（不可换片 / 不可丢）。片内临界区含 malloc（STL 链表节点），
  *      持锁方允许被短暂挂起，故绝不自旋。
  *
- * ── 锁纪律（逐条照抄头文件 + bitmap_slices.cpp 的语义，只换锁原语）─────
+ * ── 锁纪律（逐条照抄头文件语义，只换锁原语）─────
  *   - 分配（block_alloc_hard / block_alloc_soft / inode_alloc）：try_lock，
  *     忙则换片（preferred 亲和扫描，仿 FPA::alloc）。
  *   - 定点对（block_occupy_soft / block_free / inode_free / *_test）：
@@ -51,7 +51,7 @@
 #include <new>        /* std::bad_alloc */
 
 /* 平台身份合约：per-CPU preferred 路由按此返回值索引；内核端必须提供强定义，
- * 用户态由 tests/cpu_id_stub.cpp 的 weak 桩兜底（与 bitmap_slices.cpp 同款）。 */
+ * 用户态由 tests/cpu_id_stub.cpp 的 weak 桩兜底）。 */
 extern "C" uint32_t get_processor_id();
 
 /* ═══════════════════════════════════════════════════════════════
@@ -145,7 +145,7 @@ uint64_t sum_runs(const fs_run_list_t &runs) {
 /* ═══════════════════════════════════════════════════════════════
  * ctor — 装配：2^n 上界 ∩ 满片数 → 末片非空迭代 → 双组 enable → preferred 初始化
  *
- * 推导（位图版 bitmap_slices_mgr_t::bitmap_slices_mgr_t 原样照抄，只把 32768
+ * 推导（沿用位图版几何推导，只把 32768
  * 换成 cfg.min_slice_bits；该字段默认 32768，注释标「勿动」）：
  *   n   = 2^ceil(log2(logical_processor_count))            （2^n 上界）
  *   cap = min(block_nbits, inode_nbits) / msb              （满片数约束）
@@ -170,6 +170,8 @@ fs_allocator_t::fs_allocator_t(const slices_cfg_t &cfg, uint64_t *res_code) {
         return;   /* block 源缺失：保持空态（inode 数据面虽独立，但 grow 需 block 组取片） */
     }
 
+    mode_ = cfg.mode;   /* 内部化分配模式（RUNTIME / DEFRAG），控制装配与硬分配策略 */
+
     const uint64_t msb = cfg.min_slice_bits ? cfg.min_slice_bits : 32768;
 
     /* 2^n 上界（仿 FPA；0 → 由 cpu_slots_ 兜底单槽） */
@@ -188,6 +190,9 @@ fs_allocator_t::fs_allocator_t(const slices_cfg_t &cfg, uint64_t *res_code) {
         if (n == 1) break;
         n >>= 1;
     }
+    /* 碎片缓解模式：block 组**强制单分片**（运维工具全片视角，无 preferred 轮转 /
+     * 跨片；硬分配的策略差异由 block_alloc_hard 落到 alloc_hard_longest_first）。 */
+    if (mode_ == SLICES_MODE_DEFRAG) n = 1;
     slice_count_ = (uint32_t)n;
     cpu_slots_   = cfg.logical_processor_count ? cfg.logical_processor_count : 1;
 
@@ -243,7 +248,11 @@ uint64_t fs_allocator_t::block_alloc_hard(uint64_t require_count, uint8_t align_
         mgr_slice_t &s = blk_.slices[idx];
         if (!s.slice_lock.try_lock()) continue;            /* 锁忙换片 */
         uint64_t out = 0;
-        const result_code_t rc = s.alloc_hard(align_log2, require_count, out);
+        /* DEFRAG：碎片缓解 → 单分片 + 最长优先（alloc_hard_longest_first）；
+         * RUNTIME：运行时模仿 → 片内 best-fit（alloc_hard）。 */
+        const result_code_t rc = (mode_ == SLICES_MODE_DEFRAG)
+            ? s.alloc_hard_longest_first(align_log2, require_count, out)
+            : s.alloc_hard(align_log2, require_count, out);
         s.slice_lock.unlock();
         if (rc == RC_OK) {
             blk_.preferred[cpu] = (uint32_t)idx;           /* 回写亲和片 */

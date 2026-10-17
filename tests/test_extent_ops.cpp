@@ -36,7 +36,7 @@
  *       要求盘是 mkfs --inode-count≥262144（8 片需要）且每次 par 前重 mkfs。
  * ═══════════════════════════════════════════════════════════════════ */
 #define private public
-#include "../include/ravenfs/ravenfs_v1.1.hpp"
+#include "../include/ravenfs/ravenfs_juvenile.hpp"
 #undef private
 #include "inode_compat.hpp"   /* v2.0 inode 读写兼容壳 */
 #include "audit_check.hpp"

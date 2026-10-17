@@ -16,7 +16,7 @@
 #include "../include/ravenfs/ravenfs_audit.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"
 #define private public
-#include "../include/ravenfs/ravenfs_v1.1.hpp"
+#include "../include/ravenfs/ravenfs_juvenile.hpp"
 #undef private
 #include "inode_compat.hpp"   /* v2.0 inode 读写兼容壳 */
 
@@ -63,9 +63,10 @@ static uint64_t audit_clean(RavenFS_juvenile &fs, const char *tag) {
     audit_walk_report_t rep;
     uint64_t a = fs.audit_dfs_root(&rep, stdout);
     uint64_t bad = (a == RC_OK) ? rep.total_bad() : (uint64_t)-1;
-    printf("  [%s] audit(%s) bad=%llu heap=%llu leak=%llu mc=%llu\n",
+    printf("  [%s] audit(%s) bad=%llu namedata=%llu inodeplane=%llu leak=%llu mc=%llu\n",
            bad == 0 ? "PASS" : "FAIL", tag, (unsigned long long)bad,
-           (unsigned long long)rep.heap_bad, (unsigned long long)rep.leaked_blk,
+           (unsigned long long)rep.namedata_bad, (unsigned long long)rep.inodeplane_bad,
+           (unsigned long long)rep.leaked_blk,
            (unsigned long long)rep.multi_claim_blk);
     return bad;
 }

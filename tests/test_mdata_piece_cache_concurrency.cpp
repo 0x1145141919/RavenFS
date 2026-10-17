@@ -13,9 +13,10 @@
  *   C) long-hold invariance: each holder writes a magic into its page and
  *      re-validates it while strong reap hammers -> row must NEVER be evicted
  *      while a live session holds it (ASan catches UAF if it is)
- *   D) flush_all concurrent with get/put (host says flush-vs-reap must not
- *      overlap; flush-vs-get is claimed safe)
- *   E) flush-vs-get lost-dirty determinism probe (CTRL_ARRAY, slow writeback)
+ *   D) flush_all concurrent with get/put (flush takes the shard write lock;
+ *      get/put are serialized behind it)
+ *   E) flush-vs-get lost-dirty determinism probe (CTRL_ARRAY, slow writeback;
+ *      RADIX closed by flush_all's write lock)
  *
  * Invariants asserted after every phase:
  *   · accessor accounting balanced (sum over all ctrl rows == 0)
@@ -420,8 +421,8 @@ static int run_tier(const char *name, uint64_t count) {
     if (getB != putB) { printf("      !! get/put stat mismatch\n"); rc = 1; }
     if (C.holder_lost.load() != 0) { printf("      !! row evicted while held (harness-visible)\n"); rc = 1; }
 
-    /* D) flush_all concurrent with get/put (no reap, per contract) */
-    printf("  [D] flush_all concurrent with get/put (no reap) ...\n");
+    /* D) flush_all concurrent with get/put (now serialized by shard write lock) */
+    printf("  [D] flush_all concurrent with get/put ...\n");
     counters_reset();
     uint64_t base_putD = g_stat[MDP_PUT].load();
     uint64_t base_getD = g_stat[MDP_GET_HIT].load() + g_stat[MDP_GET_MISS].load();
@@ -435,11 +436,11 @@ static int run_tier(const char *name, uint64_t count) {
     if (accD != 0) { printf("      !! accessor NOT balanced\n"); rc = 1; }
     if (getD != putD) { printf("      !! get/put stat mismatch\n"); rc = 1; }
 
-    /* D2) flush_all + reap concurrently (UNSUPPORTED by host contract — observe) */
+    /* D2) flush_all + reap concurrently (safe since flush_all holds the shard write lock) */
     if (g_skip_unsupported) {
         printf("  [D2] SKIPPED (MDP_SKIP_UNSUPPORTED=1)\n");
     } else {
-    printf("  [D2] flush_all + reap concurrently (contract says unsupported) ...\n");
+    printf("  [D2] flush_all + reap concurrently (serialized by shard write lock) ...\n");
     counters_reset();
     phase_flush_race(f, 6, 900, true);
     uint64_t accD2 = accessor_sum(f.mgr);

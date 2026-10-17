@@ -1,11 +1,9 @@
 # RavenFS v1.1 幼年期上帝类
 #
 # ravenfs_juvenile.cpp — 挂载/卸载 + 块/inode I/O + 上帝类编排（Raven 实现）
-# bitmap_slices.cpp — 双位图分片分配器独立模块：slice 自治单元 + mgr 几何推导/路由
-#                    （2026-09-03 从上帝类顶出；原 bitmap_slice.cpp 退役）
 # fs_allocator.cpp  — mgr_slice_t 主从红黑树分片分配器片自治单元（2026-10-03 新建）：
 #                    enable_slice / test_interval / free_interval / free_intervals /
-#                    all_dump / soft_occupy（红黑树版后端，与位图版并存待切换）
+#                    all_dump / soft_occupy（运行时分配器后端：主从侵入红黑树）
 # dentry_tree.cpp      — dentry B+tree 全套（2026-09-07 拆为 4 域文件，Sparrow 手写代码按域分置）：
 #     dentry_walk_lookup.cpp — 只读导航：node_max_hash / walk / name_cmp / 两 lookup
 #     dentry_insert_delete.cpp — 叶子条目增删 + 下游资产维护（guard 回滚）
@@ -39,6 +37,7 @@ add_library(ravenfs_juvenile STATIC
     extent_balance.cpp
     extent_map_unmap.cpp
     extent_rebuild.cpp
+    file_compact.cpp
     root_dir.cpp
     name_data_plane.cpp
     name_data_freeranges.cpp

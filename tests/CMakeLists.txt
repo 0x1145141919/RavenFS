@@ -134,6 +134,14 @@ add_executable(ravenfs_juv_extent_ops
 )
 target_link_libraries(ravenfs_juv_extent_ops PRIVATE ravenfs_juvenile Threads::Threads)
 
+# v2.0 文件碎片压缩原语 regular_file_compact 专项（真盘/镜像）：
+# 造「逻辑连续、物理断裂」extent 文件 + 稀疏带洞文件 → dry-run 规划 / apply 搬迁 /
+# 洞保持 / max_move 跳过 / audit 全绿。
+add_executable(ravenfs_juv_file_compact
+    test_file_compact.cpp
+    ${CPU_ID_STUB}
+)
+target_link_libraries(ravenfs_juv_file_compact PRIVATE ravenfs_juvenile)
 
 # v1.3 dir_rm_dentry 接口专项测试（长名 split/merge/复用 + 正反向批量删+收缩 +
 # 审计 + 重挂载；offload/nocache/selfreliat 三后端）；共享 dir_tree_check.hpp

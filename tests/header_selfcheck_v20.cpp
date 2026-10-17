@@ -7,7 +7,7 @@
  *      从而 clangd / VSCode 能拿到**真实命令**（`-I include`、`-std=gnu++20`），
  *      不再退回 .vscode/c_cpp_properties.json 的兜底（那套带 `-D__KERNEL__`
  *      且内核头路径版本可能过期 → `uint64_t` 未知类型 → 满屏假错）。
- *      —— 与 header_selfcheck_v13.cpp 同套路，v2.0 头单独开一个 TU。
+ *      —— v2.0 盘面头单独开一个 TU。
  *   2. 顺带把 v2.0 盘面结构的**布局契约**钉在编译期：每个 `RFS_STATIC_ASSERT`
  *      （在头内）+ 本文件的显式 static_assert（关键尺寸/offset）任何一条不符即编译失败。
  *

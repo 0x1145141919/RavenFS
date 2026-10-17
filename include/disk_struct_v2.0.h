@@ -1,22 +1,19 @@
 #pragma once
 /*
  * ═══════════════════════════════════════════════════════════════════════════
- * RavenFS on-disk 结构 —— v1.2（**C / C++ 双兼容**）
+ * RavenFS on-disk 结构 —— **v2.0**（**C / C++ 双兼容**）
  *
- * 来源真值：
- *   · include/disk_struct_v1.1.hpp          （全量字段基座）
- *   · Docs/disk_layout_v1.2_inode.md        （v1.2 inode 语义重定义，权威详版）
- *   · Docs/linux/ravenfs-linux-ko-requirements-spec.md  §4.5.1 / §6-E2（摘要）
+ * 权威契约（本仓库仅存 v2.0 盘面）：
+ *   · Docs/disk_layout_v2.0.md   （单一权威盘布局文档）
+ *   · include/disk_struct_v2.0.h （本文件，结构真值）
+ *   · include/magics.h           （魔数真值）
  *
- * 本文件相对 v1.1 的变更有两条主线：
- *
- * 【主线一 · 内容】v1.2 inode 语义重定义（**字节 offset / 尺寸不变**，仍 256B）
- *   · 第一字（word1）：  type:2 | direct:1 | other:61   →   type:6 | direct:1 | i_flags:57
- *   · permission_bits：  只写 12 位权限（全仓 0 处读）    →   mode:12 | xattr_ptr:52
- *   · inline_data：      内容                          →   内容 / 无数据类型(CHR/BLK) 存 rdev@[0:4]
- *   · type 值域：        REG=0 DIR=1 SYM=2             →   {FIFO1,CHR2,DIR4,BLK6,REG8,LNK10,SOCK12}
- *   · 新增：             xattr 块（单块自描述，一个 52 位块指针，超限 -E2BIG）
- *   · 版本：             RAVENFS_VERSION 2             →   3（v1.1 盘不兼容 → reformat）
+ * 【主线一 · 内容】v2.0 全局弹性 inode 数据面（**与 v1.x 不兼容 → reformat**）
+ *   · inode 存储：v1.x「几何预分配固定数组 + inode 位图」→ v2.0「超级块统辖的
+ *     全局弹性 inode 数据面」（8K 片 direct 起步 + 映射树 + 扁 fr 快照）；
+ *   · 根 inode：v1.x 读 SB `root_inode` → v2.0 **契约级硬编码 0**；
+ *   · SB magic：v1.x 单字 "RAVN" → v2.0 **256-bit**（`magic[0]` = "RAVENFS\0" 前缀）；
+ *   · 目录长名外置：v1.1「每目录 10 档名字堆」→ v2.0「每目录名字数据面」。
  *
  * 【主线二 · 形式】**用「掩码 + 宏」替代位域（bit-field）**
  *   理由（为什么全盘换掉位域）：
@@ -26,9 +23,6 @@
  *   形式：每个落盘字声明为裸 `uintN_t`；字段用 `RFS_<域>_<字段>_{SHIFT,MASK}`
  *         + `RFS_<域>_<字段>_GET(word)` + `RFS_<域>_PACK(...)` / `_SET_xxx(word,val)` 访问。
  *   每个结构后 `RFS_STATIC_ASSERT(sizeof(...) == N)` 锁死布局。
- *
- * ⚠️ 与 v1.1 代码的落差：god / mkfs / audit 现有代码访问 `.type` / `.permission_bits` /
- *    `.ptr` 等位域成员，本头文件不再提供这些成员 → 迁移动作见 disk_layout_v1.2_inode.md §8 / §8.1。
  * ═══════════════════════════════════════════════════════════════════════════
  */
 

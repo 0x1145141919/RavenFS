@@ -13,13 +13,19 @@
  *   5. 持久化：析构 flush → 重挂载 → 树内容与长名回读不变。
  *
  * 只调用 insert / lookup（不碰 rm）；校验器直读内部状态（private public）。
- * 用法：ravenfs_juv_insert <device> [batch_count=1000] [stop_at=0]
+ * 后端矩阵：offload（默认，mmap）/ selfreliat（直写 + 双 self_reliat 用户态缓存）。
+ *   审计仅在 offload 下执行（audit_dfs_root 前提 is_device_direct=false）；
+ *   RADIX 档需镜像 ≥128MiB（Piece_count = bitmap_start/2 > 8192 → bits>13）。
+ * 用法：ravenfs_juv_insert <device> [batch_count=1000] [stop_at=0] [mode=offload|selfreliat]
  *   batch_count 默认 1000 —— 适配 64MiB 镜像（≈2048 inode）；更大规模
  *   请换更大镜像。64MiB 下最深到「根分裂（depth 2）」，内部节点分裂需
  *   ~8000 条目（超镜像 inode 预算），故不在默认覆盖内。
+ *   selfreliat 集成示例（RADIX 档 + 卸载 flush_all 写锁）：
+ *     truncate -s 128M /tmp/rfs.img && ./mkfs/mkfs.ravenfs -f /tmp/rfs.img
+ *     ./build/tests/ravenfs_juv_insert /tmp/rfs.img 1000 0 selfreliat
  * ═══════════════════════════════════════════════════════════════════ */
 #define private public
-#include "../include/ravenfs/ravenfs_v1.1.hpp"
+#include "../include/ravenfs/ravenfs_juvenile.hpp"
 #undef private
 #include "dir_tree_check.hpp"
 
@@ -31,7 +37,7 @@
 struct Case { const char *name; result_code_t expect; const char *desc; };
 
 int main(int argc, char **argv) {
-    if (argc < 2) { printf("usage: %s <device> [batch_count=1000] [stop_at=0]\n", argv[0]); return 2; }
+    if (argc < 2) { printf("usage: %s <device> [batch_count=1000] [stop_at=0] [mode=offload|selfreliat]\n", argv[0]); return 2; }
     int batch_n = 1000;
     if (argc >= 3) batch_n = atoi(argv[2]);
     if (batch_n < 1) batch_n = 1;
@@ -40,17 +46,26 @@ int main(int argc, char **argv) {
     if (stop_at < 0) stop_at = 0;
     int insert_n = (stop_at > 0 && stop_at < batch_n) ? stop_at : batch_n;
 
+    /* 后端模式：offload（非直写 → mmap 全 offload）/ selfreliat（直写 → 双 self_reliat）
+     * selfreliat 下每次 dir_verify_tree 都会走 flush_all 同步点（写锁路径）。 */
+    bool mode_direct = false, mode_use_icache = false, mode_use_bcache = false;
+    if (argc >= 5 && strcmp(argv[4], "selfreliat") == 0) {
+        mode_direct = true; mode_use_icache = true; mode_use_bcache = true;
+    }
+    const bool audit_ok = !mode_direct;   /* 审计前提：mmap 后端 */
+
     printf("════════════════════════════════════════════════\n"
            " RavenFS v1.3 dir_insert_dentry 专项测试\n"
-           " device: %s   batch: %d   stop_at: %d%s\n"
+           " device: %s   batch: %d   stop_at: %d%s   mode: %s\n"
            "════════════════════════════════════════════════\n",
-           argv[1], batch_n, insert_n, stop_at > 0 ? "  (二分复播)" : "");
+           argv[1], batch_n, insert_n, stop_at > 0 ? "  (二分复播)" : "",
+           mode_direct ? "selfreliat（直写+双self_reliat）" : "offload（mmap后端）");
 
     uint64_t rc = 0;
     uint64_t inserted = 0;
     const int long_n = 300;   /* 长名批量条数（Phase 2b 与 Phase 3 回读共用） */
 
-    linux_userspace_mount_t mnt = make_mount(argv[1]);   /* mmap 后端（审计前提） */
+    linux_userspace_mount_t mnt = make_mount(argv[1], mode_direct, mode_use_icache, mode_use_bcache);
     if (mnt.dev.fd < 0) { printf("open %s failed\n", argv[1]); return 2; }
 
     /* ══ Phase 0~2：挂载 → 边界 → 批量（作用域块，析构时位图全量写回） ══ */
@@ -59,6 +74,17 @@ int main(int argc, char **argv) {
     CHECK(fs.is_mounted(), "mount rc=%s", rc_name(rc));
     if (!fs.is_mounted()) { printf("挂载失败，测试中止（先确认已 mkfs）\n"); return 1; }
     fs.dump_info();
+
+    /* 档位探针（selfreliat 集成）：Piece_count = bitmap_start/2；>8192 → bits≥14 → RADIX。
+     * dir_verify_tree 每次都会走 flush_all（片写锁路径），卸载再走一次。 */
+    if (mode_direct && fs.mdata_piece_mgr) {
+        const bool radix = (fs.mdata_piece_mgr->self_reliat_mode() == MDP_MODE_RADIX_SHARD);
+        printf("  mdata_piece cache: pieces=%llu mode=%s\n",
+               (unsigned long long)fs.mdata_piece_mgr->piece_count(),
+               radix ? "RADIX_SHARD" : "CTRL_ARRAY");
+        if (fs.mdata_piece_mgr->piece_count() > 8192)
+            CHECK(radix, "pieces>8192 → RADIX 档（flush_all 片写锁路径）");
+    }
 
     /* ══ Phase 1：边界 / 异常输入 ══ */
     printf("\n--- Phase 1: 边界与异常 ---\n");
@@ -170,7 +196,7 @@ int main(int argc, char **argv) {
     }
 
     dir_verify_tree(fs, inserted, "Phase 2b 后");
-    CHECK(audit_clean(fs, "insert-final") == 0, "audit_dfs_root 全净 (insert)");
+    if (audit_ok) CHECK(audit_clean(fs, "insert-final") == 0, "audit_dfs_root 全净 (insert)");
     }   /* ← fs 析构：位图全量写回 */
 
     if (stop_at > 0) {

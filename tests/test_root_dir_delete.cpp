@@ -26,7 +26,7 @@
  *     ./build/tests/ravenfs_juv_delete /tmp/big.img 0 0 offload 1000000
  *═══════════════════════════════════════════════════════════════════ */
 #define private public
-#include "../include/ravenfs/ravenfs_v1.1.hpp"
+#include "../include/ravenfs/ravenfs_juvenile.hpp"
 #undef private
 #include "dir_tree_check.hpp"
 

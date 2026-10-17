@@ -124,7 +124,7 @@ xattr 单块自描述。**offset 与尺寸一字不变**，破坏性在两处：
 ## 8. 交付物清单
 
 - **commits**：`89a239a`（位图回退）· `c2bf310`（v1.2 契约收口）· `1a941cc`（v1.2 迁移）· `e93f5c0`（新接口）· `08dede6`（修复工具）。
-- **接口**：`extent_tree_collapse_to_direct`（`include/ravenfs/ravenfs_v1.1.hpp` + `juvenile_god/direct_file_ops.cpp`）。
+- **接口**：`extent_tree_collapse_to_direct`（`include/ravenfs/ravenfs_juvenile.hpp` + `juvenile_god/direct_file_ops.cpp`）。
 - **工具**：`tools/rfs_compact/{rfs_compact.cpp, Makefile, README.md}`。
 - **文档**：`Docs/disk_layout_v1.2_inode.md`（收口）、`Docs/linux/ravenfs-linux-ko-defects.md`（D-5~D-8）、**本故事**。
 

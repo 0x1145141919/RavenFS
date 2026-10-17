@@ -233,9 +233,9 @@ struct audit_log_t {
 - 类型头：`include/ravenfs/ravenfs_audit.hpp`（`audit_opts_t` / `audit_log_t` /
   `audit_report_t` / `audit_ctx_t` / `audit_tree_ctx_t` / `audit_heap_occ_t` /
   `audit_heap_region_t`）。单独成头是为避开 `#define private public` 测试 TU 的
-  `<chrono>`/`<sstream>` 可访问性雷（gcc16）；`ravenfs_v1.1.hpp` 只前置声明。
+  `<chrono>`/`<sstream>` 可访问性雷（gcc16）；`ravenfs_juvenile.hpp` 只前置声明。
 - 实现：`juvenile_god/audit.cpp`，加入 `juvenile_god/CMakeLists.txt` 的 `add_library`。
-- 入口（`ravenfs_v1.1.hpp` public）：`audit_begin` / `audit_inode` / `audit_filesystem`。
+- 入口（`ravenfs_juvenile.hpp` public）：`audit_begin` / `audit_inode` / `audit_filesystem`。
 - 测试：`tests/test_audit_inode.cpp`（干净盘 / 建内容 / 单 inode / 人工污染命中 → 9/0）；
   `tests/audit_check.hpp` 提供 `audit_clean(fs, tag)` 横切封装。
 - 已融入的既有测试（末尾追加 `audit_clean` 调用）：insert / delete / extent_walk /

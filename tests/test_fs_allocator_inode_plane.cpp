@@ -172,7 +172,7 @@ static void test_alloc_free() {
 static void test_grow() {
     puts("[4] 用尽 -> grow（硬分配 + 物理尾合并 / 非邻接分裂）");
     /* block 靶场：默认全占用；只留两个 len=2 的空闲区间 [2,4) 与 [100,102)。
-     * mgr_slice_t::alloc_hard = best-fit 最小 len + **从区间尾下挖**：
+     * mgr_slice_t::alloc_hard = best-fit 最小 len + **从区间头上挖**（D-14）：
      *   两次都命中 len=2（tie 按 base 小）→ 第一次得块 2（与 extent 尾 2 邻接→合并）、
      *   第二次得块 100（与尾 4 不邻接→新 extent）。 */
     Raw blk(MSB);

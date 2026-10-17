@@ -1,6 +1,7 @@
 #pragma once
 #include "../disk_struct_v2.0.h"
 #include "cache_mgr_mode.hpp"
+#include "alloc_mode.hpp"            /* slices_mode_t：构造结构体携带分配器初始化模式 */
 #include "../magics.h"
 #include <list>
 /* audit 类型（完整定义在 ravenfs_audit.hpp；此处仅前置声明，
@@ -15,7 +16,7 @@ struct audit_fr_tree_t;
 /* 缓存子模块前置声明（仅成员指针用，不拉完整头）：
  * 完整类型由使用方 cpp 各自 include inode_cache_radix.hpp /
  * mdata_piece_caches.hpp —— 这两个头会拉 util/tsc.h → <chrono>，
- * 若在 ravenfs_v1.1.hpp 直接 include，任何用
+ * 若在 ravenfs_juvenile.hpp 直接 include，任何用
  * `#define private public` 包裹本头的测试（test_root_dir_*）会把
  * 标准库模板头一并污染，gcc16 下 sstream 可访问性检查直接报错。 */
 struct inode_io_t;             /* inode 会话绑定：数据面 + 8K 片缓存（inode_cache_radix.hpp） */
@@ -81,6 +82,10 @@ struct ravenfs_mount_param_t{
     bool if_will_use_mdata_piece_cache;
     bool is_readonly;       /* true=只读挂载（rfs-audit），须配 is_device_direct=false */
     bool allow_mounted_device = false; /* 防呆逃生阀：设备已被内核挂载时仍继续（默认 false=硬拒 → RC_ERR_BUSY）。仅供取证等极端场景；正常恒定 false */
+    /* 分配器初始化模式：RUNTIME（运行时模仿，默认）/ DEFRAG（碎片缓解）。
+     * DEFRAG：block 组**单分片** + block_alloc_hard 落到 alloc_hard_longest_first
+     * （最长优先 + 头部上挖）——供离线碎片缓解运维工具使用。见 slices_mode_t。 */
+    slices_mode_t slices_mode = SLICES_MODE_RUNTIME;
 };
 struct linux_userspace_mount_t{
     ravenfs_mount_device_t dev;
@@ -92,6 +97,40 @@ namespace ravenfs_juvenile_god_ctrl_words_bits{
     constexpr uint64_t MMAP_BACKEND_CONTROL_MASK=2;//由ravenfs_mount_device_t.is_device_direct取反无条件设置这个bit,以及那个bit为1时无条件整个盘从0 offset处mmap,后续各段考虑从那个窗口切就行了
     constexpr uint64_t BLOCK_CACHE_ENABLE_MASK=4;//MMAP_BACKEND_CONTROL_MASK为1时强制这个bit翻1,虽然内核会做缓存但是上层业务的预取，写回,失效是有意义的，MMAP_BACKEND_CONTROL_MASK=0时这个位为1则手动用户态缓存，为0则相应的session直接分配内存，硬读
     constexpr uint64_t INODE_CACHE_ENABLE_MASK=8;//同上
+};
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 文件碎片压缩（离线运维件）—— regular_file_compact 的入参 / 出参
+ *
+ * 语义：把 REG / SOFT_SYM 的 **extent 形态**文件按「逻辑 run」为单位重排：
+ *   · run = 逻辑相邻的一串记录（`prev.fblkbase+prev.length==next.fblkbase`）；
+ *   · run 内物理断裂 → 搬迁到一个新的连续物理段（block_alloc_hard 取块，
+ *     DEFRAG 模式 = 最长空闲段头部 → 数据往大空闲段头部堆）；
+ *   · run 内物理已连续 → **零搬数融合**成单条（老 D-5a 之前的遗留）；
+ *   · **洞原样不碰**（稀疏语义保持不变；绝不 hard_alloc 整域再打洞）。
+ *
+ * 写序（崩溃安全，对齐 disk_layout_v2.0 §9 不变量）：
+ *   分配新段 + 拷数 → 建**全新**树（旧树全程只读）→ inode 一次写（**唯一提交点**）
+ *   → 回收旧数据块（仅被搬 run 的）+ 释放旧树节点。
+ * 提交前崩溃 = 旧态完好、新块/新树节点为孤儿；提交后崩溃 = 新态一致、旧资产孤儿。
+ * 全程 fsck 可收，绝不出现「指向未写数据的新根」。
+ *
+ * 受理：`INODE_TYPE_REGULAR` 与 `INODE_TYPE_SOFT_SYM`；inline / direct 态直接 no-op。
+ * 部分失败：**逐 run 尽力**——某 run 分配不到 / 超 max_move_blocks → 跳过该 run，
+ *   其余照搬照提（文件仍改善），报表逐 run 计数。
+ * ═══════════════════════════════════════════════════════════════════ */
+struct file_compact_opts_t {
+    bool     dry_run         = true;   /* 只规划不写（工具 dry-run 默认） */
+    uint64_t max_move_blocks = 0;      /* 单 run 搬数上限（块）；0 = 不限 */
+    bool     collapse_direct = true;   /* 收敛成单条整域时落 direct（顺带修 D-6） */
+};
+struct file_compact_report_t {
+    uint64_t inum = 0, size = 0;
+    uint64_t records_before = 0, records_after = 0;
+    uint64_t runs_total = 0, runs_fused = 0, runs_relocated = 0, runs_skipped = 0;
+    uint64_t blocks_moved = 0;         /* dry_run 时为「将搬」估计 */
+    bool     became_direct = false;    /* 提交后（或 dry_run 将）落 direct */
+    bool     wrote = false;            /* 是否真提交 */
 };
 
 class RavenFS_juvenile {
@@ -225,6 +264,15 @@ private:
      * 失败：已释放部分不回滚（位图幂等），返回错误码；调用方（dentry 删除路径）
      * 按孤儿挂账处理（树删已生效）。destroy 清零分段批量写，成本高（销毁语义）。 */
     result_code_t regular_file_reclaim(uint64_t inode_idx,bool destroy_data);
+    /* 文件碎片压缩（离线运维；REG/SOFT_SYM 的 extent 形态）——按「逻辑 run」重排：
+     * run 内物理断裂 → 搬到新连续段；run 内物理连续 → 零搬数融合；洞不碰。
+     * 先分配+拷新段 → 建全新树 → inode 一次写（提交点）→ 回收旧数据/旧树。
+     * 逐 run 尽力（分配不到/超限的 run 跳过，其余照提）；inline/direct no-op。
+     * 入参/出参见 file_compact_opts_t / file_compact_report_t（本头上方）。
+     * ⚠ 离线（须 umount 内核不可见）；同 inode 写互斥归调用方。 */
+    result_code_t regular_file_compact(uint64_t inode_idx,
+                                       const file_compact_opts_t &opts,
+                                       file_compact_report_t *out = nullptr);
     result_code_t dir_lookup(uint64_t inode_idx,const char *name, uint64_t *out_inum);
     /* pwrite 五段管线 phase1：资源预分配 + 区间规划（pwrite_pipeline.md §5）。
      * 入参 inode = 磁盘 inode 内存映像指针（调用方 InodeSession 作用域内、会话存活期
@@ -315,6 +363,14 @@ private:
      * 已退役：extent_merge_range（区间 F/M 融合）与 extent_discard_range（lesson 已否的
      * 补偿原语）设计作废，签名一并移除。 */
     result_code_t extent_rebuild_tree(uint64_t &root_blk, uint64_t owner_inode_idx);
+    /* 由**现成记录向量**批量建一棵全新 file extent 树（均分打包 + 叶链 + 自底向上）；
+     * 从 extent_rebuild_tree 抽出（同一打包机械，供 regular_file_compact 复用）。
+     * recs 必须逻辑升序、互不重叠、非空；owner_inode_idx = 根 ".". 审计锚。
+     * 失败原子性：任何分配失败 = free 已分配新节点、返回错误；**不碰旧树/inode**。
+     * 成功 = out_root 新根块号（调用方负责提交 inode.data_root）。 */
+    result_code_t extent_build_tree(uint64_t owner_inode_idx,
+                                    const std::vector<extent_t> &recs,
+                                    uint64_t &out_root);
     /* ── 定制接口（2026-09-30，紧急）──
      * 单 extent 树 → direct 降级：传 owner inode 索引，若其数据形态为 extent 树、
      * 且树**内部仅单条记录**（根叶 count==1）且该记录**完整覆盖 [0, ceil(size/4K))**

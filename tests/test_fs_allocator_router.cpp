@@ -16,6 +16,7 @@
  *   4. block_occupy_soft：跨片续圈真实连续 / 中途撞占用停 / 锚点占用 NO_BLOCK
  *   5. block_free 跨片 + block_intervals_free 链式消费
  *   6. inode 数据面：best-fit / inode_test / free 融合 / locate / 用尽无块 NO_BLOCK
+ *   7. slices_cfg_t.mode：RUNTIME（多分片/best-fit）vs DEFRAG（单分片/最长优先）
  * ═══════════════════════════════════════════════════════════════════ */
 #include "../include/ravenfs/fs_allocator.hpp"
 
@@ -342,8 +343,44 @@ static int test_inode() {
     return 0;
 }
 
+/* ═══ 2b. slices_cfg_t.mode：RUNTIME（多分片 / best-fit）vs DEFRAG（单分片 / 最长优先）═══ */
+static int test_alloc_mode() {
+    puts("[2b] slices_cfg_t.mode：RUNTIME vs DEFRAG");
+    Raw b(BITS); Plane p; p.make(2);
+    b.clear(100, 8);                    /* 最小够用靶 [100,108) len 8  */
+    b.clear(200, 20);                   /* 最长段靶   [200,220) len 20 */
+    b.clear(400, 10);                   /* [400,410) len 10            */
+
+    {   /* 默认 RUNTIME：多分片 + best-fit */
+        slices_cfg_t cfg = make_cfg(b, p, 4);
+        uint64_t rc = 1;
+        fs_allocator_t a(cfg, &rc);
+        CHECK(rc == RC_OK, "runtime ctor ok");
+        CHECK(a.slice_count() == 4, "runtime: multi-slice (4)");
+        CHECK(a.block_alloc_hard(8, 0) == 100, "runtime: best-fit -> 100");
+    }
+    {   /* DEFRAG：强制单分片 + alloc_hard_longest_first */
+        slices_cfg_t cfg = make_cfg(b, p, 4);
+        cfg.mode = SLICES_MODE_DEFRAG;
+        uint64_t rc = 1;
+        fs_allocator_t a(cfg, &rc);
+        CHECK(rc == RC_OK, "defrag ctor ok");
+        CHECK(a.slice_count() == 1, "defrag: force single block slice");
+        CHECK(a.cpu_slots() == 4, "defrag: cpu_slots preserved");
+        for (uint32_t c = 0; c < 4; c++)
+            CHECK(a.block_preferred_of(c) == 0, "defrag: preferred all 0 (single slice)");
+        CHECK(a.block_free_total() == 38, "defrag: free 8+20+10=38");
+        CHECK(a.block_alloc_hard(8, 0) == 200, "defrag: longest-first -> 200");
+        CHECK(a.block_test(200) == true && a.block_test(207) == true, "defrag: [200,208) occupied");
+        CHECK(a.block_test(208) == false, "defrag: [208,220) still free");
+        CHECK(a.block_free_total() == 30, "defrag: free 38-8==30");
+    }
+    return 0;
+}
+
 int main() {
     test_ctor_geometry();
+    test_alloc_mode();
     test_block_alloc_hard();
     test_block_alloc_soft();
     test_block_occupy_soft();

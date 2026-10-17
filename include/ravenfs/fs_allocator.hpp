@@ -1,5 +1,6 @@
 #pragma once
 #include "rc.hpp"                    /* result_code_t / RC_* / PTR_INVALID（轻量头，零盘结构依赖） */
+#include "alloc_mode.hpp"            /* slices_mode_t（slices_cfg_t.mode；与上帝类构造结构体共用） */
 #include "../disk_struct_v2.0.h"     /* inode 数据面 fr 用契约坐标类型 inode_dataplane_coordinate_free_range_t（inode 单位 256B）*/
 #include "../util/lock.h"            /* 锁原语（本头现用 std::mutex；其余原语供实现取用） */
 #include <cstdint>
@@ -261,16 +262,23 @@ public:
     /* enable_slice：借阅 config 原始信息一次性建出主从红黑树；返回后不再引用该
      * 内存（故可随即释放 / 复用）。 */
     result_code_t enable_slice(slice_config_t config);
-    /* 硬分配：片内找 bitscount 连续空闲位、起始片内偏移 2^align_log2 对齐；
-     * 从 last_finish_hint 起扫，段尾绕回 [0, hint) 再扫一次；不部分分配。 */
+    /* 硬分配：片内 best-fit 取 len≥bitscount 最小者，自区间**头**向上对齐取块
+     * （D-14：连续分配物理升序，令锚定/叶内融合成立）；不部分分配。 */
     result_code_t alloc_hard(uint8_t align_log2, uint64_t bitscount, uint64_t &out_base_idx);
+    /* 硬分配（**先甜后苦·最长优先**；碎片缓解运维工具定制件）：**单趟**扫描全部
+     * 可容纳区间，取 **len 最大**者（同 len 取 base 最小者）；落点仍**头部上挖 +
+     * 2^align_log2 对齐**（连续分配物理升序）。与 alloc_hard 的 best-fit（取最小
+     * 够用）相对：优先吃最长空闲段、把小碎片留到后面，利于顺序写沿同一大段头部
+     * 连续推进与融合。语义/对齐/记账/失败（不部分分配）与 alloc_hard 逐条一致。 */
+    result_code_t alloc_hard_longest_first(uint8_t align_log2, uint64_t bitscount,
+                                           uint64_t &out_base_idx);
     /* 软分配（无锚版·**碎片优先**）：从从红黑树 size_（len 升序）的**小碎片端**
      * 起逐段消费，「分配到最后一刻」——直到满足 bitscount 或片内无空闲可摘。
      * 只碰小端，大块留在 size_ 尾巴上不动（不抢 alloc_hard 的连续大段）。
      * 段与段之间不要求连续（碎片化交付）；每段自身连续、起始 2^align_log2 对齐。
      *
      * 策略（用户裁 2026-10-03）：**碎片优先**——按 len 从小到大消费；**整段优先**，
-     * 只有最后一段不足时才劈（挖尾，余段 base 不变）。不做 opcode/双函数：无第二
+     * 只有最后一段不足时才劈（挖头，余段 base 前移）。不做 opcode/双函数：无第二
      * 调用者前不引入策略旋钮；真需要时另开函数而非开关。
      *
      * 契约：
@@ -319,6 +327,9 @@ public:
     result_code_t soft_occupy(uint64_t base, uint64_t len, uint64_t *rest_bits);
     result_code_t shutdown();//必须是从is_workable==true转变为is_workable==false才算成功，is_workable==false初始化状态则返回错误
 };
+/* 分配器初始化模式 slices_mode_t 定义在 alloc_mode.hpp（轻量头，供上帝类构造结构体
+ * ravenfs_juvenile.hpp 与 fs_allocator.hpp 共同 include，避免 fs_allocator.hpp 的重依赖）。 */
+
 struct slices_cfg_t {
     /* 位图原始内存（已加载/已映射），生命周期归调用方；4K 对齐 */
     uint8_t  *block_bits_raw  = nullptr;
@@ -330,6 +341,9 @@ struct slices_cfg_t {
     uint32_t  logical_processor_count = 1;
     /* 片下限（位数）：1 个位图块 = 32768 bit，4K 对齐切片约束，勿动 */
     uint64_t  min_slice_bits = 32768;
+    /* 初始化模式：RUNTIME（运行时模仿，默认）/ DEFRAG（碎片缓解，block 单分片 +
+     * alloc_hard_longest_first）。见 slices_mode_t。 */
+    slices_mode_t mode = SLICES_MODE_RUNTIME;
 };//只会使用一次给各分片构建自己的树，出了构造函数就可以释放原始位图内存
 class fs_allocator_t {
 public:
@@ -344,7 +358,9 @@ public:
 
     /* ── block 组（FS_block 分配器）── */
     /* 硬分配：require_count 连续 + 起始块号 2^align_log2 对齐；单片内完成
-     * （不跨片拼接）；全片失败 → PTR_INVALID（原子，不部分分配）。 */
+     * （不跨片拼接）；全片失败 → PTR_INVALID（原子，不部分分配）。
+     * 策略随 cfg.mode：RUNTIME = 片内 best-fit；DEFRAG = 片内
+     * alloc_hard_longest_first（且 ctor 已把 block 组压成单分片）。 */
     uint64_t block_alloc_hard(uint64_t require_count, uint8_t align_log2);
     /* 软分配（跨片·碎片优先·**穷尽所有分片**）：自 preferred 起逐片调片内
      * soft_alloc 从小碎片端消费，累计到 require_count 或分片穷尽。**all-or-nothing**：
@@ -400,4 +416,5 @@ private:
     inode_data_plane_t inode_plane_;     /* v2.0 全局 inode 数据面（extent 翻译 + fr 空闲） */
     uint32_t slice_count_ = 0;
     uint32_t cpu_slots_ = 0;
+    slices_mode_t mode_ = SLICES_MODE_RUNTIME;   /* ctor 内部化（控制硬分配策略） */
 };

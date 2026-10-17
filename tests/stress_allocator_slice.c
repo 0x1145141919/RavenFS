@@ -16,7 +16,7 @@
  *   [C] 不变量：主/从双树 rfs_rb_check；从 ⊆ 主（指针同一性）；主树两两不重叠、
  *         base 升序；元素池 live == 区间节点数；运行结束时 allocs==frees、live==0。
  *   [D] 对抗/边界：free_interval 重叠 → -EEXIST 且树不动；融合四态；对齐贴不到；
- *         片首/片尾半开；len==0 退化；越界 -EINVAL；alloc_hard best-fit+尾部下挖
+ *         片首/片尾半开；len==0 退化；越界 -EINVAL；alloc_hard best-fit+头部上挖
  *         （god 单测同款：10→506；align 2^3 8→552 拆 [540,12)+[560,4)）；soft_alloc
  *         部分交付 + all_satisfied + push_front 失败回滚；soft_occupy rest_bits 入/出账；
  *         shutdown → 重 enable 干净。
@@ -408,9 +408,9 @@ static int ref_alloc_hard(struct ref *r, u8 align, u64 n, u64 *out)
 		if (r->v[i].len < n)
 			continue;
 		end = r->v[i].base + r->v[i].len;
-		s = (end - n) & ~mask;
-		if (s < r->v[i].base)
-			continue;	/* 对齐贴不到 → 跳过 */
+		s = (r->v[i].base + mask) & ~mask;	/* D-14：头挖 */
+		if (s + n > end)
+			continue;	/* 头对齐越出右沿 → 跳过 */
 		if (best < 0) {
 			best = i;
 			continue;
@@ -424,7 +424,7 @@ static int ref_alloc_hard(struct ref *r, u8 align, u64 n, u64 *out)
 	base = r->v[best].base;
 	len = r->v[best].len;
 	end = base + len;
-	s = (end - n) & ~mask;
+	s = (base + mask) & ~mask;
 	ref_erase(r, best);
 	if (s > base)
 		ref_insert(r, base, s - base);
@@ -459,21 +459,14 @@ static int ref_soft_alloc(struct ref *r, u8 align, u64 n,
 	idx = ref_min_size(r);
 	while (idx >= 0 && remain > 0) {
 		u64 ivb = r->v[idx].base, ivl = r->v[idx].len, ive = ivb + ivl;
-		u64 t = (ivl < remain) ? ivl : remain;
-		u64 s = (ive - t) & ~mask;
+		u64 s = (ivb + mask) & ~mask;		/* D-14：头挖 */
+		u64 t;
 
-		if (s < ivb) {
-			s = (ivb + mask) & ~mask;
-			if (s >= ive) {
-				idx = ref_next_size(r, idx);
-				continue;
-			}
-			{
-				u64 avail = ive - s;
-
-				t = (avail < remain) ? avail : remain;
-			}
+		if (s >= ive) {
+			idx = ref_next_size(r, idx);
+			continue;
 		}
+		t = ((ive - s) < remain) ? (ive - s) : remain;
 		if (sn >= REF_RUNS) {
 			printf("  FATAL soft ref overflow\n");
 			exit(2);
@@ -909,10 +902,10 @@ static void test_boundaries(void)
 
 	o = 0;
 	CHECK(rfs_slice_alloc_hard(&g_s, 0, 10, &o) == 0, "bnd: alloc rc");
-	CHECK(o == 1054, "bnd: tail-carve 1054");
-	CHECK(rfs_slice_test_interval(&g_s, true, 1054, 10) == 0, "bnd: carved occupied");
-	CHECK(rfs_slice_test_interval(&g_s, false, 1054, 1) == -ENOENT, "bnd: carved not free");
-	CHECK(rfs_slice_free_interval(&g_s, 1054, 10) == 0, "bnd: restore");
+	CHECK(o == 1000, "bnd: head-carve 1000");
+	CHECK(rfs_slice_test_interval(&g_s, true, 1000, 10) == 0, "bnd: carved occupied");
+	CHECK(rfs_slice_test_interval(&g_s, false, 1000, 1) == -ENOENT, "bnd: carved not free");
+	CHECK(rfs_slice_free_interval(&g_s, 1000, 10) == 0, "bnd: restore");
 	CHECK(rfs_slice_free_count(&g_s) == 64, "bnd: restored 64");
 
 	/* len==0 no-op 不动状态 */
@@ -943,7 +936,7 @@ static void test_alloc_hard(void)
 	struct rfs_run w[4];
 	u64 o;
 
-	puts("[T3] alloc_hard best-fit + 尾部下挖 + 对齐贴不到 + god 对拍");
+	puts("[T3] alloc_hard best-fit + 头部上挖 + 对齐贴不到 + god 对拍");
 	setup_free(init, 3, 500, 64);
 	CHECK(rfs_slice_free_count(&g_s) == 48, "hard: init fc 48");
 	o = 7;
@@ -951,23 +944,23 @@ static void test_alloc_hard(void)
 	CHECK(rfs_slice_alloc_hard(&g_s, 64, 1, &o) == -EINVAL, "hard: align>63");
 	o = 0;
 	CHECK(rfs_slice_alloc_hard(&g_s, 0, 10, &o) == 0, "hard: best-fit rc");
-	CHECK(o == 506, "hard: tail-carve 506");
-	w[0] = (struct rfs_run){ 500, 6 };
+	CHECK(o == 500, "hard: head-carve 500");
+	w[0] = (struct rfs_run){ 510, 6 };
 	w[1] = (struct rfs_run){ 524, 8 };
 	w[2] = (struct rfs_run){ 540, 24 };
 	expect_dump(w, 3, "hard: remainder "
-		"[500,6)+[524,8)+[540,24)");
+		"[510,6)+[524,8)+[540,24)");
 	CHECK(rfs_slice_free_count(&g_s) == 38, "hard: fc 38");
-	check_trees("hard: after 506");
+	check_trees("hard: after 500");
 
 	o = 0;
 	CHECK(rfs_slice_alloc_hard(&g_s, 3, 8, &o) == 0, "hard: aligned rc");
-	CHECK(o == 552, "hard: aligned base 552");
-	w[0] = (struct rfs_run){ 500, 6 };
+	CHECK(o == 544, "hard: aligned base 544");
+	w[0] = (struct rfs_run){ 510, 6 };
 	w[1] = (struct rfs_run){ 524, 8 };
-	w[2] = (struct rfs_run){ 540, 12 };
-	w[3] = (struct rfs_run){ 560, 4 };
-	expect_dump(w, 4, "hard: aligned split [540,12)+[560,4)");
+	w[2] = (struct rfs_run){ 540, 4 };
+	w[3] = (struct rfs_run){ 552, 12 };
+	expect_dump(w, 4, "hard: aligned split [540,4)+[552,12)");
 	CHECK(rfs_slice_free_count(&g_s) == 30, "hard: fc 30");
 
 	o = 0xABCDEFULL;
@@ -985,7 +978,7 @@ static void test_alloc_hard(void)
 	CHECK(rfs_slice_free_count(&g_s) == 10, "hard: fc unchanged on unreachable");
 	o = 0;
 	CHECK(rfs_slice_alloc_hard(&g_s, 0, 8, &o) == 0, "hard: align0 rc");
-	CHECK(o == 503, "hard: align0 base 503");
+	CHECK(o == 501, "hard: align0 base 501");
 	CHECK(rfs_slice_free_count(&g_s) == 2, "hard: fc 2");
 }
 
@@ -1020,11 +1013,11 @@ static void test_soft_alloc(void)
 	}
 	CHECK(n == 3, "soft: 3 fragments");
 	CHECK(sum == 6, "soft: delivered 6");
-	CHECK(n >= 1 && eb[0] == 849 && el_[0] == 1, "soft: head {849,1}");
+	CHECK(n >= 1 && eb[0] == 840 && el_[0] == 1, "soft: head {840,1}");
 	rfs_run_list_fini(&rl);
-	w[0] = (struct rfs_run){ 840, 9 };
+	w[0] = (struct rfs_run){ 841, 9 };
 	w[1] = (struct rfs_run){ 880, 20 };
-	expect_dump(w, 2, "soft: remainder {840,9},{880,20}");
+	expect_dump(w, 2, "soft: remainder {841,9},{880,20}");
 	CHECK(rfs_slice_free_count(&g_s) == 29, "soft: fc 29");
 
 	/* 100 位：耗尽剩余 29 → 部分交付 */

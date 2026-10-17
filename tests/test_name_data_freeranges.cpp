@@ -19,7 +19,7 @@
 #include "../include/ravenfs/ravenfs_audit.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"
 #define private public
-#include "../include/ravenfs/ravenfs_v1.1.hpp"
+#include "../include/ravenfs/ravenfs_juvenile.hpp"
 #undef private
 #include "inode_compat.hpp"   /* v2.0 inode 读写兼容壳 */
 
@@ -164,8 +164,9 @@ int main(int argc, char **argv) {
         audit_walk_report_t rep;
         uint64_t a = fs.audit_dfs_root(&rep, stdout);
         CHECK(a == RC_OK && rep.total_bad() == 0,
-              "含分裂 fr 树的 audit 全净 (bad=%llu heap=%llu leak=%llu mc=%llu)",
-              (unsigned long long)rep.total_bad(), (unsigned long long)rep.heap_bad,
+              "含分裂 fr 树的 audit 全净 (bad=%llu namedata=%llu inodeplane=%llu leak=%llu mc=%llu)",
+              (unsigned long long)rep.total_bad(), (unsigned long long)rep.namedata_bad,
+              (unsigned long long)rep.inodeplane_bad,
               (unsigned long long)rep.leaked_blk, (unsigned long long)rep.multi_claim_blk);
 
         printf("\n--- Phase 5: release 全量回收 + audit ---\n");

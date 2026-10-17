@@ -6,10 +6,10 @@
  * （数据面 inode_locate + mdata_piece 8K 片缓存）。本头给测试提供等价的小 helper，
  * 免去逐处展开会话样板。
  *
- * 依赖：调用方以 `#define private public` 引入 ravenfs_v1.1.hpp（使 fs.inode_io /
+ * 依赖：调用方以 `#define private public` 引入 ravenfs_juvenile.hpp（使 fs.inode_io /
  * fs.mdata_piece_mgr 可达）。包含顺序：ravenfs 头之后 include 本头即可。
  * ═══════════════════════════════════════════════════════════════════ */
-#include "../include/ravenfs/ravenfs_v1.1.hpp"
+#include "../include/ravenfs/ravenfs_juvenile.hpp"
 #include "../include/ravenfs/inode_cache_radix.hpp"
 #include <cstring>
 

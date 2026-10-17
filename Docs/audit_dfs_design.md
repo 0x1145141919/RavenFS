@@ -84,7 +84,7 @@ A ∩ B  → 正常在用     ~A ∩ ~B → 真空闲
 ## 4. 接口 / 类型
 
 ```cpp
-/* public（ravenfs_v1.1.hpp） */
+/* public（ravenfs_juvenile.hpp） */
 result_code_t audit_dfs_root(audit_walk_report_t *rep = nullptr, FILE *out = stdout,
                              bool verbose = false);
 /* verbose=false（默认）：只打 发现/NAMEDATA_SUM/INODEPLANE_SUM/SUM —— 大盛盘（1.8T 实测 347k inode）

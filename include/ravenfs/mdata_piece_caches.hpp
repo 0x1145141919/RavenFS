@@ -2,6 +2,7 @@
 #include "rc.hpp"   /* result_code_t + RC_* 全局共享结果码（轻量头，零盘结构依赖） */
 #include "cache_mgr_mode.hpp"     /* cache_work_mode_t：三后端枚举（no_cache / self_reliat / offload） */
 #include "cache_wheel.hpp"        /* 共用轮子：ctrl_word 位域常量 + cache_ctrl_state_t + bitfield 分片解码 */
+#include "mdata_piece_caches_stats.hpp"  /* mdp_stat 字段枚举 + mdp_stat_hook 注入契约（对齐 ravenfs_allocator_stats.h）*/
 #include "util/tsc.h"             /* x86_64 Invariant TSC：self_reliat TTL 换算（原经 inode_cache_radix.hpp 传递，2026-10-05 显式化） */
 
 #include <atomic>
@@ -25,7 +26,7 @@
  * ── 专用负载形状（本缓存唯一的服务对象） ──
  * mdata piece = 元数据负载片：基址偶数 + 长度 2 个连续 FS_block（8192B）。
  *   - 来源：B+tree 节点（Bptree_*_node_t）恒 8192B = 2 连续 FS_block
- *     （disk_struct_v1.1.hpp static_assert(sizeof==8192)），分配一律
+ *     （disk_struct_v2.0.h static_assert(sizeof==8192)），分配一律
  *     hard_alloc(2, 1)（2 块连续 + 2^1 对齐 → 起始块号恒偶数）
  *   - 本模块不做通用块缓存：只缓存「基址偶数、长度 2」的精确负载，
  *     形状不符的 blkidx 一律判引索错误（见 mdata_piece_session::index_error）
@@ -40,7 +41,7 @@
  *     self_reliat 加载时直接 read_block(blkidx, 2) 即可。
  *     （row_bits=0：statey 表每档 sum(level_bits)=bits，无行内索引位）
  *
- * 模式语义（对应 ravenfs_v1.1.hpp ctrl_words_bits 旧掩码意图）：
+ * 模式语义（对应 ravenfs_juvenile.hpp ctrl_words_bits 旧掩码意图）：
  *   - no_cache      ：session 自管 8192B 缓冲 + read_block 直读盘（硬读，
  *                     旧 BLOCK_CACHE_ENABLE_MASK=0 且无 mmap 后端），
  *                     析构时脏则 write_block 写回，不脏直接释放
@@ -53,7 +54,7 @@
  * 几何（负载为单位）：缓存覆盖 Piece_count 个负载，首负载起始 FS_block
  * = Piece_base_FS_block_idx（必须偶数）；FS_block 覆盖区间
  * [base, base + count×2)。宿主通常传 base=0（数据区 = FS_block[0,
- * ia_bm_base)，元数据节点也在其内，block_model.md §3.2）。
+ * ia_bm_base)，元数据节点也在其内，disk_layout_v2.0.md §2）。
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -65,6 +66,21 @@
 enum mdata_piece_mode_t : uint8_t {
     MDP_MODE_CTRL_ARRAY   = 0,   /* bits ≤ 13：全量控制器数组 */
     MDP_MODE_RADIX_SHARD  = 1,   /* bits > 13：多级静态基数树分片 */
+};
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 强淘汰力度（mdata_piece_caches_mgr::self_reliat_reap_expired_strong）——两种力度：
+ *   MDP_SQUEEZE_PRESSURE  内存压力驱动：**无视 TTL**，把所有 0-ref 行踹下去
+ *                         （热行明星也误伤也认）+ 回收空表。触发 = 缺内存回调。
+ *   MDP_SQUEEZE_LOWLOAD   低载主动（ioctl）：在「强刷回 + 回收空表」基础上，只踹
+ *                         **TTL 已到期**（剩余时日不多）的 0-ref 冷行，**放过热度高
+ *                         （剩余 TTL 多）的明星行**。触发 = ioctl 按负载预测发现低载踹一脚。
+ * 两档都只动 accessor==0（ref 归 0、无会话持有）的行 —— in-use 页绝不释放（会话
+ * 持有 cache_data 指针，释放即 UAF）。
+ * ═══════════════════════════════════════════════════════════════════ */
+enum mdp_squeeze_gear_t : uint8_t {
+    MDP_SQUEEZE_PRESSURE = 0,   /* 内存压力：无视 TTL 全踹 */
+    MDP_SQUEEZE_LOWLOAD  = 1,   /* 低载主动：只踹 TTL 到期的冷行 */
 };
 
 /* ── v2 配置：宿主侧唯一配置面（老 Block_cache_cfg_t 若存在即整体淘汰，
@@ -82,6 +98,10 @@ struct mdata_piece_caches_cfg_t{
     struct {
         uint64_t ttl_bare_seconds = 0;               /* self_reliat：TTL 裸秒（0 = 默认 2s），对齐 inode 版 self_reliat_specific */
     } self_reliat_specific;
+    /* md_ 计数器钩子（未注入 = no-op；契约见 mdata_piece_caches_stats.hpp）：
+     * 平台中立 —— 模块只调钩子，宿主把 (field, delta) 累加进自己的统计面。
+     * 装配时拷入 mgr 并下传各分片（片内埋点）。 */
+    mdp_stat_hook stat = {};
 };
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -114,6 +134,7 @@ public:
     mdata_piece_caches_mgr(const mdata_piece_caches_cfg_t &cfg, result_code_t *rc_out = nullptr)
         : backed_mode(cfg.mode), io_ctx(cfg.io_ctx),
           read_block(cfg.read_block), write_block(cfg.write_block) {
+        stat_ = cfg.stat;   /* md_ 计数器钩子（未注入 = no-op）*/
         result_code_t rc = RC_OK;
         switch (backed_mode) {
         case cache_work_mode_t::no_cache:
@@ -136,6 +157,7 @@ public:
             }
             piece_base_  = cfg.Piece_base_FS_block_idx;
             piece_count_ = cfg.Piece_count;
+            if (!piece_count_ || (piece_base_ & 1)) { rc = RC_ERR_STATE; break; }   /* 退化配置直接拒（基址必须偶数）*/
             rc = ctor_self_reliat(ttl);   /* 内部按 bits 推导双档（见 cpp） */
             break;
         }
@@ -150,14 +172,16 @@ public:
     /* flush_all — 同步点（挂载/卸载）：
      *   no_cache      ：无缓存可同步，丢弃（RC_OK）
      *   offload_cache ：msync 整片 canvas（内核页缓存同步 syscall）
-     *   self_reliat   ：脏页写回（驻留）+ 非脏页丢弃（双档统一，见 cpp） */
+     *   self_reliat   ：脏页写回（驻留）+ 非脏页丢弃（双档统一，见 cpp）
+     * 并发契约：本函数只在卸载/显式同步的静默点调用。RADIX 档由片写锁
+     * 自证独占；CTRL_ARRAY 档无片锁，宿主须保证无并发访问者。 */
     result_code_t flush_all() {
         switch (backed_mode) {
         case cache_work_mode_t::no_cache:
             return RC_OK;   /* 无缓存可同步 */
         case cache_work_mode_t::offload_cache: {
 #if defined(__linux__) || defined(__unix__)
-            const uint64_t bytes = piece_count_ * 8192;   /* 每片 2×FS_block（4096B，block_model.md §3） */
+            const uint64_t bytes = piece_count_ * 8192;   /* 每片 2×FS_block（4096B，disk_layout_v2.0.md §2） */
             if (msync((void *)virtual_canvas_base_, bytes, MS_SYNC) != 0) return RC_ERR_IO;
 #else
             /* 非 POSIX 端口：宿主自管同步（预留） */
@@ -211,6 +235,11 @@ public:
      * （CTRL_ARRAY 全扫 / RADIX 逐片扫；脏写回 + 释放，不摘表）。 */
     void     self_reliat_set_ttl_ticks(uint64_t ticks);
     void     self_reliat_reap_expired();
+    /* 强淘汰（god 扩展；ko 无对应）—— 写锁内整树"挤水"。力度见 `mdp_squeeze_gear_t`：
+     *   PRESSURE：无视 TTL，把所有 0-ref 行写回/释放 + 回收空表（内存压力驱动）；
+     *   LOWLOAD ：只踹 TTL 到期的 0-ref 冷行（放过热度高的），+ 回收空表（ioctl 低载触发）。
+     * 低频重操作（全局写锁下做整树 I/O），触发归宿主，勿放周期路径。 */
+    void     self_reliat_reap_expired_strong(mdp_squeeze_gear_t gear);
     mdata_piece_mode_t self_reliat_mode() const;   /* 仅 self_reliat 后端有意义 */
 
 private:
@@ -232,6 +261,7 @@ private:
     struct mdata_piece_ctrl_t{
         uint8_t *cache_data;          /* 8K 负载基址；working 发布/观察（ctrl_word release/acquire） */
         std::atomic<uint64_t> accss_stamp;  /* 最近访问 TSC 戳（尽力而为，relaxed 读写） */
+        std::atomic<uint64_t> latest_syn_stamp;  /* 最近一次与盘同步的 TSC 戳：首次 load（内存==盘）时由 mdp_ctrl_acquire 写入 */
         std::atomic<uint64_t> ctrl_word;    /* state/flags/accessor 单原子字（位域见 inode_cache_radix.hpp） */
         uint64_t blk;                       /* 负载起始块号（偶数；加载者 CAS io_ing 成功后写定，reap/flush 读） */
     };
@@ -249,6 +279,7 @@ private:
     mdata_piece_rt_t rt_ = {};                        /* v2 派生快照（self_reliat 消费） */
     std::atomic<uint64_t> ttl_ticks_ = 0;             /* 缓存行 TTL（TSC tick）：默认 2s（ctor 换算），
                                                          set_ttl_ticks 调整；slice 持 &ttl_ticks_ 共享 */
+    mdp_stat_hook stat_ = {};                         /* md_ 计数器钩子（ctor 从 cfg.stat 拷入；未注入 = no-op）*/
 
     /* ── CTRL_ARRAY 分支（bits ≤ 13） ── 控制器全量常驻，数据页懒分配：
      *    get 的 io_ing 态内 alloc+read 原子完成，析构 write-back+free */
@@ -261,6 +292,7 @@ private:
         mdata_piece_rt_t         rt;
         bitfield_decode_plan_t   plan;
         const std::atomic<uint64_t> *ttl_ticks;   /* 指向 mgr 的 ttl_ticks_（单一真相源） */
+        mdp_stat_hook            stat = {};        /* md_ 计数钩子（mgr 下传；未注入 = no-op）*/
     };
     class slice_radix_tree{
         /* ── rt 快照 + 拓扑（构造后只读） ── */
@@ -268,24 +300,30 @@ private:
         bitfield_decode_plan_t plan_ = {};           /* 树拓扑真相源（ctor 用，保留备析构/调试） */
         uint8_t  tree_levels_ = 0;                   /* 树层数 = plan_.total_levels - 1（level_bits[0] 是 mgr 层） */
         const std::atomic<uint64_t> *ttl_ticks_ = nullptr;
+        mdp_stat_hook stat_ = {};                    /* md_ 计数钩子（片内埋点；未注入 = no-op）*/
         uint64_t table_size_all_accumulate = 0;      /* 全部表结构内存字节（元数据域，写锁内累加） */
         std::atomic<uint64_t> real_cache_accumulate{0};  /* 已驻留缓存行字节 = 行数 × 8192（原子累加） */
         std::shared_mutex lock_;                     /* 可睡眠读写锁；读锁仅在 get 内建链窗口持有（不跨会话），
                                                          * 嵌套 session 无自死锁（2026-08-30 修复；树只增不删，
-                                                         * 会话内 locate/mark_dirty 无锁安全，页由 accessor 保护） */
+                                                         * 会话内 locate/mark_dirty 无锁安全，页由 accessor 保护）。
+                                                         * flush_all 在卸载静默点取**写锁**独占全片（H2/H3 防线） */
         void *root_ = nullptr;                       /* 根表：tree_levels_==1 → 叶表（ctrl_t 数组）；否则指针槽数组 */
     public:
         explicit slice_radix_tree(const slice_radix_tree_cfg_t &cfg);
         ~slice_radix_tree();                         /* 全部缓存：脏页写回 + 非脏丢弃 + 释放全部表 */
-        /* get：吃解析好的位域结果（树不解码）。读锁假定命中 → miss 写锁建链（无 I/O）
-         * 回头读锁；返回前读锁随 guard 析构释放（不跨会话——树只增不删，会话内
-         * locate 无锁安全；嵌套 session 内层 miss 建链不再自死锁）。
+        /* get：吃解析好的位域结果（树不解码）。并发安全委托两个带锁接口，get 内不手动玩锁：
+         *   · locate_with_rdlock     —— 命中返回「持读锁的句柄」（锁跨 acquire）
+         *   · ensure_path_with_wlock —— miss 时写锁内补建路径（无 I/O），返回后重试定位
+         * 句柄持有的读锁跨 mdp_ctrl_acquire：保护叶表不被 strong reap 释放；
+         * acquire 仅在 read_block 的 I/O 段临时放锁（此间 io_ing 钉住叶表）。
          * 行 = 1 负载：blk = pieces_base + (raw<<1)（raw = piece_idx），blk_len 恒 2。 */
         uint8_t *get(bitfield_decoded_result_t *decoded);
-        void put(bitfield_decoded_result_t *decoded);   /* accessor-1（无读锁可释放，get 已释） */
+        void put(bitfield_decoded_result_t *decoded);   /* accessor-1（locate_with_rdlock 短持读锁内递减） */
         void mark_dirty(bitfield_decoded_result_t *decoded);
-        void flush_all();
+        void flush_all();   /* 同步点（卸载）：片写锁独占 DFS —— 脏写回驻留 + 非脏丢弃；
+                             * 与 get/put/mark_dirty/reap 全互斥，勿在周期路径调用 */
         void reap_expired();
+        void reap_expired_strong(mdp_squeeze_gear_t gear);//写锁内整树挤水（力度见 mdp_squeeze_gear_t）：先踹叶表 0-ref 行（PRESSURE 无视 TTL / LOWLOAD 只踹 TTL 到期），再由下到上释放空表
         slice_radix_tree(const slice_radix_tree &) = delete;
         slice_radix_tree &operator=(const slice_radix_tree &) = delete;
         slice_radix_tree(slice_radix_tree &&) = delete;
@@ -293,10 +331,23 @@ private:
     private:
         void *alloc_leaf();
         void *alloc_internal(uint8_t level);
-        void ensure_path(bitfield_decoded_result_t *d);
+        void ensure_path(bitfield_decoded_result_t *d);//保证每个ctrl项初始状态都是idle
         mdata_piece_ctrl_t *locate(bitfield_decoded_result_t *d);
+        /* 命中 = 持读锁的句柄（锁跨 mdp_ctrl_acquire，I/O 段由 acquire 临时放）；
+         * 未命中 = 空句柄（不持锁，让 ensure_path_with_wlock 取写锁）。 */
+        struct ctrl_ref_t {
+            mdata_piece_ctrl_t *ctrl = nullptr;
+            std::shared_lock<std::shared_mutex> lock;   /* 命中时持分片读锁；空句柄为非持有 */
+            explicit operator bool() const { return ctrl != nullptr; }
+        };
+        ctrl_ref_t locate_with_rdlock(bitfield_decoded_result_t *d);//拿着读锁翻译的
+        bool ensure_path_with_wlock(bitfield_decoded_result_t *d);//拿着写锁保证路径的（无 I/O）；false=OOM
         void dfs_flush(void *table, uint8_t level);
         void dfs_reap(void *table, uint8_t level, uint64_t now, uint64_t ttl);
+        /* 强淘汰（写锁内）：先到叶表把 0-ref 的 working 行写回/释放，再由下到上释放已空的
+         * 子表；返回 true = 本表已空（父可回收本表）。
+         * respect_ttl=false（PRESSURE）→ 无视 TTL 全踹；true（LOWLOAD）→ 只踹 TTL 到期的。 */
+        bool dfs_reap_strong(void *table, uint8_t level, uint64_t now, uint64_t ttl, bool respect_ttl);
         void dfs_destroy(void *table, uint8_t level);
     };
     slice_radix_tree **slices_ = nullptr;   /* [2^level_bits[0]] 分片树（placement new，析构逐个释放） */
@@ -313,14 +364,22 @@ private:
     /* ── 缓存行级公共原语（CTRL_ARRAY 与 RADIX 共用同一状态机） ──
      * mdp_ctrl_acquire ：懒加载状态机入口。返回 working 且 accessor 已 +1 的 8K 页基址；
      *   blk_len 恒 2（负载 = 2 连续块，blkidx_valid 已保证完整）→ 无末行收窄。
+     *   held：RADIX 传调用方已持有的分片读锁 —— **只在探测段（load+CAS）持锁**
+     *   （防 strong reap 在 CAS 前释放叶表）；CAS 到 io_ing 或占坑成功后即放锁：
+     *   io_ing 与 working|accessor>0 全程钉住叶表，故 I/O 与发布无需持锁。
+     *   CTRL_ARRAY 传 nullptr（控制数组永不释放，无需锁）。
      * mdp_ctrl_reap_one：单行 TTL 淘汰尝试（working && accessor==0 && 超时）。
      * mdp_ctrl_flush_one：flush_all 单行语义（脏写回驻留 / 非脏丢弃）。
      * mdp_alloc/mdp_free：8K 对齐分配适配器（host 用户态 libc；移植时改这两处）。 */
     static uint8_t *mdp_ctrl_acquire(mdata_piece_ctrl_t *c, uint64_t blk,
-                                     const mdata_piece_rt_t &rt, bool *out_loaded = nullptr);
+                                     const mdata_piece_rt_t &rt, bool *out_loaded = nullptr,
+                                     std::shared_lock<std::shared_mutex> *held = nullptr,
+                                     const mdp_stat_hook *stat = nullptr);
     static bool     mdp_ctrl_reap_one(mdata_piece_ctrl_t *c, const mdata_piece_rt_t &rt,
-                                      uint64_t now, uint64_t ttl);
-    static bool     mdp_ctrl_flush_one(mdata_piece_ctrl_t *c, const mdata_piece_rt_t &rt);
+                                      uint64_t now, uint64_t ttl,
+                                      const mdp_stat_hook *stat = nullptr, bool strong = false);
+    static bool     mdp_ctrl_flush_one(mdata_piece_ctrl_t *c, const mdata_piece_rt_t &rt,
+                                       const mdp_stat_hook *stat = nullptr);
     static void    *mdp_alloc(uint64_t size);
     static void     mdp_free(void *ptr);
 };

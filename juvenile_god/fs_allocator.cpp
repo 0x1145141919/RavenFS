@@ -4,8 +4,8 @@
  * 2026-10-03 新建。模块契约见 include/ravenfs/fs_allocator.hpp 头注释
  * （逐字为规格）；设计意图见 Docs/runtime_tech/04_sharded_master_slave_rbtree.md。
  *
- * 旧位图实现 bitmap_slices.cpp 只作**语义参照**（位义、hint、free_count 的
- * 增量记账口径），本文件是**红黑树版**：内部结构从「位图 + 位扫」换成
+ * 本文件是**红黑树版**分配器（历史位图实现已随 v1.x 清理删除）：
+ * 内部结构从「位图 + 位扫」换成
  * 「主树 by_pos + 从树 by_size」双红黑树，坐标一律全局位号、单位一律「位」。
  *
  * 本轮只实现头文件里声明的 6 个成员函数：
@@ -302,7 +302,7 @@ result_code_t mgr_slice_t::all_dump(fs_run_dlist_t *out_runs) {
 /* ═══════════════════════════════════════════════════════════════
  * soft_occupy — 锚定软占领（定点对·对偶 free_interval）
  *
- * 语义严格对照 bitmap_slices.cpp 的 soft_occupy，换树实现：
+ * soft_occupy 语义（历史位图实现已删除），换树实现：
  *   *rest_bits 入 = 已满足量（链式记账）；real = len − *rest_bits 为本锚点
  *   目标上限；从全局 base 起贪心认领**连续空闲前缀**，claimed ≤ real；
  *   撞占用 / 上限即停；*rest_bits 出 = len − claimed（总缺口，恒等式与入值无关）。
@@ -374,10 +374,11 @@ result_code_t mgr_slice_t::soft_occupy(uint64_t base, uint64_t len, uint64_t *re
  *   故沿 len 非降序继续试，**首个可行者**即 best-fit（不破坏 best-fit 语义：
  *   第一个能容纳的、len 最小的区间）。
  *
- * 下挖位置（**从尾部下挖**）：分配段起点 s = (区间尾 − bitscount) 向下取到
- *   2^align_log2 边界（align_log2==0 时 s 恰为区间尾−bitscount）——即尽量贴尾。
- *   于是余段 = [区间头, s)，**base 不变、只 len 缩短**（改动字段最少）；只有
- *   对齐逼得贴不到尾时，才多出一段尾余 [s+bitscount, 区间尾)。
+ * 下挖位置（**从头部上挖**，D-14 方向契约）：分配段起点 s = 区间头向上取到
+ *   2^align_log2 边界（align_log2==0 时 s 恰为区间头）——即尽量贴头。于是连续
+ *   分配沿区间**物理升序**推进，令上层「锚定取左邻上沿」与「叶内四形态升序融合」
+ *   成立。余段 = [s+bitscount, 区间尾)（base 前移）；只有对齐留白时才多出
+ *   一段头余 [区间头, s)。
  *
  * 记账与一致性：挖取 [s, s+bitscount)；先 erase_both 原区间、再把残余
  *   [iv.base, s) 与 [s+bitscount, iv.end) 逐段 insert_both（先删后插 + 从⊆主）；
@@ -405,15 +406,15 @@ result_code_t mgr_slice_t::alloc_hard(uint8_t align_log2, uint64_t bitscount,
         if (iv_len < bitscount) break;                     /* 防御：升序，不应发生 */
         const uint64_t iv_end = iv_base + iv_len;
 
-        const uint64_t s = (iv_end - bitscount) & ~align_mask;   /* 尾部下挖起点（尽量贴尾 + 对齐） */
-        if (s < iv_base) continue;                         /* 对齐后落到区间头之下 → 本区间容不下 */
+        const uint64_t s = (iv_base + align_mask) & ~align_mask; /* 头部上挖起点（尽量贴头 + 对齐） */
+        if (s + bitscount > iv_end) continue;              /* 对齐后越出区间右沿 → 本区间容不下 */
 
         /* 定位主树同元素（base 唯一）——erase_both 需要主树迭代器。 */
         auto pit = pos_.lower_bound(make_pos_probe(iv_base));
         erase_both(pos_, size_, pit);                      /* 先删（从树先、主树后） */
 
-        const uint64_t left_len   = s - iv_base;           /* 余段 [iv.base, s)：base 不变、只 len 缩短 */
-        const uint64_t right_base = s + bitscount;         /* 尾余（仅对齐贴不到尾时存在） */
+        const uint64_t left_len   = s - iv_base;           /* 头余（仅对齐留白） */
+        const uint64_t right_base = s + bitscount;         /* 右余 [s+bitscount, iv.end) */
         const uint64_t right_len  = iv_end - right_base;
         if (left_len  > 0) insert_both(pos_, size_, iv_base, left_len);   /* 再插（主树先、从树后） */
         if (right_len > 0) insert_both(pos_, size_, right_base, right_len);
@@ -424,6 +425,71 @@ result_code_t mgr_slice_t::alloc_hard(uint8_t align_log2, uint64_t bitscount,
         return RC_OK;
     }
     return RC_ERR_NO_BLOCK;                                /* 满片：原子失败，不部分分配 */
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * alloc_hard_longest_first — 硬分配（**先甜后苦·最长优先**）
+ *
+ * 与 alloc_hard（best-fit，取 len≥bitscount 最小者）相对：**单趟**扫描全部
+ *   可容纳区间，取 **len 最大**者；len 相同取 **base 最小**者。落点仍
+ *   **头部上挖 + 2^align_log2 对齐**（D-14 方向契约：连续分配物理升序）。
+ *   动机（碎片缓解运维工具定制件）：优先吃掉最长空闲段 → 大块集中消耗、
+ *   小碎片留到后面（“先甜后苦”），顺序写沿同一大段头部连续推进、利于融合。
+ *
+ * 选区间：size_ 按 (len,base) 升序 ⇒ 自 (bitscount,0) 前向遍历；对每个
+ *   「可容纳 + 对齐可行」的区间，仅当 `len > best_len` 时替换 → 天然得到
+ *   「最大 len，且该 len 下 base 最小」（同 len 先到者 base 更小，不替换）。
+ * 下挖位置：同 alloc_hard —— s = (iv_base + align_mask) & ~align_mask；
+ *   余段 [iv.base, s)（对齐留白）与 [s+bitscount, iv.end)。
+ * 记账/一致性/失败语义：与 alloc_hard 逐条一致（不部分分配，失败原子）。
+ * ═══════════════════════════════════════════════════════════════ */
+result_code_t mgr_slice_t::alloc_hard_longest_first(uint8_t align_log2, uint64_t bitscount,
+                                                    uint64_t &out_base_idx) {
+    if (!is_workable) return RC_ERR_STATE;
+    if (bitscount == 0) return RC_ERR_STATE;
+    if (align_log2 > 63) return RC_ERR_STATE;              /* 对齐参数非法 */
+
+    const uint64_t align_mask = (align_log2 == 0) ? 0ULL : ((1ULL << align_log2) - 1);
+
+    fs_interval_t probe{};                                 /* 从树探针：(len, base) */
+    probe.base = 0;
+    probe.len  = bitscount;
+
+    /* 单趟：取「最大 len 且该 len 下最小 base」的可容纳区间。 */
+    const fs_interval_t *best = nullptr;
+    uint64_t best_len = 0;
+    for (auto it = size_.lower_bound(probe); it != size_.end(); ++it) {
+        if (it->len < bitscount) break;                    /* 防御：升序，不应发生 */
+        const uint64_t iv_base = it->base;
+        const uint64_t iv_end  = iv_base + it->len;
+        const uint64_t s = (iv_base + align_mask) & ~align_mask;
+
+        if (s + bitscount > iv_end) continue;              /* 对齐后越出右沿 → 本区间容不下 */
+        if (best == nullptr || it->len > best_len) {       /* 同 len 不替换 → 保 base 最小者 */
+            best = &*it;
+            best_len = it->len;
+        }
+    }
+    if (best == nullptr) return RC_ERR_NO_BLOCK;           /* 满片：原子失败，不部分分配 */
+
+    const uint64_t iv_base = best->base;
+    const uint64_t iv_end  = iv_base + best_len;
+    const uint64_t s = (iv_base + align_mask) & ~align_mask;
+
+    /* 定位主树同元素（base 唯一）——erase_both 需要主树迭代器。 */
+    auto pit = pos_.lower_bound(make_pos_probe(iv_base));
+    erase_both(pos_, size_, pit);                          /* 先删（从树先、主树后） */
+
+    const uint64_t left_len   = s - iv_base;               /* 头余（仅对齐留白） */
+    const uint64_t right_base = s + bitscount;             /* 右余 [s+bitscount, iv.end) */
+    const uint64_t right_len  = iv_end - right_base;
+    if (left_len  > 0) insert_both(pos_, size_, iv_base, left_len);   /* 再插（主树先、从树后） */
+    if (right_len > 0) insert_both(pos_, size_, right_base, right_len);
+
+    free_count_ -= bitscount;
+    if (right_base > last_finish_hint_) last_finish_hint_ = right_base;  /* 只进不退 */
+    out_base_idx = s;
+    return RC_OK;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -452,15 +518,15 @@ result_code_t mgr_slice_t::shutdown() {
  *
  * 策略（用户裁 2026-10-03）：碎片优先。size_ 按 (len,base) 升序 ⇒ begin()
  *   即当前最小碎片。只从小端消费：大块（尾巴）不碰，留给 alloc_hard。
- *   整段优先（t == 段长 时整段吃），只有最后一段不足时才劈（挖尾，余段 base 不变）。
+ *   整段优先（t == 段长 时整段吃），只有最后一段不足时才劈（挖头，余段 base 前移）。
  *   不做 opcode / 双函数——无第二调用者前不引入策略旋钮。
  *
  * 终止性：每轮要么 carve（remain 严格下降，carve 次数 ≤ 碎片数 + 1），要么
  *   `++it` 跳过不可用段（有限），故必停。carve 后 `it = begin()` 重取最小——
  *   本次 carve 的余段（更小）可能改写顺序，重取才能继续碎片优先。
  *
- * 对齐定点（与 alloc_hard 同源）：尽量贴尾 + 2^align_log2 对齐；贴不到头时
- *   退化为「自区间头向上对齐」的兜底；两者都落不下则跳过本段。
+ * 对齐定点（与 alloc_hard 同源）：尽量贴头 + 2^align_log2 对齐；对齐留白落在
+ *   区间头一侧（头余），右余 [s+t, iv.end) 供后续升序续配；落不下则跳过本段。
  *
  * 交付语义：**允许部分交付**（best-effort 本分）。all_satisfied = 本片本次是否
  *   已达 bitscount（Σ len ≥ bitscount）——**分片级**判决；跨分片全局判决归路由层。
@@ -482,19 +548,16 @@ result_code_t mgr_slice_t::soft_alloc(uint8_t align_log2, uint64_t bitscount,
     while (it != size_.end() && remain > 0) {
         const uint64_t iv_base = it->base, iv_len = it->len, iv_end = iv_base + iv_len;
 
-        uint64_t t = (iv_len < remain) ? iv_len : remain;  /* 整段优先，最多取 remain */
-        uint64_t s = (iv_end - t) & ~align_mask;           /* 尽量贴尾 + 对齐 */
-        if (s < iv_base) {                                 /* 贴尾对齐落到区间头之下 */
-            s = (iv_base + align_mask) & ~align_mask;      /* 头对齐兜底 */
-            if (s >= iv_end) { ++it; continue; }           /* 本段对齐后无可占 → 跳过 */
-            const uint64_t avail = iv_end - s;
-            t = (avail < remain) ? avail : remain;
-        }
+        /* D-14：头挖（尽量贴头 + 对齐），与 alloc_hard 同向 → 连续分配升序。 */
+        const uint64_t s = (iv_base + align_mask) & ~align_mask; /* 头部上挖起点 */
+        if (s >= iv_end) { ++it; continue; }               /* 本段对齐后无可占 → 跳过 */
+        const uint64_t avail = iv_end - s;
+        uint64_t t = (avail < remain) ? avail : remain;
 
         auto pit = pos_.lower_bound(make_pos_probe(iv_base));   /* base 唯一，定位主树同元素 */
         erase_both(pos_, size_, pit);                      /* 先删（从树先、主树后） */
-        const uint64_t left_len   = s - iv_base;           /* 余段 [iv.base, s)：base 不变 */
-        const uint64_t right_base = s + t;                 /* 尾余（贴尾时为空） */
+        const uint64_t left_len   = s - iv_base;           /* 头余（仅对齐留白） */
+        const uint64_t right_base = s + t;                 /* 右余 [s+t, iv.end) */
         const uint64_t right_len  = iv_end - right_base;
         if (left_len  > 0) insert_both(pos_, size_, iv_base, left_len);   /* 再插（主树先、从树后） */
         if (right_len > 0) insert_both(pos_, size_, right_base, right_len);

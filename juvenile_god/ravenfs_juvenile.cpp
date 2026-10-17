@@ -3,8 +3,8 @@
  *
  * 本文件负责（Raven 分工）：
  *   构造/析构（挂载/卸载）、块 I/O、inode I/O、
- *   位图原始内存加载/写回 + 装配 bitmap_slices_mgr_t（分配器本体已顶出
- *   到 bitmap_slices.cpp，2026-09-03）
+ *   位图原始内存加载/写回（分配器本体已迁至运行时区间分配器
+ *   fs_allocator.cpp / fs_allocator_router.cpp）
  *   CRC32、name_hash（XXH64）、dump_info
  *
  * 不实现（Sparrow 手写，见同目录下）：
@@ -14,7 +14,7 @@
  * 零缓存原则：所有块/inode 访问直接 pread/pwrite，无缓存层。
  * ═══════════════════════════════════════════════════════════════════ */
 
-#include "../include/ravenfs/ravenfs_v1.1.hpp"
+#include "../include/ravenfs/ravenfs_juvenile.hpp"
 #include "../include/ravenfs/inode_cache_radix.hpp"   /* inode_io_t / InodeSession（v2.0 会话） */
 #include "../include/ravenfs/mdata_piece_caches.hpp"  /* mdata_piece_caches_cfg_t：编排构造 */
 #include "../include/ravenfs/fs_allocator.hpp"       /* fs_allocator_t / slices_cfg_t：双组分配器 */
@@ -568,6 +568,7 @@ RavenFS_juvenile::RavenFS_juvenile(const linux_userspace_mount_t &mnt, uint64_t 
         acfg.inode.extents = inode_ext.data(); acfg.inode.extent_count = inode_ext.size();
         acfg.inode.fr = inode_fr.data();       acfg.inode.fr_count = inode_fr.size();
         acfg.inode.grow_batch_pieces = 1;
+        acfg.mode = mnt.param.slices_mode;   /* 上帝类构造结构体携带：RUNTIME / DEFRAG */
         uint64_t arc = RC_ERR_STATE;
         allocator = new fs_allocator_t(acfg, &arc);
         if (arc != RC_OK || allocator == nullptr) {
@@ -706,7 +707,10 @@ result_code_t RavenFS_juvenile::mdata_cache_setup() {
 }
 
 /* caches_teardown — 卸载：同步点（flush_all）→ delete 子模块/绑定 → 指针置空。
- * readonly 不 flush（mmap MAP_PRIVATE/PROT_READ 下 msync 无意义，写回本就禁止）。 */
+ * readonly 不 flush（mmap MAP_PRIVATE/PROT_READ 下 msync 无意义，写回本就禁止）。
+ * 并发契约：flush_all 只在卸载静默点调用 —— 此时不得有在途 mdata_piece_session，
+ * 也不得有淘汰线程（self_reliat_reap_expired*）在跑。RADIX 档由 flush_all 的片
+ * 写锁自证独占；CTRL_ARRAY 档无片锁，靠「卸载唯一入口 + 调用前已无访问者」保证。 */
 void RavenFS_juvenile::caches_teardown() {
     if (!param.is_readonly && mdata_piece_mgr) mdata_piece_mgr->flush_all();
     delete inode_io; inode_io = nullptr;

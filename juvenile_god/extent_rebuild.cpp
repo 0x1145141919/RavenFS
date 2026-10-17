@@ -1,4 +1,4 @@
-#include "../include/ravenfs/ravenfs_v1.1.hpp"
+#include "../include/ravenfs/ravenfs_juvenile.hpp"
 #include "../include/ravenfs/mdata_piece_caches.hpp"   /* mdata_piece_session：8K 元数据节点会话（头里仅前置声明） */
 #include <cstring>
 #include <vector>
@@ -115,7 +115,37 @@ result_code_t RavenFS_juvenile::extent_rebuild_tree(uint64_t &root_blk, uint64_t
     const uint64_t M = recs.size();
     if (M == 0) return RC_OK;   /* 空树无融合需求（结构畸形由 audit 另查） */
 
-    /* ── 3. 层规划 + 全量预分配（失败 = free 新节点，旧树无损） ── */
+    /* ── 3~5. 由记录向量批量建新树（均分打包；失败 = free 新节点，旧树无损） ── */
+    uint64_t new_root = 0;
+    result_code_t rc = extent_build_tree(owner_inode_idx, recs, new_root);
+    if (rc != RC_OK) return rc;
+
+    /* ── 6. 收尾：free 旧树（去重防环）→ root_blk 换新根 ── */
+    std::sort(old_blocks.begin(), old_blocks.end());
+    old_blocks.erase(std::unique(old_blocks.begin(), old_blocks.end()), old_blocks.end());
+    for (uint64_t b : old_blocks) block_free(b, 2);
+    root_blk = new_root;
+    return RC_OK;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * extent_build_tree — 由**现成记录向量**批量建一棵全新 file extent 树
+ * （2026-10-06 从 extent_rebuild_tree 抽出，供 regular_file_compact 复用）
+ *
+ * 输入 recs：逻辑升序、互不重叠、非空（调用方保证；本函数不校验语义）。
+ * 打包：均分到 groups = ceil(items/337)，非根节点恒 ∈ [168,337]；根单节点
+ * 任意 count ∈ [1,337]；叶链表 ptrs[1]/[2] 前后驱；内层 hint = 子树 max 开边界。
+ * 原子性：先全量预分配，任何失败 = free 已分配新节点并返回（不碰旧树/inode）。
+ * kind 恒 = EXTENT_TREE_FILE（文件区段树）。
+ * ═══════════════════════════════════════════════════════════════════ */
+result_code_t RavenFS_juvenile::extent_build_tree(uint64_t owner_inode_idx,
+                                                  const std::vector<extent_t> &recs,
+                                                  uint64_t &out_root)
+{
+    const uint64_t M = recs.size();
+    if (M == 0) return RC_ERR_STATE;   /* 空树无意义（调用方须先挡） */
+
+    /* ── 层规划 + 全量预分配（失败 = free 新节点） ── */
     std::vector<uint64_t> m;                          /* m[k] = k 层节点数 */
     m.push_back((M + 336) / 337);
     while (m.back() > 1) m.push_back((m.back() + 336) / 337);
@@ -129,14 +159,14 @@ result_code_t RavenFS_juvenile::extent_rebuild_tree(uint64_t &root_blk, uint64_t
             const uint64_t b = block_alloc_hard(2, 1);
             if (b == PTR_INVALID) {
                 for (uint64_t x : all_new) block_free(x, 2);
-                return RC_ERR_NO_BLOCK;               /* 原子失败：旧树未动 */
+                return RC_ERR_NO_BLOCK;               /* 原子失败：调用方旧态未动 */
             }
             blks[k][i] = b;
             all_new.push_back(b);
         }
     }
 
-    /* ── 4. 填叶层（level 0）：均分打包 + 叶链表 + 逐叶 max ── */
+    /* ── 填叶层（level 0）：均分打包 + 叶链表 + 逐叶 max ── */
     std::vector<uint64_t> lmax(m[0]);                 /* 层 max key 数组 */
     {
         uint64_t off = 0;
@@ -161,7 +191,7 @@ result_code_t RavenFS_juvenile::extent_rebuild_tree(uint64_t &root_blk, uint64_t
         }
     }
 
-    /* ── 5. 填内层（自底向上）：hint = 子层 max + 子块号；写子即定父（预分配） ── */
+    /* ── 填内层（自底向上）：hint = 子层 max + 子块号；写子即定父（预分配） ── */
     for (size_t k = 1; k <= top; k++) {
         std::vector<uint64_t> kmax(m[k]);
         uint64_t coff = 0;
@@ -190,10 +220,6 @@ result_code_t RavenFS_juvenile::extent_rebuild_tree(uint64_t &root_blk, uint64_t
         lmax.swap(kmax);
     }
 
-    /* ── 6. 收尾：free 旧树（去重防环）→ root_blk 换新根 ── */
-    std::sort(old_blocks.begin(), old_blocks.end());
-    old_blocks.erase(std::unique(old_blocks.begin(), old_blocks.end()), old_blocks.end());
-    for (uint64_t b : old_blocks) block_free(b, 2);
-    root_blk = blks[top][0];
+    out_root = blks[top][0];
     return RC_OK;
 }

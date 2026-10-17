@@ -3,10 +3,9 @@
 > 2026-10-06 · 覆盖全盘格式契约（块模型 / 超级块 / B+树 / inode / 文件 / 目录 /
 > 名字数据面 / 全局 inode 数据面 / xattr / 魔数 / 不变量 / mkfs / 运行时 / 工具）。
 >
-> 本文**自包含**：不再要求读者交叉阅读 `disk_layout_v1.1.md` / `v1.2_inode.md` /
-> `v1.3_name_data_plane.md` 去互相补漏。那三份（及更早的 v1 / block_model）是
-> **历史沿革**，其仍然有效的条款已**全部并入本文**；冲突之处以本文 + 盘面头
-> （`include/disk_struct_v2.0.h` / `include/magics.h`）为准。
+> 本文**自包含**：v1.1 / v1.2_inode / v1.3_name_data_plane / v1 / block_model 等历史盘布局
+> 文档已随 v1.x 清理**删除**（2026-10-16）；其仍然有效的条款已**全部并入本文**。
+> 冲突之处以本文 + 盘面头（`include/disk_struct_v2.0.h` / `include/magics.h`）为准。
 >
 > 结构真值 = `include/disk_struct_v2.0.h`（C / C++ 双兼容，含 `static_assert`）；
 > 魔数真值 = `include/magics.h`；结果码 = `include/ravenfs/rc.hpp`。
@@ -55,9 +54,8 @@ reformat，不提供迁移工具。**
 | DIR `link_count` | v1.1 `size+2` → v1.2 起（D-12）**POSIX `2 + 直属子目录数`**（§8.6） |
 | 文件类型值域 | v1.1 `type:2` → v1.2+ `type:6`（§8.2） |
 
-**历史文档地位**：`disk_layout_v1.1.md`（B+树/区段树/dentry/位图/块模型基座）、
-`disk_layout_v1.2_inode.md`（inode 语义重定义）、`disk_layout_v1.3_name_data_plane.md`
-（名字数据面）、`block_model.md`（块模型）→ 仍有效的条款已在本文重述，**不再需要查阅**。
+**历史文档地位**：v1.1 / v1.2_inode / v1.3_name_data_plane / block_model 等历史盘布局
+文档已**删除**（2026-10-16，仅保留本 v2.0 权威文档）；其仍有效的条款已在本文重述。
 
 ⚠️ `RAVENFS_VERSION = 0`（0 常被当「未初始化」）是否为最终值**待裁**；若换值须全端同步。
 
@@ -735,7 +733,7 @@ CLI：`mkfs.ravenfs --v2.0 [-f]`；`--inode-ratio/--inode-count` 在 v2.0 下被
 - **运行时**：`include/ravenfs/fs_allocator.hpp`（分配器双组 + inode 数据面）、
   `include/ravenfs/inode_cache_radix.hpp`（`InodeSession` / `inode_io_t`）、
   `include/ravenfs/mdata_piece_caches.hpp`（8K 片缓存）、`include/ravenfs/cache_wheel.hpp`（共享轮子）、
-  `include/ravenfs/ravenfs_v1.1.hpp`（上帝类接口）。
+  `include/ravenfs/ravenfs_juvenile.hpp`（上帝类接口）。
 - **实现**：`juvenile_god/ravenfs_juvenile.cpp`（挂载/分配转发/`all_sycn`/dump）、
   `juvenile_god/fs_allocator.cpp` + `fs_allocator_router.cpp`（分配器）、
   `juvenile_god/inode_cache.cpp`（InodeSession）、`juvenile_god/mdata_piece_cache.cpp`、
