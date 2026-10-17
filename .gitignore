@@ -3,6 +3,11 @@ build/
 build_fresh/
 */build/
 
+# CMake 源内构建残留（禁止在子目录 `cmake .`；用根 build_v20/ 或源外 -B <dir>）
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
 # 编译中间产物
 *.o
 *.a
@@ -16,27 +21,12 @@ stress_mkdir
 ravenfs_cli
 test_mount_bitmap
 
-# tools/audit_v1.2 产物（只提交源码）
-tools/audit_v1.2/audit_v1.2
-tools/audit_v1.2/dents_dump
-tools/audit_v1.2/mkbigdir
-tools/audit_v1.2/mkcontent
-tools/audit_v1.2/mkstates
-tools/audit_v1.2/mkstates_t
-tools/audit_v1.2/mkstates_w
-tools/audit_v1.2/readback
-tools/audit_v1.2/mkstates_a
-tools/audit_v1.2/mkstates_s
-tools/audit_v1.2/m44_attrcmp
-tools/audit_v1.2/mkstates_x
-tools/audit_v1.2/m6_xattr_dump
-
 # tools/sbinfo 产物（只提交源码）
 tools/sbinfo/sbinfo
 
 # tools 其它二进制可执行文件（统一只提交源码）
 tools/rfs_compact/rfs_compact
-tools/rfs_trim/rfs_trim
+tools/rfs_slice_fr/rfs_slice_fr
 
 # IDE / 编辑器
 .vscode/
@@ -50,6 +40,17 @@ core.*
 
 # 工作日志（Raven 侧维护，不随仓库走）
 ravenfs_log.txt
+
+# 临时/调试日志（不随仓库走）
+/leak_scan_log.txt
+/slice_fr_host.log
+
+# 破译日志 / 数据流草稿（工作资料，不随仓库走）
+/破译日志/
+/Docs/linux/vfs_dataflow/
+
+# rfs_freeruns 真盘 dump（大体积/机器相关，不随仓库走）
+fr_log.txt
 
 # kernel 测试素材（SparrowOS 侧资源，勿入 ravenfs 仓库）
 imgs/
@@ -70,8 +71,7 @@ linux/compile_commands.json
 # 独立虚拟机环境（脚本 + 磁盘镜像，不随仓库走）
 linux/vm/
 
-# tests/bitmap_core_v2 产物（只提交源码）
-tests/bitmap_core_v2/bm_test
-tests/bitmap_core_v2/bm_test_san
-tests/bitmap_core_v2/bm_test_tsan
 build_v20/
+
+# 全盘审计/TRACE 快照（大体积，含全盘文件名清单，不随仓库走）
+nvmelog.txt
