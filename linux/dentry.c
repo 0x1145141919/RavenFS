@@ -49,6 +49,10 @@
 #include "ravenfs_name_data_plane.h"
 #include "ravenfs_xattr.h"
 
+/* D-17：新 inode POSIX 属主初始化（定义见 rfs_new_inode_record 之后）。 */
+static void rfs_init_inode_owner(struct mnt_idmap *idmap, struct inode *inode,
+				 const struct inode *dir, umode_t mode);
+
 unsigned int ravenfs_type_dt(u32 type)
 {
 	switch (type) {
@@ -131,6 +135,7 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	now = current_time(dir);
 	memset(tr, 0, RAVENFS_INODE_SIZE);
 	tr->word1 = RFS_INO1_PACK(INODE_TYPE_REGULAR, 0, 0);
+	/* D-17：临时占位；真正 owner 由 rfs_init_inode_owner() 按 POSIX 落定。 */
 	tr->uid = i_uid_read(dir);
 	tr->gid = i_gid_read(dir);
 	tr->mode_xattr = RFS_MODE_XATTR_PACK(mode & 0o7777, RFS_XATTR_NONE);
@@ -145,20 +150,30 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	tr->a_ns_stamp = (u32)now.tv_nsec;
 	RAVENFS_MDATA_DIRTY(ts->mdata_session);
 
+	/* D-17：先 iget + 按 POSIX 语义定 owner，再插名字 —— 并发 lookup / 崩溃窗口
+	 * 都不会看到“父目录 owner”的过渡态。失败路径用 clear_nlink+iput 走 evict
+	 * （evict → ravenfs_inode_reclaim），不再直接 reclaim（inode 已存在）。 */
+	inode = ravenfs_iget(sb, inum);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);	/* iget_failed → nlink=0 evict 已回收记录 */
+	rfs_init_inode_owner(idmap, inode, dir, S_IFREG | (mode & 0o7777));
+
 	/* 长名（>40B）：尾段外置到所属目录名字数据面（逻辑偏移，物理经映射树解析） */
 	if (nlen > DENTRY_INLINE_NAME_MAX) {
 		u16 tlen = (u16)(nlen - DENTRY_INLINE_NAME_MAX);
 
 		err = ravenfs_nd_alloc(sb, RFS_INO_TO_IDX(dir->i_ino), tlen, &remain_ptr);
 		if (err) {
-			ravenfs_inode_reclaim(sb, inum);
+			clear_nlink(inode);
+			iput(inode);
 			return err;
 		}
 		err = ravenfs_nd_write(sb, RFS_INO_TO_IDX(dir->i_ino), remain_ptr, tlen,
 				       (const char *)dentry->d_name.name + DENTRY_INLINE_NAME_MAX);
 		if (err) {
 			ravenfs_nd_free(sb, RFS_INO_TO_IDX(dir->i_ino), remain_ptr, tlen);
-			ravenfs_inode_reclaim(sb, inum);
+			clear_nlink(inode);
+			iput(inode);
 			return err;
 		}
 	}
@@ -170,7 +185,8 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		if (nlen > DENTRY_INLINE_NAME_MAX)
 			ravenfs_nd_free(sb, RFS_INO_TO_IDX(dir->i_ino), remain_ptr,
 					(u16)(nlen - DENTRY_INLINE_NAME_MAX));
-		ravenfs_inode_reclaim(sb, inum);
+		clear_nlink(inode);
+		iput(inode);
 		return err;
 	}
 
@@ -187,9 +203,6 @@ int ravenfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	inode_set_ctime(dir, now.tv_sec, now.tv_nsec);
 	mark_inode_dirty(dir);
 
-	inode = ravenfs_iget(sb, inum);
-	if (IS_ERR(inode))
-		return PTR_ERR(inode);
 	/* M6（R-XA-03）：默认 ACL 继承 + umask（SB_POSIXACL ⇒ VFS 不再代剥 umask）。
 	 * 失败为 best-effort（名字/记录已落盘，不因 ACL 回滚整个 create）。 */
 	err = ravenfs_init_acl(inode, dir);
@@ -291,7 +304,7 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	struct raven_dir_Inode_t *dtr;
 	struct rfs_dpath path;
 	struct timespec64 now;
-	struct inode *inode;
+	struct inode *inode = NULL;
 	u64 inum, root_blk, new_root, hash;
 	u64 remain_ptr = (u64)PTR_INVALID;
 	u32 nlen = dentry->d_name.len;
@@ -352,6 +365,7 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	now = current_time(dir);
 	memset(tr, 0, RAVENFS_INODE_SIZE);
 	tr->word1 = RFS_INO1_PACK(INODE_TYPE_DIR, 0, 0);
+	/* D-17：临时占位；真正 owner 由 rfs_init_inode_owner() 按 POSIX 落定。 */
 	tr->uid = i_uid_read(dir);
 	tr->gid = i_gid_read(dir);
 	tr->mode_xattr = RFS_MODE_XATTR_PACK(mode & 0o7777, RFS_XATTR_NONE);
@@ -372,6 +386,15 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	dtr->name_data_free_ranges_count = 0;
 	memset(dtr->possible_inline_free_ranges, 0, sizeof(dtr->possible_inline_free_ranges));
 	RAVENFS_MDATA_DIRTY(ts->mdata_session);
+
+	/* D-17：先 iget + 按 POSIX 语义定 owner（S_IFDIR 触发 SGID 继承），再插名字。 */
+	inode = ravenfs_iget(sb, inum);
+	if (IS_ERR(inode)) {
+		err = PTR_ERR(inode);
+		inode = NULL;	/* iget_failed → nlink=0 evict 已回收记录 */
+		goto fail_root;
+	}
+	rfs_init_inode_owner(idmap, inode, dir, S_IFDIR | (mode & 0o7777));
 
 	if (nlen > DENTRY_INLINE_NAME_MAX) {
 		u16 tlen = (u16)(nlen - DENTRY_INLINE_NAME_MAX);
@@ -411,9 +434,6 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	inode_set_ctime(dir, now.tv_sec, now.tv_nsec);
 	mark_inode_dirty(dir);
 
-	inode = ravenfs_iget(sb, inum);
-	if (IS_ERR(inode))
-		return ERR_CAST(inode);
 	/* M6（R-XA-03）：默认 ACL 继承（子目录：default + access；best-effort）*/
 	err = ravenfs_init_acl(inode, dir);
 	if (err)
@@ -423,12 +443,16 @@ struct dentry *ravenfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	return NULL;		/* 用原 dentry（VFS 约定：非 NULL 才替换） */
 
 fail_root:
+	/* 已 iget 的新 inode：clear_nlink+iput → evict → ravenfs_inode_reclaim。 */
+	if (inode) {
+		clear_nlink(inode);
+		iput(inode);
+	}
 	if (nlen > DENTRY_INLINE_NAME_MAX && remain_ptr != (u64)PTR_INVALID)
 		ravenfs_nd_free(sb, RFS_INO_TO_IDX(dir->i_ino), remain_ptr,
 				(u16)(nlen - DENTRY_INLINE_NAME_MAX));
 	ravenfs_mdata_drop(ravenfs_mdata_cache_of(sb), new_root);
 	(void)rfs_allocator_block_free(sbi->alloc, new_root, 2);
-	ravenfs_inode_reclaim(sb, inum);
 	return ERR_PTR(err);
 }
 
@@ -856,6 +880,7 @@ static int rfs_new_inode_record(struct super_block *sb, struct inode *dir, u32 t
 	now = current_time(dir);
 	memset(tr, 0, RAVENFS_INODE_SIZE);
 	tr->word1 = RFS_INO1_PACK(type, 0, 0);
+	/* D-17：临时占位；真正 owner 由 rfs_init_inode_owner() 按 POSIX 落定。 */
 	tr->uid = i_uid_read(dir);
 	tr->gid = i_gid_read(dir);
 	tr->mode_xattr = RFS_MODE_XATTR_PACK(mode & 0o7777, RFS_XATTR_NONE);
@@ -878,6 +903,43 @@ static int rfs_new_inode_record(struct super_block *sb, struct inode *dir, u32 t
 	RAVENFS_MDATA_DIRTY(ts->mdata_session);
 	*inum_out = inum;
 	return 0;
+}
+
+/* D-17：新 inode 的 uid/gid/mode 统一按 POSIX/VFS 标准路径初始化。
+ *
+ * 旧语义是各 create 路径手抄父目录 id：非 root 在 root-owned 可写目录中创建的
+ * inode 会变成 root:root（反向则 root 创建的归普通用户）。正确语义：
+ *   · uid = current_fsuid()（经 mnt_idmap 映射）
+ *   · gid = 父目录带 S_ISGID ? 父目录 gid : current_fsgid()
+ *   · 新目录在 SGID 父目录下继承 S_ISGID 位
+ * mode 必须带类型位（S_IFREG/S_IFDIR/S_IFLNK...），inode_init_owner() 靠 S_ISDIR
+ * 判定目录的 SGID 继承。
+ *
+ * 必须在 d_instantiate() 与 ravenfs_init_acl() 之前调用，并立刻把 VFS 字段同步
+ * 回盘记录：会话记录是 256B 盘记录的唯一来源，晚同步会让盘上留下“父目录 owner”
+ * 的过渡态（崩溃/并发 flush 时尤其明显）。
+ */
+static void rfs_init_inode_owner(struct mnt_idmap *idmap, struct inode *inode,
+				 const struct inode *dir, umode_t mode)
+{
+	struct super_block *sb = inode->i_sb;
+	struct ravenfs_inode_session *s __free(ravenfs_inode_session) = NULL;
+	struct raven_Inode_t *r;
+
+	inode_init_owner(idmap, inode, dir, mode);
+	mark_inode_dirty(inode);	/* 兜底：即使记录会话暂不可达，回刷仍同步 VFS 字段 */
+
+	s = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
+	if (IS_ERR(s))
+		return;
+
+	r = ravenfs_inode_session_record(s);
+	r->uid = i_uid_read(inode);
+	r->gid = i_gid_read(inode);
+	r->mode_xattr = RFS_MODE_XATTR_PACK(inode->i_mode & 0o7777,
+					    RFS_XATTRPTR_GET(r->mode_xattr));
+	RAVENFS_MDATA_DIRTY(s->mdata_session);
+	RFS_ATOMIC64_SET(&s->mdata_row->acc_stamp, (s64)RFS_NOW_NS());
 }
 
 /* R-NS-05：硬链接。前置全过才 ++（不变量 19）；目录禁链（防环）。
@@ -1035,9 +1097,11 @@ int ravenfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	inode = ravenfs_iget(sb, inum);
 	if (IS_ERR(inode)) {
 		err = PTR_ERR(inode);
-		ravenfs_inode_reclaim(sb, inum);
+		/* iget_failed → nlink=0 evict 已带记录回收；不再 reclaim（防双重 free）。 */
 		return err;
 	}
+	/* D-17：symlink 的 uid/gid 同样取创建者（mode 固定 0777，类型位供 SGID 判定）。 */
+	rfs_init_inode_owner(idmap, inode, dir, S_IFLNK | 0777);
 
 	/* slow：写文件数据，再切 page_get_link 态（read_inode 此前按 size=0 装了 fast） */
 	if (len > RAVENFS_SYMLINK_INLINE_MAX) {
@@ -1096,15 +1160,18 @@ int ravenfs_mknod(struct mnt_idmap *idmap, struct inode *dir, struct dentry *den
 	if (err)
 		return err;
 
-	/* 先插名字后 iget（同 create：iget 失败极少且仅 I/O 级，此处不额外回滚） */
-	err = rfs_dir_link_inode(sb, dir, dentry, inum);
-	if (err) {
-		ravenfs_inode_reclaim(sb, inum);
-		return err;
-	}
+	/* D-17：先 iget + 按 POSIX 语义定 owner，再插名字（理由同 create）。 */
 	inode = ravenfs_iget(sb, inum);
 	if (IS_ERR(inode))
-		return PTR_ERR(inode);
+		return PTR_ERR(inode);	/* iget_failed → nlink=0 evict 已回收记录 */
+	rfs_init_inode_owner(idmap, inode, dir, mode);
+
+	err = rfs_dir_link_inode(sb, dir, dentry, inum);
+	if (err) {
+		clear_nlink(inode);
+		iput(inode);
+		return err;
+	}
 	/* M6（R-XA-03）：默认 ACL 继承（best-effort）*/
 	err = ravenfs_init_acl(inode, dir);
 	if (err)
@@ -1140,9 +1207,11 @@ int ravenfs_tmpfile(struct mnt_idmap *idmap, struct inode *dir, struct file *fil
 	inode = ravenfs_iget(sb, inum);
 	if (IS_ERR(inode)) {
 		err = PTR_ERR(inode);
-		ravenfs_inode_reclaim(sb, inum);
+		/* iget_failed → nlink=0 evict 已带记录回收；不再 reclaim（防双重 free）。 */
 		return err;
 	}
+	/* D-17：O_TMPFILE 匿名 inode 同样按创建者定 owner。 */
+	rfs_init_inode_owner(idmap, inode, dir, S_IFREG | (mode & 0o7777));
 	/* M6（R-XA-03）：默认 ACL 继承（best-effort）*/
 	err = ravenfs_init_acl(inode, dir);
 	if (err)

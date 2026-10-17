@@ -2,6 +2,13 @@
 # ravenfs-dkms —— RavenFS（实验性）内核模块。
 #   内核更新：DKMS alpm hook 自动为每个已装内核重编（需对应 *-headers）。
 #   initramfs：自带 /etc/mkinitcpio.conf.d/ravenfs.conf → 自动入镜像。
+# v0.2.2（2026-10-17）：D-17 POSIX 属主语义修复 —— 新 inode 的 uid/gid 不再抄父目录：
+#   create/mkdir/mknod/symlink/tmpfile 五条创建路径统一 inode_init_owner(idmap)：
+#   uid=创建者 fsuid、gid 按父目录 S_ISGID / 创建者 fsgid、目录继承 S_ISGID，
+#   并在 d_instantiate 前把 i_uid/i_gid/i_mode 同步回 256B 盘记录。
+#   create/mkdir/mknod 改为「先 iget 定 owner 再插名字」，消除父目录 owner 过渡态。
+#   VM owner 矩阵 13/13 PASS + 卸载重挂 owner 保持 + default ACL 继承正确 + audit bad_total=0。
+#   详见 Docs/linux/ravenfs-linux-ko-defects.md D-17。
 # v0.2.0（2026-10-06）：盘面契约 v2.0 大迁移（KO 追平上帝类两跳：v1.2 → v1.3 → v2.0）。
 #   第一跳 v1.3：每目录「名字数据面」（映射树 + 字节粒度 fr 空闲区间树）取代 10 档名字堆；
 #     ddentry 长名改逻辑偏移 full_char_remain_offset；extent 机械 kind 参数化。
@@ -18,7 +25,7 @@
 #   D-7/D-8 由分配器 v2 结构性消解（best-fit 无位置游标 / 独立几何查询取代共用前移游标）。
 #   详见 Docs/linux/ravenfs-linux-ko-defects.md。
 pkgname=ravenfs-dkms
-pkgver=0.2.1
+pkgver=0.2.2
 
 pkgrel=1
 pkgdesc="RavenFS (experimental) kernel module, built via DKMS"
