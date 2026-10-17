@@ -2,7 +2,7 @@
 /*
  * ravenfs.h —— RavenFS Linux KO 核心头（全模块共享的最小集）
  *
- * 盘面真值：include/disk_struct_v1.3.h（v1.3，C/C++ 双兼容；内置 __KERNEL__ 分支）
+ * 盘面真值：include/disk_struct_v2.0.h（v2.0，C/C++ 双兼容；内置 __KERNEL__ 分支）
  * 规格：Docs/linux/ravenfs-linux-ko-requirements-spec.md
  *
  * 【M1 范围声明（诚实边界，勿当成品）】
@@ -22,8 +22,8 @@
  *   2. 本文件只留「所有模块都要共享」的核心：常量、sbi、inode_info、
  *      几何推导、iget/read_node、停机/flush；
  *   3. 依赖方向单向：子系统头 → include 本文件，核心不回指任何子系统头
- *      （子系统间互用，如 mdata_cache 用 ROW 行机制，由 mdata 头自己
- *      include ravenfs_cache.h 表达）；
+ *      （子系统间互用由各自头显式 include 表达，如 inode 会话头依赖
+ *      mdata 块缓存核心头）；
  *   4. .c 只 include 核心 + 实际用到的子系统头（IWYU，编译器背书）。
  *
  * 原各段注释（设计推理 / 踩坑 / 用户裁决）随声明原样搬迁，不因拆分丢
@@ -70,7 +70,7 @@
 #define RAVENFS_NODE_BYTES 8192
 
 /*
- * ── inode 号契约（ABI，D-10；disk_layout_v1.2_inode.md §7 不变量 31）──
+ * ── inode 号契约（ABI，D-10；disk_layout_v2.0.md §8）──
  *
  * `st_ino = inode_idx + 1`（盘格式 v1.2 内恒定）：
  *   · `st_ino` 恒 ≠ 0 → 解「0 = 用户态已删除哨兵」（glibc is_zero_ino 忽略）；
@@ -96,11 +96,11 @@
 
 /* ─────────────── 前向声明（定义在各 ravenfs_*.h） ─────────────── */
 
-struct ravenfs_session;
+struct ravenfs_inode_session;
 struct ravenfs_ttl;		/* cache_ttl.c：自写 TTL 淘汰器，不透明句柄 */
 struct rfs_allocator;	/* include/linux/ravenfs_allocator_top.h：运行时多分片主从红黑树分配器 */
-struct ravenfs_mdata_cache;	/* mdata_cache.c：元数据节点缓存 */
-struct ravenfs_mrow;
+struct ravenfs_mdata_cache;	/* mdata 缓存核心（ravenfs_mdata_cache_core.h）；装配在 adapter */
+struct ravenfs_mrow_simple;
 struct ravenfs_mdata_shard;
 struct ravenfs_msession;
 
@@ -154,15 +154,40 @@ struct ravenfs_sb_stats {
 	atomic64_t	ic_flush;	/* inode_flush */
 	atomic64_t	ic_err;		/* 其它内部错（如 mdata_get 失败）*/
 
-	/* C. mdata 节点缓存 md_（8） */
+	/* C. mdata 节点缓存 md_（25）—— 与核心 enum ravenfs_md_stat 同序对位，
+	 * 与 god `mdata_piece_caches_stats.hpp::enum mdp_stat` 逐项对应；
+	 * 末尾 md_drop 为 ko 独有（块复用前丢弃陈旧缓存行）。 */
+	/* A 装配 / 生命周期 */
+	atomic64_t	md_init_ok;
+	atomic64_t	md_init_fail;
+	atomic64_t	md_slices;
+	atomic64_t	md_init_ctrl_array;
+	atomic64_t	md_init_radix;
+	/* B 会话 */
 	atomic64_t	md_hit;
 	atomic64_t	md_miss;
 	atomic64_t	md_node_load;
 	atomic64_t	md_retry;
-	atomic64_t	md_drop;
-	atomic64_t	md_reap;
-	atomic64_t	md_node_wb;
+	atomic64_t	md_put;
+	atomic64_t	md_dirty;
 	atomic64_t	md_err;
+	/* C 表结构 */
+	atomic64_t	md_table_alloc_internal;
+	atomic64_t	md_table_alloc_leaf;
+	atomic64_t	md_table_free;
+	/* D 淘汰 / 回写 */
+	atomic64_t	md_reap;
+	atomic64_t	md_reap_strong;
+	atomic64_t	md_node_wb;
+	atomic64_t	md_flush_wb;
+	atomic64_t	md_flush_drop;
+	/* E 驻留量（gauge 上下拆分；查看端作差） */
+	atomic64_t	md_resident_add_bytes;
+	atomic64_t	md_resident_del_bytes;
+	atomic64_t	md_table_add_bytes;
+	atomic64_t	md_table_del_bytes;
+	/* ko 扩展 */
+	atomic64_t	md_drop;
 
 	/* D. TTL 后台 ttl_（2）—— “机制还活着”的证据 */
 	atomic64_t	ttl_rounds;
@@ -328,7 +353,7 @@ struct ravenfs_sb_info {
 	/* FS_block[i] 在设备上的字节偏移 = blk0_off + i*4096；blk0_off 恒 4096 */
 	u64	blk0_off;
 
-	struct ravenfs_mdata_cache *mcache;	/* mdata_piece_cache_mgr（8K 节点） */
+	struct ravenfs_mdata_cache *mcache;	/* mdata 节点缓存核心 self（8K；adapter 装配）*/
 	struct ravenfs_ttl *ttl;	/* 自写 TTL 淘汰器（cache_ttl.c） */
 	struct rfs_allocator *alloc;	/* 运行时树分配器（挂载必建、无回退）；定义在 allocator_adapter.c */
 
@@ -340,6 +365,18 @@ struct ravenfs_sb_info {
 	struct proc_dir_entry *proc_dir;/* procfs 公开出口目录（D-11；`/proc/fs/ravenfs/<s_id>`，人人可读） */
 	u64		mounted_at_ns;	/* stats 文件头行用（非计数器，§8.1） */
 };
+
+/* ── mdata 缓存核心 self 访问器（唯一入口）──────────────────────────────
+ * 核心 API（ravenfs_mdata_*) 的 arg0 = struct ravenfs_mdata_cache *；
+ * FS 调用点统一经本访问器从 sb 取 `sbi->mcache`，不再经 sb 版薄壳。
+ * 返回 NULL 时核心各入口按各自契约处理（get → -EIO，其余 no-op）。*/
+static inline struct ravenfs_mdata_cache *
+ravenfs_mdata_cache_of(struct super_block *sb)
+{
+	struct ravenfs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+	return sbi ? sbi->mcache : NULL;
+}
 
 /*
  * ── 打点宏（§7.1；唯一入口）──
@@ -424,7 +461,8 @@ static inline u64 ravenfs_bitmap_blocks(u64 total_blocks)
 /* ─────────────── 跨模块核心入口（super.c 实现） ─────────────── */
 
 struct inode *ravenfs_iget(struct super_block *sb, u64 inum);
-/* 读一个 B+tree 节点（8K）到调用方缓冲；实现随 mdata 节点读路径（mdata_cache.c），
+/* 读一个 B+tree 节点（8K）到调用方缓冲；实现随 mdata 节点读路径
+ * （mdata_cache_adapter.c，直接调用核心 8K 缓存），
  * 但消费方横跨 dentry/extent/file/super → 归核心 */
 int ravenfs_read_node(struct super_block *sb, u64 blk, void *buf);
 
