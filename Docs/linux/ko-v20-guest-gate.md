@@ -57,5 +57,5 @@ KO 盘面 v1.3 → v2.0（第二跳）：SB 256-bit magic、无 `root_inode`（r
   非包内容，未清理。
 - `nh_*`/`row_size=` 等旧语义字段/选项保留但已惰性。
 - `name_data_rebuild` / `name_data_fr_compact`（离线压实/压缩）未移植。
-- 未跑 lockdep/KASAN（stock 内核）；未做 ENOSPC 往返与大文件 O_DIRECT 矩阵。
+- 未跑 lockdep/KASAN（stock 内核）；ENOSPC 往返与大文件 O_DIRECT 压测未做（**D-4 专项矩阵已补**：`linux/vm/share/d4-direct-io.sh`，86 用例 / audit 0）。
 - 仅契约移植：不随包审计/fsck 工具（审计尺为宿主 god 构建，非包内容）。

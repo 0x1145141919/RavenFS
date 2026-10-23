@@ -11,6 +11,8 @@
 
 /* ── M4.1 只读数据路径（file.c） ── */
 extern const struct address_space_operations ravenfs_aops;
+/* D-4：O_DIRECT 能力位由 file->open 置（FMODE_CAN_ODIRECT） */
+int ravenfs_file_open(struct inode *inode, struct file *file);
 ssize_t ravenfs_file_read_iter(struct kiocb *iocb, struct iov_iter *iter);
 /* M4.2：可写 mmap 立刻分配（D-M4-12）——挂自写 vm_ops（page_mkwrite→iomap 写向） */
 struct vm_area_desc;

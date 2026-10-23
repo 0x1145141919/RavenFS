@@ -16,7 +16,10 @@
  *     真分配（**2026-09-28 用户裁，修订 D-M4-12**；O-13 保护不丢：洞在 bio 提交前被分配）。
  *     接受的代价：回写期 ENOSPC → iomap 清脏位 + mapping_error（fsync 报错）丢数据；
  *     /mnt/huge_data 空间大，风险声明接受（裁决记录在 spec D-M4-12 行）。
- *   · 无 direct_IO（O_DIRECT 后置 D-M4-5：open(O_DIRECT) 直接 -EINVAL）。
+ *   · O_DIRECT：->open 置 FMODE_CAN_ODIRECT；读写在 read_iter/write_iter 内
+ *     自路由 iomap_dio_rw（D-4，2026-10-23）。**不挂 a_ops->direct_IO**
+ *     （legacy 分支会让 ki_pos 推进两次）。唯一回退是 iomap 的 -ENOTBLK
+ *     （脏页失效失败），不是"接受 O_DIRECT 偷走 page cache"。
  */
 #include <linux/module.h>
 #include <linux/fs.h>
@@ -157,6 +160,109 @@ static int ravenfs_writepages(struct address_space *mapping,
 	return iomap_writepages(&wpc);
 }
 
+/*
+ * ── O_DIRECT（D-4，2026-10-23）────────────────────────────────────────────
+ *
+ * 框架接线：iomap_dio_rw（7.2 成熟件）+ 本文件自有 iomap_ops。
+ *   · 读：ravenfs_file_read_iter 在 IOCB_DIRECT 时**直接**调 iomap_dio_rw
+ *     （7.2 框架：O_DIRECT 能力位由 ->open 置 FMODE_CAN_ODIRECT；不走
+ *     a_ops->direct_IO —— 那条 legacy 路径会在返回后再推进一次 ki_pos）。
+ *   · 写：本文件 write_iter 显式分流（VFS 不会替自有 write_iter 路由）。
+ *
+ * 对齐口径（**用户裁定 2026-10-23**）：
+ *   · 写：pos / 长度 / 用户 buffer 全部按 fs block（4K）对齐，否则 -EINVAL。
+ *     预检放在 iomap_begin 之前 —— iomap 核心的对齐检查发生在 begin 之后，
+ *     若只靠内核兜底，洞已被分配、extent 已插树才报错（脏元数据）。
+ *   · 读：iomap 默认（bdev logical block，通常 512）；inline 文件由
+ *     iomap_dio_inline_iter 按字节处理，无需特判。
+ *   · O_APPEND 且 EOF 非 4K 对齐 → 写向 -EINVAL（同 XFS 口径）。
+ *
+ * 完成模型：IOMAP_DIO_FORCE_WAIT（**用户裁定 2026-10-23**）——AIO/io_uring 的
+ * DIO 也同步完成，免去在 truncate/punch 路径补 inode_dio_wait。后续要真异步时，
+ * 去掉该 flag 并给 rfs_truncate/rfs_punch_hole 加 inode_dio_wait(inode)。
+ *
+ * 回退：仅 iomap 返回 -ENOTBLK（页缓存脏页失效失败）时 write_iter 落回 buffered，
+ * 与 XFS/ext4 同构；这不是"接受 O_DIRECT 偷走 page cache"。
+ */
+static ssize_t ravenfs_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
+			      bool is_write)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	unsigned int dio_flags = IOMAP_DIO_FORCE_WAIT;
+	const struct iomap_dio_ops *dops = NULL;
+	ssize_t ret;
+
+	WARN_ON_ONCE(is_write != (iov_iter_rw(iter) == WRITE));
+
+	if (unlikely(ravenfs_is_shutdown(inode->i_sb)))
+		return -EIO;
+
+	if (is_write) {
+		struct ravenfs_inode_info *ri = RAVENFS_I(inode);
+		struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = NULL;
+		struct raven_Inode_t *r;
+		unsigned int align = i_blocksize(inode);
+
+		/* 预检：iomap 的对齐检查在 iomap_begin 之后，先挡住以免脏分配 */
+		if ((iocb->ki_pos | iov_iter_count(iter) |
+		     iov_iter_alignment(iter)) & (align - 1))
+			return -EINVAL;
+
+		/* D-4：保存前像 —— begin 可能已提交 inline→extent/direct 迁移；
+		 * dops->end_io 在失败/0 字节时用前像回滚（inode_lock 独占 + FORCE_WAIT）。
+		 * struct_movable：只有 inline/direct 前像的结构可安全还原（旧资产未被
+		 * begin 改动）；extent 前像的根可能已换/已 free → 只回滚 size。 */
+		ses = ravenfs_inode_session_get(inode->i_sb,
+						RFS_INO_TO_IDX(inode->i_ino));
+		if (IS_ERR(ses))
+			return PTR_ERR(ses);
+		r = ravenfs_inode_session_record(ses);
+		WARN_ON_ONCE(ri->dio_saved.valid);
+		ri->dio_saved.valid = true;
+		ri->dio_saved.struct_movable =
+			(r->size <= RAVENFS_INLINE_BYTES) ||
+			RFS_INO1_GET_DIRECT(r->word1);
+		ri->dio_saved.size = i_size_read(inode);
+		ri->dio_saved.r_size = r->size;
+		ri->dio_saved.data_root = r->data_root;
+		ri->dio_saved.word1 = r->word1;
+		/* 一次分配，begin 里不再 krealloc（避免持会话锁时分配） */
+		ri->dio_saved.runs = kmalloc_array(RFS_DIO_MAX_RUNS,
+						   sizeof(*ri->dio_saved.runs),
+						   GFP_KERNEL);
+		ri->dio_saved.nr_runs = 0;
+		ri->dio_saved.cap_runs = ri->dio_saved.runs ? RFS_DIO_MAX_RUNS : 0;
+
+		dio_flags |= IOMAP_DIO_FSBLOCK_ALIGNED;
+		dops = &ravenfs_dio_write_ops;
+	}
+
+	ret = iomap_dio_rw(iocb, iter, &ravenfs_iomap_ops, dops,
+			   dio_flags, NULL, 0);
+
+	if (is_write) {
+		struct ravenfs_inode_info *ri = RAVENFS_I(inode);
+
+		/* valid 是记忆安全闸门：先关闸，再释放 run 表（end_io 已在此前收口） */
+		ri->dio_saved.valid = false;
+		kfree(ri->dio_saved.runs);
+		ri->dio_saved.runs = NULL;
+		ri->dio_saved.nr_runs = 0;
+		ri->dio_saved.cap_runs = 0;
+	}
+	return ret;
+}
+
+/* D-4：O_DIRECT 能力位由 ->open 置（7.2 框架，ext4/xfs/zonefs 同款）。
+ * **不能**用 a_ops->direct_IO：generic_file_read_iter 的 direct_IO 分支会在返回后
+ * 再推进一次 ki_pos，而 iomap_dio_complete 已推进过 → 顺序读位置 2×（2026-10-23
+ * VM 实测：每次 read 返回正确字节但 f_pos 前进两倍，累计半长 EOF）。 */
+int ravenfs_file_open(struct inode *inode, struct file *file)
+{
+	file->f_mode |= FMODE_CAN_ODIRECT;
+	return generic_file_open(inode, file);
+}
+
 /* iomap 家族 a_ops（spec §2.2，7.2.3 核实版）：无 write_begin/write_end */
 const struct address_space_operations ravenfs_aops = {
 	.read_folio		= ravenfs_read_folio,
@@ -193,7 +299,8 @@ int ravenfs_file_mmap_prepare(struct vm_area_desc *desc)
  */
 ssize_t ravenfs_file_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
-	struct super_block *sb = file_inode(iocb->ki_filp)->i_sb;
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct super_block *sb = inode->i_sb;
 	ssize_t ret;
 
 	RFS_STAT_INC(sb, op_read_iter);
@@ -201,7 +308,17 @@ ssize_t ravenfs_file_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 		RFS_STAT_INC(sb, err_shutdown_hits);
 		return -EIO;
 	}
-	ret = generic_file_read_iter(iocb, iter);
+
+	if (iocb->ki_flags & IOCB_DIRECT) {
+		/* D-4：DIO 读直接走 iomap（self-routed，不经 generic_file_read_iter
+		 * 的 direct_IO 分支）。共享锁与 truncate/punch/DIO 写串行。 */
+		file_accessed(iocb->ki_filp);
+		inode_lock_shared(inode);
+		ret = ravenfs_dio_rw(iocb, iter, false);
+		inode_unlock_shared(inode);
+	} else {
+		ret = generic_file_read_iter(iocb, iter);
+	}
 	if (ret > 0)
 		RFS_STAT_ADD(sb, op_read_bytes, ret);	/* IO 放大分母 */
 	return ret;
@@ -242,6 +359,17 @@ ssize_t ravenfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	ret = file_update_time(iocb->ki_filp);
 	if (ret)
 		goto out;
+
+	/* D-4：O_DIRECT 写走 iomap DIO（对齐预检在 ravenfs_dio_rw 内）。
+	 * 仅 iomap 的 -ENOTBLK（页缓存脏页失效失败）回退 buffered —— 标准口径。 */
+	if (iocb->ki_flags & IOCB_DIRECT) {
+		ret = ravenfs_dio_rw(iocb, from, true);
+		if (ret != -ENOTBLK) {
+			if (ret > 0)
+				RFS_STAT_ADD(inode->i_sb, op_write_bytes, ret);
+			goto out;
+		}
+	}
 
 	ret = iomap_file_buffered_write(iocb, from, &ravenfs_iomap_ops, NULL, NULL);
 	if (ret > 0)

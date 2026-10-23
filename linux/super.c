@@ -339,6 +339,11 @@ static struct inode *ravenfs_alloc_inode(struct super_block *sb)
 		return NULL;
 	inode_init_once(&ri->vfs_inode);
 	init_rwsem(&ri->xattr_sem);	/* M6：per-inode xattr 串行 */
+	/* D-4：DIO 前像/run 表（slab 不保证清零；valid=0 是安全初始态） */
+	ri->dio_saved.valid = false;
+	ri->dio_saved.runs = NULL;
+	ri->dio_saved.nr_runs = 0;
+	ri->dio_saved.cap_runs = 0;
 	return &ri->vfs_inode;
 }
 
@@ -1058,7 +1063,8 @@ static int ravenfs_fsync(struct file *file, loff_t start, loff_t end, int datasy
 
 static const struct file_operations ravenfs_file_operations = {
 	.llseek		= generic_file_llseek,
-	.read_iter	= ravenfs_file_read_iter,		/* M4.1（自写壳 → generic_file_read_iter） */
+	.open		= ravenfs_file_open,			/* D-4：FMODE_CAN_ODIRECT */
+	.read_iter	= ravenfs_file_read_iter,		/* M4.1（自写壳：buffered → generic / DIO → iomap） */
 	.write_iter	= ravenfs_file_write_iter,		/* M4.2（自写壳 → iomap_file_buffered_write，立刻分配） */
 	.mmap_prepare	= ravenfs_file_mmap_prepare,		/* M4.2：generic vm_ops 只标脏；分配在回写落点（2026-09-28 修订 D-M4-12）*/
 	.fallocate	= ravenfs_fallocate,			/* M4.3（R-FD-07；D-M4-11 拒纯 KEEP_SIZE） */
@@ -1576,11 +1582,15 @@ static int __init ravenfs_init(void)
 	/* R-NS-06 fast symlink：`i_link` 指向本对象内的 `symlink_target`，readlink(2)
 	 * 经 copy_to_user 从该 slab 对象导出 → 必须给该字段一条 usercopy 白名单，
 	 * 否则 hardened usercopy 判「从无白名单 SLUB 对象导出」直接 BUG（照抄 ext2/ufs：
-	 * fs/ext2/super.c kmem_cache_create_usercopy(…, offsetof(i_data), sizeof(i_data))）。 */
+	 * fs/ext2/super.c kmem_cache_create_usercopy(…, offsetof(i_data), sizeof(i_data))）。
+	 * D-4：`inline_data` 与 `symlink_target` 相邻；iomap_dio_inline_iter 会直接
+	 * copy_to/from_iter 操作 `inline_data` → 白名单必须**从 inline_data 起、
+	 * 覆盖两字段**（否则 inline 文件 O_DIRECT 读触发 usercopy BUG）。 */
 	ravenfs_inode_cachep = kmem_cache_create_usercopy("ravenfs_inode_cache",
 					sizeof(struct ravenfs_inode_info), 0,
 					SLAB_HWCACHE_ALIGN | SLAB_RECLAIM_ACCOUNT,
-					offsetof(struct ravenfs_inode_info, symlink_target),
+					offsetof(struct ravenfs_inode_info, inline_data),
+					sizeof_field(struct ravenfs_inode_info, inline_data) +
 					sizeof_field(struct ravenfs_inode_info, symlink_target),
 					NULL);
 	if (!ravenfs_inode_cachep)

@@ -404,21 +404,51 @@ ravenfs_mdata_cache_of(struct super_block *sb)
 			atomic64_add((n), &__rfs_s->al.field);		\
 	} while (0)
 
+/* D-4：一次 DIO 写期间为「洞→立刻分配」记录的新物理 run（失败时零填，
+ * 防陈旧盘内容经「已映射但未写」的洞暴露）。容量在 dio 入口一次性分配。 */
+#define RFS_DIO_MAX_RUNS	256
+struct rfs_dio_run {
+	u64		blk;		/* FS_block 起始 */
+	u32		cnt;		/* 块数 */
+};
+
 struct ravenfs_inode_info {
 	struct inode		vfs_inode;	/* 骨架：盘记录归 mgr（§4.11.1）；此处仅备将来私有字段 */
 	/* M4.1：REG/SYM inline 态（size ≤ 160）数据镜像。
 	 * iomap->inline_data 须在 iomap_begin 返回后持续有效，而盘记录位于会随会话
-	 * 释放的缓存行中 → 在此留稳定副本（iomap.c 在 inline 分支拷贝）。 */
+	 * 释放的缓存行中 → 在此留稳定副本（iomap.c 在 inline 分支拷贝）。
+	 * D-4：iomap_dio_inline_iter 会直接把本字段 copy_to/from_iter（用户态），
+	 * 因此必须与 symlink_target 一起落在 kmem_cache_create_usercopy 白名单内
+	 * —— 两字段**必须相邻**（见 super.c 的 usersize 计算）。 */
 	u8			inline_data[160];
 	/* M5 残（R-NS-06）：fast symlink（≤160 内联）target 的内存稳定副本。
 	 * 盘记录 inline_data 随缓存行可被淘汰 → 不能直接作 inode->i_link；
-	 * read_inode 在此拷贝 target 并补 NUL，simple_get_link 返回此指针。 */
+	 * read_inode 在此拷贝 target 并补 NUL，simple_get_link 返回此指针。
+	 * usercopy：readlink(2) 从本字段导出 → 与 inline_data 共用同一白名单区。 */
 	char			symlink_target[RAVENFS_SYMLINK_INLINE_MAX + 1];
 	/* M6（R-XA-01/03）：per-inode xattr 串行。
 	 * set/ACL 走 xattr 块「读-改-写」，VFS 的 inode_lock 只覆盖 set 路径；
 	 * get/list 无 inode_lock → 需自持锁防「并发 set 期间读到半改块 / 块被 free」。
 	 * 锁序：inode_lock（VFS，set 路径持有）→ xattr_sem（本锁）；get/list 仅持本锁。 */
 	struct rw_semaphore	xattr_sem;
+	/* D-4：DIO 写的前像（begin 期间可能已提交 inline→extent/direct 迁移）。
+	 * DIO 写路径由 inode_lock 独占串行，且 IOMAP_DIO_FORCE_WAIT 保证同任务内完成，
+	 * 故一次仅一个在飞 DIO 写；dops->end_io 用前像做失败/0 字节回滚。
+	 *
+	 * struct_movable：**只有前像是 inline 或 direct 时**，还原 data_root/word1 才安全
+	 * （两者的旧资产未被 begin 改动）。前像是 extent 树时，begin 可能已换根，
+	 * 甚至把旧根 free 掉（both 收缩）→ 绝不能还原结构，只回滚 size。 */
+	struct {
+		bool		valid;
+		bool		struct_movable;
+		loff_t		size;		/* inode->i_size 前像 */
+		u64		r_size;		/* 盘记录 r->size 前像 */
+		u64		data_root;	/* 盘记录 r->data_root 前像（仅 movable 时可信） */
+		u64		word1;		/* 盘记录 r->word1 前像（仅 movable 时可信） */
+		struct rfs_dio_run *runs;	/* 本次洞分配 run 表（入口分配，返回后释放） */
+		unsigned int	nr_runs;
+		unsigned int	cap_runs;
+	} dio_saved;
 };
 
 static inline struct ravenfs_inode_info *RAVENFS_I(struct inode *inode)

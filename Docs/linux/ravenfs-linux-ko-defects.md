@@ -1,6 +1,6 @@
 # RavenFS Linux KO · 缺陷名单（Defects）
 
-> 2026-09-29 · Raven（2026-09-30 修订：D-2 部分落地 / D-9 修复；**2026-10-01 修订：去版本化 + 并入 D-10**；**2026-10-04 修订：新增 D-11 / D-12；D-10 修复落地**；**2026-10-05 修订：D-12 修复落地 + 新增 D-13（名字堆粒度灾难，含审计统计面铁证）**；**2026-10-06 修订：新增 D-14（分配器 hard_alloc「尾挖」方向契约：令锚定与叶内四形态融合永久空转，含真盘 trace 铁证）；D-14 修复落地（ko + god 同步「尾挖」→「头挖」）**；**2026-10-13 修订：新增 D-15（block 位图 checkpoint 全量写回 → 按脏写；即 D-2「30s 全量回写」遗留的具体化）**；**2026-10-13 修订（二）：新增 D-16（mdata 脏行回写触发缺口：KO 无「最后引用释放即回写」，且 TTL reap 丢弃 god 的「脏原地回写」→ 脏行仅靠 60s 周期 aging；god 真值为 ~2s）**；**2026-10-15 修订：D-15 部分落地（分片脏标志 + TTL 同步按脏写回，非全量；`al_checkpoint_blocks` 语义改记脏块数；TTL 心跳日志 `pr_info`→`pr_debug`，不再淹没 dmesg）**；**2026-10-17 修订：新增 D-17（新 inode 属主/gid 取父目录而非创建者：create/mkdir/mknod/symlink/tmpfile 全部受影响；VM 冒烟实测暴露）**；**2026-10-17 修订（二）：D-17 修复代码落地——五条创建路径统一 `inode_init_owner(idmap)` + 盘记录同步，`create/mkdir/mknod` 改为「先定 owner 再插名字」；VM owner 矩阵 13/13 通过（sticky/SGID/反向/卸载重挂/default ACL），audit bad_total=0；idmapped mount 因 FS 未声明 `FS_ALLOW_IDMAP` 暂不适用**）
+> 2026-09-29 · Raven（2026-09-30 修订：D-2 部分落地 / D-9 修复；**2026-10-01 修订：去版本化 + 并入 D-10**；**2026-10-04 修订：新增 D-11 / D-12；D-10 修复落地**；**2026-10-05 修订：D-12 修复落地 + 新增 D-13（名字堆粒度灾难，含审计统计面铁证）**；**2026-10-06 修订：新增 D-14（分配器 hard_alloc「尾挖」方向契约：令锚定与叶内四形态融合永久空转，含真盘 trace 铁证）；D-14 修复落地（ko + god 同步「尾挖」→「头挖」）**；**2026-10-13 修订：新增 D-15（block 位图 checkpoint 全量写回 → 按脏写；即 D-2「30s 全量回写」遗留的具体化）**；**2026-10-13 修订（二）：新增 D-16（mdata 脏行回写触发缺口：KO 无「最后引用释放即回写」，且 TTL reap 丢弃 god 的「脏原地回写」→ 脏行仅靠 60s 周期 aging；god 真值为 ~2s）**；**2026-10-15 修订：D-15 部分落地（分片脏标志 + TTL 同步按脏写回，非全量；`al_checkpoint_blocks` 语义改记脏块数；TTL 心跳日志 `pr_info`→`pr_debug`，不再淹没 dmesg）**；**2026-10-17 修订：新增 D-17（新 inode 属主/gid 取父目录而非创建者：create/mkdir/mknod/symlink/tmpfile 全部受影响；VM 冒烟实测暴露）**；**2026-10-17 修订（二）：D-17 修复代码落地——五条创建路径统一 `inode_init_owner(idmap)` + 盘记录同步，`create/mkdir/mknod` 改为「先定 owner 再插名字」；VM owner 矩阵 13/13 通过（sticky/SGID/反向/卸载重挂/default ACL），audit bad_total=0；idmapped mount 因 FS 未声明 `FS_ALLOW_IDMAP` 暂不适用**；**2026-10-23 修订：D-4 落地——`->open` 置 `FMODE_CAN_ODIRECT` + 读写自路由 `iomap_dio_rw`（不走 legacy `a_ops->direct_IO`，避免 ki_pos 2×）；写向 4K 对齐（`IOMAP_DIO_FSBLOCK_ALIGNED`）+ `IOMAP_DIO_FORCE_WAIT` + `-ENOTBLK` 回退 buffered；`iomap.c` 移除 `IOMAP_DIRECT → -EOPNOTSUPP`，`dops->end_io` 收口成功提交/失败回滚（前像 inline/direct 才还原结构），失败写新洞 run 零填；`ravenfs_inode_cache` usercopy 白名单扩到 `inline_data`**）
 > **定位**：本文件是 **linux-ko 的缺陷总名单**（跨版本累积），**不按版本归类**。
 > **口径（2026-10-01 定，用户裁定）**：缺陷的组织轴是「**当前处理状态**」，**不是版本**。缺陷真正关心的是「**现在处理到哪一步**」；版本号只作「首次暴露 / 修复落点」的**附注**，不作分类依据。
 > **为何去版本化**：有些缺陷是**设计期就被忽视的点**——把它归到 0.1.0 / 0.1.1 / 0.1.2 **都是错的**（例：D-10，`i_ino` 契约从第一天起就不存在）。故本名单**不设版本归属**。
@@ -16,7 +16,7 @@
 | **D-1** | **无 sb 级性能计数器 / 无 debugfs 出口** | 可观测性 | 中 | 代码已落（`a358cc0`），**未随包发布** |
 | **D-2** | **位图分片器全量常驻（80MB），内存浪费 + 30s 全量回写** | 内存/写放大 | 中（对 SparrowOS 目标机为硬伤） | **ko 已落地 CHUNK 后端**（`rfs_bm` 类 + 挂载选项 `bitmap_mode=chunk`；运行时常驻内存 ↓）；「30s 全量回写」未收敛（**2026-09-30 用户接受**，NVMe SLC 写量小） |
 | **D-3** | **mount / umount 时间戳不回写** | 正确性（元数据） | 低-中 | **已修 + 已提交**（`linux/super.c` 时间戳回写；随 `8b32497` 入仓）——仍未随包发布 |
-| **D-4** | **O_DIRECT（`direct_IO`）故意留白 → `open(O_DIRECT)` 被拒** | 能力缺口（设计级留白） | 低（实验期）→ 中（长期通用） | **mainline 有意不做**（R-FD-10「可降级」） |
+| **D-4** | **O_DIRECT（`direct_IO`）故意留白 → `open(O_DIRECT)` 被拒** | 能力缺口（设计级留白） | 低（实验期）→ 中（长期通用） | **已修（2026-10-23，iomap DIO 接线落地；未随包发布）** |
 | **D-5** | **ko 移植时降级：丢掉 god 的叶内 extent 融合（四形态）→ 写请求粒度即碎片** | 功能缺失（移植降级） | 中（元数据膨胀 / 读放大 / 回收负担） | **D-5a 叶内四形态已落 ko**（`extent_write.c`，2026-10-06 前）；此前曾被 **D-14 分配方向压灭而空转**，D-14 修复后生效 |
 | **D-6** | **inline→extent 不试 direct：>160B 文件恒背 8K 区段树节点（单 extent 也背）** | 元数据膨胀（实现缺口） | 中 | ko 无（`iomap.c:195` 恒建树；direct 仅 truncate 坍缩） |
 | **D-7** | **分配 hint 不持久化：每次 mount 重置到片首 → 低地址被反复复用** | 局部性 / 恢复友好度（实现缺口） | 中 | **已由分配器 v2（树版）结构性消解（2026-10-04）**——best-fit 无位置游标，hint 生态位被算法消灭 |
@@ -31,7 +31,7 @@
 | **D-16** | **mdata 脏行回写触发缺口：KO 无「最后引用释放即回写」；TTL reap 主动排除脏行 → 脏行仅靠 60s 周期 aging 落盘（god 真值：TTL 淘汰时原地回写，~2s）** | 回写策略（**触发时机**）/ 移植降级（god→ko 丢行为） | 中（崩溃丢窗 60s vs god 2s + 脏行内存滞留） | **未做（待办）；注释与实现相反（`cache_ttl.c:9` / `mdata_cache.c:401`）** |
 | **D-17** | **新 inode 属主/gid 取父目录而非创建者：`create/mkdir/mknod/symlink/tmpfile` 全部把 `dir->i_uid/gid` 复制进盘记录 → 非 root 在 root-owned 可写目录中创建的文件变成 root:root** | 权限/属主语义（POSIX 契约 + 安全完整性）/ 移植遗漏 | **高**（跨用户属主错置 + 后续写/utimens EACCES + quota/ACL/idmap 失真） | **已修（2026-10-17，VM owner 矩阵 13/13 通过；idmapped mount 暂不适用）** |
 
-> **四类性质，勿混**：**D-1~D-3 = “发布落后 mainline”**（mainline 已有修复，未进包）；**D-4 = “有意留白 / 能力缺口”**（非发布落后）；**D-5 = 移植降级**（god 有完整实现，ko 移植时丢掉）；**D-6~D-8 = ko 实现/分配器层缺口**（D-6/7 迁移与持久化，D-8 为元数据/数据分配器耦合）；**D-9 = 两版共有的接口缺口**（发布版与 mainline 都缺，**非“发布落后”**）；**D-10 = 契约缺失（设计级 ABI）+ AI 协作事故**——与全部实现级缺陷**不同类**：不是“实现没跟上”，是“**该契约从第一天起就没被定义过**”。
+> **四类性质，勿混**：**D-1~D-3 = “发布落后 mainline”**（mainline 已有修复，未进包）；**D-4 = “有意留白 / 能力缺口”**（非发布落后；**2026-10-23 已闭合**）；**D-5 = 移植降级**（god 有完整实现，ko 移植时丢掉）；**D-6~D-8 = ko 实现/分配器层缺口**（D-6/7 迁移与持久化，D-8 为元数据/数据分配器耦合）；**D-9 = 两版共有的接口缺口**（发布版与 mainline 都缺，**非“发布落后”**）；**D-10 = 契约缺失（设计级 ABI）+ AI 协作事故**——与全部实现级缺陷**不同类**：不是“实现没跟上”，是“**该契约从第一天起就没被定义过**”。
 > D-1 与 D-2 有交集（D-2 的 CHUNK 后端需要 D-1 的计数器做 A/B 判据，见 counters 设计 §3.F）。
 > **D-11 与 D-1 同族但独立**：D-1 管「有没有观测面」，D-11 管「观测面放的位置是否人人可读」——D-1 已落地**不消解** D-11（出口仍 `0700` root-only）。
 > **D-12 与 D-10 同族**：均为**对外契约层**问题，且**同含 AI 协作放大事故维度**——D-10 是「契约没定义」，D-12 是「把『dentry 条目数』与『直属 DIR 型 inode 数』当成一个量、契约定义得反 POSIX」；D-12 的错语义由 v1.1 #13 落定，本条即推翻该决策（**修复落点 v1.2**）。
@@ -135,7 +135,7 @@ state  : 从未挂载（或挂载路径未回写时间戳）
 
 ## D-4 O_DIRECT 故意留白（设计级留白 · 能力缺口）
 
-**现象**：`open(O_DIRECT)` 被拒——`ravenfs_aops`（iomap 家族）**无 `.direct_IO`**，VFS 在 `fs/open.c` 直接返 `-EINVAL`（**不经过 write**）；另有 `linux/iomap.c:296` 的 `if (flags & IOMAP_DIRECT) return -EOPNOTSUPP` 作兜底。
+**现象（2026-10-23 前）**：`open(O_DIRECT)` 被拒——`ravenfs_aops`（iomap 家族）**无 `.direct_IO`**，VFS 在 `fs/open.c` 直接返 `-EINVAL`（**不经过 write**）；另有 `linux/iomap.c` 写向的 `if (flags & IOMAP_DIRECT) return -EOPNOTSUPP` 作兜底（旧文写的 `:296` 是过期行号，实际落点为 `iomap.c:448-449`，2026-10-23 已移除）。
 
 **定性（关键：与 D-1~D-3 不同类）**
 - **不是正确性缺陷**：loud 拒绝（**绝不**静默走 page cache）、有先例（**ext2 无 `direct_IO`**）、是已裁的「可降级」项（R-FD-10，优先级 C）——符合第二约束「顺位 2 降级功能」。
@@ -148,13 +148,59 @@ state  : 从未挂载（或挂载路径未回写时间戳）
 
 **必须守的边界（否则会从“缺口”滑成“真缺陷”）**
 1. **永远 loud**：不得改成“接受 O_DIRECT 但偷走 page cache”——那才是静默语义违反（真缺陷）。
-2. **errno 口径统一**：现两处不一致——`fs/open.c` 给 `-EINVAL`，`iomap.c:296` 给 `-EOPNOTSUPP`；按 ext4/xfs 惯例**选一个**（用户态对两者反应不同）。
+2. **errno 口径统一**：落地后 DIO 全路径不再产生 `-EOPNOTSUPP`；不对齐统一 `-EINVAL`、`RWF_NOWAIT` 统一 `-EAGAIN`（见下「落地口径」）。
 
 **方向 / 出口**
 - 实现：挂 `iomap_dio_rw` + `iomap_dio_ops`（框架现成件，“照抄”路径，非“自创”）。
-- 出口条件（待补）：如“声称通用 root FS / 出现真实 O_DIRECT workload 且其失败不可接受”时 → 必须实现。
+- 出口条件：**已触发**——ravenfs 已宣称通用 root FS 目标，O_DIRECT workload 覆盖不可再拒。
 
-**mainline 状态**：**有意不做**（D-M4-5 后置，R-FD-10 标 C/可降级）；**非**发布落后。
+### 落地（2026-10-23，用户拍板）
+
+**代码落点**
+- `linux/file.c`
+  - `ravenfs_file_operations.open = ravenfs_file_open`：置 `FMODE_CAN_ODIRECT`（7.2 框架，ext4/xfs/zonefs 同款）。**不挂 `a_ops->direct_IO`**——legacy direct_IO 分支会在返回后再推进一次 `ki_pos`，而 `iomap_dio_complete` 已推进过（VM 实测：每次 read 返回正确字节但 f_pos 2×，累计半长 EOF）。
+  - 读：`ravenfs_file_read_iter` 在 `IOCB_DIRECT` 时**直接**调 `iomap_dio_rw`（共享 `inode_lock`，与 truncate/punch/DIO 写串行）；buffered 仍走 `generic_file_read_iter`。
+  - 写：`ravenfs_file_write_iter()` 在 `file_update_time()` 后按 `IOCB_DIRECT` 分流到 `iomap_dio_rw()`（自写 `.write_iter` 不会由 VFS 代路由）。
+  - 新增 `ravenfs_dio_rw(iocb, iter, is_write)`：shutdown 检查、写向 4K 预检、`IOMAP_DIO_FORCE_WAIT`、写向加 `IOMAP_DIO_FSBLOCK_ALIGNED`。
+- `linux/iomap.c`
+  - 删除写向 `IOMAP_DIRECT → -EOPNOTSUPP` 硬拒。
+  - `ravenfs_iomap_end()`：`IOMAP_DIRECT && written>0` 时推进 in-flight `i_size`（多映射下一次 begin 需看到新 size）；`r->size` 改为**不缩水**（begin 可能已提交迁移，旧逻辑会用旧 `i_size` 覆盖）。
+  - 新增 `ravenfs_dio_write_end_io()` + `ravenfs_dio_write_ops`（`dops->end_io`）：DIO 写的**最终提交 / 回滚**点。
+  - 新增失败写「洞块零填」：洞→立刻分配且 `insert` 成功后登记 `(phys_run, cnt)`（`dio_saved.runs`，入口一次分配 256 项）；`end_io` 失败/0 字节时对登记 run 调 `sb_issue_zeroout`（块层批量零填，可走硬件 WRITE_ZEROES），防陈旧盘内容经“已映射未写”的洞暴露。
+
+**落地口径（ABI/语义）**
+
+| 项 | 口径 |
+|---|---|
+| 打开 | `open(O_DIRECT)` 成功；`FMODE_CAN_ODIRECT` 由 `ravenfs_file_open()` 置位（**不靠** `a_ops->direct_IO`） |
+| 写对齐 | **4K**（`IOMAP_DIO_FSBLOCK_ALIGNED`）；pos / 长度 / 用户 buffer 任一不对齐 → `-EINVAL`。**预检在 `iomap_begin` 之前**（内核的对齐检查在 begin 之后，若只靠内核会在洞已分配、extent 已插树后才报错） |
+| 读对齐 | iomap 默认（`bdev_logical_block_size`，通常 512）；inline 文件由 7.2 内核 `iomap_dio_inline_iter` 按字节处理 |
+| 完成模型 | 读写均 `IOMAP_DIO_FORCE_WAIT`：AIO/io_uring 的 DIO 同步完成；首版不依赖 `inode_dio_wait()` |
+| `-ENOTBLK` | 仅当页缓存脏页失效失败时由 `write_iter` 回退 buffered（XFS/ext4 同构）；**不是**“接受 O_DIRECT 偷 page cache” |
+| 失败语义 | `dops->end_io` 收口：成功按实写量推进 size；失败/0 字节回滚 `i_size`+`r->size`。**前像 inline/direct** 时额外还原 `data_root`/`word1`（旧资产未被 begin 改动，安全）；**前像 extent 树**时只回滚 size，绝不还原结构（begin 可能已换根或 free 旧根 → 还原会悬挂）。错误路径新分配的数据/树节点不释放（空间泄漏可接受，绝不产生悬挂引用）；本次新分配的洞 run 零填 |
+| O_APPEND | EOF 位于 4K 边界时追加成功；EOF 非 4K 对齐 → `-EINVAL`（同 XFS 口径） |
+| `RWF_NOWAIT` | **不支持**：ravenfs 未置 `FMODE_NOWAIT`，VFS 在 `kiocb_set_rw_flags` 阶段即 `-EOPNOTSUPP`，到不了 iomap |
+| 统计 | 仍走 `op_read_bytes` / `op_write_bytes`，不改 98 字段计数器结构 |
+
+**已知限制 / 后续**
+- 真异步 DIO（去掉 `FORCE_WAIT`）需先给 `rfs_truncate()` / `rfs_punch_hole()` 补 `inode_dio_wait(inode)`，并把 `dio_saved` 生命周期改为 `end_io` 独占（现在依赖 FORCE_WAIT 的同任务收口）；本条不阻塞 D-4 验收。
+- 失败写的洞块零填是**批量块层零填**（`sb_issue_zeroout`，可能走 WRITE_ZEROES，否则块层写零）：极端情况下（大请求 + 后半段 EFAULT/ENOSPC）零填量 = 本次已分配量。选择“宁可多写、绝不留陈旧数据”；后续可改成「失败时 unmap+free 新 range」以彻底消除写放大（需 extent 范围 punch/拆融合支持）。
+- 失败写不释放新分配块/树节点：错误路径的空间泄漏（无悬挂、无跨文件破坏），由 audit 可观测。
+- `io_uring IOPOLL` 不支持（fops 无 `.iopoll`），同步 `pread/pwrite`、AIO（降级同步）不受影响。
+- 子块（512B）对齐的 DIO 写不支持——与“FS block = 分配粒度”一致。
+- **buffered 侧**同类「迁移后 0 字节提交 → `write_inode` 用 `i_size` 缩回」缺口不在本条范围（D-4 只覆盖 DIO 写；回滚同时还原 `i_size`/`r->size`，不会被 `write_inode` 抵消）。
+
+**验收**
+- 脚本：`linux/vm/share/d4-direct-io.sh`（自定位 `serial=deadbeef` 盘 → insmod → mkfs --v2.0 → mount → 12 段矩阵 → umount → audit → dmesg）。
+- 覆盖：open(O_DIRECT) / 4K 对齐三方一致 / 对齐矩阵（含 512B 拒 `EINVAL`）/ inline 短读与迁移 / 稀疏洞 / extent 覆盖写 / direct 跨 EOF 迁移 / O_APPEND / 卸载重挂持久化 / DIO+buffered 并发 / audit + `dmesg` WARN 扫描 / stats 采样。
+- VM 结果（2026-10-23，guest `7.2.6-arch2-1`，独立验收 agent）：**`RESULT: PASS 86/86（SKIP=0）`**。
+  - 首轮 12 项 FAIL 全在 DIO 读：根因是 legacy `a_ops->direct_IO` 路由让 `ki_pos` **推进两次**（`iomap_dio_complete` 一次 + `generic_file_read_iter` 一次）→ 顺序读累计半长 EOF；改为 `->open` 置 `FMODE_CAN_ODIRECT` + `read_iter` 自路由后全绿。
+  - inline 100B DIO 读的 `usercopy_abort`（`ravenfs_inode_cache` 白名单只含 `symlink_target`）已消：白名单扩为 `inline_data + symlink_target` 连续区。
+  - 定点回归：`bs=4K` / `bs=64K` 顺序 DIO 读 `pos_advance == ret`（1×），EOF 位置正确；inline 短读 100B 无告警。
+  - `dmesg` 全文 `BUG|Oops|panic|WARNING|Call Trace|usercopy_abort` 命中 **0**；`audit_v20` rc=0、`bad_total=0`（unprot 0/0、leak 0/0）；umount rc=0。
+  - 日志：`linux/vm/test-runs/20261023-203603-d4-direct-io/`（`linux/vm/` 已 gitignore）。
+
+**mainline 状态（2026-10-23）**：**已修**（代码 + 编译通过；VM 验收见上）。设计文档 D-M4-5 的“O_DIRECT 后置”与本条 R-FD-10「可降级」同时**退出**——能力缺口闭合；**未随包发布**（随下一版 `pkgver`）。
 
 ---
 

@@ -34,6 +34,7 @@
 #include <linux/fs.h>
 #include <linux/iomap.h>
 #include <linux/buffer_head.h>
+#include <linux/blkdev.h>
 #include <linux/slab.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
@@ -104,6 +105,43 @@ static int rfs_store_block(struct super_block *sb, u64 fs_blk, const void *buf)
 	RFS_STAT_INC(sb, io_write_ops);
 	RFS_STAT_ADD(sb, io_write_bytes, RAVENFS_BLOCK_SIZE);
 	return 0;
+}
+
+/* D-4：失败路径整段零填一个 run。用 sb_issue_zeroout（块层批量零填，可走硬件
+ * WRITE_ZEROES；不支持时块层自动回退写零）——避免逐块 sb_bread/sync_dirty_buffer
+ * 的“同步读+同步写”放大。 */
+static void ravenfs_dio_zero_run(struct super_block *sb, u64 blk, u32 cnt)
+{
+	struct ravenfs_sb_info *sbi = sb->s_fs_info;
+	int err;
+
+	err = sb_issue_zeroout(sb, ravenfs_dev_blk(sbi, blk), cnt, GFP_NOFS);
+	if (err) {
+		pr_warn_ratelimited("ravenfs: D-4 zero failed blk=%llu cnt=%u err=%d\n",
+				    blk, cnt, err);
+		return;
+	}
+	RFS_STAT_ADD(sb, io_write_bytes, (u64)cnt << RAVENFS_BLK_SHIFT);
+	RFS_STAT_ADD(sb, io_write_ops, cnt);
+}
+
+/* D-4：登记本次 DIO 写「洞→立刻分配」的新物理 run（失败时统一清零）。
+ * 表满（或入口分配失败）→ 立刻清零该 run；宁可多一次写也不留陈旧内容。 */
+static void ravenfs_dio_record_run(struct inode *inode, u64 blk, u32 cnt)
+{
+	struct ravenfs_inode_info *ri = RAVENFS_I(inode);
+
+	if (!ri->dio_saved.valid)
+		return;
+	if (ri->dio_saved.nr_runs >= ri->dio_saved.cap_runs) {
+		pr_warn_ratelimited("ravenfs: D-4 run table full, zero-on-alloc blk=%llu cnt=%u\n",
+				    blk, cnt);
+		ravenfs_dio_zero_run(inode->i_sb, blk, cnt);
+		return;
+	}
+	ri->dio_saved.runs[ri->dio_saved.nr_runs].blk = blk;
+	ri->dio_saved.runs[ri->dio_saved.nr_runs].cnt = cnt;
+	ri->dio_saved.nr_runs++;
 }
 
 /* 区域树 walk（上界路由）/ i_blocks 计数在 extent_write.c：
@@ -445,8 +483,6 @@ static int ravenfs_iomap_begin_write(struct inode *inode, loff_t pos, loff_t len
 	u64 size, end, blk, end_blk;
 	int err;
 
-	if (flags & IOMAP_DIRECT)
-		return -EOPNOTSUPP;		/* O_DIRECT 后置（D-M4-5） */
 	ses = ravenfs_inode_session_get(sb, RFS_INO_TO_IDX(inode->i_ino));
 	if (IS_ERR(ses))
 		return PTR_ERR(ses);
@@ -566,6 +602,10 @@ static int ravenfs_iomap_begin_write(struct inode *inode, loff_t pos, loff_t len
 				ravenfs_mdata_drop(ravenfs_mdata_cache_of(sb), old_root);
 				(void)rfs_allocator_block_free(sbi->alloc, old_root, 2);
 			}
+			/* 插入成功才登记（失败路径会把 run 归还，若还登记会在 end_io
+			 * 零填已归还/可能被他人复用的块）。 */
+			if (flags & IOMAP_DIRECT)
+				ravenfs_dio_record_run(inode, run, cnt);
 			iomap->offset = ALIGN_DOWN(pos, RAVENFS_BLOCK_SIZE);
 			iomap->type = IOMAP_MAPPED;
 			iomap->addr = ravenfs_dev_byte(sbi, run);
@@ -719,8 +759,24 @@ static int ravenfs_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 		memcpy(r->inline_data, ri->inline_data, sizeof(r->inline_data));
 	}
 
-	/* 大小提交（实际写入量）；短写尾**不清算**（D-M4-10(b)，evict 再算） */
-	r->size = inode->i_size;
+	/*
+	 * D-4：DIO 写不经过 iomap buffered 的 i_size 推进 —— 迭代期必须由本处推进
+	 * in-flight i_size（否则跨多映射的下一次 begin 仍按旧 size 解码）。
+	 * 最终成功提交/失败回滚在 dops->end_io（ravenfs_dio_write_end_io）收口；
+	 * 仅 DIO 推进（IOMAP_ZERO 不能抬 size：FALLOC_FL_KEEP_SIZE 语义）。
+	 */
+	if ((flags & IOMAP_DIRECT) && written > 0) {
+		loff_t end = pos + written;
+
+		if (end > i_size_read(inode))
+			i_size_write(inode, end);
+	}
+
+	/* 大小提交（实际写入量）；短写尾**不清算**（D-M4-10(b)，evict 再算）。
+	 * **不缩水**：begin 可能在 0 字节提交时已提交 inline→extent/direct 迁移
+	 * （r->size=end）；此时用旧 i_size 覆盖会破坏「inline⇒data_root 无效」不变式。 */
+	if (i_size_read(inode) > r->size)
+		r->size = i_size_read(inode);
 
 	/* i_blocks 诚实化 */
 	ravenfs_write_update_blocks(sb, inode, r);
@@ -732,4 +788,95 @@ static int ravenfs_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 const struct iomap_ops ravenfs_iomap_ops = {
 	.iomap_begin	= ravenfs_iomap_begin,
 	.iomap_end	= ravenfs_iomap_end,
+};
+
+static void ravenfs_dio_zero_runs(struct inode *inode)
+{
+	struct ravenfs_inode_info *ri = RAVENFS_I(inode);
+	unsigned int i;
+
+	for (i = 0; i < ri->dio_saved.nr_runs; i++)
+		ravenfs_dio_zero_run(inode->i_sb,
+				     ri->dio_saved.runs[i].blk,
+				     ri->dio_saved.runs[i].cnt);
+	ri->dio_saved.nr_runs = 0;
+}
+
+/* ── D-4：DIO 写的最终提交 / 回滚点 ─────────────────────────────────────────
+ *
+ * iomap_end 在**提交阶段**（bio 可能仍在飞）为多映射迭代推进 in-flight i_size；
+ * 真正的完成语义在这里收口。IOMAP_DIO_FORCE_WAIT 保证本回调在提交任务内执行，
+ * 且 inode_lock（dio 写独占）仍由 ravenfs_file_write_iter 持有 → 可安全取会话。
+ *
+ * 失败/0 字节：
+ *   · 前像 inline/direct → 结构可安全还原（旧资产未被 begin 改动）；
+ *   · 前像 extent 树   → **只回滚 size，绝不还原 data_root/word1**：begin 可能已
+ *     换根（旧根变内部节点）或把旧根 free 掉（both 收缩）→ 还原会悬挂/-EIO。
+ *   · 任何新分配块/新树节点都不释放：错误路径的空间泄漏可接受，优先级是
+ *     **绝不产生悬挂引用**（与 D-2/D-15 的崩溃方向同一纪律）。
+ *   · 本次「洞→立刻分配」的新 run 统一零填：否则失败写会把洞变成
+ *     「已映射但含上一任使用者数据」的块（信息暴露）。
+ */
+static int ravenfs_dio_write_end_io(struct kiocb *iocb, ssize_t size, int error,
+				    unsigned int flags)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct ravenfs_inode_info *ri = RAVENFS_I(inode);
+	struct ravenfs_inode_session *ses __free(ravenfs_inode_session) = NULL;
+	struct raven_Inode_t *r;
+	bool rollback = (error || size <= 0);
+	loff_t end = iocb->ki_pos + size;
+
+	(void)flags;
+
+	if (WARN_ON_ONCE(!ri->dio_saved.valid))
+		return error;
+
+	if (!rollback) {
+		if (end > i_size_read(inode))
+			i_size_write(inode, end);
+		ses = ravenfs_inode_session_get(inode->i_sb,
+						RFS_INO_TO_IDX(inode->i_ino));
+		if (IS_ERR(ses)) {
+			ri->dio_saved.valid = false;
+			return 0;
+		}
+		r = ravenfs_inode_session_record(ses);
+		/* iomap_end 已提交 size/i_blocks；仅当 end 更大时补一次（短写/未来语义） */
+		if (i_size_read(inode) > r->size) {
+			r->size = i_size_read(inode);
+			ravenfs_write_update_blocks(inode->i_sb, inode, r);
+		}
+		RAVENFS_MDATA_DIRTY(ses->mdata_session);
+		ri->dio_saved.valid = false;
+		return 0;
+	}
+
+	/* ── 回滚：先取会话，失败则整段跳过（不做半回滚）── */
+	ses = ravenfs_inode_session_get(inode->i_sb, RFS_INO_TO_IDX(inode->i_ino));
+	if (IS_ERR(ses)) {
+		ri->dio_saved.valid = false;
+		return error;
+	}
+	r = ravenfs_inode_session_record(ses);
+
+	/* 失败写新分配的洞块清零（防陈旧盘内容经洞暴露）。
+	 * movable（inline/direct 前像）不会走洞分配 → nr_runs 必为 0；固化该不变式。 */
+	WARN_ON_ONCE(ri->dio_saved.struct_movable && ri->dio_saved.nr_runs);
+	ravenfs_dio_zero_runs(inode);
+
+	i_size_write(inode, ri->dio_saved.size);
+	r->size = ri->dio_saved.r_size;
+	if (ri->dio_saved.struct_movable) {
+		r->data_root = ri->dio_saved.data_root;
+		r->word1 = ri->dio_saved.word1;
+	}
+	ravenfs_write_update_blocks(inode->i_sb, inode, r);
+	RAVENFS_MDATA_DIRTY(ses->mdata_session);
+	ri->dio_saved.valid = false;
+	return error;
+}
+
+const struct iomap_dio_ops ravenfs_dio_write_ops = {
+	.end_io	= ravenfs_dio_write_end_io,
 };
