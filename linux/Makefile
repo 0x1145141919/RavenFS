@@ -41,8 +41,10 @@ all:
 	-@python3 $(PWD)/../tools/ide/gen_compile_commands.py
 	@echo "[ravenfs] built version = $(RAVENFS_VERSION)"
 
+# 安装路径去 DWARF（保留 .BTF）：本地 build 的 ravenfs.ko 6MB → 安装后 ~620KB。
+# 本地 `make` 产物仍保留调试信息（addr2line/gdb 可用）。
 modules_install:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
+	$(MAKE) -C $(KDIR) M=$(PWD) INSTALL_MOD_STRIP=1 modules_install
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
