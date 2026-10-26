@@ -25,6 +25,7 @@ test_mount_bitmap
 tools/sbinfo/sbinfo
 
 # tools 其它二进制可执行文件（统一只提交源码）
+tools/rfs_cachectl
 tools/rfs_compact/rfs_compact
 tools/rfs_slice_fr/rfs_slice_fr
 tools/rfs_freeruns/rfs_freeruns
