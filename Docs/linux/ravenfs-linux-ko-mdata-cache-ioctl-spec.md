@@ -1,6 +1,8 @@
-# RavenFS Linux KO · mdata 缓存强淘汰 ioctl 契约（v1）
+# RavenFS Linux KO · mdata 缓存强淘汰 ioctl 契约（v1.1）
 
 > **状态**：已实现（2026-10-17）；本文件是该 ioctl 的**唯一对外契约**。
+> **v1.1（2026-10-17）**：ioctl ABI 不变；新增 **TTL 空闲自动触发**
+> （静置 `idle_squeeze_seconds` 后由 TTL work 调用 `SQUEEZE_LOWLOAD`，§4.8）。
 > **代码入口**：`include/linux/ravenfs_mdata_ioctl.h`（UAPI）+ `linux/mdata_cache_ioctl.c`（处理器）
 > → `linux/mdata_cache_core.c`（强淘汰算法；处理器直接以 `sbi->mcache` 调用核心）。
 > **规范用语**：**必须**（MUST）/ **禁止**（MUST NOT）/ **应当**（SHOULD）/ **可以**（MAY）。
@@ -24,7 +26,7 @@
 | 典型错误 | `-EPERM` / `-EFAULT` / `-EINVAL` / `-EROFS` / `-ENOTTY` / `-EIO` |
 | 结果 | `rows_reaped` / `tables_freed` / `table_bytes_freed` / `write_errors` |
 | 幂等 | 是；可重复调用，无累积状态 |
-| 自动触发 | 无；`PRESSURE`/`LOWLOAD` 均由用户态或未来内核编排显式调用 |
+| 自动触发 | 空闲触发（v1.1）：TTL work 在静置 `ravenfs_idle_squeeze_seconds`（默认 30s）后调用一次 `LOWLOAD`；**无压力触发/shrinker** |
 
 ---
 
@@ -42,7 +44,8 @@
 ### 1.2 非目标
 
 - **不是 `syncfs`**：不负责 inode 数据面、block 位图、Superblock 的全量落盘；
-- **不是 shrinker**：本版本不注册内核内存回收器，也不自动触发；
+- **不是 shrinker**：本版本不注册内核内存回收器；**空闲触发**由自写 TTL work
+  承担（v1.1，§4.8），不参与 Linux page reclaim / memcg reclaim；
 - **不是 per-inode/per-key 操作**：不能指定文件、inode、分片或 key 范围；
 - **不保证回收全部行**：`ref>0`、`IO_ING`、`EVICTING`、`F_WB` 的行必须跳过；
 - **不提供 `NOWRITE` 档**：只读挂载直接拒绝，不回收干净行；
@@ -68,6 +71,9 @@ linux/mdata_cache_core.c  ravenfs_mdata_reap_expired_strong(c, gear, ttl_ns, out
       │  两阶段：行回收（片读锁 + CAS）→ 表精简（片写锁 + 后序 DFS）
       ▼
 mdata 8K 缓存行 / RADIX 静态基数树
+
+（v1.1 第二调用方：cache_ttl.c 空闲触发 → adapter ops->squeeze
+  → 同一个 ravenfs_mdata_reap_expired_strong()，见 §4.8）
 ```
 
 **禁止**绕过本契约直接调用 `ravenfs_mdata_reap_expired_strong()` 之外的内部函数；
@@ -241,6 +247,24 @@ u64 cutoff = now - age_ns;
 - 第二次调用可能回收第一次之后新装载/新变冷的行，也可能什么都不做；
 - 表被摘除后再次 `get` 会重建，重复调用不会破坏缓存一致性。
 
+### 4.8 空闲自动触发（v1.1 · 内核内部调用，非 ioctl）
+
+- **唯一判据是时间**：核心在 `ravenfs_mdata_get/put/mark_dirty` 中粗粒度更新
+  `cache->last_access_ns`（距上次 ≥ 1s 才写一次，判定滞后 ≤ 1s）；
+  **禁止**用 `md_*` 统计计数器反推空闲（计数器增删会静默破坏判定）。
+- TTL work 每 `reap_ms`（默认 4s）检查一次：
+  `now - last_access_ns >= idle_squeeze_seconds`（默认 30s；`0` = 关闭）
+  → 本段空闲期触发一次
+  `ravenfs_mdata_reap_expired_strong(c, LOWLOAD, now - idle_ns)`。
+- **每段空闲期只触发一次**；出现新访问后条件自然失效并重新武装。
+  `-EAGAIN`（用户 ioctl 正持有 `squeeze_lock`）→ 下一轮重试。
+- 前置闸同 §5.4：只读挂载 / force-shutdown 直接跳过。执行上下文是 TTL work，
+  **不在 page reclaim / memcg reclaim 中**，可安全睡眠与回写。
+- 与 ioctl 共用 `cache->squeeze_lock`：ioctl 阻塞取锁，空闲触发 `trylock`。
+- 观测：`md_idle_squeeze`（触发次数）、`md_idle_ms`（当前静置毫秒）；
+  行/表回收仍看 `md_reap_strong` / `md_table_free` / `md_table_del_bytes`。
+  注意 `md_reap_strong` 只在 `rows_reaped > 0` 时累加，0 行摘表不会体现在它上面。
+
 ---
 
 ## 5. 前置条件、权限与生命周期
@@ -262,6 +286,8 @@ u64 cutoff = now - age_ns;
 - 不满足 → `-EPERM`。
 - 权限检查在 `cmd` 分发之前：非 root 对未知命令也返回 `-EPERM`；
   root 对未知命令返回 `-ENOTTY`（见 §6 顺序）。
+- v1.1 的空闲自动触发由内核 TTL work 发起，**不经过**本权限检查；
+  它受只读挂载 / force-shutdown 闸约束（§4.8、§5.4）。
 
 ### 5.3 状态闸
 
@@ -349,6 +375,10 @@ u64 cutoff = now - age_ns;
   正常的用户态 ioctl 不持有任何缓存锁。
 - **禁止**把本 ioctl 当实时接口；`wb_dirty/wb_node` 仍持片写锁做 I/O，
   强淘汰本身也可能回写脏行。
+- v1.1 起 TTL work 的空闲触发是同算法第二调用方：与 ioctl 由
+  `cache->squeeze_lock` 串行（TTL 侧 trylock），但**仍须**在
+  `ravenfs_ttl_stop()` 之后再 `ravenfs_mdata_cache_detach()`，禁止与
+  `cache_fini()/detach()` 并发。
 
 ---
 
@@ -361,6 +391,8 @@ u64 cutoff = now - age_ns;
 | 脏行写回失败 | `RAVENFS_MD_ERR`（`md_err`） | 每失败一次 |
 | 表释放 | `RAVENFS_MD_TABLE_FREE`（`md_table_free`） | 强淘汰摘除的空表数 |
 | 表字节回收 | `RAVENFS_MD_TABLE_DEL_BYTES`（`md_table_del_bytes`） | 与 `md_table_add_bytes` 作差得驻留量 |
+| 空闲强淘汰触发 | `RAVENFS_MD_IDLE_SQUEEZE`（`md_idle_squeeze`） | v1.1：TTL work 触发次数（非行数） |
+| 当前静置时长 | `md_idle_ms`（`/proc/.../stats` state 段） | 距最近一次 get/put/mark_dirty 的毫秒 |
 
 - `md_reap_strong` 与 `md_reap` 分列；统计面已与 god `mdp_stat` 全量对位。
 - `table_bytes_freed` 为几何估算，不是分配器账本；不要用它做精确内存对账。
@@ -423,19 +455,39 @@ gcc -std=gnu11 -Wall -Wextra -Werror -I include/linux \
     tools/rfs_cachectl.c -o rfs_cachectl
 ```
 
-### 9.2 现成 CLI
+### 9.2 现成 CLI（`rfs_cachectl`，v0.2.2 起随包安装到 `/usr/bin`）
 
 ```sh
 # 压力档：回收所有可回收行（无视 TTL）
 rfs_cachectl /mnt/ravenfs pressure
 
-# 低载档：只回收空闲超过 2s 的冷行（ttl 是绝对 cutoff）
-cutoff=$(python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC)-2_000_000_000)')
-rfs_cachectl /mnt/ravenfs lowload "$cutoff"
+# 低载档：只回收空闲超过 2s 的冷行（工具自动算 CLOCK_MONOTONIC cutoff）
+rfs_cachectl /mnt/ravenfs lowload 2s
 
-# 低载档且不按 TTL 过滤（会回收热行，谨慎）
+# 低载档且不按 TTL 过滤（会回收热行，谨慎）；省略 age 默认 2s
 rfs_cachectl /mnt/ravenfs lowload 0
+rfs_cachectl /mnt/ravenfs lowload
+
+# 兼容旧接口：裸绝对 cutoff（ns）原样透传
+rfs_cachectl /mnt/ravenfs lowload 1770000000000000000
+
+# 脚本用：-q 只报错；-v 额外打印 ioctl 前后 stats 原始快照
+rfs_cachectl -q /mnt/ravenfs pressure
+rfs_cachectl -v /mnt/ravenfs lowload 500ms
 ```
+
+工具在 ioctl 前后各读一次 `/proc/fs/ravenfs/<s_id>/stats`，用累计量增量
+交叉核对本次成效（`<s_id>` 由 mountinfo 的 ravenfs 挂载 + 源设备名定位）：
+
+| stats 字段 | 增量含义 | 换算 |
+|---|---|---|
+| `md_resident_del_bytes` | 归还的 8K 节点缓冲字节 | ÷ 8192 = 回收行数 |
+| `md_table_del_bytes` | 释放的翻译表结构字节 | 与 `table_bytes_freed` 对比 |
+| `md_reap_strong` | 强淘汰回收行数 | 与 `rows_reaped` 对比 |
+
+同时打印 `resident_add-del` / `table_add-del` 的**在驻量**前后值。
+注意：del 计数是累计量，窗口内若有并发 TTL reap/drop，增量会略大于本次
+ioctl 贡献；以 ioctl 返回的 `rows_reaped`/`table_bytes_freed` 为本次权威值。
 
 ---
 
@@ -445,11 +497,12 @@ rfs_cachectl /mnt/ravenfs lowload 0
 
 | 项 | 结果 |
 |---|---|
-| 核心单测 `tests/test_mdata_cache_core.c` | 874 pass / 0 fail |
-| ASan + UBSan（leak detect） | 874 pass / 0 fail |
-| TSan（并发烟测） | 874 pass / 0 fail，无 race |
+| 核心单测 `tests/test_mdata_cache_core.c` | 930 pass / 0 fail（含空闲时间戳用例） |
+| ASan + UBSan（leak detect） | 930 pass / 0 fail |
+| TSan（并发烟测） | 930 pass / 0 fail，无 race |
 | UAPI 头用户态编译（`sizeof == 48`） | 通过 |
 | `tools/rfs_cachectl.c` `-Werror` 编译 | 通过 |
+| `tools/Makefile` 构建 / `install`（`/usr/bin`） | 通过 |
 | 独立 kbuild 烟测 | `rfs_mdata_probe.ko` 构建成功 |
 | 生产模块 `make -C linux` | `ravenfs.ko` 构建成功，无 warning/undefined/duplicate |
 
@@ -460,21 +513,30 @@ rfs_cachectl /mnt/ravenfs lowload 0
 1. `insmod ravenfs.ko` → `/proc/filesystems` 出现 `ravenfs`；
 2. `mkfs.ravenfs` + `mount -t ravenfs`；
 3. 产生冷/热/脏/被引用行（文件读写 + 目录操作）；
-4. `rfs_cachectl <mnt> lowload <cutoff>` → 冷行回收、热行保留、脏行落盘；
-5. `rfs_cachectl <mnt> pressure` → 0-ref 行回收、`tables_freed > 0`（RADIX）；
+4. `rfs_cachectl <mnt> lowload 2s` → 冷行回收、热行保留、脏行落盘；
+5. `rfs_cachectl <mnt> pressure` → 0-ref 行回收、`tables_freed > 0`（RADIX），
+   前后 stats 的 `md_resident_del_bytes`/`md_table_del_bytes` 增量与 ioctl 结果对得上；
 6. 非 root 调用 → `-EPERM`；ro 挂载 → `-EROFS`；未知命令 → `-ENOTTY`；
-7. `dmesg` 无 UAF/警告；卸载后重挂载，数据/审计一致。
+7. `dmesg` 无 UAF/警告；卸载后重挂载，数据/审计一致；
+8. **空闲自动触发（v1.1）**：`touch`/`find` 产生冷行 → 静置
+   `ravenfs_idle_squeeze_seconds`（默认 30s，可临时调小到 5s 验收）→
+   `md_idle_squeeze` +1、`md_table_del_bytes`/`md_resident_del_bytes` 上涨；
+   同一空闲期不重复触发；有新访问后再次静置可再触发；ro 挂载不触发；
+   与并发 `rfs_cachectl pressure` 同时跑无 UAF/死锁（`squeeze_lock` 串行）；
+   `ravenfs_idle_squeeze_seconds=0` 时完全不触发。
 
 **在运行时验收完成前，本契约只能声明“构建/单测已通过”，不能声明“端到端已验证”。**
 
 ---
 
-## 11. 已知限制（v1）
+## 11. 已知限制（v1.1）
 
 1. **只读挂载一律 `-EROFS`**：即使只回收干净行也拒绝；未来若需要“ro 只收缩干净行”，
    必须新增 flag/命令，不能改变 v1 语义。
 2. **没有 `NOWRITE`**：不能只回收干净行、跳过写回。
-3. **没有自动触发**：不注册 shrinker；`PRESSURE` 也需显式调用。
+3. **空闲触发有，压力触发没有**：v1.1 由 TTL work 在静置后调用 `LOWLOAD`；
+   **仍不注册 shrinker**，也不参与 page reclaim / memcg reclaim。活跃使用期间近 OOM
+   的强制回收留待后续版本。
 4. **`LOWLOAD` 的冷热按 `acc_stamp`**：`mark_dirty` 不刷新它；写多读少的行可能被判冷。
 5. **`get` 在表被摘后可能重试/重建（H6）**：没有重试上界；持续强淘汰压力下
    读者可能短暂饥饿。
@@ -485,6 +547,10 @@ rfs_cachectl /mnt/ravenfs lowload 0
 9. **compat 未 runtime 验证**：结构无指针、32/64 布局一致，理论上
    `compat_ptr_ioctl` 足够，但未跑 32 位用户态。
 10. **运行时验收未执行**：见 §10.2。
+11. **空闲判据只看 mdata 访问**：VFS 缓存命中但不触碰 mdata 的负载会被判空闲
+    （此时 mdata 缓存确实无新活动，回收是安全的）；判定滞后上限 1s（粗粒度写时间戳）。
+12. **空闲阈值与 `wb_age` 独立**：默认 30s < 60s，可能提前同步写回脏行，产生额外
+    写放大；可把 `idle_squeeze_seconds` 调到 ≥ `wb_age_seconds`。
 
 ---
 
@@ -493,6 +559,7 @@ rfs_cachectl /mnt/ravenfs lowload 0
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | v1 | 2026-10-17 | 首版：`RAVENFS_IOC_CACHE_SQUEEZE`；PRESSURE/LOWLOAD；结果四字段；表精简；ro/shutdown 闸 |
+| v1.1 | 2026-10-17 | ioctl ABI 不变；TTL work 增加**空闲自动触发**（`idle_squeeze_seconds` 默认 30s → `LOWLOAD`）；`squeeze_lock` 串行化；新增 `md_idle_squeeze` / `md_idle_ms` |
 
 **变更纪律**：
 
@@ -511,10 +578,11 @@ rfs_cachectl /mnt/ravenfs lowload 0
 | UAPI | `include/linux/ravenfs_mdata_ioctl.h` |
 | ioctl 处理器 | `linux/mdata_cache_ioctl.c` |
 | fops 接线 | `linux/super.c`（`ravenfs_dir_operations` / `ravenfs_file_operations`） |
-| FS 装配 | `linux/mdata_cache_adapter.c`（mount/umount 注入面，无运行期调用薄壳） |
+| FS 装配 | `linux/mdata_cache_adapter.c`（mount/umount 注入面 + TTL 的 reap/wb/squeeze 后端） |
+| 空闲触发 | `linux/cache_ttl.c`（`ravenfs_idle_squeeze_seconds`，调用 `ops->squeeze`） |
 | 核心算法 | `linux/mdata_cache_core.c`（`ravenfs_mdata_reap_expired_strong` / `ravenfs_mdata_discard_all`） |
 | 核心契约 | `include/linux/ravenfs_mdata_cache_core.h` |
-| 用户态工具 | `tools/rfs_cachectl.c` |
+| 用户态工具 | `tools/rfs_cachectl.c`（构建/安装：`tools/Makefile`） |
 | 单测 | `tests/test_mdata_cache_core.c` |
 
 ## 附录 B · 与 god 的对应

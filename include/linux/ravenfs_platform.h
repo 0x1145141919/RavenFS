@@ -273,6 +273,7 @@ typedef struct rw_semaphore rfs_rwsem_t;
 
 #  define RFS_MUTEX_INIT(m)    mutex_init(m)
 #  define RFS_MUTEX_LOCK(m)    mutex_lock(m)
+#  define RFS_MUTEX_TRYLOCK(m) mutex_trylock(m)		/* 1 = 拿到 */
 #  define RFS_MUTEX_UNLOCK(m)  mutex_unlock(m)
 
 #  define RFS_RWSEM_INIT(l)       init_rwsem(l)
@@ -302,6 +303,7 @@ typedef pthread_rwlock_t    rfs_rwsem_t;
 
 #  define RFS_MUTEX_INIT(m)    pthread_mutex_init((m), NULL)
 #  define RFS_MUTEX_LOCK(m)    pthread_mutex_lock(m)
+#  define RFS_MUTEX_TRYLOCK(m) (pthread_mutex_trylock(m) == 0)	/* true = 拿到 */
 #  define RFS_MUTEX_UNLOCK(m)  pthread_mutex_unlock(m)
 
 #  define RFS_RWSEM_INIT(l)       pthread_rwlock_init((l), NULL)

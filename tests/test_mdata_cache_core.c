@@ -1720,6 +1720,50 @@ static void test_stat_hook(void)
 
 /* ══════════════════════════ main ══════════════════════════ */
 
+/* v0.2.3：空闲判据只依赖一个时间戳 —— get/put/mark_dirty 都必须推进它。
+ * 粗粒度更新（>=1s 才写）通过把 last_access 人为拨回 2s 前来触发。*/
+static void test_idle_access_clock(void)
+{
+	struct fixture fx;
+	struct ravenfs_msession *ms;
+	unsigned char *buf;
+	u64 t0, t1, old;
+	int rc;
+
+	if (fx_init(&fx, 1024, 1) != 0) {
+		CHECK(0, "idle clock fixture init");
+		return;
+	}
+	buf = calloc(1, RAVENFS_MDATA_NODE_BYTES);
+
+	t0 = ravenfs_mdata_last_access_ns(&fx.c);
+	CHECK(t0 > 0, "idle clock set at init");
+	CHECK(ravenfs_mdata_last_access_ns(NULL) == 0, "idle clock NULL cache");
+
+	/* get + put（read 走 RAII get/put）必须推进时间戳 */
+	old = RFS_NOW_NS() - 2000000000ULL;
+	RFS_ATOMIC64_SET(&fx.c.last_access_ns, (s64)old);
+	rc = ravenfs_mdata_read(&fx.c, 0, buf);
+	CHECK(rc == 0, "idle clock read");
+	t1 = ravenfs_mdata_last_access_ns(&fx.c);
+	CHECK(t1 > old, "idle clock advances on get/put");
+
+	/* mark_dirty 也必须推进 */
+	ms = ravenfs_mdata_get(&fx.c, 0);
+	CHECK(!RFS_IS_ERR_OR_NULL(ms), "idle clock dirty get");
+	if (!RFS_IS_ERR_OR_NULL(ms)) {
+		RFS_ATOMIC64_SET(&fx.c.last_access_ns, (s64)old);
+		ravenfs_mdata_mark_dirty(ms);
+		CHECK(ravenfs_mdata_last_access_ns(&fx.c) > old,
+		      "idle clock advances on mark_dirty");
+		ravenfs_mdata_put(ms);
+	}
+
+	free(buf);
+	fx_fini(&fx);
+	fx_check_balanced(&fx, "idle clock balance");
+}
+
 int main(void)
 {
 	printf("ravenfs mdata cache core tests\n");
@@ -1742,6 +1786,7 @@ int main(void)
 	test_fault_injection();
 	test_multithread();
 	test_stat_hook();
+	test_idle_access_clock();
 
 	printf("----\npass=%d fail=%d\n", g_pass, g_fail);
 	return g_fail == 0 ? 0 : 1;

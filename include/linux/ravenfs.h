@@ -154,7 +154,7 @@ struct ravenfs_sb_stats {
 	atomic64_t	ic_flush;	/* inode_flush */
 	atomic64_t	ic_err;		/* 其它内部错（如 mdata_get 失败）*/
 
-	/* C. mdata 节点缓存 md_（25）—— 与核心 enum ravenfs_md_stat 同序对位，
+	/* C. mdata 节点缓存 md_（26）—— 与核心 enum ravenfs_md_stat 同序对位，
 	 * 与 god `mdata_piece_caches_stats.hpp::enum mdp_stat` 逐项对应；
 	 * 末尾 md_drop 为 ko 独有（块复用前丢弃陈旧缓存行）。 */
 	/* A 装配 / 生命周期 */
@@ -188,6 +188,7 @@ struct ravenfs_sb_stats {
 	atomic64_t	md_table_del_bytes;
 	/* ko 扩展 */
 	atomic64_t	md_drop;
+	atomic64_t	md_idle_squeeze;	/* v0.2.3：空闲触发的 LOWLOAD 次数 */
 
 	/* D. TTL 后台 ttl_（2）—— “机制还活着”的证据 */
 	atomic64_t	ttl_rounds;

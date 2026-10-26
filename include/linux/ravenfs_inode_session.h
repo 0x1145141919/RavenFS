@@ -102,6 +102,10 @@ ravenfs_inode_session_record(struct ravenfs_inode_session *s)
 struct ravenfs_wb_ops {
 	int		(*wb_dirty)(struct super_block *sb, u64 age_cutoff_ns, bool ignore_age);
 	long		(*reap)(struct super_block *sb, u64 cutoff_ns);
+	/* v0.2.3：空闲触发的强淘汰（gear/ttl 语义同 ioctl）。
+	 * 0 = 已执行，或后端闸门（ro/shutdown/无缓存）直接跳过；
+	 * -EAGAIN = 强淘汰互斥忙；其他负值 = 脏行写回失败等。*/
+	int		(*squeeze)(struct super_block *sb, u32 gear, u64 ttl_cutoff_ns);
 };
 extern const struct ravenfs_wb_ops ravenfs_wb_mdata_ops;	/* mdata_cache_adapter.c */
 

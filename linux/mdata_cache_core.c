@@ -452,6 +452,9 @@ int ravenfs_mdata_cache_init(struct ravenfs_mdata_cache *self,
 	}
 	/* 先快照 stat，保证后续所有失败/成功路径都能打点（P1：不参与控制流）。*/
 	self->stat = cfg->stat;
+	/* v0.2.3：空闲判据从装配时刻起算；强淘汰互斥锁随缓存生命周期。*/
+	RFS_ATOMIC64_SET(&self->last_access_ns, (s64)RFS_NOW_NS());
+	RFS_MUTEX_INIT(&self->squeeze_lock);
 	if (!cfg->total_blocks || !cfg->mem.alloc || !cfg->mem.free ||
 	    !cfg->pool.alloc || !cfg->pool.free ||
 	    !cfg->io.read_block || !cfg->io.write_block) {
@@ -583,6 +586,7 @@ void ravenfs_mdata_cache_fini(struct ravenfs_mdata_cache *self)
 	self->n_slices = 0;
 	self->n_nodes = 0;
 	self->total_blocks = 0;
+	RFS_ATOMIC64_SET(&self->last_access_ns, 0);
 }
 
 /* ══════════════════════════ 装载（慢路径）══════════════════════════ */
@@ -643,6 +647,27 @@ static int mrow_load(struct ravenfs_mdata_cache *c,
 
 /* ═══════════════════════ 会话（节点租借）═══════════════════════ */
 
+/*
+ * v0.2.3 空闲判据：记录最近一次 get/put/mark_dirty 的单调时间。
+ * 粗粒度更新 —— 距上次 >= 1s 才写一次，热路径只剩「一次原子读 + 比较」；
+ * 判定滞后上限 1s，对 30s 级空闲阈值无影响，也避免多核抢同一 cacheline。
+ */
+static inline void mcore_note_access(struct ravenfs_mdata_cache *c)
+{
+	u64 now = RFS_NOW_NS();
+	u64 last = (u64)RFS_ATOMIC64_READ(&c->last_access_ns);
+
+	if (now - last >= 1000000000ULL)
+		RFS_ATOMIC64_SET(&c->last_access_ns, (s64)now);
+}
+
+u64 ravenfs_mdata_last_access_ns(struct ravenfs_mdata_cache *self)
+{
+	if (!self)
+		return 0;
+	return (u64)RFS_ATOMIC64_READ(&self->last_access_ns);
+}
+
 struct ravenfs_msession *ravenfs_mdata_get(struct ravenfs_mdata_cache *self,
 					   u64 blk)
 {
@@ -654,6 +679,7 @@ struct ravenfs_msession *ravenfs_mdata_get(struct ravenfs_mdata_cache *self,
 
 	if (!self || !self->shards)
 		return RFS_ERR_PTR(-EIO);
+	mcore_note_access(self);
 	if (blk >= self->total_blocks) {
 		RAVENFS_MD_STAT1(self->stat, RAVENFS_MD_ERR);
 		return RFS_ERR_PTR(-EIO);
@@ -779,6 +805,8 @@ void ravenfs_mdata_put(struct ravenfs_msession *s)
 {
 	if (!s)
 		return;
+	if (s->cache)
+		mcore_note_access(s->cache);
 	if (s->row)
 		mrow_put_ref(s->row);
 	if (s->cache) {
@@ -793,6 +821,7 @@ void ravenfs_mdata_mark_dirty(struct ravenfs_msession *s)
 {
 	if (!s || !s->row || !s->shard)
 		return;
+	mcore_note_access(s->cache);
 	{
 		RFS_RWSEM_READ_GUARD(lk, &s->shard->lock);
 

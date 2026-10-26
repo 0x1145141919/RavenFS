@@ -302,7 +302,28 @@ static long ravenfs_mdata_sb_reap_expired(struct super_block *sb, u64 cutoff_ns)
 	return ravenfs_mdata_reap_expired(c, cutoff_ns);
 }
 
+/* v0.2.3：TTL 空闲触发的强淘汰后端。
+ * 与用户 ioctl 共用 cache->squeeze_lock：TTL 用 trylock，抢不到返回 -EAGAIN，
+ * 由调用方下轮再试（不阻塞、不做无用功）。*/
+static int ravenfs_mdata_sb_squeeze(struct super_block *sb, u32 gear,
+				    u64 ttl_cutoff_ns)
+{
+	struct ravenfs_mdata_cache *c = ravenfs_mdata_cache_of(sb);
+	struct ravenfs_mdata_squeeze_res res;
+	int ret;
+
+	if (!c || !ravenfs_sb_writable(sb) || ravenfs_is_shutdown(sb))
+		return 0;
+	if (!RFS_MUTEX_TRYLOCK(&c->squeeze_lock))
+		return -EAGAIN;
+
+	ret = ravenfs_mdata_reap_expired_strong(c, gear, ttl_cutoff_ns, &res);
+	RFS_MUTEX_UNLOCK(&c->squeeze_lock);
+	return ret;
+}
+
 const struct ravenfs_wb_ops ravenfs_wb_mdata_ops = {
 	.wb_dirty = ravenfs_mdata_sb_wb_dirty,
 	.reap     = ravenfs_mdata_sb_reap_expired,
+	.squeeze  = ravenfs_mdata_sb_squeeze,
 };

@@ -85,9 +85,12 @@ long ravenfs_mdata_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (!mc)
 		return -EIO;
 
-	/* ttl_ns 原样下传：PRESSURE 由核心忽略；LOWLOAD 的 0 = 无 TTL 过滤。*/
+	/* ttl_ns 原样下传：PRESSURE 由核心忽略；LOWLOAD 的 0 = 无 TTL 过滤。
+	 * v0.2.3：与 TTL 空闲强淘汰串行化（TTL 侧用 trylock，抢不到跳过）。*/
+	RFS_MUTEX_LOCK(&mc->squeeze_lock);
 	ret = ravenfs_mdata_reap_expired_strong(mc, (u32)uarg.gear, uarg.ttl_ns,
 						&res);
+	RFS_MUTEX_UNLOCK(&mc->squeeze_lock);
 
 	/* 无论 ret 是否 0 都回填结果（partial 可观测：例如部分脏行写回失败）。*/
 	uarg.rows_reaped = res.rows_reaped;

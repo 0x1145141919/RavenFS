@@ -226,6 +226,7 @@ enum ravenfs_md_stat {
 
 	/* ── ko 扩展（不在 mdp 组）── */
 	RAVENFS_MD_DROP,
+	RAVENFS_MD_IDLE_SQUEEZE,	/* 空闲触发的 LOWLOAD 强淘汰次数（v0.2.3）*/
 
 	RAVENFS_MD_STAT_COUNT
 };
@@ -323,6 +324,17 @@ struct ravenfs_mdata_cache {
 	struct ravenfs_mdata_pool	pool;
 	struct ravenfs_mdata_io		io;
 	struct ravenfs_mdata_stat	stat;
+
+	/*
+	 * 空闲判定（v0.2.3）：最近一次 get/put/mark_dirty 的 CLOCK_MONOTONIC ns。
+	 * 热路径只做「距上次 >= 1s 才写」的粗粒度更新，避免多核抢同一 cacheline。
+	 * TTL 线程据此判断「静置 idle_squeeze_seconds」后触发一次 LOWLOAD 强淘汰。
+	 */
+	rfs_atomic64_t			last_access_ns;
+
+	/* 强淘汰串行化：用户 ioctl 用 lock，TTL 空闲触发用 trylock（拿不到跳过本轮）。
+	 * 防止两路并发全量 DFS 做无用功；未来 shrinker 复用同一把锁。*/
+	rfs_mutex_t			squeeze_lock;
 };
 
 /* 节点租借会话。*/
@@ -362,6 +374,10 @@ void	ravenfs_mdata_drop(struct ravenfs_mdata_cache *self, u64 blk);
 
 /* 读一个 8K 节点到调用方缓冲。0 / 负 errno。*/
 int	ravenfs_mdata_read(struct ravenfs_mdata_cache *self, u64 blk, void *buf);
+
+/* 最近一次 mdata 访问（get/put/mark_dirty）的 CLOCK_MONOTONIC ns。
+ * 未装配 / 从未访问 → 0。只读、无锁；TTL 空闲强淘汰的唯一时间判据（v0.2.3）。*/
+u64	ravenfs_mdata_last_access_ns(struct ravenfs_mdata_cache *self);
 
 /* 会话节点缓冲直址。*/
 static inline void *ravenfs_msession_node(struct ravenfs_msession *s)

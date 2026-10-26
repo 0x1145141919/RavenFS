@@ -41,6 +41,7 @@
 #include "ravenfs_dir.h"
 #include "ravenfs_file.h"
 #include "ravenfs_inode_session.h"
+#include "ravenfs_mdata_cache_core.h"
 #include "ravenfs_mdata_ioctl.h"
 #include "ravenfs_allocator_top.h"
 #include "ravenfs_allocator_adapter.h"
@@ -96,7 +97,7 @@ static const char *const ravenfs_stat_names[] = {
 	"md_flush_drop",
 	"md_resident_add_bytes", "md_resident_del_bytes",
 	"md_table_add_bytes", "md_table_del_bytes",
-	"md_drop",
+	"md_drop", "md_idle_squeeze",
 	/* D ttl_ */ "ttl_rounds", "ttl_round_errs",
 	/* E io_ */  "io_read_ops", "io_read_bytes", "io_write_ops", "io_write_bytes",
 	"io_flush_ops",
@@ -185,6 +186,15 @@ static int ravenfs_stats_show(struct seq_file *m, void *v)
 	}
 	/* §5：状态段（gauge）*/
 	seq_printf(m, "# state\nshutdown\t%d\n", ravenfs_is_shutdown(sb) ? 1 : 0);
+	{
+		u64 last = ravenfs_mdata_last_access_ns(sbi->mcache);
+		u64 now = RFS_NOW_NS();
+
+		/* v0.2.3：距最近一次 mdata get/put/mark_dirty 的毫秒数；
+		 * 空闲强淘汰阈值看 module param idle_squeeze_seconds。*/
+		seq_printf(m, "md_idle_ms\t%llu\n",
+			   last && now > last ? (now - last) / 1000000ULL : 0);
+	}
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(ravenfs_stats);

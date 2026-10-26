@@ -5,9 +5,12 @@
  * 为什么自写：token 经济性 / 路线可靠性 —— 不指望内核压力回收做"冷集淘汰"，
  * 自己掌握 TTL 语义（**压力 shrinker 已移除**，TTL 为唯一冷工作集淘汰路径）。
  *
- * 每轮（delayed_work）三趟，I/O 全在锁外：
+ * 每轮（delayed_work）四趟，I/O 全在锁外：
  *   趟1 淘汰  `ops->reap(sb, now - ttl)`              —— 超时冷行：脏原地回写 → 释放
  *   趟2 回写  `ops->wb_dirty(sb, now - wb_age, 0)`    —— 超龄脏行：copy-out 回写
+ *   趟2.5 空闲 `ops->squeeze(sb, LOWLOAD, now - idle)`（v0.2.3）
+ *             —— 距最近一次 mdata get/put/mark_dirty >= idle_squeeze_seconds 时，
+ *                触发一次强淘汰（行 + 空表一起收）；每个空闲期只触发一次。
  *   趟3 位图  `ravenfs_allocator_flush(sb)` —— **每 `bitmap_sync_seconds`(30s)** 闸门到点才
  *             同步 block 位图；**D-15 按脏写回**：只重建/写回「自上次落盘以来变过的片」
  *             （分片脏标志，alloc/free 时置位），未变过的片跳过。
@@ -23,6 +26,8 @@
  *   ravenfs_reap_ms              默认 4000（扫描周期；2026-09-27 由 1s 改 4s）
  *   ravenfs_wb_age_seconds       默认 60  （脏行回写 aging；0 = 关闭周期回写）
  *   ravenfs_bitmap_sync_seconds  默认 30  （位图同步闸门；0 = 关闭；按脏写回，D-15）
+ *   ravenfs_idle_squeeze_seconds 默认 30  （v0.2.3：静置多久触发 LOWLOAD 强淘汰；
+ *                                          0 = 关闭）
  */
 #include <linux/module.h>
 #include <linux/fs.h>
@@ -52,6 +57,14 @@ static unsigned int bitmap_sync_seconds = 30;
 module_param(bitmap_sync_seconds, uint, 0644);
 MODULE_PARM_DESC(bitmap_sync_seconds, "位图全片同步闸门（秒）；0 = 关闭周期同步");
 
+/* v0.2.3：空闲强淘汰。判据只有一个 —— 距最近一次 mdata get/put/mark_dirty
+ * （core->last_access_ns）>= idle_squeeze_seconds。每段空闲只触发一次，
+ * 有新活动后重新武装。0 = 关闭。*/
+static unsigned int idle_squeeze_seconds = 30;
+module_param(idle_squeeze_seconds, uint, 0644);
+MODULE_PARM_DESC(idle_squeeze_seconds,
+		 "静置多少秒后触发一次 LOWLOAD 强淘汰；0 = 关闭（默认 30）");
+
 struct ravenfs_ttl {
 	struct delayed_work	work;
 	struct super_block	*sb;
@@ -60,6 +73,7 @@ struct ravenfs_ttl {
 	unsigned long		bm_total;
 	unsigned long		rounds;
 	u64			bm_last;	/* 上次位图全片同步（ktime_ns） */
+	bool			idle_squeezed;	/* 本段空闲期已触发过强淘汰（v0.2.3） */
 };
 
 static void ravenfs_ttl_work(struct work_struct *w)
@@ -92,6 +106,46 @@ static void ravenfs_ttl_work(struct work_struct *w)
 			ravenfs_force_shutdown(sb, "ttl: periodic writeback failed");
 		if (wb)
 			RFS_STAT_INC(sb, ttl_round_errs);	/* 后台刷盘失败累积 */
+	}
+
+	/* 趟2.5：空闲强淘汰（v0.2.3）。
+	 * 唯一判据 = 核心记录的「最近一次 get/put/mark_dirty」时间：
+	 *   · 静置 >= idle_squeeze_seconds → 本段空闲期触发一次 LOWLOAD；
+	 *   · 有新访问 → 条件自然变为 false，重新武装；
+	 *   · ioctl 正在强淘汰（-EAGAIN）→ 下轮再试，不改变已触发态。
+	 * 只在 TTL work 上下文执行，可安全睡眠/写盘；与用户 ioctl 共用
+	 * cache->squeeze_lock（本侧 trylock，不阻塞）。*/
+	if (idle_squeeze_seconds) {
+		struct ravenfs_mdata_cache *mc = ravenfs_mdata_cache_of(sb);
+		u64 last = ravenfs_mdata_last_access_ns(mc);
+		u64 idle_ns = (u64)idle_squeeze_seconds * NSEC_PER_SEC;
+
+		if (last && now - last >= idle_ns) {
+			if (!t->idle_squeezed) {
+				int sq = ravenfs_wb_mdata_ops.squeeze ?
+					 ravenfs_wb_mdata_ops.squeeze(sb,
+						RAVENFS_MDATA_SQUEEZE_LOWLOAD,
+						now - idle_ns) : 0;
+
+				if (sq == -EAGAIN) {
+					/* 用户 ioctl 正在跑：保持未触发态，下轮再试 */
+				} else {
+					t->idle_squeezed = true;
+					if (!sq) {
+						RFS_STAT_INC(sb, md_idle_squeeze);
+					} else {
+						RFS_STAT_INC(sb, ttl_round_errs);
+						ravenfs_force_shutdown(sb,
+							"ttl: idle squeeze writeback failed");
+					}
+					pr_debug_ratelimited(
+						"ravenfs: ttl: idle squeeze idle=%us ret=%d\n",
+						idle_squeeze_seconds, sq);
+				}
+			}
+		} else {
+			t->idle_squeezed = false;
+		}
 	}
 
 	/* 趟3：分配器同步（闸门 `bitmap_sync_seconds`；D-15 按脏写回——只重建/写回脏片）
