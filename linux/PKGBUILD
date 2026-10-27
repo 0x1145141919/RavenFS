@@ -13,10 +13,16 @@
 #     /proc stats 新增 md_idle_squeeze / md_idle_ms。
 #
 # ⚠️ 盘面 v2.0：与 v1.x 不兼容 → 需 reformat，无迁移工具。
+#
+# pkgrel=2（2026-10-27）—— 新增公共盘面契约头安装：
+#   /usr/include/ravenfs/{disk_struct_v2.0.h, magics.h, rc.hpp}
+#   供 init.elf / panic.elf / 宿主工具以 <ravenfs/...> 消费；
+#   /usr/src/ravenfs-<pkgver>/include 的 DKMS 内部快照保持不变（路径随版本变，
+#   不能作为消费方的稳定 -I）。
 pkgname=ravenfs-dkms
 pkgver=0.2.4
 
-pkgrel=1
+pkgrel=2
 pkgdesc="RavenFS (experimental) kernel module, built via DKMS"
 arch=('x86_64')
 url="https://github.com/openclaw/openclaw"
@@ -42,6 +48,19 @@ package() {
   # include/ravenfs/：盘面头 disk_struct_v*.h 反向 #include "ravenfs/rc.hpp"
   # （结果码/哨兵轻量头）；不装则 DKMS 构建缺头。随包快照一并安装。
   install -m644 "$_srcroot"/include/ravenfs/*.hpp "$dst/include/ravenfs/" 2>/dev/null || true
+
+  # ── 公共盘面契约头（2026-10-27）──
+  # DKMS 快照在 /usr/src/ravenfs-<pkgver>/include：路径随包版本变化，只服务本包构建，
+  # 不能作为外部消费方的稳定 -I。这里另装一份到 /usr/include/ravenfs/：
+  #     #include <ravenfs/disk_struct_v2.0.h>
+  #     #include <ravenfs/magics.h>
+  #     #include <ravenfs/rc.hpp>
+  # 只装“盘结构真值三件套”；参考实现的 .hpp 属于原型，不进公共头。
+  install -d "$pkgdir/usr/include/ravenfs"
+  install -m644 "$_srcroot/include/disk_struct_v2.0.h" "$pkgdir/usr/include/ravenfs/"
+  install -m644 "$_srcroot/include/magics.h"           "$pkgdir/usr/include/ravenfs/"
+  install -m644 "$_srcroot/include/ravenfs/rc.hpp"     "$pkgdir/usr/include/ravenfs/"
+
   install -m644 "$srcdir/dkms.conf" "$dst/dkms.conf"
   sed -i "s/@PKGVER@/${pkgver}/" "$dst/dkms.conf"
   install -Dm755 "$srcdir/mkinitcpio-ravenfs-hook" "$pkgdir/usr/lib/initcpio/install/ravenfs"

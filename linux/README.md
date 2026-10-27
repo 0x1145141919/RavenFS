@@ -13,6 +13,11 @@
 **包的动作被严格限定为「部署源代码 + 构建脚本」**：
 
 - 部署物 = DKMS 源快照：`/usr/src/ravenfs-<ver>/{linux/*.c,*.h, Makefile, include/*.h, dkms.conf}`。
+- **例外（2026-10-27）**：公共盘面契约头装到稳定路径
+  `/usr/include/ravenfs/{disk_struct_v2.0.h, magics.h, rc.hpp}`，
+  供 init.elf / panic.elf / 宿主工具以 `<ravenfs/...>` 消费。
+  `/usr/src/.../include` 的副本随 `pkgver` 变，只服务本包 DKMS 构建，不作为消费方 `-I`；
+  参考实现的 `.hpp` 属于原型，只留在源快照里，不进公共头。
 - 由 **DKMS** 在**每个已装内核**（`linux`、`linux-vfio`…）上重编；内核升级由 `dkms` 的 alpm 钩子触发（需对应 `*-headers`）。
 
 **包不部署任何“运行期 / 系统集成件”**——这些是**外部配置**，由各自的自动化钩子自己部署：
