@@ -49,6 +49,17 @@
 static bool g_json = false;
 static bool g_readonly_flag = false;
 
+/* ── 可选的“身份”建模（--uid/--gid）────────────────────────────────
+ * 默认不启用：uid=gid=0（root），**不做任何权限检查**，行为与历史版本
+ * 逐字节一致——运维工具的第一性原则是“离线镜像上无阻运维”。
+ * 一旦显式给出 --uid/--gid，则按 Linux VFS 的 DAC 规则（属主/属组/other
+ * 三段 rwx + root 旁路）检查每一次 inode 访问，并按该身份铸新 inode 的
+ * uid/gid。这是可选的多用户语义层，不是安全边界：离线镜像的物理持有者
+ * 永远可以直接改盘——它只负责让权限位在真实盘面上真正起作用。 */
+static bool     g_cred_enforce = false;
+static uint32_t g_cred_uid = 0;
+static uint32_t g_cred_gid = 0;
+
 static constexpr uint64_t kChunk = 1ULL << 20;          /* 1 MiB 流式块 */
 static constexpr uint64_t kPtrInvalid52 = (uint64_t)PTR_INVALID & ((1ULL << 52) - 1);
 
@@ -98,6 +109,10 @@ static bool ptr_invalid(uint64_t p) { return p == kPtrInvalid52 || p == PTR_INVA
         "\n"
         "全局: --readonly  强制只读挂载（写命令会拒绝）\n"
         "      --json      机器可读输出（df/info/ls/stat/hash/audit/vmcore/find）\n"
+        "      --uid N     以 uid N 身份运行；默认 0（root，**不做 DAC 检查**）\n"
+        "      --gid N     以 gid N 身份运行；默认 0\n"
+        "                  给了 --uid/--gid 才启用 Linux VFS 权限（属主/属组/other\n"
+        "                  + root 旁路）；新建 inode 按该身份铸 uid/gid\n"
         "      --help      本帮助\n"
         "\n"
         "只读命令:\n"
@@ -121,6 +136,8 @@ static bool ptr_invalid(uint64_t p) { return p == kPtrInvalid52 || p == PTR_INVA
         "  cpout <fspath> <hostdir> [--force]      递归导出目录内容\n"
         "  cpin <hostdir> <fspath> [--force]       递归导入目录内容（symlink 跳过）\n"
         "  truncate <path> <size>\n"
+        "  chmod <八进制mode> <path>               改权限位（如 644 / 600 / 755）\n"
+        "  chown <uid>:<gid> <path>                改属主（仅 root）\n"
         "\n"
         "示例:\n"
         "  rfs_admin ravenfs-data.img df\n"
@@ -392,6 +409,67 @@ static bool read_inode(RavenFS_juvenile &fs, uint64_t inum, InodeInfo &out)
     return true;
 }
 
+/* ── DAC 检查（仅在 --uid/--gid 显式给出时生效）────────────────────
+ * mask：4=r，2=w，1=x，可或。语义对齐 Linux generic_permission()：
+ *   · 属主匹配取 owner 位，否则属组匹配取 group 位，否则取 other 位；
+ *   · uid==0（root）旁路 rwx，但**普通文件的 x** 仍要求任一 x 位置位
+ *     （与 POSIX/内核一致）；目录的搜索权 root 直接放行。
+ * 未启用身份层时恒真，不改变历史行为。 */
+static const char *mask_name(int mask)
+{
+    switch (mask) {
+    case 1: return "x";
+    case 2: return "w";
+    case 3: return "wx";
+    case 4: return "r";
+    case 5: return "rx";
+    case 6: return "rw";
+    case 7: return "rwx";
+    default: return "?";
+    }
+}
+
+static bool may(const InodeInfo &ii, int mask)
+{
+    if (!g_cred_enforce) return true;
+    const uint32_t mode = ii.mode();
+    if (g_cred_uid == 0) {
+        if ((mask & 1) && !ii.is_dir()) return (mode & 0111u) != 0;
+        return true;
+    }
+    uint32_t bits;
+    if (g_cred_uid == ii.uid)      bits = (mode >> 6) & 7u;
+    else if (g_cred_gid == ii.gid) bits = (mode >> 3) & 7u;
+    else                           bits = mode & 7u;
+    return (bits & (uint32_t)mask) == (uint32_t)mask;
+}
+
+/* errout 非空时只填错误串（由调用方统一打印，避免重复两行）。 */
+static bool need_perm(const InodeInfo &ii, int mask, const std::string &path,
+                      const char *what, std::string *errout = nullptr)
+{
+    if (may(ii, mask)) return true;
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "%s: 权限不足（%s 需要 %s；mode=%04o，属主 %u:%u，当前身份 %u:%u）",
+                  path.c_str(), what, mask_name(mask), ii.mode(),
+                  ii.uid, ii.gid, g_cred_uid, g_cred_gid);
+    if (errout) *errout = buf;
+    else errf("%s", buf);
+    return false;
+}
+
+/* 新建 inode 的属主：仅在身份层启用时铸成当前身份；默认仍是 0:0。 */
+static void stamp_owner(RavenFS_juvenile &fs, uint64_t inum)
+{
+    if (!g_cred_enforce) return;
+    InodeSession s(fs.inode_io, inum);
+    if (!s) return;
+    s.inode->uid = g_cred_uid;
+    s.inode->gid = g_cred_gid;
+    s.dirty();
+}
+
 /* 路径拆分：去前导 '/'、折叠重复 '/'、跳过 '.'；任何 '..' → 拒绝。 */
 static bool split_path(const std::string &path, std::vector<std::string> &out,
                        std::string &err)
@@ -439,6 +517,8 @@ static Lookup lookup_path(RavenFS_juvenile &fs, const std::string &path,
             err = "不是目录: " + (prefix.empty() ? std::string("/") : prefix);
             return Lookup::Error;
         }
+        if (!need_perm(ii, 1, prefix.empty() ? "/" : prefix, "进入目录", &err))
+            return Lookup::Error;
         uint64_t child = 0;
         result_code_t rc = fs.dir_lookup(cur, c.c_str(), &child);
         if (rc == RC_ERR_NOT_FOUND) {
@@ -475,6 +555,8 @@ static bool ensure_parent(RavenFS_juvenile &fs, const std::string &path, bool mk
             err = "父路径不是目录: " + (prefix.empty() ? std::string("/") : prefix);
             return false;
         }
+        if (!need_perm(ii, 1, prefix.empty() ? "/" : prefix, "进入目录", &err))
+            return false;
         uint64_t child = 0;
         result_code_t rc = fs.dir_lookup(cur, c.c_str(), &child);
         if (rc == RC_ERR_NOT_FOUND) {
@@ -482,6 +564,8 @@ static bool ensure_parent(RavenFS_juvenile &fs, const std::string &path, bool mk
                 err = "父目录不存在: " + (prefix.empty() ? "/" : prefix) + c;
                 return false;
             }
+            if (!need_perm(ii, 3, prefix.empty() ? "/" : prefix, "在目录内创建", &err))
+                return false;
             result_code_t ir = fs.dir_insert_dentry(cur, c.c_str(), INODE_TYPE_DIR);
             if (ir != RC_OK) {
                 err = "创建目录 " + (prefix.empty() ? "/" : prefix) + c + " → " + rc_name(ir);
@@ -492,6 +576,7 @@ static bool ensure_parent(RavenFS_juvenile &fs, const std::string &path, bool mk
                 err = "创建后 lookup " + c + " → " + rc_name(ir);
                 return false;
             }
+            stamp_owner(fs, child);
         } else if (rc != RC_OK) {
             err = "lookup(" + c + ") → " + rc_name(rc);
             return false;
@@ -796,6 +881,10 @@ static void ls_one_dir(RavenFS_juvenile &fs, const std::string &path, uint64_t i
                        std::set<uint64_t> &visited)
 {
     if (depth > 128) { errf("递归深度超限: %s", path.c_str()); return; }
+    {
+        InodeInfo di;
+        if (!read_inode(fs, inum, di) || !need_perm(di, 4, path, "列目录")) return;
+    }
     std::vector<DirEntry> entries;
     std::string err;
     if (!read_dir(fs, inum, entries, err)) {
@@ -843,6 +932,7 @@ static void ls_one_dir(RavenFS_juvenile &fs, const std::string &path, uint64_t i
         if (!read_inode(fs, e.inum, ii)) continue;
         if (!ii.is_dir()) continue;
         std::string cpath = (path == "/" ? "" : path) + "/" + e.name;
+        if (!need_perm(ii, 1, cpath, "进入目录")) continue;
         if (!g_json) std::printf("\n");
         ls_one_dir(fs, cpath, e.inum, longfmt, recursive, depth + 1, visited);
     }
@@ -878,6 +968,7 @@ static int cmd_ls(RavenFS_juvenile &fs, const std::vector<std::string> &args)
     }
     InodeInfo ii;
     if (!read_inode(fs, inum, ii)) { errf("无法读取 inode %" PRIu64, inum); return 2; }
+    if (ii.is_dir() && !need_perm(ii, 4, path, "列目录")) return 2;
     if (!ii.is_dir()) {
         if (g_json) {
             std::printf("[{\"name\":\"%s\",\"path\":\"%s\",\"inum\":%" PRIu64
@@ -1358,6 +1449,7 @@ static int cmd_cat(RavenFS_juvenile &fs, const std::vector<std::string> &args)
     uint64_t inum = 0;
     InodeInfo ii;
     if (!open_fs_file(fs, ra.path, inum, ii, err)) { errf("%s", err.c_str()); return 2; }
+    if (!need_perm(ii, 4, ra.path, "读取")) return 2;
     uint64_t len = effective_length(ii, ra.offset, ra.has_len, ra.length);
     if (!stream_file(fs, inum, ra.offset, len,
                      [](const uint8_t *p, size_t n, uint64_t) {
@@ -1389,6 +1481,7 @@ static int cmd_get(RavenFS_juvenile &fs, const std::vector<std::string> &args)
     uint64_t inum = 0;
     InodeInfo ii;
     if (!open_fs_file(fs, ra.path, inum, ii, err)) { errf("%s", err.c_str()); return 2; }
+    if (!need_perm(ii, 4, ra.path, "读取")) return 2;
     uint64_t len = effective_length(ii, ra.offset, ra.has_len, ra.length);
 
     struct stat st;
@@ -1440,6 +1533,7 @@ static int cmd_hash(RavenFS_juvenile &fs, const std::vector<std::string> &args)
     uint64_t inum = 0;
     InodeInfo ii;
     if (!open_fs_file(fs, ra.path, inum, ii, err)) { errf("%s", err.c_str()); return 2; }
+    if (!need_perm(ii, 4, ra.path, "读取")) return 2;
     uint64_t len = effective_length(ii, ra.offset, ra.has_len, ra.length);
 
     Xxh64 h;
@@ -1946,6 +2040,7 @@ static int cmd_mkdir(RavenFS_juvenile &fs, const std::vector<std::string> &args)
             errf("mkdir: 父路径不是目录: %s", (prefix.empty() ? "/" : prefix).c_str());
             return 2;
         }
+        if (!need_perm(ii, 1, prefix.empty() ? "/" : prefix, "进入目录")) return 2;
         uint64_t child = 0;
         result_code_t lr = fs.dir_lookup(cur, c.c_str(), &child);
         bool is_last = (i + 1 == comps.size());
@@ -1964,6 +2059,7 @@ static int cmd_mkdir(RavenFS_juvenile &fs, const std::vector<std::string> &args)
                 errf("mkdir: 父目录不存在: %s", ((prefix.empty() ? "/" : prefix) + c).c_str());
                 return 2;
             }
+            if (!need_perm(ii, 3, prefix.empty() ? "/" : prefix, "在目录内创建")) return 2;
             result_code_t ir = fs.dir_insert_dentry(cur, c.c_str(), INODE_TYPE_DIR);
             if (ir != RC_OK) {
                 errf("mkdir: 创建 %s → %s", ((prefix.empty() ? "/" : prefix) + c).c_str(),
@@ -1978,6 +2074,7 @@ static int cmd_mkdir(RavenFS_juvenile &fs, const std::vector<std::string> &args)
             }
             cur = ni;
             created_any = true;
+            stamp_owner(fs, ni);
         } else {
             errf("mkdir: lookup %s → %s", c.c_str(), rc_name(lr));
             return 2;
@@ -2029,6 +2126,7 @@ static int cmd_put(RavenFS_juvenile &fs, const std::vector<std::string> &args)
         ::close(hfd);
         return 2;
     }
+    if (!need_perm(pi, 3, fspath, "在父目录创建")) { ::close(hfd); return 2; }
 
     uint64_t inum = 0;
     bool created = false;
@@ -2043,6 +2141,7 @@ static int cmd_put(RavenFS_juvenile &fs, const std::vector<std::string> &args)
             ::close(hfd);
             return 2;
         }
+        if (!need_perm(ti, 2, fspath, "覆盖写")) { ::close(hfd); return 2; }
         result_code_t tr = fs.direct_file_trunacate(inum, 0);
         if (tr != RC_OK) {
             errf("put: truncate(%s, 0) → %s", fspath.c_str(), rc_name(tr));
@@ -2063,6 +2162,7 @@ static int cmd_put(RavenFS_juvenile &fs, const std::vector<std::string> &args)
             ::close(hfd);
             return 2;
         }
+        stamp_owner(fs, inum);
     } else {
         errf("put: lookup %s → %s", fspath.c_str(), rc_name(lr));
         ::close(hfd);
@@ -2180,7 +2280,11 @@ static int cmd_rm(RavenFS_juvenile &fs, const std::vector<std::string> &args)
     if (comps.empty()) { errf("rm: 拒绝删除根目录 /"); return 2; }
 
     uint64_t parent = fs.root_inum;
+    std::string prefix;
     for (size_t i = 0; i + 1 < comps.size(); ++i) {
+        InodeInfo di;
+        if (!read_inode(fs, parent, di) ||
+            !need_perm(di, 1, prefix.empty() ? "/" : prefix, "进入目录")) return 2;
         uint64_t child = 0;
         result_code_t rc = fs.dir_lookup(parent, comps[i].c_str(), &child);
         if (rc != RC_OK) {
@@ -2192,7 +2296,14 @@ static int cmd_rm(RavenFS_juvenile &fs, const std::vector<std::string> &args)
             errf("rm: 父路径不是目录: %s", comps[i].c_str());
             return 2;
         }
+        prefix += "/" + comps[i];
         parent = child;
+    }
+    {
+        InodeInfo di;
+        if (!read_inode(fs, parent, di) ||
+            !need_perm(di, 3, prefix.empty() ? "/" : prefix, "删除目录项（需写+搜索）"))
+            return 2;
     }
     const std::string &name = comps.back();
     uint64_t inum = 0;
@@ -2208,6 +2319,7 @@ static int cmd_rm(RavenFS_juvenile &fs, const std::vector<std::string> &args)
         errf("rm: %s 是目录（非空/空目录均需 -r）", path.c_str());
         return 2;
     }
+    if (ii.is_dir() && !need_perm(ii, 4, path, "递归删除需列目录")) return 2;
 
     uint64_t before = fs.allocator ? fs.allocator->block_free_total() : 0;
     bool ok;
@@ -2367,6 +2479,7 @@ static int cmd_cpout(RavenFS_juvenile &fs, const std::vector<std::string> &args)
     if (lr != Lookup::Ok) { errf("%s", err.c_str()); return 2; }
     InodeInfo ii;
     if (!read_inode(fs, inum, ii)) { errf("读取 inode 失败"); return 2; }
+    if (!need_perm(ii, ii.is_dir() ? 5 : 4, fspath, "导出")) return 2;
 
     if (!mkdir_hosts(hostdir, err)) { errf("cpout: %s", err.c_str()); return 2; }
 
@@ -2403,6 +2516,14 @@ static bool cpin_host_entry(RavenFS_juvenile &fs, const std::string &hostpath,
                             const std::string &name, uint64_t fsparent, bool force,
                             std::string &err)
 {
+    {
+        InodeInfo pi;
+        if (!read_inode(fs, fsparent, pi) || !pi.is_dir()) {
+            err = "导入目标父 inode 不是目录";
+            return false;
+        }
+        if (!need_perm(pi, 3, name, "导入（父目录需写+搜索）")) return false;
+    }
     struct stat st;
     if (::lstat(hostpath.c_str(), &st) != 0) {
         err = "lstat " + hostpath + " 失败: " + std::strerror(errno);
@@ -2421,6 +2542,7 @@ static bool cpin_host_entry(RavenFS_juvenile &fs, const std::string &hostpath,
             if (ir != RC_OK) { err = "mkdir " + name + " → " + rc_name(ir); return false; }
             ir = fs.dir_lookup(fsparent, name.c_str(), &child);
             if (ir != RC_OK) { err = "lookup " + name + " → " + rc_name(ir); return false; }
+            stamp_owner(fs, child);
         } else if (lr != RC_OK) {
             err = "lookup " + name + " → " + rc_name(lr);
             return false;
@@ -2449,6 +2571,7 @@ static bool cpin_host_entry(RavenFS_juvenile &fs, const std::string &hostpath,
         if (ti.is_dir()) { err = "目标同名但是目录: " + name; return false; }
         if (!ti.is_reg()) { err = "目标同名但不是普通文件: " + name; return false; }
         if (!force) { err = "目标已存在（加 --force 覆盖）: " + name; return false; }
+        if (!need_perm(ti, 2, name, "覆盖写")) return false;
         result_code_t tr = fs.direct_file_trunacate(inum, 0);
         if (tr != RC_OK) { err = "truncate " + name + " → " + rc_name(tr); return false; }
     } else if (lr == RC_ERR_NOT_FOUND) {
@@ -2457,6 +2580,7 @@ static bool cpin_host_entry(RavenFS_juvenile &fs, const std::string &hostpath,
         created = true;
         ir = fs.dir_lookup(fsparent, name.c_str(), &inum);
         if (ir != RC_OK) { err = "lookup " + name + " → " + rc_name(ir); return false; }
+        stamp_owner(fs, inum);
     } else {
         err = "lookup " + name + " → " + rc_name(lr);
         return false;
@@ -2578,6 +2702,77 @@ static int cmd_cpin(RavenFS_juvenile &fs, const std::vector<std::string> &args)
 /* ═══════════════════════════════════════════════════════════════════
  * truncate / find
  * ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════
+ * chmod / chown —— 属主与权限位（身份层的“道具”）
+ * 默认（未给 --uid/--gid）就是 root，可随意改；给了身份则按 VFS：
+ *   chmod 需属主或 root；chown 仅 root。
+ * ═══════════════════════════════════════════════════════════════════ */
+static int cmd_chmod(RavenFS_juvenile &fs, const std::vector<std::string> &args)
+{
+    if (args.size() != 2) { errf("用法: chmod <八进制mode> <path>"); return 2; }
+    char *end = nullptr;
+    const unsigned long mode = std::strtoul(args[0].c_str(), &end, 8);
+    if (end == args[0].c_str() || *end != '\0' || mode > 07777) {
+        errf("chmod: 非法 mode: %s（八进制，如 644 / 600 / 755）", args[0].c_str());
+        return 2;
+    }
+    const std::string &path = args[1];
+    uint64_t inum = 0;
+    std::string err;
+    Lookup lr = lookup_path(fs, path, inum, err);
+    if (lr != Lookup::Ok) { errf("%s", err.c_str()); return 2; }
+    InodeInfo ii;
+    if (!read_inode(fs, inum, ii)) { errf("chmod: 读取 inode 失败"); return 2; }
+    if (g_cred_enforce && g_cred_uid != 0 && g_cred_uid != ii.uid) {
+        errf("%s: 权限不足（chmod 需属主或 root；属主 %u:%u，当前身份 %u:%u）",
+             path.c_str(), ii.uid, ii.gid, g_cred_uid, g_cred_gid);
+        return 2;
+    }
+    InodeSession s(fs.inode_io, inum);
+    if (!s) { errf("chmod: 无法打开 inode 会话"); return 2; }
+    s.inode->mode_xattr = RFS_MODE_XATTR_PACK(mode, RFS_XATTRPTR_GET(s.inode->mode_xattr));
+    s.dirty();
+    std::printf("chmod: %s %04o → %04lo\n", path.c_str(), ii.mode(), mode);
+    return 0;
+}
+
+static int cmd_chown(RavenFS_juvenile &fs, const std::vector<std::string> &args)
+{
+    if (args.size() != 2) { errf("用法: chown <uid>:<gid> <path>"); return 2; }
+    const std::string &own = args[0];
+    size_t colon = own.find(':');
+    if (colon == std::string::npos) { errf("chown: 需要 uid:gid 形式: %s", own.c_str()); return 2; }
+    const std::string uid_s = own.substr(0, colon);
+    const std::string gid_s = own.substr(colon + 1);
+    char *e1 = nullptr, *e2 = nullptr;
+    const unsigned long uid = std::strtoul(uid_s.c_str(), &e1, 10);
+    const unsigned long gid = std::strtoul(gid_s.c_str(), &e2, 10);
+    if (uid_s.empty() || gid_s.empty() || *e1 != '\0' || *e2 != '\0' ||
+        uid > 0xffffffffUL || gid > 0xffffffffUL) {
+        errf("chown: 非法 uid:gid: %s", own.c_str());
+        return 2;
+    }
+    if (g_cred_enforce && g_cred_uid != 0) {
+        errf("chown: 权限不足（只有 root 能改属主；当前身份 %u:%u）",
+             g_cred_uid, g_cred_gid);
+        return 2;
+    }
+    const std::string &path = args[1];
+    uint64_t inum = 0;
+    std::string err;
+    Lookup lr = lookup_path(fs, path, inum, err);
+    if (lr != Lookup::Ok) { errf("%s", err.c_str()); return 2; }
+    InodeInfo ii;
+    if (!read_inode(fs, inum, ii)) { errf("chown: 读取 inode 失败"); return 2; }
+    InodeSession s(fs.inode_io, inum);
+    if (!s) { errf("chown: 无法打开 inode 会话"); return 2; }
+    s.inode->uid = (uint32_t)uid;
+    s.inode->gid = (uint32_t)gid;
+    s.dirty();
+    std::printf("chown: %s %u:%u → %lu:%lu\n", path.c_str(), ii.uid, ii.gid, uid, gid);
+    return 0;
+}
+
 static int cmd_truncate(RavenFS_juvenile &fs, const std::vector<std::string> &args)
 {
     std::string path;
@@ -2594,6 +2789,7 @@ static int cmd_truncate(RavenFS_juvenile &fs, const std::vector<std::string> &ar
     InodeInfo ii;
     std::string err;
     if (!open_fs_file(fs, path, inum, ii, err)) { errf("%s", err.c_str()); return 2; }
+    if (!need_perm(ii, 2, path, "截断")) return 2;
     result_code_t rc = fs.direct_file_trunacate(inum, size);
     if (rc != RC_OK) { errf("truncate %s → %s", path.c_str(), rc_name(rc)); return 2; }
     std::printf("truncate: %s %" PRIu64 " → %" PRIu64 " bytes\n", path.c_str(), ii.size, size);
@@ -2604,6 +2800,10 @@ static void find_walk(RavenFS_juvenile &fs, uint64_t inum, const std::string &pa
                       const std::string &substr, int depth, std::set<uint64_t> &visited)
 {
     if (depth > 128) return;
+    {
+        InodeInfo di;
+        if (!read_inode(fs, inum, di) || !need_perm(di, 4, path, "遍历目录")) return;
+    }
     std::vector<DirEntry> entries;
     std::string err;
     if (!read_dir(fs, inum, entries, err)) {
@@ -2678,7 +2878,8 @@ static int cmd_find(RavenFS_juvenile &fs, const std::vector<std::string> &args)
 static bool command_is_write(const std::string &cmd)
 {
     return cmd == "mkdir" || cmd == "put" || cmd == "rm" ||
-           cmd == "cpin" || cmd == "truncate";
+           cmd == "cpin" || cmd == "truncate" ||
+           cmd == "chmod" || cmd == "chown";
 }
 
 int main(int argc, char **argv)
@@ -2688,13 +2889,52 @@ int main(int argc, char **argv)
 
     const std::string image = argv[1];
 
+    /* --uid/--gid 可出现在镜像名后任意位置；两种写法：--uid N / --uid=N。
+     * 允许负号前缀的命令参数（如 rm -r）不受影响：只截获这两个精确选项。 */
+    auto parse_id = [](const std::string &s, uint32_t &out) -> bool {
+        if (s.empty()) return false;
+        char *end = nullptr;
+        errno = 0;
+        unsigned long v = std::strtoul(s.c_str(), &end, 10);
+        if (errno || end == s.c_str() || *end != '\0' || v > 0xffffffffUL) return false;
+        out = (uint32_t)v;
+        return true;
+    };
+
     std::vector<std::string> toks;
+    bool have_uid = false, have_gid = false;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--readonly") g_readonly_flag = true;
-        else if (a == "--json") g_json = true;
-        else toks.push_back(std::move(a));
+        if (a == "--readonly") { g_readonly_flag = true; continue; }
+        if (a == "--json") { g_json = true; continue; }
+        if (a == "--uid" || a == "-u") {
+            if (i + 1 >= argc || !parse_id(argv[++i], g_cred_uid)) {
+                errf("--uid 需要非负整数"); return 2;
+            }
+            have_uid = true;
+            continue;
+        }
+        if (a == "--gid" || a == "-g") {
+            if (i + 1 >= argc || !parse_id(argv[++i], g_cred_gid)) {
+                errf("--gid 需要非负整数"); return 2;
+            }
+            have_gid = true;
+            continue;
+        }
+        if (a.rfind("--uid=", 0) == 0) {
+            if (!parse_id(a.substr(6), g_cred_uid)) { errf("--uid 需要非负整数"); return 2; }
+            have_uid = true;
+            continue;
+        }
+        if (a.rfind("--gid=", 0) == 0) {
+            if (!parse_id(a.substr(6), g_cred_gid)) { errf("--gid 需要非负整数"); return 2; }
+            have_gid = true;
+            continue;
+        }
+        toks.push_back(std::move(a));
     }
+    /* 只有“显式给出了身份”才开 DAC；只给 --uid 时 gid 保持 0（进程主组缺省）。 */
+    g_cred_enforce = have_uid || have_gid;
     if (toks.empty() || toks[0] == "--help" || toks[0] == "-h" || toks[0] == "help")
         usage(toks.empty() ? 2 : 0);
 
@@ -2734,6 +2974,8 @@ int main(int argc, char **argv)
     else if (cmd == "cpout") rc = cmd_cpout(fs, args);
     else if (cmd == "cpin") rc = cmd_cpin(fs, args);
     else if (cmd == "truncate") rc = cmd_truncate(fs, args);
+    else if (cmd == "chmod") rc = cmd_chmod(fs, args);
+    else if (cmd == "chown") rc = cmd_chown(fs, args);
     else {
         errf("未知命令: %s", cmd.c_str());
         usage(2);

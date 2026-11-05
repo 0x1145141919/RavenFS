@@ -99,9 +99,30 @@ rfs_admin <image> <command> [args...]
 |------|------|
 | `--readonly` | 强制只读挂载；写命令与之组合会直接拒绝 |
 | `--json` | 机器可读输出（`df/info/ls/stat/hash/audit/vmcore/find`） |
+| `--uid N` | 以 uid N 身份运行（默认 0=root：**不做任何权限检查**） |
+| `--gid N` | 以 gid N 身份运行（默认 0） |
 | `--help` | 帮助 |
 
 读命令会自动按只读挂载；写命令自动按读写挂载。
+
+### 4.1 可选身份层（`--uid` / `--gid`）
+
+rfs_admin 的默认人格是 **root**：不带 `--uid/--gid` 时完全不碰权限位，行为与历史
+版本逐字节一致——离线镜像的运维不应被 DAC 挡住。
+
+显式给出 `--uid N`（和/或 `--gid N`）后，工具按 Linux VFS 的 DAC 规则检查每一次
+inode 访问：
+
+- 权限判定：属主匹配取 owner 位 → 属组匹配取 group 位 → 否则 other 位；
+  需要的权限按操作给出（路径各分量 `x`、列目录 `r`、读文件 `r`、写/截断 `w`、
+  创建/删除目录项 `w+x`）。
+- `uid=0` 旁路 rwx（CAP_DAC_OVERRIDE 口径），但普通文件的 `x` 仍要求任一 `x` 位置位。
+- `mkdir` / `put` / `cpin` 新建的 inode **按当前身份铸 uid/gid**；覆盖写不改属主。
+- 未实现 sticky bit / ACL / setuid 语义；目录的 `x` 检查覆盖所有路径遍历。
+- 定位：**可表演层，不是安全边界**。镜像物理持有者永远能直接改盘；
+  它解决的是“在真实盘面上演示 VFS 权限语义”，不是防越权。
+
+配合 `chmod` / `chown` 可以构造完整的多用户场景（见 §5 示例）。
 
 ### 只读
 
@@ -129,6 +150,8 @@ rfs_admin <image> <command> [args...]
 | `cpout <fspath> <hostdir> [--force]` | 递归导出目录**内容**到 hostdir；文件导出为 `<hostdir>/<basename>` |
 | `cpin <hostdir> <fspath> [--force]` | 递归导入 hostdir 的**内容**；symlink / 特殊文件跳过并告警；只处理普通文件与目录 |
 | `truncate <path> <size>` | 截断/扩展普通文件（扩展为稀疏零） |
+| `chmod <八进制mode> <path>` | 改盘上 `mode_xattr` 的权限 12 位（如 `644` / `600` / `755`） |
+| `chown <uid>:<gid> <path>` | 改盘上 inode 属主；身份层启用时仅 root 可用 |
 
 安全拒绝：
 
@@ -177,6 +200,27 @@ rfs_admin ravenfs-data.img rm /images/firmware.bin
 rfs_admin ravenfs-data.img rm -r /old_tree --shred
 rfs_admin ravenfs-data.img df
 rfs_admin ravenfs-data.img audit
+```
+
+### 多用户与权限位（`--uid/--gid`）
+
+```bash
+# root：建家目录并交给 1000
+rfs_admin img mkdir /home
+rfs_admin img mkdir /home/alice
+rfs_admin img chown 1000:1000 /home/alice
+rfs_admin img chmod 700 /home/alice
+
+# 以 1000 身份写入：新 inode 属主自动是 1000:1000
+rfs_admin img --uid 1000 --gid 1000 put ./note.txt /home/alice/note.txt
+rfs_admin img --uid 1000 --gid 1000 chmod 600 /home/alice/note.txt
+
+# 以 1001 身份：对方家目录 0700 → 连列目录都不行
+rfs_admin img --uid 1001 --gid 1001 ls /home/alice
+# rfs_admin: /home/alice: 权限不足（列目录 需要 r；mode=0700，属主 1000:1000，当前身份 1001:1001）
+
+# 默认身份（root）：旁路，照常运维
+rfs_admin img ls -l /home/alice
 ```
 
 ---
@@ -289,8 +333,9 @@ $ rfs_admin img tree /src
   `audit` 定位（本工具不做修复）。
 - **symlink 不复制**：`cpout` 遇到 `SOFT_SYM` 报错；`cpin` 遇到 host symlink
   跳过并告警（不跟随，避免逃出源目录）。`cpin` 只处理普通文件和目录。
-- **mode / uid / gid 不保留**：god 创建文件固定 0644、目录 0755；导出按宿主
-  umask 落 0644。host → FS 的 uid/gid 不映射。
+- **mode 默认固定**：god 创建文件固定 0644、目录 0755（用 `chmod` 可改）；
+  导出按宿主 umask 落 0644。`cpin` 不继承 host 的 uid/gid/mode；仅当给出
+  `--uid/--gid` 时，新建 inode 才按该身份铸属主。
 - **host 文件名长度**：受宿主 FS 限制（ext4 通常 255B），超过会失败；
   RavenFS 自身支持 552B，`cpin` 会把 host 名原样写入。
 - `cpout/cpin` 的语义是 **目录内容的镜像**：`cpout /a /out` 得到
